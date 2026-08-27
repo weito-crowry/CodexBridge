@@ -50,9 +50,7 @@ class FakeProcess:
             if method == "initialize":
                 self.feed({"jsonrpc": "2.0", "id": message["id"], "result": {"ok": True}})
             elif method in self.responses:
-                self.feed(
-                    {"jsonrpc": "2.0", "id": message["id"], "result": self.responses[method]}
-                )
+                self.feed({"jsonrpc": "2.0", "id": message["id"], "result": self.responses[method]})
 
         self.stdin.on_message = on_message
 
@@ -82,4 +80,3 @@ class FakeProcessFactory:
     async def __call__(self, *args: str) -> FakeProcess:
         self.args = args
         return self.process
-

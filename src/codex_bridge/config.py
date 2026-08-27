@@ -46,7 +46,9 @@ class BridgeConfig:
         if wait_max > 30.0:
             raise ConfigurationError("maximum wait must not exceed 30 seconds")
         if wait_default > wait_max:
-            raise ConfigurationError("default wait cannot exceed the configured default wait maximum")
+            raise ConfigurationError(
+                "default wait cannot exceed the configured default wait maximum"
+            )
 
         port_raw = os.environ.get("CODEX_BRIDGE_PORT", "8000")
         try:

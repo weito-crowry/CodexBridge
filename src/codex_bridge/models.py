@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-
 NormalizedState = Literal[
     "in_progress",
     "needs_approval",
@@ -46,7 +45,7 @@ class TurnState:
     state: NormalizedState = "in_progress"
     latest_agent_message: str = ""
     current_diff: str = ""
-    pending_request_id: str | None = None
+    pending_request_id: RequestId | None = None
     error: str | None = None
     generation: int = 0
     recent_events: list[str] = field(default_factory=list)

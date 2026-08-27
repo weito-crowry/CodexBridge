@@ -15,9 +15,7 @@ def test_empty_allowed_roots_fail_closed(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_config_parses_host_origin_and_bounded_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ROOTS", r"C:\work;D:\repo")
-    monkeypatch.setenv(
-        "CODEX_BRIDGE_ALLOWED_HOSTS", "bridge.example.com, bridge.example.com:*"
-    )
+    monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_HOSTS", "bridge.example.com, bridge.example.com:*")
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ORIGINS", "https://chat.example.com")
     monkeypatch.setenv("CODEX_BRIDGE_WAIT_MAX_SECONDS", "29")
 

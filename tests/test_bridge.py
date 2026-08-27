@@ -32,7 +32,14 @@ class FakeAppServer:
         if method == "thread/list":
             return {"data": []}
         if method == "thread/read":
-            return {"thread": {"id": params["threadId"], "turns": []}}
+            return {
+                "thread": {
+                    "id": params["threadId"],
+                    "turns": [],
+                    "raw": "do not expose",
+                    "chain_of_thought": "do not expose",
+                }
+            }
         raise AssertionError(f"unexpected method {method}")
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
@@ -83,12 +90,33 @@ async def test_steer_uses_expected_turn_id(allowed_dir) -> None:
 
 
 @pytest.mark.asyncio
+async def test_threads_list_and_read_are_bounded_and_sanitized(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    listed = await bridge.threads(limit=5, cursor="next")
+    detail = await bridge.threads("native-thread", include_history=True)
+
+    assert listed["threads"] == []
+    assert app.calls[-2:] == [
+        ("thread/list", {"limit": 5, "cursor": "next"}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": True}),
+    ]
+    assert detail["thread"] == {"id": "native-thread", "turns": []}
+
+
+@pytest.mark.asyncio
 async def test_wait_returns_immediately_for_terminal_event(allowed_dir) -> None:
     bridge, _, _ = make_bridge(allowed_dir)
     await bridge.start(str(allowed_dir), "prompt")
 
     bridge.handle_notification(
-        {"method": "turn/completed", "params": {"threadId": "native-thread", "turn": {"id": "native-turn", "status": "completed"}}}
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "native-thread",
+                "turn": {"id": "native-turn", "status": "completed"},
+            },
+        }
     )
 
     result = await bridge.wait("native-thread", "native-turn", 0.1)
@@ -104,7 +132,13 @@ async def test_wait_wakes_when_matching_turn_completes(allowed_dir) -> None:
     await asyncio.sleep(0)
 
     bridge.handle_notification(
-        {"method": "turn/completed", "params": {"threadId": "native-thread", "turn": {"id": "native-turn", "status": "completed"}}}
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "native-thread",
+                "turn": {"id": "native-turn", "status": "completed"},
+            },
+        }
     )
 
     assert (await waiter)["state"] == "completed"
@@ -113,10 +147,17 @@ async def test_wait_wakes_when_matching_turn_completes(allowed_dir) -> None:
 @pytest.mark.asyncio
 async def test_terminal_statuses_are_normalized(allowed_dir) -> None:
     bridge, _, store = make_bridge(allowed_dir)
-    for native, expected in (("completed", "completed"), ("interrupted", "interrupted"), ("failed", "failed")):
+    for native, expected in (
+        ("completed", "completed"),
+        ("interrupted", "interrupted"),
+        ("failed", "failed"),
+    ):
         store.ensure_turn("thread", "turn")
         bridge.handle_notification(
-            {"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "turn", "status": native}}}
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thread", "turn": {"id": "turn", "status": native}},
+            }
         )
         assert store.snapshot("thread", "turn")["state"] == expected
 
@@ -126,10 +167,16 @@ async def test_agent_delta_and_diff_are_retained(allowed_dir) -> None:
     bridge, _, store = make_bridge(allowed_dir)
 
     bridge.handle_notification(
-        {"method": "item/agentMessage/delta", "params": {"threadId": "thread", "turnId": "turn", "itemId": "item", "delta": "hello"}}
+        {
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread", "turnId": "turn", "itemId": "item", "delta": "hello"},
+        }
     )
     bridge.handle_notification(
-        {"method": "turn/diff/updated", "params": {"threadId": "thread", "turnId": "turn", "diff": "diff"}}
+        {
+            "method": "turn/diff/updated",
+            "params": {"threadId": "thread", "turnId": "turn", "diff": "diff"},
+        }
     )
 
     snapshot = store.snapshot("thread", "turn")
@@ -204,3 +251,14 @@ async def test_interrupt_response_does_not_become_terminal_state(allowed_dir) ->
 
     assert result["state"] == "in_progress"
     assert app.methods == ["turn/interrupt"]
+
+
+def test_app_server_failure_marks_active_turn_failed(allowed_dir) -> None:
+    bridge, _, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    bridge.handle_app_server_failure("JSON-RPC transport closed")
+
+    snapshot = store.snapshot("thread", "turn")
+    assert snapshot["state"] == "failed"
+    assert snapshot["error"] == "JSON-RPC transport closed"

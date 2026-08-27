@@ -43,7 +43,9 @@ async def test_notification_and_server_request_are_routed() -> None:
     )
     task = asyncio.create_task(transport.run())
     reader.feed_data(b'{"jsonrpc":"2.0","method":"turn/completed","params":{}}\n')
-    reader.feed_data(b'{"jsonrpc":"2.0","id":9,"method":"item/tool/requestUserInput","params":{}}\n')
+    reader.feed_data(
+        b'{"jsonrpc":"2.0","id":9,"method":"item/tool/requestUserInput","params":{}}\n'
+    )
     await asyncio.sleep(0.05)
 
     assert notifications == [{"jsonrpc": "2.0", "method": "turn/completed", "params": {}}]

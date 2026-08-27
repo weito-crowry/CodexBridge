@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from typing import Any
 
 from .models import NormalizedState, PendingRequest, RequestId, ThreadState, TurnState
-
 
 _MAX_MESSAGE_CHARS = 16_000
 _MAX_DIFF_CHARS = 32_000
@@ -107,7 +105,9 @@ class StateStore:
         try:
             async with condition:
                 await asyncio.wait_for(
-                    condition.wait_for(lambda: self._turn(thread_id, turn_id).generation != generation),
+                    condition.wait_for(
+                        lambda: self._turn(thread_id, turn_id).generation != generation
+                    ),
                     timeout=timeout,
                 )
         except TimeoutError:
@@ -116,7 +116,11 @@ class StateStore:
 
     def snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         turn = self._turn(thread_id, turn_id)
-        pending = self._pending.get(turn.pending_request_id or "")
+        pending = (
+            self._pending.get(turn.pending_request_id)
+            if turn.pending_request_id is not None
+            else None
+        )
         return {
             "thread_id": thread_id,
             "turn_id": turn_id,

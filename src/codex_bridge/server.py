@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -12,7 +12,8 @@ from starlette.routing import Mount
 
 from .app_server import AppServerClient
 from .bridge import Bridge
-from .config import BridgeConfig
+from .config import BridgeConfig, ConfigurationError
+from .logging_utils import log_event
 from .models import ApprovalDecision
 from .paths import AllowedPathPolicy
 from .state import StateStore
@@ -34,10 +35,12 @@ class BridgeRuntime:
 
     async def start(self) -> None:
         await self.app_server.start()
+        log_event("bridge.start")
 
     async def shutdown(self) -> None:
         await self.bridge.interrupt_active_turns()
         await self.app_server.shutdown(self.config.shutdown_grace_seconds)
+        log_event("bridge.shutdown")
 
 
 def build_runtime(config: BridgeConfig) -> BridgeRuntime:
@@ -53,15 +56,21 @@ def build_runtime(config: BridgeConfig) -> BridgeRuntime:
     app_server.set_handlers(
         on_notification=bridge.handle_notification,
         on_server_request=bridge.handle_server_request,
+        on_failure=bridge.handle_app_server_failure,
     )
     return BridgeRuntime(bridge=bridge, app_server=app_server, config=config)
 
 
 def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | None:
     if not config.allowed_hosts and not config.allowed_origins:
+        if config.host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ConfigurationError("non-loopback bind requires at least one allowed host")
         return None
+    allowed_hosts = list(config.allowed_hosts)
+    if not allowed_hosts and config.host in {"127.0.0.1", "localhost", "::1"}:
+        allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     return TransportSecuritySettings(
-        allowed_hosts=list(config.allowed_hosts),
+        allowed_hosts=allowed_hosts,
         allowed_origins=list(config.allowed_origins),
     )
 
@@ -69,7 +78,7 @@ def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | Non
 def create_app(
     config: BridgeConfig,
     *,
-    runtime_factory=build_runtime,
+    runtime_factory: Callable[[BridgeConfig], RuntimeLike] = build_runtime,
 ) -> Starlette:
     mcp = MCPServer("CodexBridge", version="0.1.0")
     runtime_holder: dict[str, RuntimeLike | None] = {"runtime": None}
@@ -142,14 +151,14 @@ def create_app(
     )
 
     @asynccontextmanager
-    async def lifespan(app: Starlette):
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with mcp.session_manager.run():
             runtime = runtime_factory(config)
             runtime_holder["runtime"] = runtime
             app.state.runtime = runtime
             app.state.bridge = runtime.bridge
-            await runtime.start()
             try:
+                await runtime.start()
                 yield
             finally:
                 await runtime.shutdown()
@@ -171,4 +180,3 @@ async def run_server(config: BridgeConfig) -> None:
     app = create_app(config)
     server = uvicorn.Server(uvicorn.Config(app, host=config.host, port=config.port))
     await server.serve()
-

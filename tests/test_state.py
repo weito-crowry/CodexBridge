@@ -49,3 +49,17 @@ def test_pending_request_is_scoped_to_one_request_id() -> None:
     assert store.get_pending_request("request-b") is None
     assert store.pop_pending_request("request-a") == pending
     assert store.get_pending_request("request-a") is None
+
+
+def test_zero_pending_request_id_is_exposed_in_snapshot() -> None:
+    store = StateStore()
+    pending = PendingRequest(
+        request_id=0,
+        method="item/fileChange/requestApproval",
+        thread_id="thread",
+        turn_id="turn",
+    )
+
+    store.put_pending_request(pending)
+
+    assert store.snapshot("thread", "turn")["pending_request"] == pending

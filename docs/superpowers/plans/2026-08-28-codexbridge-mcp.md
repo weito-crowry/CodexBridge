@@ -252,8 +252,17 @@ async def test_steer_uses_expected_turn_id(fake_app):
 async def test_terminal_events_normalize_completed_interrupted_and_failed(fake_app):
     store = StateStore()
     bridge = Bridge(fake_app, store, path_policy)
-    for native, expected in (("completed", "completed"), ("interrupted", "interrupted"), ("failed", "failed")):
-        bridge.handle_notification({"method": "turn/completed", "params": {"threadId": "t", "turn": {"id": "u", "status": native}}})
+    for native, expected in (
+        ("completed", "completed"),
+        ("interrupted", "interrupted"),
+        ("failed", "failed"),
+    ):
+        bridge.handle_notification(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "t", "turn": {"id": "u", "status": native}},
+            }
+        )
         assert store.snapshot("t", "u")["state"] == expected
 ```
 
@@ -302,8 +311,14 @@ git commit -m "feat: bridge native Codex threads and turns"
 def test_server_registers_exactly_eight_tools(app):
     names = {tool.name for tool in app_mcp_tools(app)}
     assert names == {
-        "codex_start", "codex_continue", "codex_wait", "codex_steer",
-        "codex_approval", "codex_user_input", "codex_interrupt", "codex_threads",
+        "codex_start",
+        "codex_continue",
+        "codex_wait",
+        "codex_steer",
+        "codex_approval",
+        "codex_user_input",
+        "codex_interrupt",
+        "codex_threads",
     }
 
 

@@ -4,6 +4,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, Protocol
 
+from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
     NormalizedState,
@@ -103,6 +104,7 @@ class Bridge:
             raise BridgeError("turn/start did not return a turn id")
         turn_id = turn["id"]
         self._state.ensure_turn(thread_id, turn_id)
+        log_event("turn.start", thread_id=thread_id, turn_id=turn_id)
         status = _native_state(turn.get("status"))
         if status in _TERMINAL_STATES:
             self._state.set_terminal(thread_id, turn_id, status, _bounded_text(turn.get("error")))
@@ -116,6 +118,7 @@ class Bridge:
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
         self._state.mark_loaded(thread_id)
+        log_event("thread.start", thread_id=thread_id)
         return await self._start_turn(thread_id, prompt)
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
@@ -125,6 +128,7 @@ class Bridge:
             if not isinstance(thread, dict) or thread.get("id") != thread_id:
                 raise BridgeError("thread/resume returned a mismatched thread id")
             self._state.mark_loaded(thread_id)
+            log_event("thread.resume", thread_id=thread_id)
         return await self._start_turn(thread_id, prompt)
 
     async def wait(
@@ -140,7 +144,9 @@ class Bridge:
             if snapshot["state"] != "in_progress" or snapshot["pending_request"] is not None:
                 return snapshot
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not await self._state.wait_for_change(thread_id, turn_id, remaining):
+            if remaining <= 0 or not await self._state.wait_for_change(
+                thread_id, turn_id, remaining
+            ):
                 return self._public_snapshot(thread_id, turn_id)
 
     async def steer(self, thread_id: str, turn_id: str, prompt: str) -> dict[str, Any]:
@@ -163,6 +169,7 @@ class Bridge:
             raise ValueError("unknown approval request")
         await self._app_server.respond(request_id, {"decision": decision})
         self._state.pop_pending_request(request_id)
+        log_event("approval.resolved", request_id=request_id, decision=decision)
         return self._public_snapshot(pending.thread_id, pending.turn_id)
 
     async def answer_user_input(
@@ -177,17 +184,23 @@ class Bridge:
             raise ValueError("answers must match pending question ids")
         normalized: dict[str, UserInputAnswer] = {}
         for question_id, values in answers.items():
-            if not isinstance(values, (list, tuple)) or not all(isinstance(value, str) for value in values):
+            if not isinstance(values, (list, tuple)) or not all(
+                isinstance(value, str) for value in values
+            ):
                 raise ValueError("each answer must be a list of strings")
             normalized[question_id] = UserInputAnswer(tuple(values))
-        payload = {"answers": {key: {"answers": list(value.answers)} for key, value in normalized.items()}}
+        payload = {
+            "answers": {key: {"answers": list(value.answers)} for key, value in normalized.items()}
+        }
         await self._app_server.respond(request_id, payload)
         self._state.pop_pending_request(request_id)
+        log_event("user_input.resolved", request_id=request_id)
         return self._public_snapshot(pending.thread_id, pending.turn_id)
 
     async def interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         await self._app_server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         self._state.ensure_turn(thread_id, turn_id)
+        log_event("turn.interrupt", thread_id=thread_id, turn_id=turn_id)
         return self._public_snapshot(thread_id, turn_id)
 
     async def interrupt_active_turns(self) -> None:
@@ -196,6 +209,11 @@ class Bridge:
                 await self.interrupt(thread_id, turn_id)
             except Exception:
                 continue
+
+    def handle_app_server_failure(self, error: str) -> None:
+        for thread_id, turn_id in self._state.active_turns():
+            self._state.set_terminal(thread_id, turn_id, "failed", error)
+            log_event("turn.terminal", thread_id=thread_id, turn_id=turn_id, state="failed")
 
     async def threads(
         self,
@@ -244,6 +262,13 @@ class Bridge:
                     summary=_bounded_text(params.get("reason") or params.get("command")),
                 )
             )
+            log_event(
+                "approval.request",
+                request_id=request_id,
+                method=method,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
             return
         if method == _USER_INPUT_METHOD:
             raw_questions = params.get("questions")
@@ -251,7 +276,9 @@ class Bridge:
                 raise BridgeError("user-input request questions are malformed")
             questions: list[UserInputQuestion] = []
             for raw in raw_questions:
-                if not isinstance(raw, dict) or not all(isinstance(raw.get(key), str) for key in ("header", "id", "question")):
+                if not isinstance(raw, dict) or not all(
+                    isinstance(raw.get(key), str) for key in ("header", "id", "question")
+                ):
                     raise BridgeError("user-input question is malformed")
                 questions.append(
                     UserInputQuestion(header=raw["header"], id=raw["id"], question=raw["question"])
@@ -266,6 +293,13 @@ class Bridge:
                     questions=tuple(questions),
                 )
             )
+            log_event(
+                "user_input.request",
+                request_id=request_id,
+                method=method,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
             return
         raise BridgeError(f"unsupported App Server request method: {method}")
 
@@ -276,27 +310,48 @@ class Bridge:
             return
         thread_id, turn_id = params.get("threadId"), params.get("turnId")
         if method == "item/agentMessage/delta":
-            if isinstance(thread_id, str) and isinstance(turn_id, str) and isinstance(params.get("delta"), str):
+            if (
+                isinstance(thread_id, str)
+                and isinstance(turn_id, str)
+                and isinstance(params.get("delta"), str)
+            ):
                 self._state.append_agent_message(thread_id, turn_id, params["delta"])
             return
         if method == "turn/diff/updated":
-            if isinstance(thread_id, str) and isinstance(turn_id, str) and isinstance(params.get("diff"), str):
+            if (
+                isinstance(thread_id, str)
+                and isinstance(turn_id, str)
+                and isinstance(params.get("diff"), str)
+            ):
                 self._state.update_diff(thread_id, turn_id, params["diff"])
             return
         if method == "turn/started":
             turn = params.get("turn")
-            if isinstance(thread_id, str) and isinstance(turn, dict) and isinstance(turn.get("id"), str):
+            if (
+                isinstance(thread_id, str)
+                and isinstance(turn, dict)
+                and isinstance(turn.get("id"), str)
+            ):
                 self._state.ensure_turn(thread_id, turn["id"])
             return
         if method == "turn/completed":
             turn = params.get("turn")
-            if isinstance(thread_id, str) and isinstance(turn, dict) and isinstance(turn.get("id"), str):
+            if (
+                isinstance(thread_id, str)
+                and isinstance(turn, dict)
+                and isinstance(turn.get("id"), str)
+            ):
                 status = _native_state(turn.get("status"))
-                self._state.set_terminal(thread_id, turn["id"], status, _bounded_text(turn.get("error")))
+                self._state.set_terminal(
+                    thread_id, turn["id"], status, _bounded_text(turn.get("error"))
+                )
+                log_event("turn.terminal", thread_id=thread_id, turn_id=turn["id"], state=status)
             return
         if method == "error":
             if isinstance(thread_id, str) and isinstance(turn_id, str):
-                self._state.set_terminal(thread_id, turn_id, "failed", _bounded_text(params.get("message")))
+                self._state.set_terminal(
+                    thread_id, turn_id, "failed", _bounded_text(params.get("message"))
+                )
 
     def _public_snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         snapshot = self._state.snapshot(thread_id, turn_id)
@@ -310,7 +365,8 @@ class Bridge:
                 "item_id": pending.item_id,
                 "summary": pending.summary,
                 "questions": [
-                    {"header": q.header, "id": q.id, "question": q.question} for q in pending.questions
+                    {"header": q.header, "id": q.id, "question": q.question}
+                    for q in pending.questions
                 ],
             }
         return snapshot

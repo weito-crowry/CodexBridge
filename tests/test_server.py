@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 
-from codex_bridge.config import BridgeConfig
+from codex_bridge.config import BridgeConfig, ConfigurationError
 from codex_bridge.server import create_app
 
 
@@ -79,3 +79,11 @@ def test_configured_host_security_is_exposed_on_app(tmp_path) -> None:
     security = app.state.transport_security
     assert security.allowed_hosts == ["bridge.example.com", "bridge.example.com:*"]
     assert security.allowed_origins == []
+
+
+def test_non_loopback_bind_requires_allowed_host(tmp_path) -> None:
+    runtime = FakeRuntime()
+    settings = replace(config(tmp_path), host="0.0.0.0")
+
+    with pytest.raises(ConfigurationError, match="allowed host"):
+        create_app(settings, runtime_factory=lambda _: runtime)

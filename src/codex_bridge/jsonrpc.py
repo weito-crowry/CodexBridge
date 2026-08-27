@@ -6,7 +6,6 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
-
 JsonObject = dict[str, Any]
 MessageCallback = Callable[[JsonObject], Awaitable[None] | None]
 
@@ -64,6 +63,10 @@ class JsonRpcTransport:
         self._on_notification = on_notification
         self._on_server_request = on_server_request
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     async def _write(self, message: JsonObject) -> None:
         encoded = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         async with self._write_lock:
@@ -78,7 +81,9 @@ class JsonRpcTransport:
         future: asyncio.Future[JsonObject] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         try:
-            await self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            await self._write(
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            )
             return await future
         finally:
             self._pending.pop(request_id, None)
@@ -124,12 +129,18 @@ class JsonRpcTransport:
                         continue
                     if "error" in message:
                         error = message["error"]
-                        text = error.get("message", "remote JSON-RPC error") if isinstance(error, dict) else str(error)
+                        text = (
+                            error.get("message", "remote JSON-RPC error")
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
                         future.set_exception(JsonRpcRemoteError(text))
                     else:
                         result = message.get("result")
                         if not isinstance(result, dict):
-                            future.set_exception(JsonRpcProtocolError("JSON-RPC result must be an object"))
+                            future.set_exception(
+                                JsonRpcProtocolError("JSON-RPC result must be an object")
+                            )
                         else:
                             future.set_result(result)
                 elif "method" in message:

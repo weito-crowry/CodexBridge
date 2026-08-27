@@ -17,7 +17,11 @@ async def test_app_server_sends_initialize_then_initialized() -> None:
 
     assert factory.args == ("codex", "app-server", "--stdio")
     assert factory.process.methods == ["initialize"]
-    assert factory.process.stdin.writes[-1] == {"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    assert factory.process.stdin.writes[-1] == {
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {},
+    }
     await client.shutdown()
     assert factory.process.terminated is True
 
@@ -52,4 +56,17 @@ async def test_app_server_marks_abnormal_stdout_exit() -> None:
     await asyncio.sleep(0.05)
 
     assert client.failed is True
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_app_server_notifies_failure_handler() -> None:
+    factory = FakeProcessFactory()
+    failures: list[str] = []
+    client = AppServerClient("codex", process_factory=factory, on_failure=failures.append)
+    await client.start()
+    factory.process.feed_eof()
+    await asyncio.sleep(0.05)
+
+    assert failures == ["JSON-RPC transport closed"]
     await client.shutdown()
