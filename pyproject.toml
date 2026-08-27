@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codexbridge"
+version = "0.1.0"
+description = "A thin Streamable HTTP MCP bridge to the local Codex App Server."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2,<3",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+codex-bridge = "codex_bridge.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_bridge"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
