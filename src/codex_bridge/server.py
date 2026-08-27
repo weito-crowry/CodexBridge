@@ -38,7 +38,9 @@ class BridgeRuntime:
         log_event("bridge.start")
 
     async def shutdown(self) -> None:
-        await self.bridge.interrupt_active_turns()
+        await self.bridge.interrupt_active_turns(
+            wait_seconds=min(0.5, self.config.shutdown_grace_seconds)
+        )
         await self.app_server.shutdown(self.config.shutdown_grace_seconds)
         log_event("bridge.shutdown")
 

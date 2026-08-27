@@ -451,3 +451,58 @@ Run: `git rev-parse HEAD`; `git ls-remote origin refs/heads/main`; `git status -
 
 Expected: the remote ref equals the final local SHA and the worktree is clean.
 
+---
+
+## Review Fix Plan for `f108c6c`
+
+**Goal:** Preserve the existing eight-tool bridge while closing the reviewed security, protocol, lifecycle, and process-recovery defects.
+
+**Schema evidence:** Regenerate with `codex app-server generate-json-schema --experimental`; in the installed `codex-cli 0.137.0` schema, `Thread.cwd` is required, `PermissionsRequestApprovalParams` contains `cwd`, `environmentId`, `permissions`, and `reason`, `PermissionsRequestApprovalResponse` requires `permissions` and permits `scope` `turn|session`, `ServerRequestResolvedNotification` carries `requestId` and `threadId`, and `McpServerElicitationRequestResponse` requires action `accept|decline|cancel`.
+
+### Review Task 1: Enforce canonical cwd policy on persisted threads
+
+**Files:** modify `src/codex_bridge/models.py`, `src/codex_bridge/state.py`, `src/codex_bridge/bridge.py`, and `tests/test_bridge.py`.
+
+- Add `ThreadState.validated_cwd` and make `mark_loaded()` require the canonical cwd.
+- Before `thread/resume`, call `thread/read` with `includeTurns=false`, validate `thread.cwd` through `AllowedPathPolicy`, and only then resume; store the validated cwd after the native response matches the requested thread.
+- For `codex_threads(thread_id=...)`, validate metadata before optionally fetching history; for list responses, validate each native `cwd` and exclude invalid/out-of-root rows while preserving native cursors.
+- First add tests proving allowed continue, pre-resume rejection, no resume call, detail/history rejection, list filtering, sibling-prefix/case/symlink enforcement, then run those tests red before implementing.
+
+### Review Task 2: Make permission approvals method-aware and schema-shaped
+
+**Files:** modify `src/codex_bridge/models.py`, `src/codex_bridge/bridge.py`, and `tests/test_bridge.py`.
+
+- Add a bounded typed permission request payload containing requested permissions, cwd, environment id, reason, and safe scope-related data; do not retain arbitrary credential-like fields.
+- Keep command/file approvals as `{"decision": ...}`. For permission approvals, map `accept` to `{"permissions": requested, "scope": "turn"}`, `acceptForSession` to the same requested subset with `scope: "session"`, and `decline`/`cancel` to the schema-required empty grant profile with turn scope.
+- Add tests asserting exact response dictionaries against the generated 0.137.0 response schema shape and that the public pending request is bounded and credential-free.
+
+### Review Task 3: Reconcile pending requests on resolution and terminal events
+
+**Files:** modify `src/codex_bridge/state.py`, `src/codex_bridge/bridge.py`, and `tests/test_bridge.py`.
+
+- Handle `serverRequest/resolved` by matching both native request id and thread id, removing only that pending request.
+- Terminal transitions purge all pending requests for the turn and clear `pending_request_id`; resolving a stale or duplicate request must not move a terminal turn back to `in_progress`.
+- Add tests for approval/user-input resolution, duplicate/unknown resolution, pending-plus-completed, pending-plus-interrupt-then-completed, and failed-terminal cleanup.
+
+### Review Task 4: Isolate unsupported server requests and callback failures
+
+**Files:** modify `src/codex_bridge/jsonrpc.py`, `src/codex_bridge/bridge.py`, `src/codex_bridge/app_server.py`, and tests under `tests/`.
+
+- Add a native JSON-RPC error response method. Unsupported server requests receive a bounded `-32601` error and the reader continues; `mcpServer/elicitation/request` receives the schema-valid `{"action": "cancel"}` response without adding a ninth MCP tool.
+- Ensure callback exceptions settle all pending client futures; server-request callback failures receive a bounded error response and do not kill the reader loop.
+- Add fake-stream tests that send an unsupported request followed by notification/response, verify no active turn is failed, verify no pending future hangs, and validate elicitation cancellation against the generated response shape.
+
+### Review Task 5: Hard-bound App Server shutdown and document the boundary
+
+**Files:** modify `src/codex_bridge/app_server.py`, `src/codex_bridge/server.py`, `tests/fakes.py`, `tests/test_app_server.py`, `tests/test_server.py`, `README.md`, and `scripts/integration_smoke.py` only if needed for the explicit smoke report.
+
+- Extend `ProcessLike` with `kill`; implement `terminate -> bounded wait -> kill -> bounded final wait`, retaining a process reference if an OS-level final wait still times out.
+- Give interrupted turns a short terminal-notification grace before closing the protocol, while keeping shutdown bounded.
+- Add terminate-respecting and terminate-ignoring fake processes, assert kill fallback, and assert pending cleanup after interruption/terminal events.
+- Document that allowed-root filtering applies to start, resume, detail/history, and list; permission responses are method-aware; unsupported requests fail closed with a protocol error or elicitation cancel.
+
+### Review verification and delivery
+
+- Run `uv run pytest -q`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy src`, `uv run python -m compileall -q src tests scripts`, and `uv lock --check`.
+- Re-run `uv run python scripts/integration_smoke.py` in a temporary workspace and report start, continue, shutdown/restart, resume, steer, and file-change approval separately from unmeasured permission/user-input cases.
+- Scan tracked paths for secrets, commit as an additional commit on `main`, push with ordinary `git push`, and verify local/remote SHA equality without amend, rebase, or force push.

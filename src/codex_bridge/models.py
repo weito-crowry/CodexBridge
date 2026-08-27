@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 NormalizedState = Literal[
     "in_progress",
@@ -13,6 +13,7 @@ NormalizedState = Literal[
 ]
 RequestId = int | str
 ApprovalDecision = Literal["accept", "acceptForSession", "decline", "cancel"]
+PermissionGrantScope = Literal["turn", "session"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,15 @@ class UserInputAnswer:
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionRequestDetails:
+    requested_permissions: dict[str, Any]
+    cwd: str
+    environment_id: str | None
+    reason: str | None
+    allowed_scopes: tuple[PermissionGrantScope, ...] = ("turn", "session")
+
+
+@dataclass(frozen=True, slots=True)
 class PendingRequest:
     request_id: RequestId
     method: str
@@ -36,6 +46,7 @@ class PendingRequest:
     item_id: str | None = None
     questions: tuple[UserInputQuestion, ...] = ()
     summary: str | None = None
+    permission: PermissionRequestDetails | None = None
 
 
 @dataclass(slots=True)
@@ -56,3 +67,4 @@ class ThreadState:
     thread_id: str
     turns: dict[str, TurnState] = field(default_factory=dict)
     loaded: bool = False
+    validated_cwd: str | None = None

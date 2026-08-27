@@ -23,6 +23,8 @@ class ProcessLike(Protocol):
 
     def terminate(self) -> Any: ...
 
+    def kill(self) -> Any: ...
+
 
 ProcessFactory = Callable[..., Awaitable[ProcessLike]]
 MessageCallback = Callable[[JsonObject], Awaitable[None] | None]
@@ -90,6 +92,8 @@ class AppServerClient:
     async def start(self) -> None:
         if self._transport is not None:
             return
+        if self._process is not None:
+            raise RuntimeError("previous App Server process is still running")
         self._process = await self._process_factory(self._executable, "app-server", "--stdio")
         if (
             self._process.stdin is None
@@ -161,28 +165,73 @@ class AppServerClient:
             raise RuntimeError("App Server is not started")
         await self._transport.send_response(request_id, result)
 
+    async def reject(self, request_id: int | str, code: int, message: str) -> None:
+        if self._transport is None:
+            raise RuntimeError("App Server is not started")
+        await self._transport.send_error(request_id, code, message)
+
     async def shutdown(self, grace_seconds: float = 3.0) -> None:
         transport, process = self._transport, self._process
-        if transport is None or process is None:
+        if process is None:
             return
-        await transport.close()
+        deadline = asyncio.get_running_loop().time() + max(0.0, grace_seconds)
+        if transport is not None:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(transport.close(), timeout=remaining)
+                except TimeoutError:
+                    logger.error("App Server transport close exceeded shutdown deadline")
+                except Exception:
+                    logger.debug("App Server transport close failed during shutdown")
         if self._reader_task is not None:
-            try:
-                await asyncio.wait_for(self._reader_task, timeout=grace_seconds)
-            except TimeoutError:
-                if not self._reader_task.done():
-                    self._reader_task.cancel()
-            except Exception:
-                pass
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(self._reader_task, timeout=remaining)
+                except TimeoutError:
+                    if not self._reader_task.done():
+                        self._reader_task.cancel()
+                    await asyncio.gather(self._reader_task, return_exceptions=True)
+                except Exception:
+                    pass
         if self._stderr_task is not None:
             self._stderr_task.cancel()
             await asyncio.gather(self._stderr_task, return_exceptions=True)
         if process.returncode is None:
-            process.terminate()
             try:
-                await asyncio.wait_for(process.wait(), timeout=grace_seconds)
-            except TimeoutError:
-                logger.error("App Server did not exit during graceful shutdown")
+                process.terminate()
+            except Exception:
+                logger.debug("App Server terminate failed during shutdown")
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=remaining / 2)
+                except TimeoutError:
+                    pass
+                except Exception:
+                    pass
+        if process.returncode is None:
+            try:
+                process.kill()
+            except Exception:
+                logger.error("App Server kill failed during shutdown")
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=remaining)
+                except TimeoutError:
+                    logger.error("App Server did not exit after kill")
+                except Exception:
+                    pass
+        if process.returncode is None:
+            logger.error("App Server process remains after bounded shutdown")
+            self._transport = None
+            self._reader_task = None
+            self._stderr_task = None
+            return
         self._transport = None
         self._process = None
+        self._reader_task = None
+        self._stderr_task = None
         log_event("app_server.shutdown")

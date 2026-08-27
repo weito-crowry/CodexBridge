@@ -100,25 +100,29 @@ Normalized states are `in_progress`, `needs_approval`, `needs_input`, `completed
 5. Continue polling `codex_wait` until `completed`, `interrupted`, or `failed`.
 6. Use `codex_steer` while the turn is running, or `codex_interrupt` when it must stop.
 
-After a CodexBridge restart, call `codex_continue` with the same native `thread_id`. The bridge calls `thread/resume`; it does not edit rollout/history files or repair a failed resume.
+After a CodexBridge restart, call `codex_continue` with the same native `thread_id`. The bridge first reads the persisted thread metadata, validates its canonical `cwd`, and calls `thread/resume` only when that cwd is allowed; it does not edit rollout/history files or repair a failed resume.
 
 ## Approval flow
 
-Codex server requests are stored only in process memory and surfaced by `codex_wait`. Approval responses are method-specific JSON-RPC responses with the closed decision enum from the installed App Server schema; arbitrary JSON passthrough and automatic approval are intentionally absent. User-input responses must match the pending question IDs and use the App Server shape `{ "answers": ["..."] }` per question. Unknown, duplicate, or mismatched request IDs are rejected without resolving another request.
+Codex server requests are stored only in process memory and surfaced by `codex_wait`. Approval responses are method-specific JSON-RPC responses with the closed decision enum from the installed App Server schema; arbitrary JSON passthrough and automatic approval are intentionally absent. Command/file approvals use the native `decision` response. Permission approvals retain only the schema-shaped requested file-system/network subset plus bounded `cwd`, `environmentId`, reason, and available turn/session scopes; accept grants that subset, `acceptForSession` selects session scope, and decline/cancel returns an empty native grant. User-input responses must match the pending question IDs and use the App Server shape `{ "answers": ["..."] }` per question. Unknown, duplicate, or mismatched request IDs are rejected without resolving another request.
+
+The allowed-root policy applies to every bridge entry point that can select a thread: `codex_start` validates its input `cwd`; `codex_continue` validates persisted metadata before resume; `codex_threads` validates detail/history before returning it and filters list rows by canonical `cwd`. A list page may contain fewer rows than its native page size because disallowed or malformed rows are omitted.
+
+Unsupported App Server server-initiated requests fail closed with a bounded JSON-RPC error and do not stop the reader. MCP `mcpServer/elicitation/request` is answered with the schema-valid `action: cancel`; the initial tool surface remains eight tools. Terminal events and `serverRequest/resolved` notifications clear stale pending requests defensively.
 
 ## Shutdown behavior
 
-SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns, wait for the configured short grace period, close protocol pipes, and terminate the App Server child if it has not exited. Infinite waits, hard-kill recovery, rollback, and crash repair are out of scope.
+SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then closes protocol pipes and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
 
 ## Security assumptions and limitations
 
 - This is single-user/local-use software; it has no authentication database or multi-user isolation.
-- The cwd allowlist is an additional bridge boundary, not a replacement for Codex sandbox and approval policy.
+- The cwd allowlist is an additional bridge boundary, not a replacement for Codex sandbox and approval policy; it applies to new starts, persisted-thread resume, detail/history reads, and list filtering.
 - `cwd` must be an absolute existing directory. Canonical resolution rejects `..`, sibling-prefix collisions, case bypasses, and symlink/junction escapes outside allowed roots.
 - Logs record lifecycle/state metadata only. Prompt text, credentials, API keys, tokens, complete environment data, raw event history, and raw chain-of-thought are not logged or returned by bounded status tools.
 - State is intentionally process-memory only. Native Codex persistence is required for resume after restart.
 - One App Server process serves all threads. Multi-process workers, shared state, and durable pending approvals are not supported.
-- A real approval flow depends on Codex policy and runtime conditions; protocol routing is covered by fake App Server tests and the smoke test reports approval cases that cannot be safely reproduced.
+- A real approval flow depends on Codex policy and runtime conditions. The smoke test exercised a temporary file-change approval; permission, command-execution, and user-input cases are covered by fake App Server/schema-shaped tests and are not automatically bypassed.
 - The bridge does not provide dedicated commit/push/shell/file/Git tools. Put those instructions in the Codex task prompt.
 
 ## `codex mcp-server` Spike

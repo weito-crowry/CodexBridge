@@ -10,6 +10,7 @@ class FakeWriter:
     def __init__(self) -> None:
         self.writes: list[dict[str, Any]] = []
         self.closed = False
+        self.ignore_wait_closed = False
         self.on_message: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
 
     def write(self, data: bytes) -> None:
@@ -27,6 +28,8 @@ class FakeWriter:
         self.closed = True
 
     async def wait_closed(self) -> None:
+        if self.ignore_wait_closed:
+            await asyncio.sleep(10)
         return None
 
 
@@ -37,10 +40,15 @@ class FakeProcess:
         self.stdin = FakeWriter()
         self.returncode: int | None = None
         self.terminated = False
+        self.killed = False
+        self.ignore_terminate = False
+        self.ignore_kill = False
         self.waited = asyncio.Event()
         self.methods: list[str] = []
         self.responses: dict[str, dict[str, Any]] = {}
         self.server_request: dict[str, Any] | None = None
+        self.thread_cwds: dict[str, str] = {}
+        self.thread_list: list[dict[str, Any]] = []
 
         async def on_message(message: dict[str, Any]) -> None:
             method = message.get("method")
@@ -49,6 +57,20 @@ class FakeProcess:
             self.methods.append(method)
             if method == "initialize":
                 self.feed({"jsonrpc": "2.0", "id": message["id"], "result": {"ok": True}})
+            elif method == "thread/read":
+                thread_id = message["params"]["threadId"]
+                thread: dict[str, Any] = {"id": thread_id, "turns": []}
+                if thread_id in self.thread_cwds:
+                    thread["cwd"] = self.thread_cwds[thread_id]
+                self.feed({"jsonrpc": "2.0", "id": message["id"], "result": {"thread": thread}})
+            elif method == "thread/list":
+                self.feed(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {"data": self.thread_list},
+                    }
+                )
             elif method in self.responses:
                 self.feed({"jsonrpc": "2.0", "id": message["id"], "result": self.responses[method]})
 
@@ -68,7 +90,16 @@ class FakeProcess:
 
     def terminate(self) -> None:
         self.terminated = True
+        if self.ignore_terminate:
+            return
         self.returncode = 0
+        self.waited.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        if self.ignore_kill:
+            return
+        self.returncode = -9
         self.waited.set()
 
 

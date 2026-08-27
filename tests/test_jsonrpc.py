@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -69,5 +70,34 @@ async def test_eof_fails_pending_requests() -> None:
 
     with pytest.raises(Exception, match="closed"):
         await request
+    with pytest.raises(JsonRpcClosedError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_server_request_callback_failure_does_not_hang_pending_request() -> None:
+    reader = asyncio.StreamReader()
+    writer = FakeWriter()
+
+    async def failing_callback(message: dict[str, object]) -> None:
+        raise RuntimeError("callback failed")
+
+    transport = JsonRpcTransport(reader, writer, on_server_request=failing_callback)
+    task = asyncio.create_task(transport.run())
+    request = asyncio.create_task(transport.send_request("after-callback", {}))
+    await asyncio.sleep(0)
+    request_id = writer.writes[-1]["id"]
+    reader.feed_data(b'{"jsonrpc":"2.0","id":"server-1","method":"unknown","params":{}}\n')
+    reader.feed_data(
+        json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {"ok": True}}).encode() + b"\n"
+    )
+
+    assert await asyncio.wait_for(request, timeout=0.5) == {"ok": True}
+    assert writer.writes[-1] == {
+        "jsonrpc": "2.0",
+        "id": "server-1",
+        "error": {"code": -32603, "message": "server request callback failed"},
+    }
+    await transport.close()
     with pytest.raises(JsonRpcClosedError):
         await task

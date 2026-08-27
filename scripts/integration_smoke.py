@@ -82,7 +82,11 @@ async def _run_smoke() -> int:
                 return 1
 
             continued = await first_bridge.continue_thread(
-                thread_id, "Read the smoke file and reply with its exact contents."
+                thread_id,
+                (
+                    "Confirm that the previous file-creation task completed. Do not use "
+                    "shell, filesystem, network, or other tools; reply exactly CONTINUE-OK."
+                ),
             )
             second_result = await _wait_until_terminal(
                 thread_id=thread_id, turn_id=str(continued["turn_id"]), bridge=first_bridge
@@ -103,7 +107,11 @@ async def _run_smoke() -> int:
         await second_app.start()
         try:
             resumed = await second_bridge.continue_thread(
-                thread_id, "Confirm that the previous smoke task is complete."
+                thread_id,
+                (
+                    "Confirm that the previous smoke task is complete. Do not use shell, "
+                    "filesystem, network, or other tools; reply exactly RESUME-OK."
+                ),
             )
             resumed_result = await _wait_until_terminal(
                 second_bridge, thread_id, str(resumed["turn_id"])
@@ -116,15 +124,15 @@ async def _run_smoke() -> int:
             steer_started = await second_bridge.continue_thread(
                 thread_id,
                 (
-                    "Keep this turn active briefly while you inspect the smoke workspace, "
-                    "then report done."
+                    "Keep this turn active briefly without using shell, filesystem, network, "
+                    "or other tools; wait for further input."
                 ),
             )
             try:
                 steered = await second_bridge.steer(
                     thread_id,
                     str(steer_started["turn_id"]),
-                    "Stop the inspection and report the current state now.",
+                    "Stop now and reply exactly STEER-OK without using any tools.",
                 )
                 print(f"steer: accepted state={steered['state']}")
             except Exception as exc:

@@ -42,8 +42,10 @@ class StateStore:
     def ensure_turn(self, thread_id: str, turn_id: str) -> TurnState:
         return self._turn(thread_id, turn_id)
 
-    def mark_loaded(self, thread_id: str) -> None:
-        self._threads.setdefault(thread_id, ThreadState(thread_id=thread_id)).loaded = True
+    def mark_loaded(self, thread_id: str, validated_cwd: str) -> None:
+        thread = self._threads.setdefault(thread_id, ThreadState(thread_id=thread_id))
+        thread.loaded = True
+        thread.validated_cwd = validated_cwd
 
     def active_turns(self) -> tuple[tuple[str, str], ...]:
         active: list[tuple[str, str]] = []
@@ -54,7 +56,8 @@ class StateStore:
         return tuple(active)
 
     def is_loaded(self, thread_id: str) -> bool:
-        return self._threads.get(thread_id, ThreadState(thread_id=thread_id)).loaded
+        thread = self._threads.get(thread_id)
+        return thread is not None and thread.loaded and thread.validated_cwd is not None
 
     def update_latest_message(self, thread_id: str, turn_id: str, message: str) -> None:
         turn = self._turn(thread_id, turn_id)
@@ -74,13 +77,19 @@ class StateStore:
         self, thread_id: str, turn_id: str, state: NormalizedState, error: str | None = None
     ) -> None:
         turn = self._turn(thread_id, turn_id)
+        for request_id, pending in tuple(self._pending.items()):
+            if pending.thread_id == thread_id and pending.turn_id == turn_id:
+                del self._pending[request_id]
+        turn.pending_request_id = None
         turn.state = state
         turn.error = error[-2_000:] if error else None
         self._touch(turn, f"terminal:{state}")
 
     def put_pending_request(self, pending: PendingRequest) -> None:
-        self._pending[pending.request_id] = pending
         turn = self._turn(pending.thread_id, pending.turn_id)
+        if turn.pending_request_id is not None and turn.pending_request_id != pending.request_id:
+            self._pending.pop(turn.pending_request_id, None)
+        self._pending[pending.request_id] = pending
         turn.pending_request_id = pending.request_id
         turn.state = "needs_input" if "UserInput" in pending.method else "needs_approval"
         self._touch(turn, f"pending:{turn.state}")
@@ -94,8 +103,9 @@ class StateStore:
             turn = self._turn(pending.thread_id, pending.turn_id)
             if turn.pending_request_id == request_id:
                 turn.pending_request_id = None
-                turn.state = "in_progress"
-                self._touch(turn, "pending:resolved")
+                if turn.state not in {"completed", "interrupted", "failed"}:
+                    turn.state = "in_progress"
+                    self._touch(turn, "pending:resolved")
         return pending
 
     async def wait_for_change(self, thread_id: str, turn_id: str, timeout: float) -> bool:

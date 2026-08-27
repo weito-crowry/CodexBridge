@@ -145,12 +145,27 @@ class JsonRpcTransport:
                             future.set_result(result)
                 elif "method" in message:
                     if "id" in message:
-                        await self._dispatch(self._on_server_request, message)
+                        try:
+                            await self._dispatch(self._on_server_request, message)
+                        except Exception:
+                            request_id = message["id"]
+                            if not isinstance(request_id, (int, str)) or isinstance(
+                                request_id, bool
+                            ):
+                                raise
+                            await self.send_error(
+                                request_id, -32603, "server request callback failed"
+                            )
                     else:
                         await self._dispatch(self._on_notification, message)
                 else:
                     raise JsonRpcProtocolError("unrecognized JSON-RPC message")
         except (JsonRpcClosedError, JsonRpcProtocolError) as exc:
+            for future in tuple(self._pending.values()):
+                if not future.done():
+                    future.set_exception(exc)
+            raise
+        except Exception as exc:
             for future in tuple(self._pending.values()):
                 if not future.done():
                     future.set_exception(exc)
