@@ -4,7 +4,7 @@ import asyncio
 from collections import deque
 from typing import Any
 
-from .models import NormalizedState, PendingRequest, ThreadState, TurnState
+from .models import NormalizedState, PendingRequest, RequestId, ThreadState, TurnState
 
 
 _MAX_MESSAGE_CHARS = 16_000
@@ -15,7 +15,7 @@ _MAX_EVENTS = 32
 class StateStore:
     def __init__(self) -> None:
         self._threads: dict[str, ThreadState] = {}
-        self._pending: dict[str, PendingRequest] = {}
+        self._pending: dict[RequestId, PendingRequest] = {}
         self._conditions: dict[tuple[str, str], asyncio.Condition] = {}
 
     def _turn(self, thread_id: str, turn_id: str) -> TurnState:
@@ -79,10 +79,10 @@ class StateStore:
         turn.state = "needs_input" if "UserInput" in pending.method else "needs_approval"
         self._touch(turn, f"pending:{turn.state}")
 
-    def get_pending_request(self, request_id: str) -> PendingRequest | None:
+    def get_pending_request(self, request_id: RequestId) -> PendingRequest | None:
         return self._pending.get(request_id)
 
-    def pop_pending_request(self, request_id: str) -> PendingRequest | None:
+    def pop_pending_request(self, request_id: RequestId) -> PendingRequest | None:
         pending = self._pending.pop(request_id, None)
         if pending is not None:
             turn = self._turn(pending.thread_id, pending.turn_id)

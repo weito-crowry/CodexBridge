@@ -12,6 +12,7 @@ NormalizedState = Literal[
     "interrupted",
     "failed",
 ]
+RequestId = int | str
 ApprovalDecision = Literal["accept", "acceptForSession", "decline", "cancel"]
 
 
@@ -29,7 +30,7 @@ class UserInputAnswer:
 
 @dataclass(frozen=True, slots=True)
 class PendingRequest:
-    request_id: str
+    request_id: RequestId
     method: str
     thread_id: str
     turn_id: str
