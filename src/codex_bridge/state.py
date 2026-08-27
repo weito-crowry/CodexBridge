@@ -47,6 +47,14 @@ class StateStore:
     def mark_loaded(self, thread_id: str) -> None:
         self._threads.setdefault(thread_id, ThreadState(thread_id=thread_id)).loaded = True
 
+    def active_turns(self) -> tuple[tuple[str, str], ...]:
+        active: list[tuple[str, str]] = []
+        for thread_id, thread in self._threads.items():
+            for turn_id, turn in thread.turns.items():
+                if turn.state in {"in_progress", "needs_approval", "needs_input"}:
+                    active.append((thread_id, turn_id))
+        return tuple(active)
+
     def is_loaded(self, thread_id: str) -> bool:
         return self._threads.get(thread_id, ThreadState(thread_id=thread_id)).loaded
 

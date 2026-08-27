@@ -55,6 +55,15 @@ class JsonRpcTransport:
         self._next_id = 1
         self._closed = False
 
+    def set_callbacks(
+        self,
+        *,
+        on_notification: MessageCallback | None = None,
+        on_server_request: MessageCallback | None = None,
+    ) -> None:
+        self._on_notification = on_notification
+        self._on_server_request = on_server_request
+
     async def _write(self, message: JsonObject) -> None:
         encoded = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         async with self._write_lock:

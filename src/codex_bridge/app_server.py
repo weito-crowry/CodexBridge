@@ -55,6 +55,20 @@ class AppServerClient:
         self._failed = False
         self._failure: str | None = None
 
+    def set_handlers(
+        self,
+        *,
+        on_notification: MessageCallback | None = None,
+        on_server_request: MessageCallback | None = None,
+    ) -> None:
+        self._on_notification = on_notification
+        self._on_server_request = on_server_request
+        if self._transport is not None:
+            self._transport.set_callbacks(
+                on_notification=on_notification,
+                on_server_request=on_server_request,
+            )
+
     @property
     def failed(self) -> bool:
         return self._failed
@@ -134,4 +148,3 @@ class AppServerClient:
                 logger.error("App Server did not exit during graceful shutdown")
         self._transport = None
         self._process = None
-

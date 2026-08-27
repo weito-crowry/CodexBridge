@@ -190,6 +190,13 @@ class Bridge:
         self._state.ensure_turn(thread_id, turn_id)
         return self._public_snapshot(thread_id, turn_id)
 
+    async def interrupt_active_turns(self) -> None:
+        for thread_id, turn_id in self._state.active_turns():
+            try:
+                await self.interrupt(thread_id, turn_id)
+            except Exception:
+                continue
+
     async def threads(
         self,
         thread_id: str | None = None,
