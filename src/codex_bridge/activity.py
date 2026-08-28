@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import deque
 from collections.abc import Mapping
@@ -57,6 +58,40 @@ _SECRET_PATTERNS = (
         r"(?i)(\b(?:api[_-]?key|token|password|secret|credential)\b\s*(?:[:=]|\s)\s*)[^\s,;]+"
     ),
 )
+
+
+class ActivitySubscription:
+    """A bounded, process-local stream of safe Activity records."""
+
+    def __init__(self, store: ActivityStore, thread_id: str | None) -> None:
+        self._store = store
+        self._thread_id = thread_id
+        self._queue: asyncio.Queue[Activity] = asyncio.Queue(maxsize=100)
+        self._closed = False
+
+    async def get(self) -> Activity:
+        if self._closed:
+            raise RuntimeError("activity subscription is closed")
+        return await self._queue.get()
+
+    def _publish(self, activity: Activity) -> None:
+        if self._closed or (self._thread_id is not None and self._thread_id != activity.thread_id):
+            return
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+        try:
+            self._queue.put_nowait(activity)
+        except asyncio.QueueFull:
+            return
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._store._unsubscribe(self)
 
 
 def _timestamp() -> str:
@@ -127,6 +162,15 @@ class ActivityStore:
 
     def __init__(self) -> None:
         self._activities: dict[str, deque[Activity]] = {}
+        self._subscribers: set[ActivitySubscription] = set()
+
+    def subscribe(self, thread_id: str | None = None) -> ActivitySubscription:
+        subscription = ActivitySubscription(self, thread_id)
+        self._subscribers.add(subscription)
+        return subscription
+
+    def _unsubscribe(self, subscription: ActivitySubscription) -> None:
+        self._subscribers.discard(subscription)
 
     def add(
         self,
@@ -153,6 +197,8 @@ class ActivityStore:
         self._activities.setdefault(thread_id, deque(maxlen=_MAX_ACTIVITIES_PER_THREAD)).append(
             activity
         )
+        for subscriber in tuple(self._subscribers):
+            subscriber._publish(activity)
         return activity
 
     def get_recent(

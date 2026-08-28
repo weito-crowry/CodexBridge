@@ -30,6 +30,7 @@ def config(tmp_path) -> BridgeConfig:
     return BridgeConfig(
         host="127.0.0.1",
         port=8000,
+        ui_port=8001,
         allowed_roots=(str(tmp_path),),
         allowed_hosts=(),
         allowed_origins=(),
@@ -88,3 +89,12 @@ def test_non_loopback_bind_requires_allowed_host(tmp_path) -> None:
 
     with pytest.raises(ConfigurationError, match="allowed host"):
         create_app(settings, runtime_factory=lambda _: runtime)
+
+
+def test_mcp_app_does_not_register_ui_routes(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+
+    assert all(
+        not getattr(route, "path", "").startswith(("/healthz", "/ui-api")) for route in app.routes
+    )

@@ -18,6 +18,8 @@ from .logging_utils import log_event
 from .models import ApprovalDecision
 from .paths import AllowedPathPolicy
 from .state import StateStore
+from .ui_api import create_ui_app
+from .ui_server import LocalUiServer
 
 
 class RuntimeLike(Protocol):
@@ -34,15 +36,22 @@ class BridgeRuntime:
     app_server: AppServerClient
     activity_store: ActivityStore
     config: BridgeConfig
+    ui_server: LocalUiServer
 
     async def start(self) -> None:
         await self.app_server.start()
+        try:
+            await self.ui_server.start()
+        except BaseException:
+            await self.app_server.shutdown(self.config.shutdown_grace_seconds)
+            raise
         log_event("bridge.start")
 
     async def shutdown(self) -> None:
         await self.bridge.interrupt_active_turns(
             wait_seconds=min(0.5, self.config.shutdown_grace_seconds)
         )
+        await self.ui_server.shutdown(min(0.5, self.config.shutdown_grace_seconds))
         await self.app_server.shutdown(self.config.shutdown_grace_seconds)
         log_event("bridge.shutdown")
 
@@ -64,11 +73,13 @@ def build_runtime(config: BridgeConfig) -> BridgeRuntime:
         on_server_request=bridge.handle_server_request,
         on_failure=bridge.handle_app_server_failure,
     )
+    ui_server = LocalUiServer(create_ui_app(bridge, activity_store, config), config.ui_port)
     return BridgeRuntime(
         bridge=bridge,
         app_server=app_server,
         activity_store=activity_store,
         config=config,
+        ui_server=ui_server,
     )
 
 

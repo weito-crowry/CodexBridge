@@ -33,3 +33,34 @@ def test_default_wait_cannot_exceed_maximum(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(ConfigurationError, match="default wait"):
         BridgeConfig.from_env()
+
+
+def test_ui_port_defaults_to_8001(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEX_BRIDGE_UI_PORT", raising=False)
+
+    config = BridgeConfig.from_env()
+
+    assert config.ui_port == 8001
+
+
+def test_ui_port_is_parsed_and_must_differ_from_mcp_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_PORT", "8100")
+    monkeypatch.setenv("CODEX_BRIDGE_UI_PORT", "8101")
+
+    config = BridgeConfig.from_env()
+
+    assert config.ui_port == 8101
+
+    monkeypatch.setenv("CODEX_BRIDGE_UI_PORT", "8100")
+    with pytest.raises(ConfigurationError, match="must differ"):
+        BridgeConfig.from_env()
+
+
+@pytest.mark.parametrize("value", ["0", "65536", "not-a-port"])
+def test_ui_port_rejects_invalid_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_UI_PORT", value)
+
+    with pytest.raises(ConfigurationError, match="CODEX_BRIDGE_UI_PORT"):
+        BridgeConfig.from_env()

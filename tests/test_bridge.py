@@ -7,6 +7,7 @@ import pytest
 
 from codex_bridge.activity import ActivityStore
 from codex_bridge.bridge import Bridge
+from codex_bridge.history import HistoryValidationError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
 
@@ -19,7 +20,10 @@ class FakeAppServer:
         self.rejections: list[tuple[int | str, int, str]] = []
         self.thread_cwds: dict[str, str] = {}
         self.thread_histories: dict[str, list[dict[str, Any]]] = {}
+        self.thread_history_modes: dict[str, str] = {}
         self.thread_list: list[dict[str, Any]] = []
+        self.turns_response: dict[str, Any] = {"data": []}
+        self.items_response: dict[str, Any] = {"data": []}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
@@ -50,7 +54,13 @@ class FakeAppServer:
                 thread["cwd"] = self.thread_cwds[params["threadId"]]
             if params.get("includeTurns") and params["threadId"] in self.thread_histories:
                 thread["turns"] = self.thread_histories[params["threadId"]]
+            if params["threadId"] in self.thread_history_modes:
+                thread["historyMode"] = self.thread_history_modes[params["threadId"]]
             return {"thread": thread}
+        if method == "thread/turns/list":
+            return self.turns_response
+        if method == "thread/items/list":
+            return self.items_response
         raise AssertionError(f"unexpected method {method}")
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
@@ -254,6 +264,164 @@ async def test_threads_history_omits_reasoning_thread_items(allowed_dir) -> None
     assert "reasoning item" not in str(detail)
     assert "reasoning summary" not in str(detail)
     assert "reasoning content" not in str(detail)
+
+
+@pytest.mark.asyncio
+async def test_read_thread_turns_preflights_metadata_and_maps_paginated_page(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["paginated-thread"] = str(allowed_dir)
+    app.thread_history_modes["paginated-thread"] = "paginated"
+    app.turns_response = {
+        "data": [
+            {
+                "id": "turn-1",
+                "status": "completed",
+                "startedAt": 1,
+                "completedAt": 2,
+                "durationMs": 1,
+                "itemsView": "notLoaded",
+            }
+        ],
+        "nextCursor": "next",
+        "backwardsCursor": "back",
+    }
+
+    result = await bridge.read_thread_turns(
+        "paginated-thread", limit=2, cursor="cursor", sort_direction="asc"
+    )
+
+    assert app.calls == [
+        ("thread/read", {"threadId": "paginated-thread", "includeTurns": False}),
+        (
+            "thread/turns/list",
+            {
+                "threadId": "paginated-thread",
+                "limit": 2,
+                "cursor": "cursor",
+                "sortDirection": "asc",
+                "itemsView": "notLoaded",
+            },
+        ),
+    ]
+    assert result["history_mode"] == "paginated"
+    assert result["next_cursor"] == "next"
+    assert result["backwards_cursor"] == "back"
+    assert result["turns"][0]["items_view"] == "notLoaded"
+
+
+@pytest.mark.asyncio
+async def test_read_thread_items_preflights_metadata_and_preserves_entry_turn_id(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["paginated-thread"] = str(allowed_dir)
+    app.thread_history_modes["paginated-thread"] = "paginated"
+    app.items_response = {
+        "data": [
+            {
+                "turnId": "turn-1",
+                "item": {"id": "agent-1", "type": "agentMessage", "text": "hello"},
+            }
+        ],
+        "nextCursor": "next",
+        "backwardsCursor": "back",
+    }
+
+    result = await bridge.read_thread_items(
+        "paginated-thread", turn_id="turn-1", limit=3, cursor="cursor", sort_direction="asc"
+    )
+
+    assert app.calls == [
+        ("thread/read", {"threadId": "paginated-thread", "includeTurns": False}),
+        (
+            "thread/items/list",
+            {
+                "threadId": "paginated-thread",
+                "turnId": "turn-1",
+                "limit": 3,
+                "cursor": "cursor",
+                "sortDirection": "asc",
+            },
+        ),
+    ]
+    assert result["items"][0]["turn_id"] == "turn-1"
+    assert result["next_cursor"] == "next"
+    assert result["backwards_cursor"] == "back"
+
+
+@pytest.mark.asyncio
+async def test_read_thread_history_uses_legacy_fallback_without_cursor(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["legacy-thread"] = str(allowed_dir)
+    app.thread_histories["legacy-thread"] = [
+        {
+            "id": "turn-1",
+            "status": "completed",
+            "items": [
+                {"id": "agent-1", "type": "agentMessage", "text": "safe"},
+                {"id": "reasoning-1", "type": "reasoning", "summary": ["private"]},
+            ],
+        }
+    ]
+
+    turns = await bridge.read_thread_turns("legacy-thread", limit=1)
+    items = await bridge.read_thread_items("legacy-thread", limit=1)
+
+    assert turns["history_mode"] == "legacy"
+    assert turns["turns"][0]["items"][0]["text"] == "safe"
+    assert items["items"][0]["item"]["text"] == "safe"
+    assert app.methods == [
+        "thread/read",
+        "thread/read",
+        "thread/read",
+        "thread/read",
+    ]
+    assert app.calls[1][1] == {"threadId": "legacy-thread", "includeTurns": True}
+    assert app.calls[3][1] == {"threadId": "legacy-thread", "includeTurns": True}
+    assert turns["next_cursor"] is None
+    assert items["next_cursor"] is None
+    assert "private" not in str(turns)
+
+
+@pytest.mark.asyncio
+async def test_read_legacy_history_rejects_cursor_after_metadata_preflight(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["legacy-thread"] = str(allowed_dir)
+
+    with pytest.raises(HistoryValidationError, match="cursor"):
+        await bridge.read_thread_turns("legacy-thread", cursor="fake")
+
+    assert app.methods == ["thread/read"]
+
+
+@pytest.mark.asyncio
+async def test_read_history_rejects_invalid_query_without_rpc(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    with pytest.raises(HistoryValidationError):
+        await bridge.read_thread_turns("thread", limit=0)
+    with pytest.raises(HistoryValidationError):
+        await bridge.read_thread_items("thread", sort_direction="sideways")
+    with pytest.raises(HistoryValidationError, match="cursor"):
+        await bridge.read_thread_items("thread", cursor=123)  # type: ignore[arg-type]
+
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_read_paginated_history_rejects_disallowed_thread_before_history_rpc(
+    allowed_dir, tmp_path
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-history"
+    outside.mkdir()
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["outside-thread"] = str(outside)
+    app.thread_history_modes["outside-thread"] = "paginated"
+
+    with pytest.raises(PathPolicyError):
+        await bridge.read_thread_items("outside-thread")
+
+    assert app.methods == ["thread/read"]
 
 
 @pytest.mark.asyncio

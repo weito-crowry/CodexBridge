@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from codex_bridge.activity import ActivityStore
 
 
@@ -113,3 +117,41 @@ def test_activity_store_drops_sensitive_detail_key_variants() -> None:
             "fake-auth-value",
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_activity_subscriber_receives_matching_activity_and_unsubscribes() -> None:
+    store = ActivityStore()
+    subscription = store.subscribe(thread_id="thread-a")
+
+    store.add(thread_id="thread-b", turn_id="turn", type="error", status="failed")
+    store.add(thread_id="thread-a", turn_id="turn", type="error", status="failed")
+
+    activity = await asyncio.wait_for(subscription.get(), timeout=0.1)
+    assert activity.thread_id == "thread-a"
+
+    subscription.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await subscription.get()
+
+
+@pytest.mark.asyncio
+async def test_activity_subscriber_drops_oldest_when_queue_is_full() -> None:
+    store = ActivityStore()
+    subscription = store.subscribe()
+
+    for index in range(101):
+        store.add(
+            thread_id="thread",
+            turn_id="turn",
+            type="error",
+            status="failed",
+            summary=f"event-{index}",
+        )
+
+    received = [
+        (await asyncio.wait_for(subscription.get(), timeout=0.1)).summary for _ in range(100)
+    ]
+
+    assert received[0] == "event-1"
+    assert received[-1] == "event-100"

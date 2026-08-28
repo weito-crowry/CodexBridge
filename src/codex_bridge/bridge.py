@@ -7,6 +7,16 @@ from copy import deepcopy
 from typing import Any, Protocol
 
 from .activity import ActivityStatus, ActivityStore, ActivityType
+from .history import (
+    HistoryValidationError,
+    project_items_response,
+    project_legacy_items_response,
+    project_legacy_thread,
+    project_turns_response,
+    validate_cursor,
+    validate_history_query,
+    validate_legacy_cursor,
+)
 from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
@@ -650,6 +660,110 @@ class Bridge:
             "next_cursor": response.get("nextCursor"),
             "backwards_cursor": response.get("backwardsCursor"),
         }
+
+    async def _history_metadata(self, thread_id: str) -> tuple[dict[str, Any], str, str]:
+        response = await self._app_server.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
+        )
+        thread = self._thread_from_response(response)
+        validated_cwd = self._validate_thread_metadata(thread, thread_id)
+        mode = thread.get("historyMode")
+        history_mode = mode if mode == "paginated" else "legacy"
+        return response, history_mode, validated_cwd
+
+    async def _legacy_history_response(
+        self,
+        thread_id: str,
+        validated_cwd: str,
+    ) -> dict[str, Any]:
+        response = await self._app_server.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        )
+        thread = self._thread_from_response(response)
+        if self._validate_thread_metadata(thread, thread_id) != validated_cwd:
+            raise BridgeError("thread history returned a mismatched cwd")
+        return response
+
+    async def read_thread_turns(
+        self,
+        thread_id: str,
+        limit: int = 20,
+        cursor: str | None = None,
+        sort_direction: str = "desc",
+    ) -> dict[str, Any]:
+        limit, sort_direction = validate_history_query(limit, sort_direction)
+        validate_cursor(cursor)
+        _, history_mode, validated_cwd = await self._history_metadata(thread_id)
+        if history_mode == "paginated":
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "limit": limit,
+                "sortDirection": sort_direction,
+                "itemsView": "notLoaded",
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await self._app_server.request("thread/turns/list", params)
+            try:
+                return project_turns_response(thread_id, response, limit)
+            except HistoryValidationError as exc:
+                raise BridgeError("malformed thread turns response") from exc
+
+        validate_legacy_cursor(cursor)
+        response = await self._legacy_history_response(thread_id, validated_cwd)
+        try:
+            return project_legacy_thread(
+                thread_id, response, limit, policy=self._path_policy, cursor=cursor
+            )
+        except HistoryValidationError as exc:
+            raise BridgeError("malformed legacy thread history response") from exc
+
+    async def read_thread_items(
+        self,
+        thread_id: str,
+        turn_id: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        sort_direction: str = "desc",
+    ) -> dict[str, Any]:
+        limit, sort_direction = validate_history_query(limit, sort_direction)
+        validate_cursor(cursor)
+        _, history_mode, validated_cwd = await self._history_metadata(thread_id)
+        if history_mode == "paginated":
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "limit": limit,
+                "sortDirection": sort_direction,
+            }
+            if turn_id is not None:
+                params["turnId"] = turn_id
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await self._app_server.request("thread/items/list", params)
+            try:
+                return project_items_response(
+                    thread_id,
+                    turn_id,
+                    response,
+                    policy=self._path_policy,
+                    limit=limit,
+                )
+            except HistoryValidationError as exc:
+                raise BridgeError("malformed thread items response") from exc
+
+        validate_legacy_cursor(cursor)
+        response = await self._legacy_history_response(thread_id, validated_cwd)
+        try:
+            return project_legacy_items_response(
+                thread_id,
+                turn_id,
+                response,
+                policy=self._path_policy,
+                limit=limit,
+                cursor=cursor,
+            )
+        except HistoryValidationError as exc:
+            raise BridgeError("malformed legacy thread history response") from exc
 
     async def handle_server_request(self, message: Mapping[str, Any]) -> None:
         request_id = message.get("id")

@@ -10,7 +10,7 @@ It exposes only thread/turn control and approval or user-input forwarding. Shell
 
 ## Architecture
 
-The Streamable HTTP MCP server owns one ASGI lifespan. Startup creates exactly one `codex app-server --stdio` child and performs the JSON-RPC `initialize` / `initialized` handshake. A dedicated JSONL reader correlates response IDs and routes notifications and server-initiated requests to the in-memory state store. MCP tools call a transport-neutral bridge over that client.
+The Streamable HTTP MCP server owns one ASGI lifespan. Startup creates exactly one `codex app-server --stdio` child and performs the JSON-RPC `initialize` / `initialized` handshake. A dedicated JSONL reader correlates response IDs and routes notifications and server-initiated requests to the in-memory state store. MCP tools call a transport-neutral bridge over that client. Phase 2 also starts a separate read-only Starlette/Uvicorn listener for the local UI API; it is not mounted in the MCP app.
 
 The bridge does not create a session ID or database. Codex's native `thread.id` is returned unchanged as `thread_id`; persistence and resume are delegated to Codex rollout/history data.
 
@@ -45,6 +45,14 @@ The MCP endpoint is:
 http://127.0.0.1:8000/mcp
 ```
 
+The Phase 2 UI API endpoint is a separate listener:
+
+```text
+http://127.0.0.1:8001/healthz
+```
+
+It is fixed to `127.0.0.1`, is not a Tunnel target, and exposes only read-only history/status/activity GET endpoints. The viewer never calls `thread/resume`, `turn/start`, `turn/steer`, or another writer operation.
+
 The default bind is loopback only. The tunnel is not started or configured by CodexBridge, and no tunnel identifier or token belongs in this repository.
 
 ## Environment variables
@@ -53,6 +61,7 @@ The default bind is loopback only. The tunnel is not started or configured by Co
 | --- | --- | --- |
 | `CODEX_BRIDGE_HOST` | `127.0.0.1` | Local bind address. |
 | `CODEX_BRIDGE_PORT` | `8000` | Local bind port. |
+| `CODEX_BRIDGE_UI_PORT` | `8001` | Separate local UI API port; must differ from the MCP port. The UI host is always `127.0.0.1`. |
 | `CODEX_BRIDGE_ALLOWED_ROOTS` | empty | Required path-separated canonical roots. Empty means every `cwd` is rejected. |
 | `CODEX_BRIDGE_ALLOWED_HOSTS` | SDK loopback defaults | Exact Host allowlist, comma-separated. `example.com:*` allows any port. |
 | `CODEX_BRIDGE_ALLOWED_ORIGINS` | SDK loopback defaults | Exact browser Origin allowlist, comma-separated. This is separate from Host validation. |
@@ -118,9 +127,15 @@ Unsupported App Server server-initiated requests fail closed with a bounded JSON
 
 `codex_status` selects the requested turn, otherwise the active turn, otherwise the latest known turn. If no matching turn is known it returns `state: "not_loaded"` with an empty activity list; it never creates a synthetic turn.
 
+## Phase 2 read-only history and UI API
+
+Stored history is read through `thread/read` metadata validation followed by the App Server's `thread/turns/list` and `thread/items/list` pagination APIs when `historyMode` is `paginated`. Older or missing-mode threads use bounded `thread/read(includeTurns=true)` fallback; legacy responses do not pretend to support cursors and return null cursors plus an explicit truncation flag. Every history item passes a strict allowlist projection: reasoning and unknown items are omitted, user/agent/plan text is bounded, command output and full file diffs are omitted, MCP/dynamic tool arguments and results are omitted, and file/image paths are reduced to allowed-root-relative paths.
+
+The independent UI listener serves `GET /healthz`, `/ui-api/status`, `/ui-api/threads`, `/ui-api/threads/{thread_id}`, `/ui-api/threads/{thread_id}/turns`, `/ui-api/threads/{thread_id}/items`, `/ui-api/threads/{thread_id}/status`, and `/ui-api/events`. It binds only to `127.0.0.1:<CODEX_BRIDGE_UI_PORT>`, permits only `127.0.0.1` and `localhost` Host values, has no CORS wildcard, and is never exposed through the Tunnel, whose target remains the MCP listener only. `/ui-api/events` is an SSE stream of new safe process-local Activity records; subscriber queues are bounded to 100 with oldest-drop backpressure, and no SQLite/replay persistence exists.
+
 ## Shutdown behavior
 
-SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then closes protocol pipes and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
+SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then stops the UI listener, closes protocol pipes, and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. If UI startup fails, already-started App Server resources are cleaned up. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
 
 ## Security assumptions and limitations
 
@@ -146,7 +161,7 @@ uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
-uv run python -m compileall -q src tests
+uv run python -m compileall -q src tests scripts
 ```
 
 The explicit real integration smoke test uses a temporary workspace and is not part of the normal suite:
@@ -159,4 +174,4 @@ It attempts App Server startup, a temporary file task, completion, continuation,
 
 ## Out of scope for the initial version
 
-SQLite, bridge session IDs, multi-user support, authentication storage, web UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded.
+SQLite, bridge session IDs, multi-user support, authentication storage, PySide6/Qt GUI, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded.

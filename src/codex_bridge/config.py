@@ -31,6 +31,7 @@ def _positive_float(name: str, default: float) -> float:
 class BridgeConfig:
     host: str
     port: int
+    ui_port: int
     allowed_roots: tuple[str, ...]
     allowed_hosts: tuple[str, ...]
     allowed_origins: tuple[str, ...]
@@ -58,6 +59,16 @@ class BridgeConfig:
         if not 1 <= port <= 65535:
             raise ConfigurationError("CODEX_BRIDGE_PORT must be between 1 and 65535")
 
+        ui_port_raw = os.environ.get("CODEX_BRIDGE_UI_PORT", "8001")
+        try:
+            ui_port = int(ui_port_raw)
+        except ValueError as exc:
+            raise ConfigurationError("CODEX_BRIDGE_UI_PORT must be an integer") from exc
+        if not 1 <= ui_port <= 65535:
+            raise ConfigurationError("CODEX_BRIDGE_UI_PORT must be between 1 and 65535")
+        if ui_port == port:
+            raise ConfigurationError("CODEX_BRIDGE_UI_PORT must differ from MCP port")
+
         executable = os.environ.get("CODEX_BRIDGE_CODEX_EXECUTABLE", "codex").strip()
         if not executable:
             raise ConfigurationError("CODEX_BRIDGE_CODEX_EXECUTABLE must not be empty")
@@ -65,6 +76,7 @@ class BridgeConfig:
         return cls(
             host=os.environ.get("CODEX_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=port,
+            ui_port=ui_port,
             allowed_roots=_split(os.environ.get("CODEX_BRIDGE_ALLOWED_ROOTS"), os.pathsep),
             allowed_hosts=_split(os.environ.get("CODEX_BRIDGE_ALLOWED_HOSTS"), ","),
             allowed_origins=_split(os.environ.get("CODEX_BRIDGE_ALLOWED_ORIGINS"), ","),
