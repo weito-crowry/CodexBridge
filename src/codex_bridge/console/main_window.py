@@ -158,13 +158,13 @@ class MainWindow(QMainWindow):
 
     def refresh(self) -> None:
         self._request_health()
-        self._request_bridge_status()
         self._request_threads()
         if self._selected_thread_id is not None:
             self._request_snapshot(self._selection_generation)
 
     def _request_health(self) -> None:
         self._client.get_json("/healthz", key="health")
+        self._request_bridge_status()
 
     def _request_bridge_status(self) -> None:
         self._client.get_json("/ui-api/status", key="bridge-status")

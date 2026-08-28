@@ -329,7 +329,7 @@ class ActivityPane(QWidget):
         layout.addWidget(QLabel("Recent activities"))
         layout.addWidget(self.activity_list, 1)
 
-    def set_snapshot(self, snapshot: Mapping[str, object]) -> None:
+    def set_snapshot(self, snapshot: Mapping[str, object], *, reset: bool = False) -> None:
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
         self.state_label.setText(state)
         pending = snapshot.get("pending_request")
@@ -341,13 +341,17 @@ class ActivityPane(QWidget):
             self.pending_label.setText(f"{label}\n{summary}".strip())
         else:
             self.pending_label.setText("")
-        self.activity_list.clear()
-        self._activity_ids.clear()
-        recent = snapshot.get("recent_activities")
-        if isinstance(recent, list):
-            for activity in recent:
-                if isinstance(activity, Mapping):
-                    self.append_activity(activity)
+        if reset:
+            self.activity_list.clear()
+            self._activity_ids.clear()
+        self.merge_activities(snapshot.get("recent_activities"))
+
+    def merge_activities(self, recent: object) -> None:
+        if not isinstance(recent, list):
+            return
+        for activity in recent:
+            if isinstance(activity, Mapping):
+                self.append_activity(activity)
 
     def append_activity(self, activity: Mapping[str, object]) -> None:
         activity_id = activity.get("activity_id")

@@ -119,6 +119,26 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     window.close()
 
 
+def test_health_poll_also_refreshes_bridge_status_and_recovers_without_refresh() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client)
+
+    client.failure("bridge-status", "Bridge unavailable")
+    assert window.bridge_status_label.text() == "Bridge: disconnected"
+    assert window.app_server_status_label.text() == "App Server: failed"
+
+    client.requests.clear()
+    window._request_health()
+
+    assert [key for key, _, _ in client.requests] == ["health", "bridge-status"]
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window.bridge_status_label.text() == "Bridge: connected"
+    assert window.app_server_status_label.text() == "App Server: ready"
+    window.close()
+
+
 def test_old_selection_json_and_sse_cannot_update_new_selection() -> None:
     _application()
     client = FakeClient()
@@ -190,6 +210,42 @@ def test_activity_is_deduplicated_and_bounded() -> None:
 
     assert window.activity_pane.activity_list.count() == 200
     assert "activity-0" not in window.activity_pane.activity_list.item(0).text()
+    window.close()
+
+
+def test_periodic_status_snapshot_merges_with_sse_activities_without_loss_or_duplicates() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client)
+    window.select_thread("thread-b")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    activity_a = _activity("activity-a")
+    activity_b = _activity("activity-b")
+
+    client.result(
+        status_key,
+        {"thread_id": "thread-b", "state": "running", "recent_activities": [activity_a]},
+    )
+    client.activity(1, activity_b)
+    client.result(
+        status_key,
+        {"thread_id": "thread-b", "state": "running", "recent_activities": [activity_a]},
+    )
+
+    assert window.activity_pane.activity_list.count() == 2
+    assert "activity-a" in window.activity_pane.activity_list.item(0).text()
+    assert "activity-b" in window.activity_pane.activity_list.item(1).text()
+
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-b",
+            "state": "running",
+            "recent_activities": [activity_a, activity_b],
+        },
+    )
+
+    assert window.activity_pane.activity_list.count() == 2
     window.close()
 
 
