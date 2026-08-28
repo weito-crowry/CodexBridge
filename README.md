@@ -53,7 +53,7 @@ http://127.0.0.1:8001/healthz
 
 It is fixed to `127.0.0.1`, is not a Tunnel target, and exposes only read-only history/status/activity GET endpoints. The viewer never calls `thread/resume`, `turn/start`, `turn/steer`, or another writer operation.
 
-The default bind is loopback only. The tunnel is not started or configured by CodexBridge, and no tunnel identifier or token belongs in this repository.
+The default bind is loopback only. Tunnel profiles are not created or configured by CodexBridge; Phase 4B only supervises a profile that was configured externally. No tunnel identifier or token belongs in this repository.
 
 ## Environment variables
 
