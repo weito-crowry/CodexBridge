@@ -13,7 +13,6 @@ from PySide6.QtNetwork import (
     QTcpServer,
 )
 
-
 _DOCTOR_TIMEOUT_MS = 10_000
 _MAX_DOCTOR_OUTPUT = 8 * 1024
 _STOP_TIMEOUT_MS = 2_000
@@ -223,8 +222,12 @@ class TunnelSupervisor(QObject):
             process = self._process_factory(self)
             self._doctor_process = process
             self._doctor_output_size = 0
-            process.finished.connect(lambda *_args, process=process: self._on_doctor_finished(process))
-            process.errorOccurred.connect(lambda *_args, process=process: self._on_doctor_error(process))
+            process.finished.connect(
+                lambda *_args, process=process: self._on_doctor_finished(process)
+            )
+            process.errorOccurred.connect(
+                lambda *_args, process=process: self._on_doctor_error(process)
+            )
             process.readyReadStandardOutput.connect(
                 lambda process=process: self._read_doctor_output(process, standard_error=False)
             )
@@ -250,7 +253,12 @@ class TunnelSupervisor(QObject):
     def _read_doctor_output(self, process: Any, *, standard_error: bool) -> None:
         if process is not self._doctor_process:
             return
-        reader = process.readAllStandardError if standard_error else process.readAllStandardOutput
+        active_process: Any = process
+        reader = (
+            active_process.readAllStandardError
+            if standard_error
+            else active_process.readAllStandardOutput
+        )
         self._doctor_output_size += len(bytes(reader()))
         if self._doctor_output_size > _MAX_DOCTOR_OUTPUT:
             self._fail_doctor(process)
@@ -281,13 +289,17 @@ class TunnelSupervisor(QObject):
     def _fail_doctor(self, process: Any | None) -> None:
         self._doctor_timer.stop()
         if process is not None and process is self._doctor_process:
+            active_process: Any = process
             self._doctor_process = None
-            process.kill()
-            process.deleteLater()
+            active_process.kill()
+            active_process.deleteLater()
         self._doctor_passed = False
         self._set_state("failed", message="Tunnel: configuration check failed")
 
     def _start_process(self) -> bool:
+        executable = self._executable
+        if executable is None:
+            return False
         try:
             port = self._health_port_provider()
             if isinstance(port, bool) or not 1 <= port <= 65_535:
@@ -298,9 +310,13 @@ class TunnelSupervisor(QObject):
             self._restart_requested = False
             self._set_state("starting")
             process.started.connect(lambda process=process: self._on_process_started(process))
-            process.finished.connect(lambda *_args, process=process: self._on_process_finished(process))
-            process.errorOccurred.connect(lambda *_args, process=process: self._on_process_error(process))
-            process.setProgram(self._executable)
+            process.finished.connect(
+                lambda *_args, process=process: self._on_process_finished(process)
+            )
+            process.errorOccurred.connect(
+                lambda *_args, process=process: self._on_process_error(process)
+            )
+            process.setProgram(executable)
             process.setArguments(
                 [
                     "run",
@@ -373,7 +389,8 @@ class TunnelSupervisor(QObject):
         self._stop_timer.stop()
         self._stop_health_poll()
         self._process = None
-        process.deleteLater()
+        active_process: Any = process
+        active_process.deleteLater()
         callbacks = self._stop_callbacks
         self._stop_callbacks = []
         restart = self._restart_requested and not self._closed
@@ -390,7 +407,8 @@ class TunnelSupervisor(QObject):
         self._stop_timer.stop()
         self._stop_health_poll()
         self._process = None
-        process.deleteLater()
+        active_process: Any = process
+        active_process.deleteLater()
         self._set_state("failed")
 
     def _on_health_poll_tick(self) -> None:

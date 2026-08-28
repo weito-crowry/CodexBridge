@@ -9,7 +9,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _TUNNEL_OVERRIDE = "CODEX_BRIDGE_TUNNEL_EXECUTABLE"
 _PS1_SUFFIX = re.compile(r"\.ps1$", re.IGNORECASE)
 

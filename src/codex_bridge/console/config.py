@@ -35,7 +35,8 @@ _TUNNEL_PROFILE_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 def parse_tunnel_profile(value: object, *, source: str = "Tunnel profile") -> str:
     if not isinstance(value, str) or _TUNNEL_PROFILE_PATTERN.fullmatch(value) is None:
         raise ConsoleConfigurationError(
-            f"{source} must contain 1-64 ASCII letters, digits, '.', '_' or '-'")
+            f"{source} must contain 1-64 ASCII letters, digits, '.', '_' or '-'"
+        )
     return value
 
 

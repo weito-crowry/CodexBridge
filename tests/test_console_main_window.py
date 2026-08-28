@@ -126,7 +126,7 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     _application()
     client = FakeClient()
 
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
 
     assert len(window.findChildren(QSplitter)) == 1
     assert window.thread_pane is not None
@@ -139,7 +139,7 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
 def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
 
     window.select_thread("thread-a")
     keys = {key for key, _, _ in client.requests}
@@ -159,7 +159,7 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
 def test_health_poll_also_refreshes_bridge_status_and_recovers_without_refresh() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
 
     client.failure("bridge-status", "Bridge unavailable")
     assert window.bridge_status_label.text() == "Bridge: disconnected"
@@ -179,7 +179,7 @@ def test_health_poll_also_refreshes_bridge_status_and_recovers_without_refresh()
 def test_old_selection_json_and_sse_cannot_update_new_selection() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
 
     window.select_thread("thread-a")
     client.result(
@@ -208,7 +208,7 @@ def test_old_selection_json_and_sse_cannot_update_new_selection() -> None:
 def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-a")
     client.result(
         "selection:1:items",
@@ -239,7 +239,7 @@ def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
 def test_activity_is_deduplicated_and_bounded() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-b")
     for index in range(201):
         client.activity(1, _activity(f"activity-{index}"))
@@ -253,7 +253,7 @@ def test_activity_is_deduplicated_and_bounded() -> None:
 def test_periodic_status_snapshot_merges_with_sse_activities_without_loss_or_duplicates() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-b")
     status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
     activity_a = _activity("activity-a")
@@ -289,7 +289,7 @@ def test_periodic_status_snapshot_merges_with_sse_activities_without_loss_or_dup
 def test_close_stops_timers_and_aborts_only_client_replies() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client)
+    window = MainWindow(_config(), api_client=client, tray_available=False)
 
     window.close()
 
@@ -304,7 +304,13 @@ def test_existing_ready_bridge_is_external_and_start_is_disabled() -> None:
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
 
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "codex_app"))
     client.result("health", {"status": "ok"})
@@ -324,7 +330,13 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
 
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     client.failure("health", "Bridge unavailable")
@@ -341,7 +353,13 @@ def test_start_bridge_is_detached_once_and_readiness_marks_console_started() -> 
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "explicit"))
     client.failure("health", "Bridge unavailable")
     client.failure("bridge-status", "Bridge unavailable")
@@ -371,7 +389,13 @@ def test_successful_detached_launch_never_reenables_after_temporary_unavailable(
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     client.failure("health", "Bridge unavailable")
     client.failure("bridge-status", "Bridge unavailable")
@@ -392,7 +416,13 @@ def test_launch_readiness_timeout_does_not_retry_or_enable_start() -> None:
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     client.failure("health", "Bridge unavailable")
     client.failure("bridge-status", "Bridge unavailable")
@@ -414,7 +444,13 @@ def test_close_aborts_probe_and_readiness_only_without_stopping_bridge() -> None
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     client.failure("health", "Bridge unavailable")
     client.failure("bridge-status", "Bridge unavailable")
@@ -433,7 +469,13 @@ def test_start_stays_disabled_until_both_bridge_observations_confirm_unavailable
     client = FakeClient()
     probe = FakeCodexProbe()
     launcher = FakeLauncher()
-    window = MainWindow(_config(), api_client=client, codex_probe=probe, runtime_launcher=launcher)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
 
     assert not window.start_bridge_button.isEnabled()

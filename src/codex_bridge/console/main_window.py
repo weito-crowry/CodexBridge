@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from time import monotonic
 from typing import Any
 from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -28,6 +30,9 @@ from .codex_resolver import (
 )
 from .config import ConsoleConfig
 from .runtime_launcher import BridgeRuntimeLauncher
+from .tunnel_resolver import TunnelResolutionError
+from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
+from .tunnel_supervisor import TunnelSupervisor, tunnel_state_label
 from .widgets import (
     ActivityPane,
     HistoryPane,
@@ -59,6 +64,10 @@ class MainWindow(QMainWindow):
         api_client: Any | None = None,
         codex_probe: Any | None = None,
         runtime_launcher: Any | None = None,
+        tunnel_supervisor: Any | None = None,
+        tray_factory: Callable[[QWidget], Any] | None = None,
+        tray_available: bool | None = None,
+        quit_application: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -67,7 +76,19 @@ class MainWindow(QMainWindow):
         self._launcher = (
             runtime_launcher if runtime_launcher is not None else BridgeRuntimeLauncher()
         )
+        self._tunnel = (
+            tunnel_supervisor if tunnel_supervisor is not None else self._new_tunnel_supervisor()
+        )
+        self._tray_available = (
+            QSystemTrayIcon.isSystemTrayAvailable() if tray_available is None else tray_available
+        )
+        self._tray_factory = tray_factory or (lambda owner: QSystemTrayIcon(QIcon(), owner))
+        self._quit_application = quit_application or self._quit_qapplication
+        self.tray_icon: Any | None = None
+        self.tray_menu: QMenu | None = None
+        self._tray_actions: dict[str, QAction] = {}
         self._closing = False
+        self._exit_finished = False
         self._selection_generation = 0
         self._selected_thread_id: str | None = None
         self._timeline_entries: list[TimelineEntry] = []
@@ -97,6 +118,7 @@ class MainWindow(QMainWindow):
         self._connect_client()
         self._build_timers()
         self._connect_runtime()
+        self._build_tray()
         self._set_unavailable_state()
         self._codex_probe.start()
         self.refresh()
@@ -112,20 +134,42 @@ class MainWindow(QMainWindow):
             candidates = ()
         return CodexVersionProbe(candidates, parent=self)
 
+    def _new_tunnel_supervisor(self) -> TunnelSupervisor:
+        environ = {}
+        if self._config.tunnel_executable is not None:
+            environ["CODEX_BRIDGE_TUNNEL_EXECUTABLE"] = self._config.tunnel_executable
+        try:
+            candidates = enumerate_tunnel_candidates(environ=environ)
+        except TunnelResolutionError:
+            candidates = ()
+        executable = candidates[0].path if candidates else None
+        return TunnelSupervisor(
+            executable=executable,
+            profile=self._config.tunnel_profile,
+            parent=self,
+        )
+
     def _build_ui(self) -> None:
         self.bridge_status_label = QLabel("Bridge: disconnected")
         self.app_server_status_label = QLabel("App Server: failed")
         self.stream_status_label = QLabel("Stream: disconnected")
         self.codex_status_label = QLabel("Codex: checking")
         self.runtime_status_label = QLabel("Runtime: unavailable")
+        self.tunnel_status_label = QLabel("Tunnel: unavailable")
         self.start_bridge_button = QPushButton("Start Bridge")
+        self.start_tunnel_button = QPushButton("Start Tunnel")
+        self.stop_tunnel_button = QPushButton("Stop Tunnel")
+        self.restart_tunnel_button = QPushButton("Restart Tunnel")
         self.start_bridge_button.setEnabled(False)
+        self.stop_tunnel_button.setEnabled(False)
+        self.restart_tunnel_button.setEnabled(False)
         for label in (
             self.bridge_status_label,
             self.app_server_status_label,
             self.stream_status_label,
             self.codex_status_label,
             self.runtime_status_label,
+            self.tunnel_status_label,
         ):
             label.setObjectName("topStatus")
 
@@ -137,7 +181,11 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self.stream_status_label)
         status_bar.addWidget(self.codex_status_label)
         status_bar.addWidget(self.runtime_status_label)
+        status_bar.addWidget(self.tunnel_status_label)
         status_bar.addWidget(self.start_bridge_button)
+        status_bar.addWidget(self.start_tunnel_button)
+        status_bar.addWidget(self.stop_tunnel_button)
+        status_bar.addWidget(self.restart_tunnel_button)
 
         self.thread_pane = ThreadListPane()
         self.history_pane = HistoryPane()
@@ -188,6 +236,12 @@ class MainWindow(QMainWindow):
             """
         )
 
+    @staticmethod
+    def _quit_qapplication() -> None:
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            application.quit()
+
     def _connect_client(self) -> None:
         self._client.json_succeeded.connect(self.apply_json_result)
         self._client.json_failed.connect(self._apply_json_error)
@@ -201,6 +255,58 @@ class MainWindow(QMainWindow):
         self._codex_probe.resolved.connect(self._apply_codex_resolution)
         self._codex_probe.failed.connect(self._apply_codex_probe_error)
         self.start_bridge_button.clicked.connect(self._start_bridge)
+        self._tunnel.state_changed.connect(self._apply_tunnel_state)
+        self._tunnel.message_changed.connect(self._apply_tunnel_message)
+        self._tunnel.controls_changed.connect(self._apply_tunnel_controls)
+        self.start_tunnel_button.clicked.connect(self._start_tunnel)
+        self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
+        self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
+
+    def _build_tray(self) -> None:
+        if not self._tray_available:
+            return
+        self.tray_icon = self._tray_factory(self)
+        self.tray_icon.setToolTip("CodexBridge Console")
+        menu = QMenu(self)
+        self.tray_menu = menu
+        for text, callback in (
+            ("Show Console", self._show_console),
+            ("Hide Console", self._hide_console),
+        ):
+            action = QAction(text, self)
+            action.triggered.connect(callback)
+            menu.addAction(action)
+            self._tray_actions[text] = action
+        menu.addSeparator()
+        for text, callback in (
+            ("Start Tunnel", self._start_tunnel),
+            ("Stop Tunnel", self._stop_tunnel),
+            ("Restart Tunnel", self._restart_tunnel),
+        ):
+            action = QAction(text, self)
+            action.triggered.connect(callback)
+            menu.addAction(action)
+            self._tray_actions[text] = action
+        menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self._begin_exit)
+        menu.addAction(exit_action)
+        self._tray_actions["Exit"] = exit_action
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _show_console(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _hide_console(self) -> None:
+        self.hide()
+
+    def _on_tray_activated(self, reason: object) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._show_console()
 
     def _build_timers(self) -> None:
         self.health_timer = QTimer(self)
@@ -217,6 +323,36 @@ class MainWindow(QMainWindow):
         self.readiness_timer.timeout.connect(self._on_readiness_tick)
         self.health_timer.start()
         self.thread_timer.start()
+
+    def _apply_tunnel_state(self, state: str) -> None:
+        if not self._closing:
+            self.tunnel_status_label.setText(tunnel_state_label(state))
+
+    def _apply_tunnel_message(self, message: str) -> None:
+        if not self._closing:
+            self.bottom_status_label.setText(message)
+
+    def _apply_tunnel_controls(self, start: bool, stop: bool, restart: bool) -> None:
+        self.start_tunnel_button.setEnabled(start)
+        self.stop_tunnel_button.setEnabled(stop)
+        self.restart_tunnel_button.setEnabled(restart)
+        for name, enabled in (
+            ("Start Tunnel", start),
+            ("Stop Tunnel", stop),
+            ("Restart Tunnel", restart),
+        ):
+            action = self._tray_actions.get(name)
+            if action is not None:
+                action.setEnabled(enabled)
+
+    def _start_tunnel(self) -> None:
+        self._tunnel.start()
+
+    def _stop_tunnel(self) -> None:
+        self._tunnel.stop()
+
+    def _restart_tunnel(self) -> None:
+        self._tunnel.restart()
 
     def _set_unavailable_state(self) -> None:
         location = f"{self._config.host}:{self._config.port}"
@@ -358,6 +494,7 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_observation(self) -> None:
         ready = self._health_ok and self._bridge_ready and self._app_server_ready
+        self._tunnel.set_bridge_ready(ready)
         if ready:
             self._bridge_seen_ready = True
             if self._detached_launch_started:
@@ -643,6 +780,19 @@ class MainWindow(QMainWindow):
         self._request_selected_status()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closing:
+            event.accept()
+            return
+        if self._tray_available:
+            self.hide()
+            event.ignore()
+            return
+        self._begin_exit()
+        event.accept()
+
+    def _begin_exit(self) -> None:
+        if self._closing:
+            return
         self._closing = True
         self.health_timer.stop()
         self.thread_timer.stop()
@@ -651,4 +801,12 @@ class MainWindow(QMainWindow):
         self._codex_probe.abort()
         self._launcher.close()
         self._client.abort_all()
-        event.accept()
+        self._tunnel.close(on_finished=self._finish_exit)
+
+    def _finish_exit(self) -> None:
+        if self._exit_finished:
+            return
+        self._exit_finished = True
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        self._quit_application()
