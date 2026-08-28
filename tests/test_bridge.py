@@ -384,6 +384,53 @@ async def test_read_thread_history_uses_legacy_fallback_without_cursor(allowed_d
 
 
 @pytest.mark.asyncio
+async def test_read_legacy_history_passes_sort_direction_to_projection(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["legacy-thread"] = str(allowed_dir)
+    app.thread_histories["legacy-thread"] = [
+        {"id": "turn-1", "status": "completed", "items": []},
+        {"id": "turn-2", "status": "completed", "items": []},
+        {"id": "turn-3", "status": "completed", "items": []},
+    ]
+
+    descending = await bridge.read_thread_turns("legacy-thread", limit=2, sort_direction="desc")
+    ascending = await bridge.read_thread_turns("legacy-thread", limit=2, sort_direction="asc")
+
+    assert [turn["id"] for turn in descending["turns"]] == ["turn-3", "turn-2"]
+    assert [turn["id"] for turn in ascending["turns"]] == ["turn-1", "turn-2"]
+
+
+@pytest.mark.asyncio
+async def test_read_legacy_items_passes_sort_direction_to_projection(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["legacy-thread"] = str(allowed_dir)
+    app.thread_histories["legacy-thread"] = [
+        {
+            "id": "turn-1",
+            "status": "completed",
+            "items": [
+                {"id": "item-1", "type": "agentMessage", "text": "old"},
+                {"id": "private", "type": "reasoning", "summary": ["private"]},
+                {"id": "item-2", "type": "agentMessage", "text": "new"},
+            ],
+        },
+        {
+            "id": "turn-2",
+            "status": "completed",
+            "items": [{"id": "item-3", "type": "agentMessage", "text": "newest"}],
+        },
+    ]
+
+    descending = await bridge.read_thread_items("legacy-thread", limit=2, sort_direction="desc")
+    ascending = await bridge.read_thread_items(
+        "legacy-thread", turn_id="turn-1", limit=2, sort_direction="asc"
+    )
+
+    assert [entry["item"]["id"] for entry in descending["items"]] == ["item-3", "item-2"]
+    assert [entry["item"]["id"] for entry in ascending["items"]] == ["item-1", "item-2"]
+
+
+@pytest.mark.asyncio
 async def test_read_legacy_history_rejects_cursor_after_metadata_preflight(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
     app.thread_cwds["legacy-thread"] = str(allowed_dir)

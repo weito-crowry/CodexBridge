@@ -713,7 +713,12 @@ class Bridge:
         response = await self._legacy_history_response(thread_id, validated_cwd)
         try:
             return project_legacy_thread(
-                thread_id, response, limit, policy=self._path_policy, cursor=cursor
+                thread_id,
+                response,
+                limit,
+                sort_direction=sort_direction,
+                policy=self._path_policy,
+                cursor=cursor,
             )
         except HistoryValidationError as exc:
             raise BridgeError("malformed legacy thread history response") from exc
@@ -760,6 +765,7 @@ class Bridge:
                 response,
                 policy=self._path_policy,
                 limit=limit,
+                sort_direction=sort_direction,
                 cursor=cursor,
             )
         except HistoryValidationError as exc:

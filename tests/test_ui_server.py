@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import signal
+import socket
 from typing import Any
 
 import pytest
@@ -8,7 +10,8 @@ import pytest
 from codex_bridge.activity import ActivityStore
 from codex_bridge.config import BridgeConfig
 from codex_bridge.server import BridgeRuntime
-from codex_bridge.ui_server import LocalUiServer
+from codex_bridge.ui_api import create_ui_app
+from codex_bridge.ui_server import LocalUiServer, _create_server
 
 
 class FakeUvicornServer:
@@ -36,6 +39,22 @@ class FakeServerFactory:
         return self.server
 
 
+def test_ui_uvicorn_server_does_not_capture_process_signals(monkeypatch) -> None:
+    captured: list[tuple[signal.Signals, Any]] = []
+
+    def record_signal(signum: signal.Signals, handler: Any) -> Any:
+        captured.append((signum, handler))
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(signal, "signal", record_signal)
+    server = _create_server(object(), "127.0.0.1", 8123)
+
+    with server.capture_signals():
+        pass
+
+    assert captured == []
+
+
 @pytest.mark.asyncio
 async def test_local_ui_server_binds_fixed_loopback_host_and_configured_port() -> None:
     factory = FakeServerFactory()
@@ -60,6 +79,42 @@ async def test_local_ui_server_shutdown_is_bounded() -> None:
     factory.server.ignore_shutdown = True
 
     await asyncio.wait_for(server.shutdown(0.01), timeout=0.2)
+
+    assert server.running is False
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@pytest.mark.asyncio
+async def test_local_ui_server_shutdown_is_bounded_with_live_sse_subscription(tmp_path) -> None:
+    activities = ActivityStore()
+    app = create_ui_app(FakeBridge([]), activities, _config(tmp_path))
+    port = _free_loopback_port()
+    server = LocalUiServer(app, port)
+    await server.start()
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"GET /ui-api/events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n"
+    )
+    await writer.drain()
+    headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=1.0)
+    assert b"200 OK" in headers
+    for _ in range(100):
+        if activities._subscribers:
+            break
+        await asyncio.sleep(0.01)
+    assert activities._subscribers
+
+    try:
+        await asyncio.wait_for(server.shutdown(0.01), timeout=0.5)
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
     assert server.running is False
 

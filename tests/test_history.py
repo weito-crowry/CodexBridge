@@ -5,6 +5,7 @@ import pytest
 from codex_bridge.history import (
     HistoryValidationError,
     project_items_response,
+    project_legacy_items_response,
     project_legacy_thread,
     project_turns_response,
 )
@@ -253,7 +254,11 @@ def test_project_legacy_thread_is_bounded_and_non_paginated(tmp_path) -> None:
                             {"id": "reasoning-1", "type": "reasoning", "summary": ["private"]},
                         ],
                     },
-                    {"id": "turn-2", "status": "completed", "items": []},
+                    {
+                        "id": "turn-2",
+                        "status": "completed",
+                        "items": [{"id": "agent-2", "type": "agentMessage", "text": "new"}],
+                    },
                 ],
             }
         },
@@ -263,13 +268,121 @@ def test_project_legacy_thread_is_bounded_and_non_paginated(tmp_path) -> None:
 
     assert result["history_mode"] == "legacy"
     assert len(result["turns"]) == 1
-    assert result["turns"][0]["items"] == [
-        {"id": "agent-1", "type": "agentMessage", "text": "safe"}
-    ]
+    assert result["turns"][0]["id"] == "turn-2"
+    assert result["turns"][0]["items"] == [{"id": "agent-2", "type": "agentMessage", "text": "new"}]
     assert result["next_cursor"] is None
     assert result["backwards_cursor"] is None
     assert result["truncated"] is True
     assert "private" not in str(result)
+
+
+def _legacy_sorted_history() -> dict[str, object]:
+    return {
+        "thread": {
+            "turns": [
+                {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [
+                        {"id": "item-1", "type": "agentMessage", "text": "oldest"},
+                        {"id": "private-1", "type": "reasoning", "summary": ["private"]},
+                        {"id": "unknown-1", "type": "notPublic", "text": "unknown"},
+                        {"id": "item-2", "type": "agentMessage", "text": "old"},
+                    ],
+                },
+                {
+                    "id": "turn-2",
+                    "status": "completed",
+                    "items": [{"id": "item-3", "type": "agentMessage", "text": "middle"}],
+                },
+                {
+                    "id": "turn-3",
+                    "status": "completed",
+                    "items": [{"id": "item-4", "type": "agentMessage", "text": "newest"}],
+                },
+            ]
+        }
+    }
+
+
+def test_project_legacy_thread_applies_sort_direction_before_limit(tmp_path) -> None:
+    policy = _policy(tmp_path)
+
+    descending = project_legacy_thread(
+        "thread",
+        _legacy_sorted_history(),
+        limit=2,
+        sort_direction="desc",
+        policy=policy,
+    )
+    ascending = project_legacy_thread(
+        "thread",
+        _legacy_sorted_history(),
+        limit=2,
+        sort_direction="asc",
+        policy=policy,
+    )
+
+    assert [turn["id"] for turn in descending["turns"]] == ["turn-3", "turn-2"]
+    assert [turn["id"] for turn in ascending["turns"]] == ["turn-1", "turn-2"]
+
+
+def test_project_legacy_items_applies_sort_direction_after_safe_projection(tmp_path) -> None:
+    policy = _policy(tmp_path)
+
+    descending = project_legacy_items_response(
+        "thread",
+        None,
+        _legacy_sorted_history(),
+        limit=3,
+        sort_direction="desc",
+        policy=policy,
+    )
+    ascending = project_legacy_items_response(
+        "thread",
+        None,
+        _legacy_sorted_history(),
+        limit=3,
+        sort_direction="asc",
+        policy=policy,
+    )
+
+    assert [entry["item"]["id"] for entry in descending["items"]] == [
+        "item-4",
+        "item-3",
+        "item-2",
+    ]
+    assert [entry["item"]["id"] for entry in ascending["items"]] == [
+        "item-1",
+        "item-2",
+        "item-3",
+    ]
+    assert "private-1" not in str(descending)
+    assert "unknown-1" not in str(descending)
+
+
+def test_project_legacy_items_applies_sort_direction_for_selected_turn(tmp_path) -> None:
+    policy = _policy(tmp_path)
+
+    descending = project_legacy_items_response(
+        "thread",
+        "turn-1",
+        _legacy_sorted_history(),
+        limit=2,
+        sort_direction="desc",
+        policy=policy,
+    )
+    ascending = project_legacy_items_response(
+        "thread",
+        "turn-1",
+        _legacy_sorted_history(),
+        limit=2,
+        sort_direction="asc",
+        policy=policy,
+    )
+
+    assert [entry["item"]["id"] for entry in descending["items"]] == ["item-2", "item-1"]
+    assert [entry["item"]["id"] for entry in ascending["items"]] == ["item-1", "item-2"]
 
 
 def test_project_items_allowlists_remaining_work_summary_types(tmp_path) -> None:

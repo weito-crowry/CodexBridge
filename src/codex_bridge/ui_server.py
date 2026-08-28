@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from typing import Any, Protocol
 
+import uvicorn
 from starlette.applications import Starlette
 
 
@@ -17,10 +19,14 @@ class UvicornServerLike(Protocol):
 ServerFactory = Callable[[Starlette, str, int], UvicornServerLike]
 
 
-def _create_server(app: Starlette, host: str, port: int) -> UvicornServerLike:
-    import uvicorn
+class _SignalFreeUvicornServer(uvicorn.Server):
+    @contextmanager
+    def capture_signals(self) -> Generator[None, None, None]:
+        yield
 
-    return uvicorn.Server(uvicorn.Config(app, host=host, port=port))
+
+def _create_server(app: Starlette, host: str, port: int) -> UvicornServerLike:
+    return _SignalFreeUvicornServer(uvicorn.Config(app, host=host, port=port))
 
 
 class LocalUiServer:

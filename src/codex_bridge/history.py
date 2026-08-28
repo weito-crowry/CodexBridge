@@ -380,19 +380,23 @@ def project_legacy_thread(
     response: Mapping[str, Any],
     limit: int = 20,
     *,
+    sort_direction: str = "desc",
     policy: AllowedPathPolicy | None = None,
     cursor: str | None = None,
 ) -> dict[str, object]:
-    validate_history_query(limit, "desc")
+    validate_history_query(limit, sort_direction)
     validate_legacy_cursor(cursor)
     thread = response.get("thread")
     if not isinstance(thread, Mapping) or not isinstance(thread.get("turns"), list):
         raise HistoryValidationError("legacy thread history response is malformed")
-    turns = [
-        projected
-        for turn in thread["turns"][:_MAX_ITEMS]
-        if (projected := _project_turn(turn, policy)) is not None
-    ]
+    turns: list[dict[str, object]] = []
+    raw_turns = reversed(thread["turns"]) if sort_direction == "desc" else iter(thread["turns"])
+    for turn in raw_turns:
+        projected = _project_turn(turn, policy)
+        if projected is not None:
+            turns.append(projected)
+            if len(turns) > limit:
+                break
     return {
         "thread_id": thread_id,
         "history_mode": "legacy",
@@ -410,15 +414,17 @@ def project_legacy_items_response(
     *,
     policy: AllowedPathPolicy,
     limit: int = 100,
+    sort_direction: str = "desc",
     cursor: str | None = None,
 ) -> dict[str, object]:
-    validate_history_query(limit, "desc")
+    validate_history_query(limit, sort_direction)
     validate_legacy_cursor(cursor)
     thread = response.get("thread")
     if not isinstance(thread, Mapping) or not isinstance(thread.get("turns"), list):
         raise HistoryValidationError("legacy thread history response is malformed")
     items: list[dict[str, object]] = []
-    for turn in thread["turns"]:
+    raw_turns = reversed(thread["turns"]) if sort_direction == "desc" else iter(thread["turns"])
+    for turn in raw_turns:
         if not isinstance(turn, Mapping) or not isinstance(turn.get("id"), str):
             continue
         if turn_id is not None and turn["id"] != turn_id:
@@ -426,10 +432,15 @@ def project_legacy_items_response(
         raw_items = turn.get("items")
         if not isinstance(raw_items, list):
             continue
-        for item in raw_items:
+        ordered_items = reversed(raw_items) if sort_direction == "desc" else iter(raw_items)
+        for item in ordered_items:
             projected = _project_item(item, policy)
             if projected is not None:
                 items.append({"turn_id": turn["id"], "item": projected})
+                if len(items) > limit:
+                    break
+        if len(items) > limit:
+            break
     return {
         "thread_id": thread_id,
         "turn_id": turn_id,
