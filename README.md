@@ -66,6 +66,8 @@ The default bind is loopback only. The tunnel is not started or configured by Co
 | `CODEX_BRIDGE_ALLOWED_HOSTS` | SDK loopback defaults | Exact Host allowlist, comma-separated. `example.com:*` allows any port. |
 | `CODEX_BRIDGE_ALLOWED_ORIGINS` | SDK loopback defaults | Exact browser Origin allowlist, comma-separated. This is separate from Host validation. |
 | `CODEX_BRIDGE_CODEX_EXECUTABLE` | `codex` | Codex executable name or path. The fixed subcommand remains `app-server --stdio`. |
+| `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | unset | Optional explicit `tunnel-client` executable override; an invalid explicit value fails closed. |
+| `CODEX_BRIDGE_TUNNEL_PROFILE` | `codex-bridge` | Existing Secure MCP Tunnel profile name; valid values are 1–64 ASCII letters, digits, `.`, `_`, or `-`. |
 | `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `18` | Default long-poll duration. |
 | `CODEX_BRIDGE_WAIT_MAX_SECONDS` | `30` | Hard maximum long-poll duration. |
 | `CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS` | `3` | Shutdown grace period for the App Server child. |
@@ -155,6 +157,14 @@ When the existing UI API is ready, the Console reports `Runtime: external` and d
 
 The detached Bridge and its App Server continue after the Console closes. A launch timeout is safe and does not trigger a retry; there is no automatic restart. Phase 4A has no Stop or Restart UI and does not kill, terminate, or interrupt a Bridge, App Server, or turn. Tunnel/tray remain out of scope for Phase 4A.
 
+## Phase 4B Secure MCP Tunnel supervision and system tray
+
+Phase 4B lets the Console supervise a configured Secure MCP Tunnel profile. Tunnel profile creation remains external: CodexBridge does not run `tunnel-client init`, edit profiles, configure connectors, or accept Tunnel IDs, API keys, OAuth data, or other identity input. The Console resolves the executable in this order: explicit `CODEX_BRIDGE_TUNNEL_EXECUTABLE`, PATH `tunnel-client.exe`, then PATH `tunnel-client`; invalid explicit values fail closed and `.ps1` files are excluded. The profile defaults to `codex-bridge` and is bounded to 1–64 ASCII letters, digits, `.`, `_`, or `-`.
+
+After Bridge and App Server readiness, one asynchronous `tunnel-client doctor --profile <profile> --explain --health.listen-addr 127.0.0.1:0` preflight runs with inherited process environment, a ten-second timeout, and an 8 KiB combined output bound. Output is discarded and never shown. A managed Tunnel uses a Console-owned `QProcess`, a fresh OS-assigned `127.0.0.1` ephemeral health port, and direct program/argument configuration; the Console does not shell out, dump the environment, or construct private Tunnel targets. `/healthz` and `/readyz` are polled asynchronously, response bodies are discarded, automatic Tunnel restart is disabled, and unexpected exit is reported as `Tunnel: failed`.
+
+The Console exposes `Start Tunnel`, `Stop Tunnel`, and `Restart Tunnel` only for its own Tunnel process. Stop uses bounded `terminate` then `kill`; external Tunnel is never discovered/taken over, scanned, killed, or restarted. `QSystemTrayIcon`, `QMenu`, and `QAction` provide `Show Console`, `Hide Console`, Tunnel controls, and `Exit`. When available, window close minimizes/hides to tray when available and keeps Bridge and the Console-owned Tunnel running. explicit Exit stops Console-owned Tunnel and then quits; Bridge remains running on Console Exit. Tunnel secrets/identity are not stored by CodexBridge. Bridge Stop/Restart is Phase 4C.
+
 ## Shutdown behavior
 
 SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then stops the UI listener, closes protocol pipes, and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. If UI startup fails, already-started App Server resources are cleaned up. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
@@ -196,4 +206,4 @@ It attempts App Server startup, a temporary file task, completion, continuation,
 
 ## Out of scope for the initial version
 
-SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, Console process ownership, Tunnel management, and complete hard-crash recovery are deliberately excluded.
+SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded. Bridge Stop/Restart remains deferred to Phase 4C.

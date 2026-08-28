@@ -39,6 +39,29 @@ def test_phase4a_docs_describe_detection_detached_launch_and_boundaries() -> Non
         assert text in spec
 
 
+def test_phase4b_docs_describe_tunnel_supervision_tray_and_boundaries() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    spec = (ROOT / "docs" / "superpowers" / "specs" / "2026-08-28-codexbridge-design.md").read_text(
+        encoding="utf-8"
+    )
+
+    for text in (
+        "Phase 4B",
+        "CODEX_BRIDGE_TUNNEL_EXECUTABLE",
+        "CODEX_BRIDGE_TUNNEL_PROFILE",
+        "Tunnel profile creation remains external",
+        "Tunnel secrets/identity are not stored by CodexBridge",
+        "window close minimizes/hides to tray when available",
+        "explicit Exit stops Console-owned Tunnel",
+        "Bridge remains running on Console Exit",
+        "external Tunnel is never discovered/taken over",
+        "automatic Tunnel restart is disabled",
+        "Bridge Stop/Restart is Phase 4C",
+    ):
+        assert text in readme
+        assert text in spec
+
+
 def test_console_source_contains_no_mutation_or_process_ownership_operations() -> None:
     source = "\n".join(
         path.read_text(encoding="utf-8")
