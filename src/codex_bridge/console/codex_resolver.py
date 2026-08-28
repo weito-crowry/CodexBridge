@@ -48,6 +48,21 @@ def _is_usable_path(path: str) -> bool:
     return bool(path) and Path(path).is_file() and Path(path).suffix.casefold() != ".ps1"
 
 
+def resolve_cmd_executable(
+    environ: Mapping[str, str] | None = None,
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+) -> str | None:
+    """Resolve a usable Windows command interpreter for batch-file probes."""
+
+    values = os.environ if environ is None else environ
+    comspec = values.get("COMSPEC")
+    if comspec and _is_usable_path(comspec):
+        return comspec
+    fallback = which("cmd.exe")
+    return fallback if fallback and _is_usable_path(fallback) else None
+
+
 def _append_candidate(
     candidates: list[CodexCandidate],
     seen: set[str],
@@ -185,12 +200,16 @@ class CodexVersionProbe(QObject):
         candidates: Sequence[CodexCandidate],
         *,
         platform: str | None = None,
+        environ: Mapping[str, str] | None = None,
+        which: Callable[[str], str | None] = shutil.which,
         process_factory: ProcessFactory | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._candidates = tuple(candidates)
         self._windows = _is_windows(platform)
+        self._environ = os.environ if environ is None else environ
+        self._which = which
         self._process_factory = process_factory or (lambda owner: QProcess(owner))
         self._process: Any | None = None
         self._candidate_index = 0
@@ -221,10 +240,16 @@ class CodexVersionProbe(QObject):
         if self._finished:
             return
         if self._candidate_index >= len(self._candidates):
-            self._finished = True
-            self.failed.emit("Codex version could not be verified")
+            self._fail()
             return
         candidate = self._candidates[self._candidate_index]
+        if self._windows and candidate.path.casefold().endswith(".cmd"):
+            cmd_executable = resolve_cmd_executable(self._environ, which=self._which)
+            if cmd_executable is None:
+                self._advance_after_failure(candidate)
+                return
+        else:
+            cmd_executable = None
         self._stdout.clear()
         self._output_size = 0
         process = self._process_factory(self)
@@ -237,8 +262,12 @@ class CodexVersionProbe(QObject):
         process.readyReadStandardError.connect(
             lambda process=process: self._read_output(process, standard_error=True)
         )
-        process.setProgram(candidate.path)
-        process.setArguments(["--version"])
+        if cmd_executable is None:
+            process.setProgram(candidate.path)
+            process.setArguments(["--version"])
+        else:
+            process.setProgram(cmd_executable)
+            process.setNativeArguments(f'/d /s /c ""{candidate.path}" --version"')
         process.start()
         self._timeout_timer.start()
 
@@ -292,10 +321,21 @@ class CodexVersionProbe(QObject):
     def _reject_current(self, process: Any, *, kill: bool) -> None:
         if process is not self._process or self._finished:
             return
+        candidate = self._candidates[self._candidate_index]
         self._timeout_timer.stop()
         self._process = None
         if kill:
             active_process: Any = process
             active_process.kill()
+        self._advance_after_failure(candidate)
+
+    def _advance_after_failure(self, candidate: CodexCandidate) -> None:
+        if candidate.source == "explicit":
+            self._fail()
+            return
         self._candidate_index += 1
         self._start_next()
+
+    def _fail(self) -> None:
+        self._finished = True
+        self.failed.emit("Codex version could not be verified")

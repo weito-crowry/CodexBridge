@@ -36,6 +36,7 @@ class FakeProcess:
         self.readyReadStandardError = Signal()
         self.program: str | None = None
         self.arguments: list[str] = []
+        self.native_arguments: str | None = None
         self.stdout = b""
         self.stderr = b""
         self.exit_code = 0
@@ -47,6 +48,9 @@ class FakeProcess:
 
     def setArguments(self, arguments: list[str]) -> None:
         self.arguments = arguments
+
+    def setNativeArguments(self, arguments: str) -> None:
+        self.native_arguments = arguments
 
     def setProcessChannelMode(self, mode: object) -> None:
         del mode
@@ -212,19 +216,147 @@ def test_version_probe_is_async_and_returns_bounded_valid_result() -> None:
     assert failures == []
 
 
-def test_version_probe_uses_direct_qprocess_for_cmd_candidate() -> None:
+def test_version_probe_uses_native_cmd_qprocess_for_cmd_candidate(tmp_path: Path) -> None:
     _application()
     process = FakeProcess()
+    cmd_exe = tmp_path / "cmd.exe"
+    cmd_exe.write_bytes(b"")
+    candidate = r"C:\Program Files\Codex\codex.cmd"
     probe = CodexVersionProbe(
-        [CodexCandidate("C:/Users/user/AppData/Roaming/npm/codex.cmd", "npm")],
+        [CodexCandidate(candidate, "npm")],
         platform="win32",
+        environ={"COMSPEC": str(cmd_exe)},
         process_factory=lambda _parent: process,
     )
 
     probe.start()
 
-    assert process.program == "C:/Users/user/AppData/Roaming/npm/codex.cmd"
+    assert process.program == str(cmd_exe)
+    assert process.arguments == []
+    assert process.native_arguments == f'/d /s /c ""{candidate}" --version"'
+
+
+def test_version_probe_keeps_exe_candidate_on_direct_qprocess() -> None:
+    _application()
+    process = FakeProcess()
+    probe = CodexVersionProbe(
+        [CodexCandidate(r"C:\Program Files\Codex\codex.exe", "path")],
+        platform="win32",
+        environ={"COMSPEC": "unused"},
+        process_factory=lambda _parent: process,
+    )
+
+    probe.start()
+
+    assert process.program == r"C:\Program Files\Codex\codex.exe"
     assert process.arguments == ["--version"]
+    assert process.native_arguments is None
+
+
+def test_explicit_cmd_probe_failure_does_not_fallback(tmp_path: Path) -> None:
+    _application()
+    processes = [FakeProcess(), FakeProcess()]
+    cmd_exe = tmp_path / "cmd.exe"
+    cmd_exe.write_bytes(b"")
+
+    def process_factory(_parent: object) -> FakeProcess:
+        return processes.pop(0)
+
+    probe = CodexVersionProbe(
+        [
+            CodexCandidate(r"C:\Program Files\Codex\codex.cmd", "explicit"),
+            CodexCandidate(r"C:\Program Files\Codex\codex.exe", "path"),
+        ],
+        platform="win32",
+        environ={"COMSPEC": str(cmd_exe)},
+        process_factory=process_factory,
+    )
+    failures: list[str] = []
+    probe.failed.connect(failures.append)
+
+    explicit_process = processes[0]
+    probe.start()
+    processes_started = len(processes)
+    explicit_process.exit_code = 1
+    explicit_process.finished.emit(1, 0)
+
+    assert processes_started == 1
+    assert processes[0].started is False
+    assert failures == ["Codex version could not be verified"]
+
+
+def test_non_explicit_cmd_probe_failure_falls_back_to_next_candidate(tmp_path: Path) -> None:
+    _application()
+    cmd_process = FakeProcess()
+    exe_process = FakeProcess()
+    processes = [cmd_process, exe_process]
+    cmd_exe = tmp_path / "cmd.exe"
+    cmd_exe.write_bytes(b"")
+
+    def process_factory(_parent: object) -> FakeProcess:
+        return processes.pop(0)
+
+    probe = CodexVersionProbe(
+        [
+            CodexCandidate(r"C:\Program Files\Codex\codex.cmd", "npm"),
+            CodexCandidate(r"C:\Program Files\Codex\codex.exe", "path"),
+        ],
+        platform="win32",
+        environ={"COMSPEC": str(cmd_exe)},
+        process_factory=process_factory,
+    )
+
+    probe.start()
+    cmd_process.exit_code = 1
+    cmd_process.finished.emit(1, 0)
+
+    assert exe_process.program == r"C:\Program Files\Codex\codex.exe"
+    assert exe_process.arguments == ["--version"]
+    assert exe_process.native_arguments is None
+
+
+def test_cmd_probe_uses_which_fallback_when_comspec_is_unusable(tmp_path: Path) -> None:
+    _application()
+    process = FakeProcess()
+    fallback = tmp_path / "fallback-cmd.exe"
+    fallback.write_bytes(b"")
+    candidate = r"C:\Program Files\Codex\codex.cmd"
+
+    probe = CodexVersionProbe(
+        [CodexCandidate(candidate, "npm")],
+        platform="win32",
+        environ={"COMSPEC": str(tmp_path / "missing-cmd.exe")},
+        which=lambda name: str(fallback) if name == "cmd.exe" else None,
+        process_factory=lambda _parent: process,
+    )
+
+    probe.start()
+
+    assert process.program == str(fallback)
+    assert process.native_arguments == f'/d /s /c ""{candidate}" --version"'
+
+
+def test_unavailable_cmd_probe_falls_back_to_next_non_explicit_candidate(tmp_path: Path) -> None:
+    _application()
+    process = FakeProcess()
+    candidate = r"C:\Program Files\Codex\codex.cmd"
+    fallback_candidate = r"C:\Program Files\Codex\codex.exe"
+    probe = CodexVersionProbe(
+        [
+            CodexCandidate(candidate, "npm"),
+            CodexCandidate(fallback_candidate, "path"),
+        ],
+        platform="win32",
+        environ={"COMSPEC": str(tmp_path / "missing-cmd.exe")},
+        which=lambda _name: None,
+        process_factory=lambda _parent: process,
+    )
+
+    probe.start()
+
+    assert process.program == fallback_candidate
+    assert process.arguments == ["--version"]
+    assert process.native_arguments is None
 
 
 @pytest.mark.parametrize(
