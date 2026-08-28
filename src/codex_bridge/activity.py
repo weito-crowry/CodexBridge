@@ -39,7 +39,18 @@ _MAX_ACTIVITIES_PER_THREAD = 500
 _MAX_TEXT_CHARS = 2_000
 _MAX_DETAILS = 16
 _MAX_DETAIL_LIST_ITEMS = 100
-_SENSITIVE_DETAIL_TERMS = ("raw", "encrypted", "reasoning", "chain_of_thought", "secret", "token")
+_SENSITIVE_DETAIL_TERMS = (
+    "raw",
+    "encrypted",
+    "reasoning",
+    "chainofthought",
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "authorization",
+    "apikey",
+)
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(\bauthorization\b\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+"),
     re.compile(
@@ -70,8 +81,8 @@ def _safe_details(
         return {}
     safe: dict[str, ActivityDetailValue] = {}
     for key, value in list(details.items())[:_MAX_DETAILS]:
-        lowered = key.casefold()
-        if any(term in lowered for term in _SENSITIVE_DETAIL_TERMS):
+        normalized_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+        if any(term in normalized_key for term in _SENSITIVE_DETAIL_TERMS):
             continue
         if isinstance(value, str):
             safe[key] = _bounded_text(value) or ""

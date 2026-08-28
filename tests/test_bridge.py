@@ -18,6 +18,7 @@ class FakeAppServer:
         self.responses: list[tuple[int | str, dict[str, Any]]] = []
         self.rejections: list[tuple[int | str, int, str]] = []
         self.thread_cwds: dict[str, str] = {}
+        self.thread_histories: dict[str, list[dict[str, Any]]] = {}
         self.thread_list: list[dict[str, Any]] = []
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -47,6 +48,8 @@ class FakeAppServer:
             }
             if params["threadId"] in self.thread_cwds:
                 thread["cwd"] = self.thread_cwds[params["threadId"]]
+            if params.get("includeTurns") and params["threadId"] in self.thread_histories:
+                thread["turns"] = self.thread_histories[params["threadId"]]
             return {"thread": thread}
         raise AssertionError(f"unexpected method {method}")
 
@@ -218,6 +221,39 @@ async def test_threads_list_and_read_are_bounded_and_sanitized(allowed_dir) -> N
         "cwd": str(allowed_dir.resolve()),
         "turns": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_threads_history_omits_reasoning_thread_items(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["native-thread"] = str(allowed_dir)
+    app.thread_histories["native-thread"] = [
+        {
+            "id": "turn",
+            "items": [
+                {
+                    "id": "user-item",
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "normal userMessage"}],
+                },
+                {
+                    "id": "reasoning-item",
+                    "type": "reasoning",
+                    "summary": "reasoning summary",
+                    "content": ["reasoning content"],
+                },
+                {"id": "agent-item", "type": "agentMessage", "text": "normal agentMessage"},
+            ],
+        }
+    ]
+
+    detail = await bridge.threads("native-thread", include_history=True)
+
+    items = detail["thread"]["turns"][0]["items"]
+    assert [item["type"] for item in items] == ["userMessage", "agentMessage"]
+    assert "reasoning item" not in str(detail)
+    assert "reasoning summary" not in str(detail)
+    assert "reasoning content" not in str(detail)
 
 
 @pytest.mark.asyncio
@@ -438,7 +474,8 @@ async def test_turn_terminal_notifications_are_normalized_as_activities(allowed_
 
 @pytest.mark.asyncio
 async def test_error_notification_records_only_bounded_error_summary(allowed_dir) -> None:
-    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    bridge, _, store, activities = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
 
     bridge.handle_notification(
         {
@@ -456,8 +493,102 @@ async def test_error_notification_records_only_bounded_error_summary(allowed_dir
     public = activities.latest("thread", "turn")
     assert public is not None
     assert public.type == "error"
+    assert public.status == "failed"
     assert public.summary == "App Server request failed"
     assert "must not be retained" not in str(public.to_dict())
+    assert (await bridge.wait("thread", "turn", 0))["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_retryable_error_keeps_turn_active_until_completion(allowed_dir) -> None:
+    bridge, _, store, activities = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    bridge.handle_notification(
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "willRetry": True,
+                "error": {"message": "transient App Server error"},
+            },
+        }
+    )
+
+    result = await bridge.wait("thread", "turn", 0)
+    activity = activities.latest("thread", "turn")
+
+    assert result["state"] == "in_progress"
+    assert activity is not None
+    assert activity.type == "error"
+    assert activity.status == "in_progress"
+
+    bridge.handle_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread",
+                "turn": {"id": "turn", "status": "completed"},
+            },
+        }
+    )
+
+    assert (await bridge.wait("thread", "turn", 0))["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_retryable_error_preserves_pending_request(allowed_dir) -> None:
+    bridge, _, _, _ = make_activity_bridge(allowed_dir)
+    await bridge.handle_server_request(
+        {
+            "id": "approval-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "thread", "turnId": "turn", "reason": "write"},
+        }
+    )
+
+    bridge.handle_notification(
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "willRetry": True,
+                "error": {"message": "transient App Server error"},
+            },
+        }
+    )
+
+    result = await bridge.wait("thread", "turn", 0)
+
+    assert result["state"] == "needs_approval"
+    assert result["pending_request"]["request_id"] == "approval-1"
+
+
+@pytest.mark.asyncio
+async def test_malformed_will_retry_fails_closed(allowed_dir) -> None:
+    bridge, _, store, activities = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    bridge.handle_notification(
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "willRetry": "true",
+                "error": {"message": "malformed retry flag"},
+            },
+        }
+    )
+
+    result = await bridge.wait("thread", "turn", 0)
+    activity = activities.latest("thread", "turn")
+
+    assert result["state"] == "failed"
+    assert activity is not None
+    assert activity.status == "failed"
 
 
 @pytest.mark.asyncio

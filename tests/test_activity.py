@@ -81,3 +81,35 @@ def test_activity_store_redacts_secret_like_summary_values() -> None:
     assert "fake-token" not in str(public)
     assert "fake-key" not in str(public)
     assert "reasoning" not in public["details"]
+
+
+def test_activity_store_drops_sensitive_detail_key_variants() -> None:
+    store = ActivityStore()
+    store.add(
+        thread_id="thread",
+        turn_id="turn",
+        type="error",
+        status="failed",
+        details={
+            "password": "fake-password-value",
+            "credential": "fake-credential-value",
+            "api_key": "fake-api-key-value",
+            "apiKey": "fake-camel-api-key-value",
+            "authorization": "fake-auth-value",
+            "exit_code": 0,
+        },
+    )
+
+    public = store.latest("thread", "turn").to_dict()
+
+    assert public["details"] == {"exit_code": 0}
+    assert all(
+        value not in str(public)
+        for value in (
+            "fake-password-value",
+            "fake-credential-value",
+            "fake-api-key-value",
+            "fake-camel-api-key-value",
+            "fake-auth-value",
+        )
+    )

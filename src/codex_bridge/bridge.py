@@ -89,6 +89,29 @@ def _sanitize(value: object, key: str = "", depth: int = 0) -> object:
     return value
 
 
+def _sanitize_thread_history(thread: object) -> object:
+    sanitized = _sanitize(thread)
+    if not isinstance(sanitized, dict):
+        return sanitized
+    turns = sanitized.get("turns")
+    if not isinstance(turns, list):
+        return sanitized
+    sanitized["turns"] = [
+        {
+            **turn,
+            "items": [
+                item
+                for item in items
+                if not (isinstance(item, dict) and item.get("type") == "reasoning")
+            ],
+        }
+        if isinstance(turn, dict) and isinstance(items := turn.get("items"), list)
+        else turn
+        for turn in turns
+    ]
+    return sanitized
+
+
 def _permission_path(value: object) -> dict[str, Any]:
     if not isinstance(value, dict) or not isinstance(value.get("type"), str):
         raise BridgeError("permission path is malformed")
@@ -606,7 +629,7 @@ class Bridge:
                 history_thread = self._thread_from_response(response)
                 if self._validate_thread_metadata(history_thread, thread_id) != validated_cwd:
                     raise BridgeError("thread history returned a mismatched cwd")
-            return {"thread": _sanitize(response.get("thread", {}))}
+            return {"thread": _sanitize_thread_history(response.get("thread", {}))}
         params: dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
@@ -855,12 +878,15 @@ class Bridge:
                 error_summary = _bounded_text(params.get("error"))
                 if error_summary is None:
                     error_summary = _bounded_text(params.get("message"))
-                self._state.set_terminal(thread_id, turn_id, "failed", error_summary)
+                will_retry = params.get("willRetry")
+                retryable = will_retry is True
+                if not retryable:
+                    self._state.set_terminal(thread_id, turn_id, "failed", error_summary)
                 self._record_activity(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     type="error",
-                    status="failed",
+                    status="in_progress" if retryable else "failed",
                     summary=error_summary or "App Server error",
                 )
 
