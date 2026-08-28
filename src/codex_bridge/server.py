@@ -10,6 +10,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
+from .activity import ActivityStore
 from .app_server import AppServerClient
 from .bridge import Bridge
 from .config import BridgeConfig, ConfigurationError
@@ -31,6 +32,7 @@ class RuntimeLike(Protocol):
 class BridgeRuntime:
     bridge: Bridge
     app_server: AppServerClient
+    activity_store: ActivityStore
     config: BridgeConfig
 
     async def start(self) -> None:
@@ -47,11 +49,13 @@ class BridgeRuntime:
 
 def build_runtime(config: BridgeConfig) -> BridgeRuntime:
     state = StateStore()
+    activity_store = ActivityStore()
     app_server = AppServerClient(config.codex_executable)
     bridge = Bridge(
         app_server,
         state,
         AllowedPathPolicy(config.allowed_roots),
+        activity_store=activity_store,
         wait_default_seconds=config.wait_default_seconds,
         wait_max_seconds=config.wait_max_seconds,
     )
@@ -60,7 +64,12 @@ def build_runtime(config: BridgeConfig) -> BridgeRuntime:
         on_server_request=bridge.handle_server_request,
         on_failure=bridge.handle_app_server_failure,
     )
-    return BridgeRuntime(bridge=bridge, app_server=app_server, config=config)
+    return BridgeRuntime(
+        bridge=bridge,
+        app_server=app_server,
+        activity_store=activity_store,
+        config=config,
+    )
 
 
 def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | None:
@@ -144,6 +153,13 @@ def create_app(
             limit=limit,
             cursor=cursor,
         )
+
+    @mcp.tool()
+    async def codex_status(
+        thread_id: str, turn_id: str | None = None, activity_limit: int = 20
+    ) -> dict[str, Any]:
+        """Return the current safe state and recent activities for a native Codex turn."""
+        return await bridge().status(thread_id, turn_id, activity_limit)
 
     security = _transport_security(config)
     transport_app = mcp.streamable_http_app(

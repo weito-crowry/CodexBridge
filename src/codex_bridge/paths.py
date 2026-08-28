@@ -49,3 +49,23 @@ class AllowedPathPolicy:
             except ValueError:
                 continue
         raise PathPolicyError("cwd is outside the allowed roots")
+
+    def safe_relative_path(self, path: str) -> str:
+        """Return an allowed-root-relative display path without exposing outside paths."""
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            return "<path omitted>"
+        try:
+            canonical = candidate.resolve(strict=False)
+        except OSError:
+            return "<path omitted>"
+        normalized = os.path.normcase(os.fspath(canonical))
+        for root in self._allowed_roots:
+            try:
+                if os.path.commonpath((root, normalized)) != root:
+                    continue
+                relative = os.path.relpath(normalized, root)
+            except ValueError:
+                continue
+            return relative.replace(os.sep, "/")
+        return "<path omitted>"

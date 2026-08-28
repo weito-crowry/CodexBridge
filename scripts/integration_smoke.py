@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -42,12 +43,13 @@ async def _resolve_safe_file_approval(
 
 async def _run_smoke() -> int:
     configure_logging()
+    executable = os.environ.get("CODEX_BRIDGE_CODEX_EXECUTABLE", "codex")
     with tempfile.TemporaryDirectory(prefix="codexbridge-smoke-") as temporary:
         root = Path(temporary)
         target = root / "codexbridge_smoke.txt"
         policy = AllowedPathPolicy((str(root),))
 
-        first_app = AppServerClient("codex")
+        first_app = AppServerClient(executable)
         first_bridge = Bridge(first_app, StateStore(), policy)
         first_app.set_handlers(
             on_notification=first_bridge.handle_notification,
@@ -66,6 +68,14 @@ async def _run_smoke() -> int:
             )
             thread_id = str(started["thread_id"])
             turn_id = str(started["turn_id"])
+            running_status = await first_bridge.status(thread_id, turn_id)
+            print(
+                f"status: {running_status['state']} "
+                f"activities={len(running_status['recent_activities'])}"
+            )
+            if running_status["turn_id"] != turn_id:
+                print("status failed: selected turn does not match start", file=sys.stderr)
+                return 1
             first_result = await _wait_until_terminal(first_bridge, thread_id, turn_id)
             first_result = await _resolve_safe_file_approval(
                 first_bridge, first_result, thread_id, turn_id
@@ -80,6 +90,11 @@ async def _run_smoke() -> int:
             if first_result["state"] != "completed" or not target.exists():
                 print(f"start failed: {first_result}", file=sys.stderr)
                 return 1
+            completed_status = await first_bridge.status(thread_id, turn_id)
+            print(
+                f"status completed: {completed_status['state']} "
+                f"latest={completed_status['latest_activity']['type']}"
+            )
 
             continued = await first_bridge.continue_thread(
                 thread_id,
@@ -98,7 +113,7 @@ async def _run_smoke() -> int:
         finally:
             await first_app.shutdown()
 
-        second_app = AppServerClient("codex")
+        second_app = AppServerClient(executable)
         second_bridge = Bridge(second_app, StateStore(), policy)
         second_app.set_handlers(
             on_notification=second_bridge.handle_notification,

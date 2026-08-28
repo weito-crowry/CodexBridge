@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from codex_bridge.jsonrpc import JsonRpcClosedError, JsonRpcTransport
+from codex_bridge.jsonrpc import JsonRpcClosedError, JsonRpcProtocolError, JsonRpcTransport
 from tests.fakes import FakeWriter
 
 
@@ -72,6 +72,29 @@ async def test_eof_fails_pending_requests() -> None:
         await request
     with pytest.raises(JsonRpcClosedError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_reader_protocol_failure_closes_transport_and_rejects_followups() -> None:
+    reader = asyncio.StreamReader()
+    writer = FakeWriter()
+    transport = JsonRpcTransport(reader, writer)
+    task = asyncio.create_task(transport.run())
+    request = asyncio.create_task(transport.send_request("never", {}))
+    await asyncio.sleep(0)
+
+    reader.feed_data(b"not-json\n")
+
+    with pytest.raises(JsonRpcProtocolError, match="invalid JSON-RPC message"):
+        await request
+    with pytest.raises(JsonRpcProtocolError, match="invalid JSON-RPC message"):
+        await task
+
+    assert transport.closed is True
+    with pytest.raises(JsonRpcClosedError):
+        await transport.send_request("after-reader-failure", {})
+    with pytest.raises(JsonRpcClosedError):
+        await transport.send_notification("after-reader-failure", {})
 
 
 @pytest.mark.asyncio

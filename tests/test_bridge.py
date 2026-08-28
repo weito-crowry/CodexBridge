@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from codex_bridge.activity import ActivityStore
 from codex_bridge.bridge import Bridge
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
@@ -66,6 +67,19 @@ def make_bridge(allowed_dir) -> tuple[Bridge, FakeAppServer, StateStore]:
     store = StateStore()
     bridge = Bridge(app, store, AllowedPathPolicy((str(allowed_dir),)))
     return bridge, app, store
+
+
+def make_activity_bridge(allowed_dir) -> tuple[Bridge, FakeAppServer, StateStore, ActivityStore]:
+    app = FakeAppServer()
+    store = StateStore()
+    activities = ActivityStore()
+    bridge = Bridge(
+        app,
+        store,
+        AllowedPathPolicy((str(allowed_dir),)),
+        activity_store=activities,
+    )
+    return bridge, app, store, activities
 
 
 @pytest.mark.asyncio
@@ -284,6 +298,364 @@ async def test_agent_delta_and_diff_are_retained(allowed_dir) -> None:
     snapshot = store.snapshot("thread", "turn")
     assert snapshot["latest_agent_message"] == "hello"
     assert snapshot["current_diff"] == "diff"
+
+
+@pytest.mark.asyncio
+async def test_item_notifications_are_normalized_without_raw_output_or_diff(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    file_path = str(allowed_dir / "src" / "changed.py")
+    outside_path = str(allowed_dir.parent / "outside-secret.py")
+
+    bridge.handle_notification(
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread",
+                "turn": {"id": "turn", "status": "inProgress"},
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "startedAtMs": 1,
+                "item": {
+                    "id": "command-item",
+                    "type": "commandExecution",
+                    "command": "pytest tests/test_bridge.py",
+                    "commandActions": [],
+                    "cwd": str(allowed_dir),
+                    "status": "inProgress",
+                    "aggregatedOutput": "secret command output",
+                },
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 2,
+                "item": {
+                    "id": "command-item",
+                    "type": "commandExecution",
+                    "command": "pytest tests/test_bridge.py",
+                    "commandActions": [],
+                    "cwd": str(allowed_dir),
+                    "status": "completed",
+                    "exitCode": 0,
+                    "aggregatedOutput": "secret command output",
+                },
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "startedAtMs": 3,
+                "item": {
+                    "id": "file-item",
+                    "type": "fileChange",
+                    "status": "inProgress",
+                    "changes": [
+                        {"path": file_path, "kind": {"type": "update"}, "diff": "secret-diff"},
+                        {"path": outside_path, "kind": {"type": "update"}, "diff": "outside-diff"},
+                    ],
+                },
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 4,
+                "item": {
+                    "id": "file-item",
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {"path": file_path, "kind": {"type": "update"}, "diff": "secret-diff"},
+                        {"path": outside_path, "kind": {"type": "update"}, "diff": "outside-diff"},
+                    ],
+                },
+            },
+        }
+    )
+
+    recent = [activity.to_dict() for activity in activities.get_recent("thread", "turn")]
+
+    assert [activity["type"] for activity in recent] == [
+        "turn_started",
+        "command_started",
+        "command_completed",
+        "file_change_started",
+        "file_change_completed",
+    ]
+    assert recent[2]["details"] == {"exit_code": 0}
+    assert recent[4]["details"] == {"paths": ["src/changed.py"]}
+    assert "secret command output" not in str(recent)
+    assert "secret-diff" not in str(recent)
+    assert "outside-secret.py" not in str(recent)
+
+
+@pytest.mark.asyncio
+async def test_turn_terminal_notifications_are_normalized_as_activities(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    for native_status, expected_type, expected_status in (
+        ("completed", "turn_completed", "completed"),
+        ("failed", "turn_failed", "failed"),
+        ("interrupted", "turn_interrupted", "interrupted"),
+    ):
+        bridge.handle_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turn": {
+                        "id": native_status,
+                        "status": native_status,
+                        "error": {"message": "bounded failure"},
+                    },
+                },
+            }
+        )
+        latest = activities.latest("thread", native_status)
+        assert latest is not None
+        assert latest.type == expected_type
+        assert latest.status == expected_status
+
+
+@pytest.mark.asyncio
+async def test_error_notification_records_only_bounded_error_summary(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+
+    bridge.handle_notification(
+        {
+            "method": "error",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "willRetry": False,
+                "error": {"message": "App Server request failed"},
+                "raw": "must not be retained",
+            },
+        }
+    )
+
+    public = activities.latest("thread", "turn")
+    assert public is not None
+    assert public.type == "error"
+    assert public.summary == "App Server request failed"
+    assert "must not be retained" not in str(public.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_agent_deltas_update_state_but_create_one_completed_activity(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+
+    for _ in range(100):
+        bridge.handle_notification(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread", "turnId": "turn", "itemId": "agent", "delta": "x"},
+            }
+        )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 1,
+                "item": {"id": "agent", "type": "agentMessage", "text": "final message"},
+            },
+        }
+    )
+
+    recent = activities.get_recent("thread", "turn")
+    assert len(recent) == 1
+    assert recent[0].type == "agent_message"
+    assert recent[0].summary == "final message"
+
+
+@pytest.mark.asyncio
+async def test_approval_and_user_input_lifecycle_are_activities(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    await bridge.handle_server_request(
+        {
+            "id": "approval-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "itemId": "file-item",
+                "threadId": "thread",
+                "turnId": "turn",
+                "reason": "write",
+            },
+        }
+    )
+    await bridge.approve("approval-1", "accept")
+    await bridge.handle_server_request(
+        {
+            "id": "input-1",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "itemId": "input-item",
+                "threadId": "thread",
+                "turnId": "turn",
+                "questions": [{"header": "Choice", "id": "choice", "question": "Pick one"}],
+            },
+        }
+    )
+    await bridge.answer_user_input("input-1", {"choice": ["yes"]})
+
+    assert [activity.type for activity in activities.get_recent("thread", "turn")] == [
+        "approval_requested",
+        "approval_resolved",
+        "user_input_requested",
+        "user_input_resolved",
+    ]
+    assert "yes" not in str([activity.to_dict() for activity in activities.get_recent("thread")])
+
+
+def test_app_server_failure_records_bounded_error_and_failed_turn(allowed_dir) -> None:
+    bridge, _, store, activities = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    bridge.handle_app_server_failure("JSON-RPC transport closed with secret trace")
+
+    assert store.snapshot("thread", "turn")["state"] == "failed"
+    assert [activity.type for activity in activities.get_recent("thread", "turn")] == [
+        "turn_failed",
+        "error",
+    ]
+    public = [activity.to_dict() for activity in activities.get_recent("thread", "turn")]
+    assert "secret trace" not in str(public)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_items_are_not_recorded_or_returned(allowed_dir) -> None:
+    bridge, _, store, activities = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+    reasoning = {
+        "id": "reasoning-item",
+        "type": "reasoning",
+        "raw": "fake raw payload",
+        "encrypted": "fake encrypted payload",
+        "chain_of_thought": "fake chain of thought",
+        "reasoning": "fake reasoning body",
+        "content": ["fake reasoning body"],
+    }
+
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {"threadId": "thread", "turnId": "turn", "item": reasoning},
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {"threadId": "thread", "turnId": "turn", "item": reasoning},
+        }
+    )
+
+    result = await bridge.status("thread", "turn")
+    assert activities.get_recent("thread", "turn") == ()
+    assert all(
+        value not in str(result)
+        for value in (
+            "fake raw payload",
+            "fake encrypted payload",
+            "fake chain of thought",
+            "fake reasoning body",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_selects_active_or_latest_turn_without_fabricating_unknown_turn(
+    allowed_dir,
+) -> None:
+    bridge, _, store, _ = make_activity_bridge(allowed_dir)
+    await bridge.start(str(allowed_dir), "prompt")
+
+    active = await bridge.status("native-thread")
+    assert active["turn_id"] == "native-turn"
+    assert active["state"] == "in_progress"
+    assert active["recent_activities"][0]["type"] == "turn_started"
+
+    bridge.handle_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "native-thread",
+                "turn": {"id": "native-turn", "status": "completed"},
+            },
+        }
+    )
+    latest = await bridge.status("native-thread", activity_limit=1)
+    assert latest["turn_id"] == "native-turn"
+    assert latest["state"] == "completed"
+    assert len(latest["recent_activities"]) == 1
+
+    unknown = await bridge.status("native-thread", "missing-turn")
+    assert unknown["turn_id"] == "missing-turn"
+    assert unknown["state"] == "not_loaded"
+    assert unknown["recent_activities"] == []
+    assert store.has_turn("native-thread", "missing-turn") is False
+
+
+@pytest.mark.asyncio
+async def test_status_validates_activity_limit_and_pending_approval(allowed_dir) -> None:
+    bridge, _, _, _ = make_activity_bridge(allowed_dir)
+    with pytest.raises(ValueError, match="activity_limit"):
+        await bridge.status("thread", activity_limit=0)
+    with pytest.raises(ValueError, match="activity_limit"):
+        await bridge.status("thread", activity_limit=101)
+
+    await bridge.handle_server_request(
+        {
+            "id": "approval-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "thread", "turnId": "turn", "reason": "write"},
+        }
+    )
+    result = await bridge.status("thread", "turn")
+    assert result["state"] == "needs_approval"
+    assert result["pending_request"]["request_id"] == "approval-1"
+
+
+@pytest.mark.asyncio
+async def test_status_for_unknown_thread_returns_not_loaded_without_state_creation(
+    allowed_dir,
+) -> None:
+    bridge, _, store, _ = make_activity_bridge(allowed_dir)
+
+    result = await bridge.status("unknown-thread")
+
+    assert result == {
+        "thread_id": "unknown-thread",
+        "turn_id": None,
+        "state": "not_loaded",
+        "latest_agent_message": "",
+        "current_diff": "",
+        "pending_request": None,
+        "error": None,
+        "latest_activity": None,
+        "recent_activities": [],
+    }
+    assert store.has_thread("unknown-thread") is False
 
 
 @pytest.mark.asyncio

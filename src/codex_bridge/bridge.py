@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Protocol
 
+from .activity import ActivityStatus, ActivityStore, ActivityType
 from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
@@ -43,6 +44,8 @@ _APPROVAL_DECISIONS = {"accept", "acceptForSession", "decline", "cancel"}
 _TERMINAL_STATES = {"completed", "interrupted", "failed"}
 _PERMISSION_METHOD = "item/permissions/requestApproval"
 _PERMISSION_TEXT_LIMIT = 16_000
+_ACTIVITY_LIMIT_MIN = 1
+_ACTIVITY_LIMIT_MAX = 100
 
 
 def _native_state(value: object) -> NormalizedState:
@@ -212,14 +215,132 @@ class Bridge:
         state: StateStore,
         path_policy: AllowedPathPolicy,
         *,
+        activity_store: ActivityStore | None = None,
         wait_default_seconds: float = 18.0,
         wait_max_seconds: float = 30.0,
     ) -> None:
         self._app_server = app_server
         self._state = state
         self._path_policy = path_policy
+        self._activities = activity_store if activity_store is not None else ActivityStore()
         self._wait_default_seconds = wait_default_seconds
         self._wait_max_seconds = min(wait_max_seconds, 30.0)
+
+    @staticmethod
+    def _activity_status(value: object) -> ActivityStatus:
+        if not isinstance(value, str):
+            return "in_progress"
+        statuses: dict[str, ActivityStatus] = {
+            "inProgress": "in_progress",
+            "in_progress": "in_progress",
+            "completed": "completed",
+            "failed": "failed",
+            "declined": "declined",
+            "interrupted": "interrupted",
+        }
+        return statuses.get(value, "in_progress")
+
+    def _record_activity(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        type: ActivityType,
+        status: ActivityStatus,
+        item_id: str | None = None,
+        summary: str | None = None,
+        details: dict[str, str | int | bool | None | list[str]] | None = None,
+    ) -> None:
+        try:
+            self._activities.add(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                type=type,
+                status=status,
+                item_id=item_id,
+                summary=summary,
+                details=details,
+            )
+        except Exception as exc:
+            log_event("activity.record_error", error_type=exc.__class__.__name__)
+
+    def _has_activity_type(self, thread_id: str, turn_id: str, activity_type: ActivityType) -> bool:
+        try:
+            latest = self._activities.latest(thread_id, turn_id)
+            return latest is not None and latest.type == activity_type
+        except Exception as exc:
+            log_event("activity.lookup_error", error_type=exc.__class__.__name__)
+            return False
+
+    def _safe_file_paths(self, item: dict[str, Any]) -> list[str]:
+        changes = item.get("changes")
+        if not isinstance(changes, list):
+            return []
+        paths: list[str] = []
+        for change in changes[:100]:
+            if not isinstance(change, dict) or not isinstance(change.get("path"), str):
+                continue
+            path = self._path_policy.safe_relative_path(change["path"])
+            if path != "<path omitted>" and path not in paths:
+                paths.append(path)
+        return paths
+
+    def _record_item_activity(
+        self, method: str, thread_id: str, turn_id: str, item: dict[str, Any]
+    ) -> None:
+        item_id = item.get("id") if isinstance(item.get("id"), str) else None
+        item_type = item.get("type")
+        if item_type == "commandExecution":
+            activity_type: ActivityType = (
+                "command_started" if method == "item/started" else "command_completed"
+            )
+            details: dict[str, str | int | bool | None | list[str]] = {}
+            exit_code = item.get("exitCode")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                details["exit_code"] = exit_code
+            command = item.get("command")
+            summary = command if isinstance(command, str) else "Command execution"
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+                type=activity_type,
+                status=self._activity_status(item.get("status")),
+                summary=_bounded_text(summary),
+                details=details,
+            )
+            return
+        if item_type == "fileChange":
+            activity_type = (
+                "file_change_started" if method == "item/started" else "file_change_completed"
+            )
+            paths = self._safe_file_paths(item)
+            file_details: dict[str, str | int | bool | None | list[str]] | None = (
+                {"paths": paths} if paths else None
+            )
+            summary = ", ".join(paths) if paths else "File change"
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=item_id,
+                type=activity_type,
+                status=self._activity_status(item.get("status")),
+                summary=summary,
+                details=file_details,
+            )
+            return
+        if method == "item/completed" and item_type == "agentMessage":
+            text = item.get("text")
+            if isinstance(text, str):
+                self._state.update_latest_message(thread_id, turn_id, text)
+                self._record_activity(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    type="agent_message",
+                    status="completed",
+                    summary=_bounded_text(text),
+                )
 
     @staticmethod
     def _thread_from_response(response: dict[str, Any]) -> dict[str, Any]:
@@ -250,6 +371,31 @@ class Bridge:
         status = _native_state(turn.get("status"))
         if status in _TERMINAL_STATES:
             self._state.set_terminal(thread_id, turn_id, status, _bounded_text(turn.get("error")))
+            activity_type: ActivityType
+            if status == "completed":
+                activity_type = "turn_completed"
+            elif status == "failed":
+                activity_type = "turn_failed"
+            else:
+                activity_type = "turn_interrupted"
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                type=activity_type,
+                status=self._activity_status(status),
+                summary=_bounded_text(turn.get("error"))
+                if status == "failed"
+                else "Turn " + status,
+            )
+        else:
+            if not self._has_activity_type(thread_id, turn_id, "turn_started"):
+                self._record_activity(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    type="turn_started",
+                    status="in_progress",
+                    summary="Turn started",
+                )
         return self._public_snapshot(thread_id, turn_id)
 
     async def start(self, cwd: str, prompt: str) -> dict[str, Any]:
@@ -335,6 +481,15 @@ class Bridge:
             }
         await self._app_server.respond(request_id, payload)
         self._state.pop_pending_request(request_id)
+        self._record_activity(
+            thread_id=pending.thread_id,
+            turn_id=pending.turn_id,
+            item_id=pending.item_id,
+            type="approval_resolved",
+            status="resolved",
+            summary=pending.summary,
+            details={"decision": decision},
+        )
         log_event("approval.resolved", request_id=request_id, decision=decision)
         return self._public_snapshot(pending.thread_id, pending.turn_id)
 
@@ -360,6 +515,14 @@ class Bridge:
         }
         await self._app_server.respond(request_id, payload)
         self._state.pop_pending_request(request_id)
+        self._record_activity(
+            thread_id=pending.thread_id,
+            turn_id=pending.turn_id,
+            item_id=pending.item_id,
+            type="user_input_resolved",
+            status="resolved",
+            summary=pending.summary,
+        )
         log_event("user_input.resolved", request_id=request_id)
         return self._public_snapshot(pending.thread_id, pending.turn_id)
 
@@ -399,8 +562,24 @@ class Bridge:
             active = self._state.active_turns()
 
     def handle_app_server_failure(self, error: str) -> None:
+        lines = error.splitlines()
+        error_summary = _bounded_text(lines[0] if lines else error)
         for thread_id, turn_id in self._state.active_turns():
             self._state.set_terminal(thread_id, turn_id, "failed", error)
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                type="turn_failed",
+                status="failed",
+                summary=error_summary or "App Server failure",
+            )
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                type="error",
+                status="failed",
+                summary=error_summary or "App Server failure",
+            )
             log_event("turn.terminal", thread_id=thread_id, turn_id=turn_id, state="failed")
 
     async def threads(
@@ -473,7 +652,9 @@ class Bridge:
             return
         if method in _APPROVAL_METHODS:
             permission: PermissionRequestDetails | None = None
-            summary = _bounded_text(params.get("reason") or params.get("command"))
+            raw_summary = params.get("reason") or params.get("command")
+            summary = _bounded_text(raw_summary)
+            activity_summary = raw_summary if isinstance(raw_summary, str) else None
             if method == _PERMISSION_METHOD:
                 try:
                     cwd = params.get("cwd")
@@ -508,6 +689,14 @@ class Bridge:
                     permission=permission,
                 )
             )
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=params.get("itemId") if isinstance(params.get("itemId"), str) else None,
+                type="approval_requested",
+                status="requested",
+                summary=activity_summary,
+            )
             log_event(
                 "approval.request",
                 request_id=request_id,
@@ -539,6 +728,15 @@ class Bridge:
                     questions=tuple(questions),
                 )
             )
+            question_summary = "; ".join(question.header for question in questions)
+            self._record_activity(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=params.get("itemId") if isinstance(params.get("itemId"), str) else None,
+                type="user_input_requested",
+                status="requested",
+                summary=_bounded_text(question_summary),
+            )
             log_event(
                 "user_input.request",
                 request_id=request_id,
@@ -564,6 +762,19 @@ class Bridge:
             ):
                 pending = self._state.get_pending_request(request_id)
                 if pending is not None and pending.thread_id == thread_id:
+                    resolved_activity_type: ActivityType = (
+                        "user_input_resolved"
+                        if pending.method == _USER_INPUT_METHOD
+                        else "approval_resolved"
+                    )
+                    self._record_activity(
+                        thread_id=pending.thread_id,
+                        turn_id=pending.turn_id,
+                        item_id=pending.item_id,
+                        type=resolved_activity_type,
+                        status="resolved",
+                        summary=pending.summary,
+                    )
                     self._state.pop_pending_request(request_id)
                     log_event("server_request.resolved", request_id=request_id)
             return
@@ -592,6 +803,24 @@ class Bridge:
                 and isinstance(turn.get("id"), str)
             ):
                 self._state.ensure_turn(thread_id, turn["id"])
+                if not self._has_activity_type(thread_id, turn["id"], "turn_started"):
+                    self._record_activity(
+                        thread_id=thread_id,
+                        turn_id=turn["id"],
+                        type="turn_started",
+                        status="in_progress",
+                        summary="Turn started",
+                    )
+            return
+        if method in {"item/started", "item/completed"}:
+            if isinstance(thread_id, str) and isinstance(turn_id, str):
+                item = params.get("item")
+                if isinstance(item, dict):
+                    try:
+                        self._state.ensure_turn(thread_id, turn_id)
+                        self._record_item_activity(method, thread_id, turn_id, item)
+                    except Exception as exc:
+                        log_event("activity.normalize_error", error_type=exc.__class__.__name__)
             return
         if method == "turn/completed":
             turn = params.get("turn")
@@ -604,12 +833,35 @@ class Bridge:
                 self._state.set_terminal(
                     thread_id, turn["id"], status, _bounded_text(turn.get("error"))
                 )
+                activity_types: dict[str, ActivityType] = {
+                    "completed": "turn_completed",
+                    "failed": "turn_failed",
+                    "interrupted": "turn_interrupted",
+                }
+                activity_type = activity_types.get(status)
+                if activity_type is not None:
+                    error_summary = _bounded_text(turn.get("error"))
+                    self._record_activity(
+                        thread_id=thread_id,
+                        turn_id=turn["id"],
+                        type=activity_type,
+                        status=self._activity_status(status),
+                        summary=error_summary if status == "failed" else "Turn " + status,
+                    )
                 log_event("turn.terminal", thread_id=thread_id, turn_id=turn["id"], state=status)
             return
         if method == "error":
             if isinstance(thread_id, str) and isinstance(turn_id, str):
-                self._state.set_terminal(
-                    thread_id, turn_id, "failed", _bounded_text(params.get("message"))
+                error_summary = _bounded_text(params.get("error"))
+                if error_summary is None:
+                    error_summary = _bounded_text(params.get("message"))
+                self._state.set_terminal(thread_id, turn_id, "failed", error_summary)
+                self._record_activity(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    type="error",
+                    status="failed",
+                    summary=error_summary or "App Server error",
                 )
 
     def _public_snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
@@ -638,3 +890,47 @@ class Bridge:
                 }
             snapshot["pending_request"] = public_pending
         return snapshot
+
+    @staticmethod
+    def _not_loaded_status(thread_id: str, turn_id: str | None) -> dict[str, Any]:
+        return {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "state": "not_loaded",
+            "latest_agent_message": "",
+            "current_diff": "",
+            "pending_request": None,
+            "error": None,
+            "latest_activity": None,
+            "recent_activities": [],
+        }
+
+    async def status(
+        self, thread_id: str, turn_id: str | None = None, activity_limit: int = 20
+    ) -> dict[str, Any]:
+        if (
+            isinstance(activity_limit, bool)
+            or not isinstance(activity_limit, int)
+            or not _ACTIVITY_LIMIT_MIN <= activity_limit <= _ACTIVITY_LIMIT_MAX
+        ):
+            raise ValueError("activity_limit must be between 1 and 100")
+
+        selected_turn_id = turn_id
+        if selected_turn_id is None:
+            selected_turn_id = self._state.active_turn_for_thread(thread_id)
+            if selected_turn_id is None:
+                selected_turn_id = self._state.latest_known_turn(thread_id)
+            if selected_turn_id is None:
+                selected_turn_id = self._activities.latest_known_turn(thread_id)
+
+        if selected_turn_id is None:
+            return self._not_loaded_status(thread_id, None)
+        if not self._state.has_turn(thread_id, selected_turn_id):
+            return self._not_loaded_status(thread_id, selected_turn_id)
+
+        result = self._public_snapshot(thread_id, selected_turn_id)
+        recent = self._activities.get_recent(thread_id, selected_turn_id, limit=activity_limit)
+        latest = self._activities.latest(thread_id, selected_turn_id)
+        result["latest_activity"] = latest.to_dict() if latest is not None else None
+        result["recent_activities"] = [activity.to_dict() for activity in recent]
+        return result

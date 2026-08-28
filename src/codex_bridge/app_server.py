@@ -12,6 +12,8 @@ from .logging_utils import log_event
 
 logger = logging.getLogger(__name__)
 
+_APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
+
 
 class ProcessLike(Protocol):
     stdin: Any
@@ -37,6 +39,7 @@ async def _create_process(*args: str) -> ProcessLike:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_APP_SERVER_STREAM_LIMIT,
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
         raise RuntimeError("Codex App Server pipes are unavailable")
@@ -135,7 +138,7 @@ class AppServerClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if self._transport.closed:
+            if self._transport.closing and not self._transport.reader_failed:
                 return
             self._failed = True
             self._failure = str(exc)[:2_000]

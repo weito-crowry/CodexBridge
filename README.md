@@ -21,7 +21,7 @@ The bridge does not create a session ID or database. Codex's native `thread.id` 
 - `uv` recommended for installation and tests
 - A tunnel or reverse proxy prepared separately when ChatGPT must reach the local endpoint
 
-The implementation was developed and protocol-checked against `codex-cli 0.137.0`. The generated protocol bundle was obtained with:
+The implementation was developed and protocol-checked against `codex-cli 0.150.0-alpha.8`. The generated protocol bundle was obtained with:
 
 ```powershell
 codex app-server generate-json-schema --experimental --out <temporary-directory>
@@ -76,7 +76,7 @@ Only use the actual host and origin values supplied by the tunnel/client deploym
 
 ## MCP tools
 
-The server publishes exactly eight tools:
+The server publishes exactly nine tools:
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
@@ -88,6 +88,7 @@ The server publishes exactly eight tools:
 | `codex_user_input` | `request_id`, `answers` | Resolves one pending user-input request keyed by exact question IDs. |
 | `codex_interrupt` | `thread_id`, `turn_id` | Requests interruption; the later terminal event determines the final state. |
 | `codex_threads` | optional `thread_id`, history flag, limit, cursor | Lists native threads or reads one sanitized native thread/history response. |
+| `codex_status` | `thread_id`, optional `turn_id`, `activity_limit` (1-100, default 20) | Returns the current safe turn snapshot plus bounded recent Activity records. |
 
 Normalized states are `in_progress`, `needs_approval`, `needs_input`, `completed`, `interrupted`, and `failed`.
 
@@ -99,6 +100,7 @@ Normalized states are `in_progress`, `needs_approval`, `needs_input`, `completed
 4. If the result is `needs_input`, show the questions and call `codex_user_input` with answers keyed by their IDs.
 5. Continue polling `codex_wait` until `completed`, `interrupted`, or `failed`.
 6. Use `codex_steer` while the turn is running, or `codex_interrupt` when it must stop.
+7. Use `codex_status` for read-only observation without opening a second App Server writer.
 
 After a CodexBridge restart, call `codex_continue` with the same native `thread_id`. The bridge first reads the persisted thread metadata, validates its canonical `cwd`, and calls `thread/resume` only when that cwd is allowed; it does not edit rollout/history files or repair a failed resume.
 
@@ -108,7 +110,13 @@ Codex server requests are stored only in process memory and surfaced by `codex_w
 
 The allowed-root policy applies to every bridge entry point that can select a thread: `codex_start` validates its input `cwd`; `codex_continue` validates persisted metadata before resume; `codex_threads` validates detail/history before returning it and filters list rows by canonical `cwd`. A list page may contain fewer rows than its native page size because disallowed or malformed rows are omitted.
 
-Unsupported App Server server-initiated requests fail closed with a bounded JSON-RPC error and do not stop the reader. MCP `mcpServer/elicitation/request` is answered with the schema-valid `action: cancel`; the initial tool surface remains eight tools. Terminal events and `serverRequest/resolved` notifications clear stale pending requests defensively.
+Unsupported App Server server-initiated requests fail closed with a bounded JSON-RPC error and do not stop the reader. MCP `mcpServer/elicitation/request` is answered with the schema-valid `action: cancel`. Terminal events and `serverRequest/resolved` notifications clear stale pending requests defensively.
+
+## Activity observation
+
+`ActivityStore` is a process-local in-memory ring buffer with up to 500 normalized Activity records per native thread. It records turn lifecycle, command execution, file-change, agent-message completion, approval/user-input, and error observations. Agent-message deltas update the authoritative latest message only; they do not create one Activity per delta. Command output, full diffs, raw JSON-RPC payloads, reasoning items, credentials, tokens, and tunnel identifiers are never stored in the Activity history. File paths are reduced to allowed-root-relative display paths, and paths outside the allowlist are omitted.
+
+`codex_status` selects the requested turn, otherwise the active turn, otherwise the latest known turn. If no matching turn is known it returns `state: "not_loaded"` with an empty activity list; it never creates a synthetic turn.
 
 ## Shutdown behavior
 

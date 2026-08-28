@@ -17,7 +17,8 @@
 
 ## External MCP interface
 
-The server exposes exactly these eight tools:
+The original bridge surface exposes eight control tools. Phase 1 adds the ninth, read-only
+`codex_status` tool described in the Activity observation addendum below:
 
 | Tool | Input | Behavior |
 | --- | --- | --- |
@@ -29,6 +30,7 @@ The server exposes exactly these eight tools:
 | `codex_user_input` | `request_id`, `answers` | Resolve exactly one pending user-input request. Answers are keyed by the request's question IDs and contain string arrays. |
 | `codex_interrupt` | `thread_id`, `turn_id` | Call `turn/interrupt`; only a later terminal event determines final state. |
 | `codex_threads` | optional `thread_id`, history flag, bounded list pagination | Call `thread/list` for discovery or `thread/read` for a selected native thread and sanitize output. |
+| `codex_status` | `thread_id`, optional `turn_id`, `activity_limit` 1-100 | Return the current safe snapshot and bounded recent normalized activities without a second App Server writer. |
 
 Approval and user-input requests are held in memory and surfaced through `codex_wait`. A response is accepted only when its request ID is still pending; duplicate, unknown, or mismatched requests fail without affecting another request.
 
@@ -50,7 +52,7 @@ MCP tool handlers -> Bridge orchestration -> State store
                          codex app-server --stdio
 ```
 
-`JsonRpcTransport` owns line-delimited JSON-RPC framing, request ID correlation, one reader task, response futures, notification dispatch, and server-request dispatch. `AppServerClient` owns subprocess startup, `initialize`/`initialized`, native method calls, stderr diagnostics, and shutdown. `StateStore` owns bounded in-memory thread/turn snapshots and wait conditions. `Bridge` translates native events and calls into the eight MCP-facing behaviors. The server module owns SDK registration and ASGI lifespan.
+`JsonRpcTransport` owns line-delimited JSON-RPC framing, request ID correlation, one reader task, response futures, notification dispatch, and server-request dispatch. `AppServerClient` owns subprocess startup, `initialize`/`initialized`, native method calls, stderr diagnostics, and shutdown. `StateStore` owns bounded in-memory thread/turn snapshots and wait conditions. `ActivityStore` owns a separate process-local ring buffer of safe normalized observations. `Bridge` translates native events and calls into the MCP-facing behaviors. The server module owns SDK registration and ASGI lifespan.
 
 The reader recognizes:
 
@@ -72,5 +74,10 @@ ASGI lifespan startup creates one App Server client and performs the handshake b
 
 ## Testing and verification
 
-Unit tests use a fake App Server or transport double and never invoke real Codex. They cover handshake, request correlation, notifications, server-request routing, all eight tools, state normalization, concurrent threads, cross-talk prevention, lifecycle failures, path security, and graceful shutdown. A separate explicit integration smoke script uses a temporary workspace and a real local Codex installation; it is never part of the normal unit suite.
+Unit tests use a fake App Server or transport double and never invoke real Codex. They cover handshake, request correlation, notifications, server-request routing, all nine tools, state normalization, Activity bounds/privacy, concurrent threads, cross-talk prevention, lifecycle failures, path security, and graceful shutdown. A separate explicit integration smoke script uses a temporary workspace and a real local Codex installation; it is never part of the normal unit suite.
 
+## Phase 1 Activity observation addendum
+
+`ActivityStore` keeps at most 500 `Activity` records per native thread in memory. Each record has a process-unique ID, UTC ISO-8601 timestamp, native thread/turn identity, optional item identity, normalized type/status, bounded summary, and a small allowlisted details mapping. It records turn start/completion/failure/interruption, command start/completion, file-change start/completion, completed agent messages, approval and user-input request/resolution, and bounded errors. Agent-message deltas update `StateStore.latest_agent_message` and do not create Activity records. Reasoning items, raw/encrypted fields, raw JSON-RPC payloads, command output, full diffs, credentials, API keys, authentication tokens, and tunnel identifiers are not stored. File display paths are reduced to allowed-root-relative paths and outside-root paths are omitted.
+
+`codex_status` validates `activity_limit` between 1 and 100 (default 20), selects the supplied turn, the active turn, or the latest known turn, and returns only the existing safe state snapshot plus serialized Activity records. It returns `state: not_loaded` with no activities when no matching turn is known and never fabricates a turn.

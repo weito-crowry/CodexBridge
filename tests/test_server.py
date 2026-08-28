@@ -40,7 +40,7 @@ def config(tmp_path) -> BridgeConfig:
     )
 
 
-def test_server_registers_exactly_eight_tools(tmp_path) -> None:
+def test_server_registers_exactly_nine_tools(tmp_path) -> None:
     runtime = FakeRuntime()
     app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
 
@@ -55,6 +55,7 @@ def test_server_registers_exactly_eight_tools(tmp_path) -> None:
         "codex_user_input",
         "codex_interrupt",
         "codex_threads",
+        "codex_status",
     }
 
 

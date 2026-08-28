@@ -50,9 +50,13 @@ class JsonRpcTransport:
         self._on_notification = on_notification
         self._on_server_request = on_server_request
         self._write_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future[JsonObject]] = {}
         self._next_id = 1
         self._closed = False
+        self._close_requested = False
+        self._resources_closed = False
+        self._reader_failure: BaseException | None = None
 
     def set_callbacks(
         self,
@@ -66,6 +70,25 @@ class JsonRpcTransport:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def closing(self) -> bool:
+        return self._close_requested
+
+    @property
+    def reader_failed(self) -> bool:
+        return self._reader_failure is not None
+
+    def _set_pending_exception(self, exc: BaseException) -> None:
+        for future in tuple(self._pending.values()):
+            if not future.done():
+                future.set_exception(exc)
+
+    def _mark_reader_failure(self, exc: BaseException) -> None:
+        self._closed = True
+        if self._reader_failure is None:
+            self._reader_failure = exc
+        self._set_pending_exception(exc)
 
     async def _write(self, message: JsonObject) -> None:
         encoded = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -161,25 +184,24 @@ class JsonRpcTransport:
                 else:
                     raise JsonRpcProtocolError("unrecognized JSON-RPC message")
         except (JsonRpcClosedError, JsonRpcProtocolError) as exc:
-            for future in tuple(self._pending.values()):
-                if not future.done():
-                    future.set_exception(exc)
+            if not self._close_requested:
+                self._mark_reader_failure(exc)
             raise
         except Exception as exc:
-            for future in tuple(self._pending.values()):
-                if not future.done():
-                    future.set_exception(exc)
+            if not self._close_requested:
+                self._mark_reader_failure(exc)
             raise
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for future in tuple(self._pending.values()):
-            if not future.done():
-                future.set_exception(JsonRpcClosedError("JSON-RPC transport closed"))
-        feed_eof = getattr(self._reader, "feed_eof", None)
-        if callable(feed_eof):
-            feed_eof()
-        self._writer.close()
-        await self._writer.wait_closed()
+        async with self._close_lock:
+            if self._resources_closed:
+                return
+            self._close_requested = True
+            self._closed = True
+            self._set_pending_exception(JsonRpcClosedError("JSON-RPC transport closed"))
+            feed_eof = getattr(self._reader, "feed_eof", None)
+            if callable(feed_eof):
+                feed_eof()
+            self._writer.close()
+            await self._writer.wait_closed()
+            self._resources_closed = True
