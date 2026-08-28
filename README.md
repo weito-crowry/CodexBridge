@@ -135,7 +135,7 @@ The independent UI listener serves `GET /healthz`, `/ui-api/status`, `/ui-api/th
 
 ## Phase 3 read-only desktop Console
 
-The optional Windows-oriented PySide6 Console is a separate read-only viewer for the already-running UI API. Start the Bridge first, then launch the Console in another terminal:
+The optional Windows-oriented PySide6 Console is a read-only viewer for the UI API. It can connect to an already-running Bridge, and Phase 4A can also detect Codex and start a Bridge from the Console:
 
 ```powershell
 uv sync --extra dev --extra console
@@ -146,6 +146,14 @@ uv run codex-bridge-console
 The Console uses `CODEX_BRIDGE_UI_PORT` (default `8001`) or an explicit `--ui-port`, always connects to `http://127.0.0.1:<port>`, and uses Qt Network for asynchronous JSON GET and SSE reads. It shows the thread list, selected thread history, current status, pending approval/input summaries, recent Activity, and live Activity stream. It has no approval, input, steer, interrupt, new-thread, or other mutation controls. The UI API is loopback-only and is not a Tunnel target.
 
 Console close stops its timers and aborts only its own HTTP/SSE replies. It does not stop CodexBridge, the Codex App Server, the Tunnel, or an active Codex turn.
+
+## Phase 4A Codex detection and detached Bridge launch
+
+Phase 4A adds a small runtime area to the Console. It asynchronously discovers and verifies a Codex executable with the priority `CODEX_BRIDGE_CODEX_EXECUTABLE`, the Windows Codex App native installation, PATH (`codex.exe`, `codex.cmd`, `codex`), and `%APPDATA%\npm\codex.cmd`. Candidate paths are deduplicated with Windows case-insensitive canonical comparison. The `--version` probe has a roughly three-second timeout and bounded output, and the Console shows only the detected version and source, never raw subprocess output or environment values.
+
+When the existing UI API is ready, the Console reports `Runtime: external` and disables Start Bridge. The existing external Bridge is never replaced. A valid detected Codex enables Start Bridge only while the Bridge is unavailable. The button starts exactly one detached child using `sys.executable -m codex_bridge`; the child inherits the current environment, with only `CODEX_BRIDGE_CODEX_EXECUTABLE` and `CODEX_BRIDGE_UI_PORT` controlled by the launcher. The Console waits for `/healthz` and `/ui-api/status` readiness before showing `Runtime: started by Console`.
+
+The detached Bridge and its App Server continue after the Console closes. A launch timeout is safe and does not trigger a retry; there is no automatic restart. Phase 4A has no Stop or Restart UI and does not kill, terminate, or interrupt a Bridge, App Server, or turn. Tunnel/tray remain out of scope for Phase 4A.
 
 ## Shutdown behavior
 
