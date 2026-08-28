@@ -69,7 +69,7 @@ class FakeLauncher:
 
 
 class FakeTunnelSupervisor:
-    def __init__(self) -> None:
+    def __init__(self, *, delayed_close: bool = False) -> None:
         self.state_changed = Signal()
         self.message_changed = Signal()
         self.controls_changed = Signal()
@@ -80,6 +80,8 @@ class FakeTunnelSupervisor:
         self.stop_calls = 0
         self.restart_calls = 0
         self.close_calls = 0
+        self._delayed_close = delayed_close
+        self._close_callback: Any | None = None
 
     def set_bridge_ready(self, ready: bool) -> None:
         self.bridge_ready_calls.append(ready)
@@ -101,7 +103,15 @@ class FakeTunnelSupervisor:
     def close(self, *, on_finished=None) -> None:
         self.close_calls += 1
         if on_finished is not None:
-            on_finished()
+            if self._delayed_close:
+                self._close_callback = on_finished
+            else:
+                on_finished()
+
+    def complete_close(self) -> None:
+        callback, self._close_callback = self._close_callback, None
+        if callback is not None:
+            callback()
 
     def emit_state(self, state: str) -> None:
         self._state = state
@@ -146,12 +156,13 @@ def _window(
     tray_available: bool,
     quit_calls: list[str],
     tray: FakeTray | None = None,
+    delayed_close: bool = False,
 ) -> tuple[MainWindow, FakeClient, FakeProbe, FakeLauncher, FakeTunnelSupervisor, FakeTray | None]:
     _application()
     client = FakeClient()
     probe = FakeProbe()
     launcher = FakeLauncher()
-    supervisor = FakeTunnelSupervisor()
+    supervisor = FakeTunnelSupervisor(delayed_close=delayed_close)
     window = MainWindow(
         ConsoleConfig(),
         api_client=client,
@@ -194,6 +205,45 @@ def test_window_tunnel_controls_follow_one_supervisor_action_state() -> None:
     window.close()
 
 
+def test_initial_and_runtime_tunnel_controls_are_synced_for_window_and_tray() -> None:
+    tray = FakeTray()
+    window, _client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=[],
+        tray=tray,
+    )
+    assert tray.menu is not None
+    actions = {action.text(): action for action in tray.menu.actions() if not action.isSeparator()}
+
+    for control in (
+        window.start_tunnel_button,
+        window.stop_tunnel_button,
+        window.restart_tunnel_button,
+    ):
+        assert not control.isEnabled()
+    for name in ("Start Tunnel", "Stop Tunnel", "Restart Tunnel"):
+        assert not actions[name].isEnabled()
+
+    supervisor.emit_state("checking")
+    supervisor.controls(TunnelActionState(False, False, False))
+    supervisor.emit_state("ready_to_start")
+    supervisor.controls(TunnelActionState(True, False, False))
+    assert window.start_tunnel_button.isEnabled()
+    assert actions["Start Tunnel"].isEnabled()
+    assert not window.stop_tunnel_button.isEnabled()
+    assert not actions["Stop Tunnel"].isEnabled()
+
+    supervisor.emit_state("ready")
+    supervisor.controls(TunnelActionState(False, True, True))
+    assert not window.start_tunnel_button.isEnabled()
+    assert not actions["Start Tunnel"].isEnabled()
+    assert window.stop_tunnel_button.isEnabled()
+    assert actions["Stop Tunnel"].isEnabled()
+    assert window.restart_tunnel_button.isEnabled()
+    assert actions["Restart Tunnel"].isEnabled()
+    window._begin_exit()
+
+
 def test_available_tray_close_hides_without_cleanup_or_tunnel_stop() -> None:
     tray = FakeTray()
     quit_calls: list[str] = []
@@ -224,6 +274,7 @@ def test_tray_actions_call_same_tunnel_operations_as_window_controls() -> None:
     )
     assert tray.menu is not None
     actions = {action.text(): action for action in tray.menu.actions() if not action.isSeparator()}
+    supervisor.controls(TunnelActionState(True, True, True))
 
     actions["Start Tunnel"].trigger()
     actions["Stop Tunnel"].trigger()
@@ -268,4 +319,30 @@ def test_unavailable_tray_uses_explicit_exit_cleanup_on_window_close() -> None:
     assert client.aborted == 1
     assert probe.aborted == 1
     assert launcher.closed == 1
+    assert quit_calls == ["quit"]
+
+
+def test_unavailable_tray_close_waits_for_async_tunnel_cleanup() -> None:
+    quit_calls: list[str] = []
+    window, client, probe, launcher, supervisor, _tray = _window(
+        tray_available=False,
+        quit_calls=quit_calls,
+        delayed_close=True,
+    )
+    window.show()
+
+    assert not window.close()
+
+    assert supervisor.close_calls == 1
+    assert client.aborted == 1
+    assert probe.aborted == 1
+    assert launcher.closed == 1
+    assert window._closing
+    assert not window.isVisible()
+    assert quit_calls == []
+
+    supervisor.complete_close()
+
+    assert quit_calls == ["quit"]
+    supervisor.complete_close()
     assert quit_calls == ["quit"]

@@ -428,8 +428,8 @@ class TunnelSupervisor(QObject):
             if reply is not None:
                 self._health_reply = reply
                 reply.finished.connect(lambda reply=reply: self._on_health_finished(reply))
-        if self._health_ok and self._ready_reply is None:
-            self._ready_reply = self._get_health_reply("readyz")
+        if self._health_ok:
+            self._ensure_ready_reply()
 
     def _get_health_reply(self, endpoint: str) -> Any | None:
         if self._health_port is None:

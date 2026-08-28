@@ -388,3 +388,54 @@ def test_startup_timeout_becomes_not_ready_and_later_ready_recovers() -> None:
 
     assert supervisor.state == "ready"
     supervisor.close()
+
+
+def test_steady_health_poll_rechecks_readiness_and_recovers() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    network = FakeNetworkManager()
+    processes = [doctor, tunnel]
+    supervisor = TunnelSupervisor(
+        executable="tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        network_manager=network,
+        health_port_provider=lambda: 41001,
+    )
+    supervisor.set_bridge_ready(True)
+    doctor.finished.emit(0, 0)
+    supervisor.start()
+    tunnel.started.emit()
+
+    initial_health = network.replies[-1]
+    initial_health.status = 200
+    initial_health.finished.emit()
+    initial_ready = network.replies[-1]
+    initial_ready.status = 200
+    initial_ready.finished.emit()
+    assert supervisor.state == "ready"
+
+    supervisor._poll_health()
+    steady_health = network.replies[-2]
+    steady_ready = network.replies[-1]
+    assert steady_health.url.endswith("/healthz")
+    assert steady_ready.url.endswith("/readyz")
+    assert len(steady_ready.finished._slots) == 1
+
+    steady_health.status = 200
+    steady_health.finished.emit()
+    steady_ready.status = 503
+    steady_ready.finished.emit()
+    assert supervisor.state == "not_ready"
+
+    supervisor._poll_health()
+    recovery_health = network.replies[-2]
+    recovery_ready = network.replies[-1]
+    recovery_health.status = 200
+    recovery_health.finished.emit()
+    recovery_ready.status = 200
+    recovery_ready.finished.emit()
+
+    assert supervisor.state == "ready"
+    supervisor.close()

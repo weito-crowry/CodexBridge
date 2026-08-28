@@ -119,6 +119,7 @@ class MainWindow(QMainWindow):
         self._build_timers()
         self._connect_runtime()
         self._build_tray()
+        self._sync_tunnel_controls()
         self._set_unavailable_state()
         self._codex_probe.start()
         self.refresh()
@@ -344,6 +345,14 @@ class MainWindow(QMainWindow):
             action = self._tray_actions.get(name)
             if action is not None:
                 action.setEnabled(enabled)
+
+    def _sync_tunnel_controls(self) -> None:
+        actions = self._tunnel.action_state
+        self._apply_tunnel_controls(
+            actions.start_enabled,
+            actions.stop_enabled,
+            actions.restart_enabled,
+        )
 
     def _start_tunnel(self) -> None:
         self._tunnel.start()
@@ -788,7 +797,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._begin_exit()
-        event.accept()
+        self.hide()
+        event.ignore()
 
     def _begin_exit(self) -> None:
         if self._closing:
