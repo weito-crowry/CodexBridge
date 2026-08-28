@@ -62,6 +62,28 @@ def test_phase4b_docs_describe_tunnel_supervision_tray_and_boundaries() -> None:
         assert text in spec
 
 
+def test_phase4c_docs_describe_authenticated_graceful_bridge_control() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    spec = (ROOT / "docs" / "superpowers" / "specs" / "2026-08-28-codexbridge-design.md").read_text(
+        encoding="utf-8"
+    )
+
+    for text in (
+        "Phase 4C",
+        "Stop Bridge",
+        "Restart Bridge",
+        "CODEX_BRIDGE_CONTROL_TOKEN",
+        "process-local",
+        "POST /ui-api/control/shutdown",
+        "external Bridge is never taken over",
+        "Stopping or restarting Bridge may interrupt active Codex turns.",
+        "Bridge remains running on Console Exit",
+        "exactly nine tools",
+    ):
+        assert text in readme
+        assert text in spec
+
+
 def test_console_source_contains_no_mutation_or_process_ownership_operations() -> None:
     source = "\n".join(
         path.read_text(encoding="utf-8")
@@ -72,7 +94,6 @@ def test_console_source_contains_no_mutation_or_process_ownership_operations() -
     )
 
     for forbidden in (
-        r"\bPOST\b",
         r"\bPUT\b",
         r"\bDELETE\b",
         "thread/resume",

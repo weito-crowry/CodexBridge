@@ -79,7 +79,7 @@ async def _read_sse_event(port: int) -> str:
     return await asyncio.to_thread(request)
 
 
-async def _run_smoke() -> int:
+async def _run_smoke(*, mcp_port: int = 8000, ui_port: int = 8001) -> int:
     configure_logging()
     executable = os.environ.get("CODEX_BRIDGE_CODEX_EXECUTABLE", "codex")
     with tempfile.TemporaryDirectory(prefix="codexbridge-smoke-") as temporary:
@@ -96,8 +96,8 @@ async def _run_smoke() -> int:
         )
         ui_config = BridgeConfig(
             host="127.0.0.1",
-            port=8000,
-            ui_port=8001,
+            port=mcp_port,
+            ui_port=ui_port,
             allowed_roots=(str(root),),
             allowed_hosts=(),
             allowed_origins=(),
@@ -106,12 +106,12 @@ async def _run_smoke() -> int:
             wait_max_seconds=30.0,
             shutdown_grace_seconds=3.0,
         )
-        ui_server = LocalUiServer(create_ui_app(first_bridge, activity_store, ui_config), 8001)
+        ui_server = LocalUiServer(create_ui_app(first_bridge, activity_store, ui_config), ui_port)
         await first_app.start()
         try:
             await ui_server.start()
-            health = await _get_json(8001, "/healthz")
-            ui_status = await _get_json(8001, "/ui-api/status")
+            health = await _get_json(ui_port, "/healthz")
+            ui_status = await _get_json(ui_port, "/ui-api/status")
             print(f"ui health: {health.get('status')}")
             print(f"ui status: {ui_status.get('app_server')}:{ui_status.get('ui_port')}")
             if health != {"status": "ok"} or ui_status.get("app_server") != "ready":
@@ -150,11 +150,11 @@ async def _run_smoke() -> int:
             if first_result["state"] != "completed" or not target.exists():
                 print(f"start failed: {first_result}", file=sys.stderr)
                 return 1
-            thread_page = await _get_json(8001, "/ui-api/threads")
-            detail = await _get_json(8001, f"/ui-api/threads/{thread_id}")
-            turns = await _get_json(8001, f"/ui-api/threads/{thread_id}/turns")
-            items = await _get_json(8001, f"/ui-api/threads/{thread_id}/items")
-            api_status = await _get_json(8001, f"/ui-api/threads/{thread_id}/status")
+            thread_page = await _get_json(ui_port, "/ui-api/threads")
+            detail = await _get_json(ui_port, f"/ui-api/threads/{thread_id}")
+            turns = await _get_json(ui_port, f"/ui-api/threads/{thread_id}/turns")
+            items = await _get_json(ui_port, f"/ui-api/threads/{thread_id}/items")
+            api_status = await _get_json(ui_port, f"/ui-api/threads/{thread_id}/status")
             listed_ids = {
                 thread.get("id")
                 for thread in thread_page.get("threads", [])
@@ -191,7 +191,7 @@ async def _run_smoke() -> int:
                 print(f"continue failed: {second_result}", file=sys.stderr)
                 return 1
 
-            sse_task = asyncio.create_task(_read_sse_event(8001))
+            sse_task = asyncio.create_task(_read_sse_event(ui_port))
             await asyncio.sleep(0.3)
             sse_started = await first_bridge.continue_thread(
                 thread_id,
@@ -259,9 +259,15 @@ async def _run_smoke() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Explicit real Codex App Server smoke test.")
-    parser.parse_args()
+    parser.add_argument("--mcp-port", type=int, default=8000)
+    parser.add_argument("--ui-port", type=int, default=8001)
+    args = parser.parse_args()
+    if not 1 <= args.mcp_port <= 65_535 or not 1 <= args.ui_port <= 65_535:
+        parser.error("ports must be between 1 and 65535")
+    if args.mcp_port == args.ui_port:
+        parser.error("MCP and UI ports must differ")
     try:
-        return asyncio.run(_run_smoke())
+        return asyncio.run(_run_smoke(mcp_port=args.mcp_port, ui_port=args.ui_port))
     except KeyboardInterrupt:
         logging.getLogger(__name__).error("smoke interrupted")
         return 130

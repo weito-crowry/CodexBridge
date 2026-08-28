@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import inspect
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
 
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -52,6 +55,9 @@ class UiBridge(Protocol):
         turn_id: str | None = None,
         activity_limit: int = 20,
     ) -> dict[str, Any]: ...
+
+
+ShutdownCallback = Callable[[], Awaitable[None] | None]
 
 
 def _parse_limit(request: Request, default: int) -> int:
@@ -157,6 +163,8 @@ def create_ui_app(
     bridge: Bridge,
     activity_store: ActivityStore,
     config: BridgeConfig,
+    *,
+    shutdown_callback: ShutdownCallback | None = None,
 ) -> Starlette:
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "ok"})
@@ -254,6 +262,33 @@ def create_ui_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    async def shutdown(request: Request) -> Response:
+        token = config.control_token
+        authorization = request.headers.get("authorization")
+        authorized = False
+        if token is not None and authorization is not None:
+            prefix = "Bearer "
+            if authorization.startswith(prefix) and authorization[len(prefix) :]:
+                try:
+                    authorized = hmac.compare_digest(authorization[len(prefix) :], token)
+                except TypeError:
+                    authorized = False
+        if not authorized:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+
+        assert shutdown_callback is not None
+
+        async def run_shutdown() -> None:
+            result = shutdown_callback()
+            if inspect.isawaitable(result):
+                await result
+
+        return JSONResponse(
+            {"status": "shutdown_requested"},
+            status_code=202,
+            background=BackgroundTask(run_shutdown),
+        )
+
     routes = [
         Route("/healthz", healthz),
         Route("/ui-api/status", status),
@@ -264,6 +299,8 @@ def create_ui_app(
         Route("/ui-api/threads/{thread_id}/status", thread_status),
         Route("/ui-api/events", events),
     ]
+    if config.control_token is not None and shutdown_callback is not None:
+        routes.append(Route("/ui-api/control/shutdown", shutdown, methods=["POST"]))
     app = Starlette(routes=routes)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     app.state.bridge = bridge

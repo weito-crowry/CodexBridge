@@ -18,8 +18,8 @@ from .logging_utils import log_event
 from .models import ApprovalDecision
 from .paths import AllowedPathPolicy
 from .state import StateStore
-from .ui_api import create_ui_app
-from .ui_server import LocalUiServer
+from .ui_api import ShutdownCallback, create_ui_app
+from .ui_server import LocalUiServer, UvicornShutdownController
 
 
 class RuntimeLike(Protocol):
@@ -56,7 +56,11 @@ class BridgeRuntime:
         log_event("bridge.shutdown")
 
 
-def build_runtime(config: BridgeConfig) -> BridgeRuntime:
+def build_runtime(
+    config: BridgeConfig,
+    *,
+    shutdown_callback: ShutdownCallback | None = None,
+) -> BridgeRuntime:
     state = StateStore()
     activity_store = ActivityStore()
     app_server = AppServerClient(config.codex_executable)
@@ -73,7 +77,10 @@ def build_runtime(config: BridgeConfig) -> BridgeRuntime:
         on_server_request=bridge.handle_server_request,
         on_failure=bridge.handle_app_server_failure,
     )
-    ui_server = LocalUiServer(create_ui_app(bridge, activity_store, config), config.ui_port)
+    ui_server = LocalUiServer(
+        create_ui_app(bridge, activity_store, config, shutdown_callback=shutdown_callback),
+        config.ui_port,
+    )
     return BridgeRuntime(
         bridge=bridge,
         app_server=app_server,
@@ -100,7 +107,8 @@ def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | Non
 def create_app(
     config: BridgeConfig,
     *,
-    runtime_factory: Callable[[BridgeConfig], RuntimeLike] = build_runtime,
+    runtime_factory: Callable[[BridgeConfig], RuntimeLike] | None = None,
+    shutdown_callback: ShutdownCallback | None = None,
 ) -> Starlette:
     mcp = MCPServer("CodexBridge", version="0.1.0")
     runtime_holder: dict[str, RuntimeLike | None] = {"runtime": None}
@@ -182,7 +190,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with mcp.session_manager.run():
-            runtime = runtime_factory(config)
+            runtime: RuntimeLike
+            if runtime_factory is None:
+                runtime = build_runtime(config, shutdown_callback=shutdown_callback)
+            else:
+                runtime = runtime_factory(config)
             runtime_holder["runtime"] = runtime
             app.state.runtime = runtime
             app.state.bridge = runtime.bridge
@@ -206,6 +218,8 @@ def create_app(
 async def run_server(config: BridgeConfig) -> None:
     import uvicorn
 
-    app = create_app(config)
+    controller = UvicornShutdownController()
+    app = create_app(config, shutdown_callback=controller.request_shutdown)
     server = uvicorn.Server(uvicorn.Config(app, host=config.host, port=config.port))
+    controller.bind(server)
     await server.serve()

@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 import pytest
 
 from codex_bridge.config import BridgeConfig, ConfigurationError
-from codex_bridge.server import create_app
+from codex_bridge.server import build_runtime, create_app
 
 
 @dataclass
@@ -98,3 +98,22 @@ def test_mcp_app_does_not_register_ui_routes(tmp_path) -> None:
     assert all(
         not getattr(route, "path", "").startswith(("/healthz", "/ui-api")) for route in app.routes
     )
+
+
+def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch) -> None:
+    import codex_bridge.server as server_module
+
+    captured: list[object] = []
+
+    def fake_create_ui_app(*args, **kwargs):
+        captured.append(kwargs.get("shutdown_callback"))
+        return object()
+
+    monkeypatch.setattr(server_module, "create_ui_app", fake_create_ui_app)
+
+    def callback() -> None:
+        pass
+
+    build_runtime(config(tmp_path), shutdown_callback=callback)
+
+    assert captured == [callback]

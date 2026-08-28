@@ -52,9 +52,15 @@ class FakeManager:
     def __init__(self, replies: list[FakeReply]) -> None:
         self.replies = replies
         self.requests: list[Any] = []
+        self.post_bodies: list[bytes] = []
 
     def get(self, request: Any) -> FakeReply:
         self.requests.append(request)
+        return self.replies.pop(0)
+
+    def post(self, request: Any, body: bytes) -> FakeReply:
+        self.requests.append(request)
+        self.post_bodies.append(body)
         return self.replies.pop(0)
 
 
@@ -182,3 +188,61 @@ def test_api_client_abort_all_aborts_json_and_stream_replies() -> None:
 
     assert json_reply.aborted and json_reply.deleted
     assert stream_reply.aborted and stream_reply.deleted
+
+
+def test_api_client_posts_authenticated_control_without_token_in_url_or_body() -> None:
+    _application()
+    token = "A" * 32
+    reply = FakeReply(b'{"status":"shutdown_requested"}', status=202)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    successes: list[str] = []
+    failures: list[tuple[str, str]] = []
+    client.control_succeeded.connect(lambda key: successes.append(key))
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_shutdown(token, key="control:shutdown")
+    request = manager.requests[0]
+    assert request.url().toString() == "http://127.0.0.1:8001/ui-api/control/shutdown"
+    assert bytes(request.rawHeader("Authorization")) == f"Bearer {token}".encode()
+    assert bytes(request.rawHeader("Accept")) == b"application/json"
+    assert manager.post_bodies == [b""]
+    assert token not in request.url().toString()
+    reply.finished.emit()
+
+    assert successes == ["control:shutdown"]
+    assert failures == []
+    assert reply.deleted
+
+
+def test_api_client_maps_control_network_and_http_failures_to_fixed_message() -> None:
+    _application()
+    network_reply = FakeReply(error=1)
+    http_reply = FakeReply(b"server secret", status=403)
+    manager = FakeManager([network_reply, http_reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, str]] = []
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_shutdown("A" * 32, key="first")
+    network_reply.finished.emit()
+    assert client.post_control_shutdown("B" * 32, key="second")
+    http_reply.finished.emit()
+
+    assert failures == [
+        ("first", "Bridge control request failed"),
+        ("second", "Bridge control request failed"),
+    ]
+    assert b"server secret" not in str(failures).encode()
+
+
+def test_api_client_abort_all_cleans_up_control_reply() -> None:
+    _application()
+    reply = FakeReply()
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+
+    client.post_control_shutdown("A" * 32, key="control")
+    client.abort_all()
+
+    assert reply.aborted and reply.deleted

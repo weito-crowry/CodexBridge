@@ -16,6 +16,24 @@ class UvicornServerLike(Protocol):
     async def serve(self) -> Any: ...
 
 
+class OuterUvicornServerLike(Protocol):
+    should_exit: bool
+
+
+class UvicornShutdownController:
+    """Request graceful exit of the outer MCP Uvicorn server."""
+
+    def __init__(self) -> None:
+        self._server: OuterUvicornServerLike | None = None
+
+    def bind(self, server: OuterUvicornServerLike) -> None:
+        self._server = server
+
+    def request_shutdown(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
+
+
 ServerFactory = Callable[[Starlette, str, int], UvicornServerLike]
 
 

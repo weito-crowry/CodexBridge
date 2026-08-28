@@ -11,7 +11,20 @@ from codex_bridge.activity import ActivityStore
 from codex_bridge.config import BridgeConfig
 from codex_bridge.server import BridgeRuntime
 from codex_bridge.ui_api import create_ui_app
-from codex_bridge.ui_server import LocalUiServer, _create_server
+from codex_bridge.ui_server import LocalUiServer, UvicornShutdownController, _create_server
+
+
+def test_uvicorn_shutdown_controller_requests_outer_server_exit() -> None:
+    class FakeOuterServer:
+        should_exit = False
+
+    server = FakeOuterServer()
+    controller = UvicornShutdownController()
+    controller.bind(server)  # type: ignore[arg-type]
+
+    controller.request_shutdown()
+
+    assert server.should_exit is True
 
 
 class FakeUvicornServer:

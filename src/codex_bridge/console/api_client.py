@@ -17,6 +17,8 @@ class ApiClientError(RuntimeError):
 class NetworkManagerLike(Protocol):
     def get(self, request: QNetworkRequest) -> Any: ...
 
+    def post(self, request: QNetworkRequest, body: bytes) -> Any: ...
+
 
 def parse_json_reply(status_code: int, body: bytes) -> object:
     if status_code == 404:
@@ -36,6 +38,8 @@ class ApiClient(QObject):
     json_failed = Signal(str, str)
     activity_received = Signal(int, object)
     stream_state_changed = Signal(int, str)
+    control_succeeded = Signal(str)
+    control_failed = Signal(str, str)
 
     def __init__(
         self,
@@ -50,6 +54,7 @@ class ApiClient(QObject):
         self._base_url = base_url.rstrip("/")
         self._manager: NetworkManagerLike = manager or QNetworkAccessManager(self)
         self._json_replies: dict[str, Any] = {}
+        self._control_replies: dict[str, Any] = {}
         self._stream_reply: Any | None = None
         self._stream_generation: int | None = None
         self._stream_parser: SseParser | None = None
@@ -115,6 +120,36 @@ class ApiClient(QObject):
         else:
             self.json_succeeded.emit(key, payload)
         finally:
+            reply.deleteLater()
+
+    def post_control_shutdown(self, token: str, *, key: str) -> bool:
+        if key in self._control_replies:
+            return False
+        try:
+            request = self._request(self._url("/ui-api/control/shutdown"))
+            request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
+            reply = self._manager.post(request, b"")
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.control_failed.emit(key, "Bridge control request failed")
+            return False
+        self._control_replies[key] = reply
+        reply.finished.connect(lambda key=key, reply=reply: self._finish_control(key, reply))
+        return True
+
+    def _finish_control(self, key: str, reply: Any) -> None:
+        active_reply = self._control_replies.get(key)
+        if active_reply is None or active_reply is not reply:
+            return
+        self._control_replies.pop(key, None)
+        try:
+            status = self._status(reply)
+            if self._has_network_error(reply) or status != 202:
+                raise ApiClientError("Bridge control request failed")
+            self.control_succeeded.emit(key)
+        except ApiClientError as exc:
+            self.control_failed.emit(key, str(exc))
+        finally:
+            reply.readAll()
             reply.deleteLater()
 
     def start_stream(self, thread_id: str, generation: int) -> None:
@@ -219,4 +254,8 @@ class ApiClient(QObject):
             reply.abort()
             reply.deleteLater()
         self._json_replies.clear()
+        for reply in tuple(self._control_replies.values()):
+            reply.abort()
+            reply.deleteLater()
+        self._control_replies.clear()
         self.stop_stream()

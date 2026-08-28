@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 
 class ConfigurationError(ValueError):
     """Raised when an environment setting cannot be used safely."""
+
+
+_CONTROL_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}", re.ASCII)
+
+
+def _control_token() -> str | None:
+    raw = os.environ.get("CODEX_BRIDGE_CONTROL_TOKEN")
+    if raw is None or raw == "":
+        return None
+    if _CONTROL_TOKEN_PATTERN.fullmatch(raw) is None:
+        raise ConfigurationError(
+            "CODEX_BRIDGE_CONTROL_TOKEN must be 32-256 ASCII URL-safe characters"
+        )
+    return raw
 
 
 def _split(value: str | None, separator: str) -> tuple[str, ...]:
@@ -39,6 +54,7 @@ class BridgeConfig:
     wait_default_seconds: float
     wait_max_seconds: float
     shutdown_grace_seconds: float
+    control_token: str | None = None
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -84,4 +100,5 @@ class BridgeConfig:
             wait_default_seconds=wait_default,
             wait_max_seconds=wait_max,
             shutdown_grace_seconds=_positive_float("CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS", 3.0),
+            control_token=_control_token(),
         )

@@ -9,6 +9,7 @@ from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.runtime_launcher import DetachedLaunchResult
+from codex_bridge.console.tunnel_supervisor import TunnelActionState
 
 
 class Signal:
@@ -29,11 +30,14 @@ class FakeClient:
         self.json_failed = Signal()
         self.activity_received = Signal()
         self.stream_state_changed = Signal()
+        self.control_succeeded = Signal()
+        self.control_failed = Signal()
         self.requests: list[tuple[str, str, dict[str, object] | None]] = []
         self.streams: list[tuple[str, int]] = []
         self.aborted_groups: list[str] = []
         self.stopped_streams = 0
         self.aborted_all = False
+        self.control_requests: list[tuple[str, str]] = []
 
     def get_json(self, path: str, *, key: str, query: dict[str, object] | None = None) -> bool:
         self.requests.append((key, path, query))
@@ -51,11 +55,21 @@ class FakeClient:
     def abort_all(self) -> None:
         self.aborted_all = True
 
+    def post_control_shutdown(self, token: str, *, key: str) -> bool:
+        self.control_requests.append((token, key))
+        return True
+
     def result(self, key: str, payload: object) -> None:
         self.json_succeeded.emit(key, payload)
 
     def failure(self, key: str, message: str) -> None:
         self.json_failed.emit(key, message)
+
+    def control_success(self, key: str) -> None:
+        self.control_succeeded.emit(key)
+
+    def control_failure(self, key: str, message: str = "Bridge control request failed") -> None:
+        self.control_failed.emit(key, message)
 
     def activity(self, generation: int, payload: dict[str, object]) -> None:
         self.activity_received.emit(generation, payload)
@@ -86,14 +100,60 @@ class FakeLauncher:
     def __init__(self, *, started: bool = True) -> None:
         self.started = started
         self.calls: list[tuple[str, int]] = []
+        self.control_tokens: list[str] = []
         self.closes = 0
 
-    def launch(self, *, codex_executable: str, ui_port: int) -> DetachedLaunchResult:
+    def launch(
+        self, *, codex_executable: str, ui_port: int, control_token: str
+    ) -> DetachedLaunchResult:
         self.calls.append((codex_executable, ui_port))
+        self.control_tokens.append(control_token)
         return DetachedLaunchResult(self.started, 1234 if self.started else None)
 
     def close(self) -> None:
         self.closes += 1
+
+
+class StableTunnel:
+    def __init__(self) -> None:
+        self.state_changed = Signal()
+        self.message_changed = Signal()
+        self.controls_changed = Signal()
+        self.state = "unavailable"
+        self.action_state = TunnelActionState(False, False, False)
+        self.started = 0
+
+    def set_bridge_ready(self, _ready: bool) -> None:
+        pass
+
+    def start(self) -> bool:
+        self.started += 1
+        return True
+
+    def stop(self, *, on_finished=None) -> bool:
+        if on_finished is not None:
+            on_finished()
+        return False
+
+    def close(self, *, on_finished=None) -> None:
+        if on_finished is not None:
+            on_finished()
+
+
+class ManagedTunnel(StableTunnel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = "ready"
+        self.action_state = TunnelActionState(False, True, True)
+        self.stop_calls = 0
+
+    def stop(self, *, on_finished=None) -> bool:
+        self.stop_calls += 1
+        self.state = "stopped"
+        self.action_state = TunnelActionState(True, False, False)
+        if on_finished is not None:
+            on_finished()
+        return True
 
 
 def _application() -> QApplication:
@@ -483,4 +543,208 @@ def test_start_stays_disabled_until_both_bridge_observations_confirm_unavailable
     assert not window.start_bridge_button.isEnabled()
     client.failure("bridge-status", "Bridge unavailable")
     assert window.start_bridge_button.isEnabled()
+    window.close()
+
+
+def _owned_window(
+    tunnel: StableTunnel | None = None,
+) -> tuple[MainWindow, FakeClient, FakeLauncher]:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    tunnel = tunnel or StableTunnel()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tunnel_supervisor=tunnel,
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    window.start_bridge_button.click()
+    client.result("launch:health", {"status": "ok"})
+    client.result("launch:status", {"bridge": "ready", "app_server": "ready"})
+    return window, client, launcher
+
+
+def test_owned_ready_bridge_enables_stop_and_restart_with_process_local_token() -> None:
+    window, client, launcher = _owned_window()
+
+    assert window.runtime_state == "console_started"
+    assert window.stop_bridge_button.isEnabled()
+    assert window.restart_bridge_button.isEnabled()
+    assert len(launcher.control_tokens) == 1
+    assert len(launcher.control_tokens[0]) >= 32
+    assert client.control_requests == []
+
+    window.stop_bridge_button.click()
+
+    assert window.runtime_state == "stopping"
+    assert len(client.control_requests) == 1
+    assert not window.stop_bridge_button.isEnabled()
+    window.close()
+
+
+def test_external_bridge_keeps_bridge_controls_disabled() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window.runtime_state == "external"
+    assert not window.start_bridge_button.isEnabled()
+    assert not window.stop_bridge_button.isEnabled()
+    assert not window.restart_bridge_button.isEnabled()
+    assert launcher.calls == []
+    window.close()
+
+
+def test_stop_requires_bridge_disappearance_after_202_and_clears_ownership() -> None:
+    window, client, launcher = _owned_window()
+    old_token = launcher.control_tokens[0]
+
+    window.stop_bridge_button.click()
+    client.control_success("control:shutdown")
+
+    assert window.runtime_state == "stopping"
+    assert window._control_token == old_token
+    client.failure("health", "Bridge unavailable")
+    assert window.runtime_state == "stopping"
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert window.runtime_state == "stopped"
+    assert window._control_token is None
+    assert window._detached_pid is None
+    assert not window._detached_launch_started
+    assert window.start_bridge_button.isEnabled()
+    window.start_bridge_button.click()
+
+    assert len(launcher.control_tokens) == 2
+    assert launcher.control_tokens[1] != old_token
+    window.close()
+
+
+def test_stop_timeout_is_fail_closed_and_does_not_clear_token_or_relaunch() -> None:
+    window, client, launcher = _owned_window()
+
+    window.stop_bridge_button.click()
+    client.control_success("control:shutdown")
+    window._stop_confirmation_deadline = 0.0
+    window._on_stop_confirmation_tick()
+
+    assert window.runtime_state == "stop_timed_out"
+    assert window._control_token is not None
+    assert window._detached_launch_started
+    assert len(launcher.calls) == 1
+    assert client.control_requests == [(window._control_token, "control:shutdown")]
+    window.close()
+
+
+def test_unexpected_unreachable_owned_bridge_does_not_reenable_start() -> None:
+    window, client, _launcher = _owned_window()
+
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert window.runtime_state == "console_started_unreachable"
+    assert not window.start_bridge_button.isEnabled()
+    assert not window.stop_bridge_button.isEnabled()
+    assert not window.restart_bridge_button.isEnabled()
+    window.close()
+
+
+def test_control_failure_does_not_trigger_duplicate_launch() -> None:
+    window, client, launcher = _owned_window()
+
+    window.stop_bridge_button.click()
+    client.control_failure("control:shutdown")
+
+    assert window.runtime_state == "control_failed"
+    assert len(launcher.calls) == 1
+    assert not window.start_bridge_button.isEnabled()
+    window.close()
+
+
+def test_restart_relaunches_after_confirmed_stop_with_fresh_token() -> None:
+    window, client, launcher = _owned_window()
+    old_token = launcher.control_tokens[0]
+
+    window.restart_bridge_button.click()
+    assert window.runtime_state == "restarting"
+    client.control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert len(launcher.calls) == 2
+    assert launcher.control_tokens[1] != old_token
+    assert window.runtime_state == "launching"
+    client.result("launch:health", {"status": "ok"})
+    client.result("launch:status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window.runtime_state == "console_started"
+    assert window.stop_bridge_button.isEnabled()
+    window.close()
+
+
+def test_restart_restores_managed_tunnel_once_after_new_bridge_ready() -> None:
+    tunnel = ManagedTunnel()
+    window, client, launcher = _owned_window(tunnel)
+
+    window.restart_bridge_button.click()
+    assert tunnel.stop_calls == 1
+    client.control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    client.result("launch:health", {"status": "ok"})
+    client.result("launch:status", {"bridge": "ready", "app_server": "ready"})
+
+    assert tunnel.started == 1
+    assert len(client.control_requests) == 1
+    assert len(launcher.control_tokens) == 2
+    window.close()
+
+
+def test_restart_with_stopped_tunnel_does_not_start_it_after_readiness() -> None:
+    window, client, launcher = _owned_window()
+
+    window.restart_bridge_button.click()
+    client.control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    client.result("launch:health", {"status": "ok"})
+    client.result("launch:status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window._tunnel.started == 0
+    assert len(launcher.control_tokens) == 2
+    window.close()
+
+
+def test_restart_relaunch_failure_does_not_start_managed_tunnel() -> None:
+    tunnel = ManagedTunnel()
+    window, client, launcher = _owned_window(tunnel)
+    launcher.started = False
+
+    window.restart_bridge_button.click()
+    client.control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert window.runtime_state == "launch_failed"
+    assert tunnel.started == 0
+    assert len(launcher.control_tokens) == 2
     window.close()

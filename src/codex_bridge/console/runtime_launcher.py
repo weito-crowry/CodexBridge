@@ -31,11 +31,18 @@ class BridgeRuntimeLauncher:
         self._environment_factory = environment_factory or QProcessEnvironment.systemEnvironment
         self._process: Any | None = None
 
-    def launch(self, *, codex_executable: str, ui_port: int) -> DetachedLaunchResult:
+    def launch(
+        self,
+        *,
+        codex_executable: str,
+        ui_port: int,
+        control_token: str,
+    ) -> DetachedLaunchResult:
         process = self._process_factory()
         environment = self._environment_factory()
         environment.insert("CODEX_BRIDGE_CODEX_EXECUTABLE", codex_executable)
         environment.insert("CODEX_BRIDGE_UI_PORT", str(ui_port))
+        environment.insert("CODEX_BRIDGE_CONTROL_TOKEN", control_token)
         process.setProgram(sys.executable)
         process.setArguments(["-m", "codex_bridge"])
         process.setProcessEnvironment(environment)

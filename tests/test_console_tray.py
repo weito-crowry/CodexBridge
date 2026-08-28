@@ -23,12 +23,16 @@ class Signal:
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.json_succeeded = Signal()
         self.json_failed = Signal()
         self.activity_received = Signal()
         self.stream_state_changed = Signal()
+        self.control_succeeded = Signal()
+        self.control_failed = Signal()
         self.aborted = 0
+        self.control_requests: list[tuple[str, str]] = []
+        self.events = events if events is not None else []
 
     def get_json(self, _path: str, *, key: str, query: object = None) -> bool:
         del key, query
@@ -45,6 +49,11 @@ class FakeClient:
 
     def abort_all(self) -> None:
         self.aborted += 1
+
+    def post_control_shutdown(self, token: str, *, key: str) -> bool:
+        self.control_requests.append((token, key))
+        self.events.append("control.post")
+        return True
 
 
 class FakeProbe:
@@ -69,7 +78,13 @@ class FakeLauncher:
 
 
 class FakeTunnelSupervisor:
-    def __init__(self, *, delayed_close: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        delayed_close: bool = False,
+        delayed_stop: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
         self.state_changed = Signal()
         self.message_changed = Signal()
         self.controls_changed = Signal()
@@ -81,7 +96,14 @@ class FakeTunnelSupervisor:
         self.restart_calls = 0
         self.close_calls = 0
         self._delayed_close = delayed_close
+        self._delayed_stop = delayed_stop
         self._close_callback: Any | None = None
+        self._stop_callback: Any | None = None
+        self.events = events if events is not None else []
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     def set_bridge_ready(self, ready: bool) -> None:
         self.bridge_ready_calls.append(ready)
@@ -92,8 +114,12 @@ class FakeTunnelSupervisor:
 
     def stop(self, *, on_finished=None) -> bool:
         self.stop_calls += 1
+        self.events.append("tunnel.stop")
         if on_finished is not None:
-            on_finished()
+            if self._delayed_stop:
+                self._stop_callback = on_finished
+            else:
+                on_finished()
         return True
 
     def restart(self) -> bool:
@@ -110,6 +136,11 @@ class FakeTunnelSupervisor:
 
     def complete_close(self) -> None:
         callback, self._close_callback = self._close_callback, None
+        if callback is not None:
+            callback()
+
+    def complete_stop(self) -> None:
+        callback, self._stop_callback = self._stop_callback, None
         if callback is not None:
             callback()
 
@@ -157,12 +188,18 @@ def _window(
     quit_calls: list[str],
     tray: FakeTray | None = None,
     delayed_close: bool = False,
+    delayed_stop: bool = False,
 ) -> tuple[MainWindow, FakeClient, FakeProbe, FakeLauncher, FakeTunnelSupervisor, FakeTray | None]:
     _application()
-    client = FakeClient()
+    events: list[str] = []
+    client = FakeClient(events)
     probe = FakeProbe()
     launcher = FakeLauncher()
-    supervisor = FakeTunnelSupervisor(delayed_close=delayed_close)
+    supervisor = FakeTunnelSupervisor(
+        delayed_close=delayed_close,
+        delayed_stop=delayed_stop,
+        events=events,
+    )
     window = MainWindow(
         ConsoleConfig(),
         api_client=client,
@@ -284,6 +321,80 @@ def test_tray_actions_call_same_tunnel_operations_as_window_controls() -> None:
     assert supervisor.stop_calls == 1
     assert supervisor.restart_calls == 1
     window._begin_exit()
+
+
+def test_tray_bridge_actions_share_owned_state_and_stop_tunnel_before_control_post() -> None:
+    tray = FakeTray()
+    window, client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=[],
+        tray=tray,
+    )
+    assert tray.menu is not None
+    actions = {action.text(): action for action in tray.menu.actions() if not action.isSeparator()}
+    supervisor.emit_state("ready")
+    supervisor.controls(TunnelActionState(False, True, True))
+    window._runtime_state = "console_started"
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._control_token = "A" * 32
+    window._update_bridge_controls()
+
+    assert actions["Stop Bridge"].isEnabled()
+    assert actions["Restart Bridge"].isEnabled()
+    actions["Stop Bridge"].trigger()
+
+    assert supervisor.stop_calls == 1
+    assert client.control_requests == [("A" * 32, "control:shutdown")]
+    assert client.events == ["tunnel.stop", "control.post"]
+    window._begin_exit()
+
+
+def test_tunnel_transition_disables_bridge_actions_from_shared_state() -> None:
+    tray = FakeTray()
+    window, _client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=[],
+        tray=tray,
+    )
+    assert tray.menu is not None
+    actions = {action.text(): action for action in tray.menu.actions() if not action.isSeparator()}
+    window._runtime_state = "console_started"
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._control_token = "A" * 32
+    supervisor.emit_state("starting")
+    supervisor.controls(TunnelActionState(False, False, False))
+    window._update_bridge_controls()
+
+    assert not window.stop_bridge_button.isEnabled()
+    assert not window.restart_bridge_button.isEnabled()
+    assert not actions["Stop Bridge"].isEnabled()
+    assert not actions["Restart Bridge"].isEnabled()
+    window._begin_exit()
+
+
+def test_console_exit_does_not_post_bridge_control_after_tunnel_stop_callback() -> None:
+    tray = FakeTray()
+    window, client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=[],
+        tray=tray,
+        delayed_stop=True,
+    )
+    supervisor.emit_state("ready")
+    supervisor.controls(TunnelActionState(False, True, True))
+    window._runtime_state = "console_started"
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._control_token = "A" * 32
+    window._update_bridge_controls()
+
+    window.stop_bridge_button.click()
+    window._begin_exit()
+    supervisor.complete_stop()
+
+    assert client.control_requests == []
 
 
 def test_tray_exit_cleans_up_and_quits_after_tunnel_close() -> None:

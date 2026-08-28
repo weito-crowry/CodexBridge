@@ -43,6 +43,38 @@ def test_ui_port_defaults_to_8001(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.ui_port == 8001
 
 
+def test_control_token_is_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEX_BRIDGE_CONTROL_TOKEN", raising=False)
+
+    config = BridgeConfig.from_env()
+
+    assert config.control_token is None
+
+
+def test_control_token_accepts_bounded_url_safe_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "A_b-9" * 7
+    monkeypatch.setenv("CODEX_BRIDGE_CONTROL_TOKEN", token)
+
+    config = BridgeConfig.from_env()
+
+    assert config.control_token == token
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["too-short", "A" * 257, "A" * 31 + "."],
+)
+def test_control_token_rejects_invalid_values_without_echoing_secret(
+    monkeypatch: pytest.MonkeyPatch, token: str
+) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_CONTROL_TOKEN", token)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        BridgeConfig.from_env()
+
+    assert token not in str(exc_info.value)
+
+
 def test_ui_port_is_parsed_and_must_differ_from_mcp_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

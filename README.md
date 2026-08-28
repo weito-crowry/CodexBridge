@@ -66,6 +66,7 @@ The default bind is loopback only. Tunnel profiles are not created or configured
 | `CODEX_BRIDGE_ALLOWED_HOSTS` | SDK loopback defaults | Exact Host allowlist, comma-separated. `example.com:*` allows any port. |
 | `CODEX_BRIDGE_ALLOWED_ORIGINS` | SDK loopback defaults | Exact browser Origin allowlist, comma-separated. This is separate from Host validation. |
 | `CODEX_BRIDGE_CODEX_EXECUTABLE` | `codex` | Codex executable name or path. The fixed subcommand remains `app-server --stdio`. |
+| `CODEX_BRIDGE_CONTROL_TOKEN` | unset | Optional per-launch ASCII URL-safe control token; Console-launched values are process-local and never persisted. |
 | `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | unset | Optional explicit `tunnel-client` executable override; an invalid explicit value fails closed. |
 | `CODEX_BRIDGE_TUNNEL_PROFILE` | `codex-bridge` | Existing Secure MCP Tunnel profile name; valid values are 1–64 ASCII letters, digits, `.`, `_`, or `-`. |
 | `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `18` | Default long-poll duration. |
@@ -165,6 +166,14 @@ After Bridge and App Server readiness, one asynchronous `tunnel-client doctor --
 
 The Console exposes `Start Tunnel`, `Stop Tunnel`, and `Restart Tunnel` only for its own Tunnel process. Stop uses bounded `terminate` then `kill`; external Tunnel is never discovered/taken over, scanned, killed, or restarted. `QSystemTrayIcon`, `QMenu`, and `QAction` provide `Show Console`, `Hide Console`, Tunnel controls, and `Exit`. When available, window close minimizes/hides to tray when available and keeps Bridge and the Console-owned Tunnel running. explicit Exit stops Console-owned Tunnel and then quits; Bridge remains running on Console Exit. Tunnel secrets/identity are not stored by CodexBridge. Bridge Stop/Restart is Phase 4C.
 
+## Phase 4C authenticated graceful Bridge control
+
+Phase 4C adds `Start Bridge`, `Stop Bridge`, and `Restart Bridge` to the Console window and tray. Stop Bridge and Restart Bridge apply only to a Bridge started by the current Console session after `/healthz` and `/ui-api/status` readiness; an existing external Bridge is never taken over, and its lifecycle controls remain disabled. A fresh `secrets.token_urlsafe(32)` value is generated for every launch, held process-locally, passed only as the inherited `CODEX_BRIDGE_CONTROL_TOKEN` environment override, and never persisted, displayed, logged, put in a URL/body, or sent through the Tunnel.
+
+The authenticated control surface is only the fixed-loopback UI route `POST /ui-api/control/shutdown`. It is not present on the MCP port or Tunnel target. `Authorization: Bearer <token>` is checked with constant-time comparison; missing, malformed, and wrong credentials return a fixed `403`, while a valid request returns fixed `202` JSON and schedules the outer Uvicorn graceful-exit request after the response. The outer lifecycle then runs the existing Starlette lifespan cleanup and `BridgeRuntime.shutdown()` ordering. Stopping or restarting Bridge may interrupt active Codex turns.
+
+Stop first stops the Console-owned Tunnel when it is running, then posts the Bridge control request and waits asynchronously until both UI health/status endpoints become unreachable. Only confirmed disappearance changes the state to `Runtime: stopped`, clears the old token/PID/launch guard, and permits a new Start Bridge. A control failure or roughly ten-second stop timeout is fail closed: no retry, duplicate launch, PID kill, taskkill, OS signal, or force-kill fallback is used. Restart remembers whether the Console-owned Tunnel was running, performs the same graceful Bridge stop, launches with a fresh token, waits for readiness, and starts that Tunnel once only after the new Bridge is ready. Console Exit still does not stop Bridge; it only performs the existing Console/Tunnel cleanup. The MCP surface remains exactly nine tools and no dependency is added.
+
 ## Shutdown behavior
 
 SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then stops the UI listener, closes protocol pipes, and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. If UI startup fails, already-started App Server resources are cleaned up. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
@@ -206,4 +215,4 @@ It attempts App Server startup, a temporary file task, completion, continuation,
 
 ## Out of scope for the initial version
 
-SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded. Bridge Stop/Restart remains deferred to Phase 4C.
+SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded. Automatic crash recovery and remote/MCP Bridge lifecycle control remain out of scope.

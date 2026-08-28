@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from secrets import token_urlsafe
 from time import monotonic
 from typing import Any
 from urllib.parse import quote
@@ -44,12 +45,19 @@ from .widgets import (
 _RECONNECT_MS = 1_500
 _READINESS_INTERVAL_MS = 350
 _READINESS_TIMEOUT_SECONDS = 10.0
+_STOP_CONFIRMATION_INTERVAL_MS = 350
+_STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
     "external": "Runtime: external",
     "launching": "Runtime: launching",
     "launch_failed": "Runtime: launch failed",
     "launch_timed_out": "Runtime: launch timed out",
+    "stopping": "Runtime: stopping",
+    "restarting": "Runtime: restarting",
+    "stopped": "Runtime: stopped",
+    "control_failed": "Runtime: control failed",
+    "stop_timed_out": "Runtime: stop timed out",
 }
 
 
@@ -107,6 +115,16 @@ class MainWindow(QMainWindow):
         self._launch_in_progress = False
         self._detached_launch_started = False
         self._detached_pid: int | None = None
+        self._control_token: str | None = None
+        self._launch_generation = 0
+        self._bridge_transition = False
+        self._pending_bridge_action: str | None = None
+        self._restart_tunnel_was_running = False
+        self._control_request_pending = False
+        self._stop_confirmation_active = False
+        self._stop_confirmation_health_unavailable = False
+        self._stop_confirmation_status_unavailable = False
+        self._stop_confirmation_deadline = 0.0
         self._readiness_deadline = 0.0
         self._readiness_health_ok = False
         self._readiness_bridge_ready = False
@@ -158,10 +176,14 @@ class MainWindow(QMainWindow):
         self.runtime_status_label = QLabel("Runtime: unavailable")
         self.tunnel_status_label = QLabel("Tunnel: unavailable")
         self.start_bridge_button = QPushButton("Start Bridge")
+        self.stop_bridge_button = QPushButton("Stop Bridge")
+        self.restart_bridge_button = QPushButton("Restart Bridge")
         self.start_tunnel_button = QPushButton("Start Tunnel")
         self.stop_tunnel_button = QPushButton("Stop Tunnel")
         self.restart_tunnel_button = QPushButton("Restart Tunnel")
         self.start_bridge_button.setEnabled(False)
+        self.stop_bridge_button.setEnabled(False)
+        self.restart_bridge_button.setEnabled(False)
         self.stop_tunnel_button.setEnabled(False)
         self.restart_tunnel_button.setEnabled(False)
         for label in (
@@ -184,6 +206,8 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self.runtime_status_label)
         status_bar.addWidget(self.tunnel_status_label)
         status_bar.addWidget(self.start_bridge_button)
+        status_bar.addWidget(self.stop_bridge_button)
+        status_bar.addWidget(self.restart_bridge_button)
         status_bar.addWidget(self.start_tunnel_button)
         status_bar.addWidget(self.stop_tunnel_button)
         status_bar.addWidget(self.restart_tunnel_button)
@@ -248,6 +272,8 @@ class MainWindow(QMainWindow):
         self._client.json_failed.connect(self._apply_json_error)
         self._client.activity_received.connect(self._apply_activity)
         self._client.stream_state_changed.connect(self._apply_stream_state)
+        self._client.control_succeeded.connect(self._apply_control_success)
+        self._client.control_failed.connect(self._apply_control_failure)
         self.thread_pane.refresh_requested.connect(self.refresh)
         self.thread_pane.thread_selected.connect(self.select_thread)
         self.history_pane.older_requested.connect(self.load_older)
@@ -256,6 +282,8 @@ class MainWindow(QMainWindow):
         self._codex_probe.resolved.connect(self._apply_codex_resolution)
         self._codex_probe.failed.connect(self._apply_codex_probe_error)
         self.start_bridge_button.clicked.connect(self._start_bridge)
+        self.stop_bridge_button.clicked.connect(self._stop_bridge)
+        self.restart_bridge_button.clicked.connect(self._restart_bridge)
         self._tunnel.state_changed.connect(self._apply_tunnel_state)
         self._tunnel.message_changed.connect(self._apply_tunnel_message)
         self._tunnel.controls_changed.connect(self._apply_tunnel_controls)
@@ -273,6 +301,16 @@ class MainWindow(QMainWindow):
         for text, callback in (
             ("Show Console", self._show_console),
             ("Hide Console", self._hide_console),
+        ):
+            action = QAction(text, self)
+            action.triggered.connect(callback)
+            menu.addAction(action)
+            self._tray_actions[text] = action
+        menu.addSeparator()
+        for text, callback in (
+            ("Start Bridge", self._start_bridge),
+            ("Stop Bridge", self._stop_bridge),
+            ("Restart Bridge", self._restart_bridge),
         ):
             action = QAction(text, self)
             action.triggered.connect(callback)
@@ -322,18 +360,24 @@ class MainWindow(QMainWindow):
         self.readiness_timer = QTimer(self)
         self.readiness_timer.setInterval(_READINESS_INTERVAL_MS)
         self.readiness_timer.timeout.connect(self._on_readiness_tick)
+        self.stop_confirmation_timer = QTimer(self)
+        self.stop_confirmation_timer.setInterval(_STOP_CONFIRMATION_INTERVAL_MS)
+        self.stop_confirmation_timer.timeout.connect(self._on_stop_confirmation_tick)
         self.health_timer.start()
         self.thread_timer.start()
 
     def _apply_tunnel_state(self, state: str) -> None:
         if not self._closing:
             self.tunnel_status_label.setText(tunnel_state_label(state))
+            self._update_bridge_controls()
 
     def _apply_tunnel_message(self, message: str) -> None:
         if not self._closing:
             self.bottom_status_label.setText(message)
 
     def _apply_tunnel_controls(self, start: bool, stop: bool, restart: bool) -> None:
+        if self._bridge_transition:
+            start = stop = restart = False
         self.start_tunnel_button.setEnabled(start)
         self.stop_tunnel_button.setEnabled(stop)
         self.restart_tunnel_button.setEnabled(restart)
@@ -345,6 +389,33 @@ class MainWindow(QMainWindow):
             action = self._tray_actions.get(name)
             if action is not None:
                 action.setEnabled(enabled)
+
+    def _tunnel_is_transitioning(self) -> bool:
+        return getattr(self._tunnel, "state", "unavailable") in {
+            "checking",
+            "starting",
+            "stopping",
+        }
+
+    def _update_bridge_controls(self) -> None:
+        enabled = (
+            not self._closing
+            and self._runtime_state == "console_started"
+            and self._bridge_ready
+            and self._app_server_ready
+            and self._control_token is not None
+            and not self._bridge_transition
+            and not self._tunnel_is_transitioning()
+        )
+        self.stop_bridge_button.setEnabled(enabled)
+        self.restart_bridge_button.setEnabled(enabled)
+        for name in ("Stop Bridge", "Restart Bridge"):
+            action = self._tray_actions.get(name)
+            if action is not None:
+                action.setEnabled(enabled)
+        start_action = self._tray_actions.get("Start Bridge")
+        if start_action is not None:
+            start_action.setEnabled(self.start_bridge_button.isEnabled())
 
     def _sync_tunnel_controls(self) -> None:
         actions = self._tunnel.action_state
@@ -394,6 +465,7 @@ class MainWindow(QMainWindow):
         self._runtime_state = state
         self.runtime_status_label.setText(label or _RUNTIME_LABELS.get(state, f"Runtime: {state}"))
         self._update_start_button()
+        self._update_bridge_controls()
 
     def _update_start_button(self) -> None:
         enabled = (
@@ -407,8 +479,14 @@ class MainWindow(QMainWindow):
             and not self._bridge_seen_ready
             and not self._launch_in_progress
             and not self._detached_launch_started
+            and not self._bridge_transition
+            and not self._tunnel_is_transitioning()
+            and self._runtime_state in {"unavailable", "stopped", "launch_failed"}
         )
         self.start_bridge_button.setEnabled(enabled)
+        start_action = self._tray_actions.get("Start Bridge")
+        if start_action is not None:
+            start_action.setEnabled(enabled)
 
     def _start_bridge(self) -> None:
         resolution = self._codex_resolution
@@ -418,23 +496,39 @@ class MainWindow(QMainWindow):
             or self._bridge_seen_ready
             or self._launch_in_progress
             or self._detached_launch_started
+            or self._bridge_transition
             or self._closing
         ):
             return
+        self._pending_bridge_action = None
+        self._restart_tunnel_was_running = False
+        self._bridge_transition = True
+        self._sync_tunnel_controls()
+        self._launch_bridge(resolution.path)
+
+    def _launch_bridge(self, codex_executable: str) -> None:
+        self._launch_generation += 1
+        control_token = token_urlsafe(32)
+        self._control_token = control_token
         self._launch_in_progress = True
         self._set_runtime_state("launching")
         try:
             result = self._launcher.launch(
-                codex_executable=resolution.path,
+                codex_executable=codex_executable,
                 ui_port=self._config.port,
+                control_token=control_token,
             )
         except Exception:
             self._launch_in_progress = False
+            self._control_token = None
+            self._bridge_transition = False
             self._set_runtime_state("launch_failed")
             self.bottom_status_label.setText("Bridge launch failed")
             return
         if not result.started:
             self._launch_in_progress = False
+            self._control_token = None
+            self._bridge_transition = False
             self._set_runtime_state("launch_failed")
             self.bottom_status_label.setText("Bridge launch failed")
             return
@@ -498,11 +592,161 @@ class MainWindow(QMainWindow):
         self._bridge_ready = True
         self._app_server_ready = True
         self._bridge_seen_ready = True
+        self._bridge_transition = False
         self._set_runtime_state("console_started", label="Runtime: started by Console")
         self.bottom_status_label.setText("Bridge started by Console")
+        self._tunnel.set_bridge_ready(True)
+        self._restore_restarted_tunnel()
+
+    def _restore_restarted_tunnel(self) -> None:
+        if self._restart_tunnel_was_running:
+            self._restart_tunnel_was_running = False
+            self._tunnel.start()
+
+    def _bridge_control_allowed(self) -> bool:
+        return (
+            self._runtime_state == "console_started"
+            and self._bridge_ready
+            and self._app_server_ready
+            and self._control_token is not None
+            and not self._bridge_transition
+            and not self._tunnel_is_transitioning()
+            and not self._closing
+        )
+
+    def _tunnel_owned_running(self) -> bool:
+        actions = getattr(self._tunnel, "action_state", None)
+        return bool(getattr(actions, "stop_enabled", False)) and getattr(
+            self._tunnel, "state", "running"
+        ) in {"running", "ready", "not_ready"}
+
+    def _stop_bridge(self) -> None:
+        if not self._bridge_control_allowed():
+            return
+        self._begin_bridge_transition("stop", tunnel_running=self._tunnel_owned_running())
+
+    def _restart_bridge(self) -> None:
+        if not self._bridge_control_allowed():
+            return
+        self._begin_bridge_transition("restart", tunnel_running=self._tunnel_owned_running())
+
+    def _begin_bridge_transition(self, action: str, *, tunnel_running: bool) -> None:
+        self._bridge_transition = True
+        self._pending_bridge_action = action
+        self._restart_tunnel_was_running = tunnel_running
+        self._sync_tunnel_controls()
+        self._set_runtime_state("restarting" if action == "restart" else "stopping")
+        if tunnel_running:
+            started = self._tunnel.stop(on_finished=self._on_tunnel_stopped_for_bridge)
+            if not started and not self._control_request_pending:
+                self._request_bridge_shutdown()
+        else:
+            self._request_bridge_shutdown()
+
+    def _on_tunnel_stopped_for_bridge(self) -> None:
+        self._request_bridge_shutdown()
+
+    def _request_bridge_shutdown(self) -> None:
+        if self._closing or self._control_request_pending or self._stop_confirmation_active:
+            return
+        token = self._control_token
+        if token is None:
+            self._apply_control_failure("control:shutdown", "Bridge control request failed")
+            return
+        self._control_request_pending = True
+        if not self._client.post_control_shutdown(token, key="control:shutdown"):
+            self._control_request_pending = False
+            self._apply_control_failure("control:shutdown", "Bridge control request failed")
+            return
+
+    def _apply_control_success(self, key: str) -> None:
+        if key != "control:shutdown" or not self._control_request_pending:
+            return
+        self._control_request_pending = False
+        self._stop_confirmation_active = True
+        self._stop_confirmation_health_unavailable = False
+        self._stop_confirmation_status_unavailable = False
+        self._stop_confirmation_deadline = monotonic() + _STOP_CONFIRMATION_TIMEOUT_SECONDS
+        self.stop_confirmation_timer.start()
+        self.bottom_status_label.setText("Bridge shutdown requested")
+        self._request_health()
+
+    def _apply_control_failure(self, key: str, _message: str) -> None:
+        if key != "control:shutdown":
+            return
+        self._control_request_pending = False
+        self._stop_confirmation_active = False
+        self.stop_confirmation_timer.stop()
+        self._bridge_transition = False
+        self._set_runtime_state("control_failed")
+        self.bottom_status_label.setText("Bridge control request failed")
+
+    def _maybe_finish_stop_confirmation(self) -> None:
+        if (
+            self._stop_confirmation_active
+            and self._stop_confirmation_health_unavailable
+            and self._stop_confirmation_status_unavailable
+        ):
+            self._confirm_bridge_stopped()
+
+    def _on_stop_confirmation_tick(self) -> None:
+        if not self._stop_confirmation_active:
+            self.stop_confirmation_timer.stop()
+            return
+        if (
+            self._stop_confirmation_health_unavailable
+            and self._stop_confirmation_status_unavailable
+        ):
+            self._confirm_bridge_stopped()
+        elif monotonic() >= self._stop_confirmation_deadline:
+            self._stop_confirmation_active = False
+            self.stop_confirmation_timer.stop()
+            self._bridge_transition = False
+            self._set_runtime_state("stop_timed_out")
+            self.bottom_status_label.setText("Bridge stop timed out")
+        else:
+            self._request_health()
+
+    def _confirm_bridge_stopped(self) -> None:
+        action = self._pending_bridge_action
+        self._stop_confirmation_active = False
+        self.stop_confirmation_timer.stop()
+        self._bridge_ready = False
+        self._app_server_ready = False
+        self._health_ok = False
+        self._control_token = None
+        self._detached_pid = None
+        self._detached_launch_started = False
+        self._bridge_seen_ready = False
+        self._launch_in_progress = False
+        self._tunnel.set_bridge_ready(False)
+        self._pending_bridge_action = None
+        if action == "restart":
+            resolution = self._codex_resolution
+            if resolution is None:
+                self._bridge_transition = False
+                self._restart_tunnel_was_running = False
+                self._set_runtime_state("launch_failed")
+                self.bottom_status_label.setText("Bridge relaunch failed")
+                return
+            self._launch_bridge(resolution.path)
+            return
+        self._restart_tunnel_was_running = False
+        self._bridge_transition = False
+        self._sync_tunnel_controls()
+        self.bridge_status_label.setText("Bridge: disconnected")
+        self.app_server_status_label.setText("App Server: failed")
+        self._set_runtime_state("stopped")
+        self.bottom_status_label.setText("Bridge stopped")
 
     def _apply_runtime_observation(self) -> None:
         ready = self._health_ok and self._bridge_ready and self._app_server_ready
+        if self._bridge_transition or self._stop_confirmation_active:
+            self._tunnel.set_bridge_ready(False)
+            return
+        if self._runtime_state == "stop_timed_out":
+            self._tunnel.set_bridge_ready(False)
+            return
         self._tunnel.set_bridge_ready(ready)
         if ready:
             self._bridge_seen_ready = True
@@ -510,6 +754,7 @@ class MainWindow(QMainWindow):
                 self._launch_in_progress = False
                 self.readiness_timer.stop()
                 self._set_runtime_state("console_started", label="Runtime: started by Console")
+                self._restore_restarted_tunnel()
             else:
                 self._set_runtime_state("external")
             return
@@ -605,6 +850,18 @@ class MainWindow(QMainWindow):
         return parsed
 
     def apply_json_result(self, key: str, payload: object) -> None:
+        if self._stop_confirmation_active and key in {"health", "bridge-status"}:
+            if key == "health":
+                self._health_observed = True
+                self._health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
+                self._stop_confirmation_health_unavailable = False
+            elif isinstance(payload, Mapping):
+                self._status_observed = True
+                self._bridge_ready = payload.get("bridge") in {"ready", "connected"}
+                self._app_server_ready = payload.get("app_server") in {"ready", "connected"}
+                self._stop_confirmation_status_unavailable = False
+            self._maybe_finish_stop_confirmation()
+            return
         if key == "health":
             self._health_observed = True
             self._health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
@@ -725,6 +982,20 @@ class MainWindow(QMainWindow):
             self._readiness_bridge_ready = False
             self._readiness_app_server_ready = False
             return
+        if self._stop_confirmation_active and key in {"health", "bridge-status"}:
+            if key == "health":
+                self._health_observed = True
+                self._health_ok = False
+                self._stop_confirmation_health_unavailable = True
+                self.bridge_status_label.setText("Bridge: disconnected")
+            else:
+                self._status_observed = True
+                self._bridge_ready = False
+                self._app_server_ready = False
+                self._stop_confirmation_status_unavailable = True
+                self.app_server_status_label.setText("App Server: failed")
+            self._maybe_finish_stop_confirmation()
+            return
         if key in {"health", "bridge-status"}:
             if key == "health":
                 self._health_observed = True
@@ -808,6 +1079,7 @@ class MainWindow(QMainWindow):
         self.thread_timer.stop()
         self.selected_status_timer.stop()
         self.readiness_timer.stop()
+        self.stop_confirmation_timer.stop()
         self._codex_probe.abort()
         self._launcher.close()
         self._client.abort_all()

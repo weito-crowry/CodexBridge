@@ -115,14 +115,20 @@ def _request(
     query: str = "",
     host: str = "127.0.0.1",
     path_params: dict[str, str] | None = None,
+    *,
+    method: str = "GET",
+    authorization: str | None = None,
 ) -> Request:
+    headers = [(b"host", host.encode())]
+    if authorization is not None:
+        headers.append((b"authorization", authorization.encode()))
     return Request(
         {
             "type": "http",
-            "method": "GET",
+            "method": method,
             "path": path,
             "query_string": query.encode(),
-            "headers": [(b"host", host.encode())],
+            "headers": headers,
             "path_params": path_params or {},
         }
     )
@@ -347,6 +353,120 @@ def test_ui_app_has_only_get_routes_and_no_mcp_route(tmp_path) -> None:
         route.methods <= {"GET", "HEAD"} for route in app.routes if hasattr(route, "methods")
     )
     assert all(middleware.cls.__name__ != "CORSMiddleware" for middleware in app.user_middleware)
+
+
+@pytest.mark.asyncio
+async def test_control_route_is_not_registered_without_token_or_callback(tmp_path) -> None:
+    app = create_ui_app(FakeBridge(), ActivityStore(), config(tmp_path))
+
+    assert "/ui-api/control/shutdown" not in {
+        route.path for route in app.routes if hasattr(route, "path")
+    }
+
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/ui-api/control/shutdown",
+            "query_string": b"",
+            "headers": [(b"host", b"127.0.0.1")],
+        },
+        receive,
+        send,
+    )
+
+    assert sent[0]["status"] == 404
+
+
+@pytest.mark.asyncio
+async def test_control_route_authenticates_and_runs_shutdown_after_response(tmp_path) -> None:
+    token = "valid-token_" * 4
+    settings = config(tmp_path)
+    settings = settings.__class__(
+        host=settings.host,
+        port=settings.port,
+        ui_port=settings.ui_port,
+        allowed_roots=settings.allowed_roots,
+        allowed_hosts=settings.allowed_hosts,
+        allowed_origins=settings.allowed_origins,
+        codex_executable=settings.codex_executable,
+        wait_default_seconds=settings.wait_default_seconds,
+        wait_max_seconds=settings.wait_max_seconds,
+        shutdown_grace_seconds=settings.shutdown_grace_seconds,
+        control_token=token,
+    )
+    calls: list[str] = []
+
+    async def shutdown() -> None:
+        calls.append("shutdown")
+
+    app = create_ui_app(FakeBridge(), ActivityStore(), settings, shutdown_callback=shutdown)
+    route = _route(app, "/ui-api/control/shutdown")
+
+    response = await route.endpoint(
+        _request(
+            "/ui-api/control/shutdown",
+            method="POST",
+            authorization=f"Bearer {token}",
+        )
+    )
+
+    assert response.status_code == 202
+    assert json.loads(response.body) == {"status": "shutdown_requested"}
+    assert calls == []
+    assert response.background is not None
+    await response.background()
+    assert calls == ["shutdown"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "authorization", [None, "Bearer", "Basic valid-token", "Bearer wrong-token"]
+)
+async def test_control_route_rejects_missing_malformed_and_wrong_tokens(
+    tmp_path, authorization: str | None
+) -> None:
+    token = "valid-token_" * 4
+    settings = config(tmp_path)
+    settings = settings.__class__(
+        host=settings.host,
+        port=settings.port,
+        ui_port=settings.ui_port,
+        allowed_roots=settings.allowed_roots,
+        allowed_hosts=settings.allowed_hosts,
+        allowed_origins=settings.allowed_origins,
+        codex_executable=settings.codex_executable,
+        wait_default_seconds=settings.wait_default_seconds,
+        wait_max_seconds=settings.wait_max_seconds,
+        shutdown_grace_seconds=settings.shutdown_grace_seconds,
+        control_token=token,
+    )
+    calls: list[str] = []
+
+    def shutdown() -> None:
+        calls.append("shutdown")
+
+    app = create_ui_app(FakeBridge(), ActivityStore(), settings, shutdown_callback=shutdown)
+    response = await _route(app, "/ui-api/control/shutdown").endpoint(
+        _request(
+            "/ui-api/control/shutdown",
+            method="POST",
+            authorization=authorization,
+        )
+    )
+
+    assert response.status_code == 403
+    assert response.body == b'{"error":"forbidden"}'
+    assert token not in response.body.decode()
+    assert calls == []
 
 
 @pytest.mark.asyncio

@@ -67,7 +67,12 @@ def test_launcher_uses_python_module_and_only_authorized_environment_overrides(m
         environment_factory=environment_factory,
     )
 
-    result = launcher.launch(codex_executable="C:/Codex/codex.exe", ui_port=8456)
+    token = "A" * 32
+    result = launcher.launch(
+        codex_executable="C:/Codex/codex.exe",
+        ui_port=8456,
+        control_token=token,
+    )
 
     assert result.started
     assert result.pid == 4321
@@ -80,7 +85,9 @@ def test_launcher_uses_python_module_and_only_authorized_environment_overrides(m
         "CODEX_BRIDGE_PORT": "8123",
         "CODEX_BRIDGE_UI_PORT": "8456",
         "CODEX_BRIDGE_CODEX_EXECUTABLE": "C:/Codex/codex.exe",
+        "CODEX_BRIDGE_CONTROL_TOKEN": token,
     }
+    assert token not in process.arguments
 
 
 def test_launcher_accepts_qprocess_bool_detached_result_without_pid() -> None:
@@ -91,7 +98,7 @@ def test_launcher_accepts_qprocess_bool_detached_result_without_pid() -> None:
         environment_factory=lambda: FakeEnvironment({}),
     )
 
-    result = launcher.launch(codex_executable="codex", ui_port=8001)
+    result = launcher.launch(codex_executable="codex", ui_port=8001, control_token="A" * 32)
 
     assert result.started
     assert result.pid is None
@@ -104,7 +111,7 @@ def test_launcher_close_does_not_terminate_detached_process() -> None:
         process_factory=lambda: process,
         environment_factory=lambda: FakeEnvironment({}),
     )
-    launcher.launch(codex_executable="codex", ui_port=8001)
+    launcher.launch(codex_executable="codex", ui_port=8001, control_token="A" * 32)
 
     launcher.close()
 
