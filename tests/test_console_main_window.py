@@ -655,6 +655,104 @@ def test_stop_timeout_is_fail_closed_and_does_not_clear_token_or_relaunch() -> N
     window.close()
 
 
+def test_launch_timeout_recovers_to_owned_ready_on_late_normal_poll() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    window.start_bridge_button.click()
+    old_token = launcher.control_tokens[0]
+
+    window._readiness_deadline = 0.0
+    window._on_readiness_tick()
+
+    assert window.runtime_state == "launch_timed_out"
+    assert not window._bridge_transition
+    assert not window.start_bridge_button.isEnabled()
+    assert len(launcher.calls) == 1
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window.runtime_state == "console_started"
+    assert window.stop_bridge_button.isEnabled()
+    assert window.restart_bridge_button.isEnabled()
+    assert len(launcher.calls) == 1
+    assert window._control_token == old_token
+    window.close()
+
+
+def test_stop_timeout_recovers_to_owned_ready_without_relaunch() -> None:
+    window, client, launcher = _owned_window()
+    old_token = launcher.control_tokens[0]
+
+    window.stop_bridge_button.click()
+    client.control_success("control:shutdown")
+    window._stop_confirmation_deadline = 0.0
+    window._on_stop_confirmation_tick()
+
+    assert window.runtime_state == "stop_timed_out"
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window.runtime_state == "console_started"
+    assert window._control_token == old_token
+    assert len(launcher.calls) == 1
+    assert window.stop_bridge_button.isEnabled()
+    assert window.restart_bridge_button.isEnabled()
+    window.close()
+
+
+def test_stop_timeout_late_unavailable_confirms_stopped_and_allows_start() -> None:
+    window, client, launcher = _owned_window()
+
+    window.stop_bridge_button.click()
+    client.control_success("control:shutdown")
+    window._stop_confirmation_deadline = 0.0
+    window._on_stop_confirmation_tick()
+
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert window.runtime_state == "stopped"
+    assert window._control_token is None
+    assert window._detached_pid is None
+    assert not window._detached_launch_started
+    assert window.start_bridge_button.isEnabled()
+    assert len(launcher.calls) == 1
+    window.close()
+
+
+def test_restart_timeout_late_stop_does_not_automatically_relaunch() -> None:
+    tunnel = ManagedTunnel()
+    window, client, launcher = _owned_window(tunnel)
+
+    window.restart_bridge_button.click()
+    client.control_success("control:shutdown")
+    window._stop_confirmation_deadline = 0.0
+    window._on_stop_confirmation_tick()
+
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert window.runtime_state == "stopped"
+    assert len(launcher.calls) == 1
+    assert tunnel.started == 0
+    assert window.start_bridge_button.isEnabled()
+    window.close()
+
+
 def test_unexpected_unreachable_owned_bridge_does_not_reenable_start() -> None:
     window, client, _launcher = _owned_window()
 

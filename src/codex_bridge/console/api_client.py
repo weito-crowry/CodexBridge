@@ -9,6 +9,8 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 
 from .sse import SseParser, SseProtocolError, parse_activity_event
 
+_MAX_CONTROL_RESPONSE_BYTES = 4 * 1024
+
 
 class ApiClientError(RuntimeError):
     """A bounded user-safe API client error."""
@@ -55,6 +57,7 @@ class ApiClient(QObject):
         self._manager: NetworkManagerLike = manager or QNetworkAccessManager(self)
         self._json_replies: dict[str, Any] = {}
         self._control_replies: dict[str, Any] = {}
+        self._control_response_sizes: dict[str, int] = {}
         self._stream_reply: Any | None = None
         self._stream_generation: int | None = None
         self._stream_parser: SseParser | None = None
@@ -133,14 +136,45 @@ class ApiClient(QObject):
             self.control_failed.emit(key, "Bridge control request failed")
             return False
         self._control_replies[key] = reply
+        self._control_response_sizes[key] = 0
+        reply.readyRead.connect(lambda key=key, reply=reply: self._consume_control_data(key, reply))
         reply.finished.connect(lambda key=key, reply=reply: self._finish_control(key, reply))
+        return True
+
+    def _fail_control_reply(self, key: str, reply: Any) -> None:
+        active_reply = self._control_replies.get(key)
+        if active_reply is not reply:
+            return
+        self._control_replies.pop(key, None)
+        self._control_response_sizes.pop(key, None)
+        active_reply.abort()
+        active_reply.deleteLater()
+        self.control_failed.emit(key, "Bridge control request failed")
+
+    def _consume_control_data(self, key: str, reply: Any) -> bool:
+        active_reply = self._control_replies.get(key)
+        if active_reply is None or active_reply is not reply:
+            return False
+        try:
+            chunk = bytes(active_reply.read(_MAX_CONTROL_RESPONSE_BYTES + 1))
+        except (AttributeError, TypeError, ValueError):
+            self._fail_control_reply(key, reply)
+            return False
+        size = self._control_response_sizes.get(key, 0) + len(chunk)
+        self._control_response_sizes[key] = size
+        if size > _MAX_CONTROL_RESPONSE_BYTES:
+            self._fail_control_reply(key, reply)
+            return False
         return True
 
     def _finish_control(self, key: str, reply: Any) -> None:
         active_reply = self._control_replies.get(key)
         if active_reply is None or active_reply is not reply:
             return
+        if not self._consume_control_data(key, reply):
+            return
         self._control_replies.pop(key, None)
+        self._control_response_sizes.pop(key, None)
         try:
             status = self._status(reply)
             if self._has_network_error(reply) or status != 202:
@@ -149,7 +183,6 @@ class ApiClient(QObject):
         except ApiClientError as exc:
             self.control_failed.emit(key, str(exc))
         finally:
-            reply.readAll()
             reply.deleteLater()
 
     def start_stream(self, thread_id: str, generation: int) -> None:
@@ -258,4 +291,5 @@ class ApiClient(QObject):
             reply.abort()
             reply.deleteLater()
         self._control_replies.clear()
+        self._control_response_sizes.clear()
         self.stop_stream()

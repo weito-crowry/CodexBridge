@@ -111,6 +111,37 @@ async def test_app_server_process_accepts_large_jsonrpc_lines_on_stdout_and_stde
 
 
 @pytest.mark.asyncio
+async def test_default_process_factory_scrubs_control_token_only_from_child_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class PipeProcess:
+        stdin = object()
+        stdout = object()
+        stderr = object()
+
+    async def fake_create_subprocess_exec(*args: str, **kwargs: object) -> PipeProcess:
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return PipeProcess()
+
+    monkeypatch.setenv("CODEX_BRIDGE_CONTROL_TOKEN", "secret-token")
+    monkeypatch.setenv("PATH", "safe-path")
+    monkeypatch.setenv("CODEX_BRIDGE_SAFE_TEST", "safe-value")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    await _create_process("codex", "app-server", "--stdio")
+
+    assert captured["args"] == ("codex", "app-server", "--stdio")
+    child_environment = captured["env"]
+    assert isinstance(child_environment, dict)
+    assert "CODEX_BRIDGE_CONTROL_TOKEN" not in child_environment
+    assert child_environment["PATH"] == "safe-path"
+    assert child_environment["CODEX_BRIDGE_SAFE_TEST"] == "safe-value"
+
+
+@pytest.mark.asyncio
 async def test_app_server_reader_failure_closes_transport_for_followup_requests() -> None:
     factory = FakeProcessFactory()
     failures: list[str] = []

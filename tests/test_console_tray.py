@@ -260,6 +260,8 @@ def test_initial_and_runtime_tunnel_controls_are_synced_for_window_and_tray() ->
         assert not control.isEnabled()
     for name in ("Start Tunnel", "Stop Tunnel", "Restart Tunnel"):
         assert not actions[name].isEnabled()
+    for name in ("Start Bridge", "Stop Bridge", "Restart Bridge"):
+        assert not actions[name].isEnabled()
 
     supervisor.emit_state("checking")
     supervisor.controls(TunnelActionState(False, False, False))

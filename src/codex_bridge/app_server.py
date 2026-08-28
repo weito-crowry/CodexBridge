@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
@@ -34,12 +35,15 @@ FailureCallback = Callable[[str], Awaitable[None] | None]
 
 
 async def _create_process(*args: str) -> ProcessLike:
+    child_environment = os.environ.copy()
+    child_environment.pop("CODEX_BRIDGE_CONTROL_TOKEN", None)
     process = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=_APP_SERVER_STREAM_LIMIT,
+        env=child_environment,
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
         raise RuntimeError("Codex App Server pipes are unavailable")

@@ -35,6 +35,10 @@ class FakeReply:
         body, self._body = self._body, b""
         return body
 
+    def read(self, max_bytes: int) -> bytes:
+        body, self._body = self._body[:max_bytes], self._body[max_bytes:]
+        return body
+
     def attribute(self, attribute: object) -> int:
         return self._status
 
@@ -245,4 +249,36 @@ def test_api_client_abort_all_cleans_up_control_reply() -> None:
     client.post_control_shutdown("A" * 32, key="control")
     client.abort_all()
 
+    assert reply.aborted and reply.deleted
+
+
+def test_api_client_rejects_oversized_control_response_without_exposing_body() -> None:
+    _application()
+    reply = FakeReply(b"secret-control-body" * 512, status=202)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, str]] = []
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_shutdown("A" * 32, key="control")
+    reply.readyRead.emit()
+
+    assert failures == [("control", "Bridge control request failed")]
+    assert reply.aborted and reply.deleted
+    reply.finished.emit()
+    assert failures == [("control", "Bridge control request failed")]
+
+
+def test_api_client_rejects_oversized_http_failure_body_with_fixed_message() -> None:
+    _application()
+    reply = FakeReply(b"server-secret" * 512, status=403)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, str]] = []
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_shutdown("A" * 32, key="control")
+    reply.readyRead.emit()
+
+    assert failures == [("control", "Bridge control request failed")]
     assert reply.aborted and reply.deleted

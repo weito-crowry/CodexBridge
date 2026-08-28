@@ -125,6 +125,7 @@ class MainWindow(QMainWindow):
         self._stop_confirmation_health_unavailable = False
         self._stop_confirmation_status_unavailable = False
         self._stop_confirmation_deadline = 0.0
+        self._stop_outcome_uncertain = False
         self._readiness_deadline = 0.0
         self._readiness_health_ok = False
         self._readiness_bridge_ready = False
@@ -138,6 +139,7 @@ class MainWindow(QMainWindow):
         self._connect_runtime()
         self._build_tray()
         self._sync_tunnel_controls()
+        self._sync_bridge_controls()
         self._set_unavailable_state()
         self._codex_probe.start()
         self.refresh()
@@ -417,6 +419,10 @@ class MainWindow(QMainWindow):
         if start_action is not None:
             start_action.setEnabled(self.start_bridge_button.isEnabled())
 
+    def _sync_bridge_controls(self) -> None:
+        self._update_start_button()
+        self._update_bridge_controls()
+
     def _sync_tunnel_controls(self) -> None:
         actions = self._tunnel.action_state
         self._apply_tunnel_controls(
@@ -554,6 +560,7 @@ class MainWindow(QMainWindow):
         if monotonic() >= self._readiness_deadline:
             self.readiness_timer.stop()
             self._launch_in_progress = False
+            self._bridge_transition = False
             self._set_runtime_state("launch_timed_out")
             self.bottom_status_label.setText("Bridge launch timed out; it may still be starting")
             return
@@ -702,6 +709,9 @@ class MainWindow(QMainWindow):
             self._stop_confirmation_active = False
             self.stop_confirmation_timer.stop()
             self._bridge_transition = False
+            self._stop_outcome_uncertain = True
+            self._health_observed = False
+            self._status_observed = False
             self._set_runtime_state("stop_timed_out")
             self.bottom_status_label.setText("Bridge stop timed out")
         else:
@@ -709,8 +719,10 @@ class MainWindow(QMainWindow):
 
     def _confirm_bridge_stopped(self) -> None:
         action = self._pending_bridge_action
+        stop_outcome_was_uncertain = self._stop_outcome_uncertain
         self._stop_confirmation_active = False
         self.stop_confirmation_timer.stop()
+        self._stop_outcome_uncertain = False
         self._bridge_ready = False
         self._app_server_ready = False
         self._health_ok = False
@@ -721,7 +733,7 @@ class MainWindow(QMainWindow):
         self._launch_in_progress = False
         self._tunnel.set_bridge_ready(False)
         self._pending_bridge_action = None
-        if action == "restart":
+        if action == "restart" and not stop_outcome_was_uncertain:
             resolution = self._codex_resolution
             if resolution is None:
                 self._bridge_transition = False
@@ -744,9 +756,19 @@ class MainWindow(QMainWindow):
         if self._bridge_transition or self._stop_confirmation_active:
             self._tunnel.set_bridge_ready(False)
             return
-        if self._runtime_state == "stop_timed_out":
-            self._tunnel.set_bridge_ready(False)
-            return
+        if self._stop_outcome_uncertain:
+            fresh_observations = self._health_observed and self._status_observed
+            if fresh_observations and ready:
+                self._stop_outcome_uncertain = False
+                self._pending_bridge_action = None
+            elif fresh_observations and (
+                not self._health_ok and not self._bridge_ready and not self._app_server_ready
+            ):
+                self._confirm_bridge_stopped()
+                return
+            else:
+                self._tunnel.set_bridge_ready(False)
+                return
         self._tunnel.set_bridge_ready(ready)
         if ready:
             self._bridge_seen_ready = True
