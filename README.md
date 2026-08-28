@@ -133,6 +133,20 @@ Stored history is read through `thread/read` metadata validation followed by the
 
 The independent UI listener serves `GET /healthz`, `/ui-api/status`, `/ui-api/threads`, `/ui-api/threads/{thread_id}`, `/ui-api/threads/{thread_id}/turns`, `/ui-api/threads/{thread_id}/items`, `/ui-api/threads/{thread_id}/status`, and `/ui-api/events`. It binds only to `127.0.0.1:<CODEX_BRIDGE_UI_PORT>`, permits only `127.0.0.1` and `localhost` Host values, has no CORS wildcard, and is never exposed through the Tunnel, whose target remains the MCP listener only. `/ui-api/events` is an SSE stream of new safe process-local Activity records; subscriber queues are bounded to 100 with oldest-drop backpressure, and no SQLite/replay persistence exists.
 
+## Phase 3 read-only desktop Console
+
+The optional Windows-oriented PySide6 Console is a separate read-only viewer for the already-running UI API. Start the Bridge first, then launch the Console in another terminal:
+
+```powershell
+uv sync --extra dev --extra console
+uv run codex-bridge
+uv run codex-bridge-console
+```
+
+The Console uses `CODEX_BRIDGE_UI_PORT` (default `8001`) or an explicit `--ui-port`, always connects to `http://127.0.0.1:<port>`, and uses Qt Network for asynchronous JSON GET and SSE reads. It shows the thread list, selected thread history, current status, pending approval/input summaries, recent Activity, and live Activity stream. It has no approval, input, steer, interrupt, new-thread, or other mutation controls. The UI API is loopback-only and is not a Tunnel target.
+
+Console close stops its timers and aborts only its own HTTP/SSE replies. It does not stop CodexBridge, the Codex App Server, the Tunnel, or an active Codex turn.
+
 ## Shutdown behavior
 
 SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then stops the UI listener, closes protocol pipes, and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. If UI startup fails, already-started App Server resources are cleaned up. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
@@ -174,4 +188,4 @@ It attempts App Server startup, a temporary file task, completion, continuation,
 
 ## Out of scope for the initial version
 
-SQLite, bridge session IDs, multi-user support, authentication storage, PySide6/Qt GUI, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded.
+SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, Console process ownership, Tunnel management, and complete hard-crash recovery are deliberately excluded.
