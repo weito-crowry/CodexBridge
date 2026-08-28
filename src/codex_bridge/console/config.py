@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 
 class ConsoleConfigurationError(ValueError):
-    """Raised when the console port cannot be used safely."""
+    """Raised when console-only configuration cannot be used safely."""
 
 
 def parse_ui_port(value: object, *, source: str = "UI port") -> int:
@@ -28,17 +29,30 @@ def parse_ui_port(value: object, *, source: str = "UI port") -> int:
     return port
 
 
+_TUNNEL_PROFILE_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def parse_tunnel_profile(value: object, *, source: str = "Tunnel profile") -> str:
+    if not isinstance(value, str) or _TUNNEL_PROFILE_PATTERN.fullmatch(value) is None:
+        raise ConsoleConfigurationError(
+            f"{source} must contain 1-64 ASCII letters, digits, '.', '_' or '-'")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ConsoleConfig:
     """Small console-only configuration; the host is intentionally fixed."""
 
     host: str = "127.0.0.1"
     port: int = 8001
+    tunnel_executable: str | None = None
+    tunnel_profile: str = "codex-bridge"
 
     def __post_init__(self) -> None:
         if self.host != "127.0.0.1":
             raise ConsoleConfigurationError("console host is fixed to 127.0.0.1")
         parse_ui_port(self.port)
+        parse_tunnel_profile(self.tunnel_profile)
 
     @property
     def base_url(self) -> str:
@@ -59,4 +73,11 @@ class ConsoleConfig:
             port = (
                 8001 if raw_port is None else parse_ui_port(raw_port, source="CODEX_BRIDGE_UI_PORT")
             )
-        return cls(port=port)
+        return cls(
+            port=port,
+            tunnel_executable=values.get("CODEX_BRIDGE_TUNNEL_EXECUTABLE"),
+            tunnel_profile=parse_tunnel_profile(
+                values.get("CODEX_BRIDGE_TUNNEL_PROFILE", "codex-bridge"),
+                source="CODEX_BRIDGE_TUNNEL_PROFILE",
+            ),
+        )
