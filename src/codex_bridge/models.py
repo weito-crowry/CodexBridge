@@ -68,3 +68,11 @@ class ThreadState:
     turns: dict[str, TurnState] = field(default_factory=dict)
     loaded: bool = False
     validated_cwd: str | None = None
+    thread_metadata: dict[str, str | None] = field(
+        default_factory=lambda: {
+            "model_provider": None,
+            "model": None,
+            "reasoning_effort": None,
+            "cli_version": None,
+        }
+    )

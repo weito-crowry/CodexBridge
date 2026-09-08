@@ -104,6 +104,28 @@ def test_launcher_accepts_qprocess_bool_detached_result_without_pid() -> None:
     assert result.pid is None
 
 
+def test_launcher_propagates_explicit_allowed_roots_to_child() -> None:
+    _application()
+    process = FakeProcess()
+    launcher = BridgeRuntimeLauncher(
+        process_factory=lambda: process,
+        environment_factory=lambda: FakeEnvironment({}),
+    )
+
+    result = launcher.launch(
+        codex_executable="codex.exe",
+        ui_port=8001,
+        control_token="A" * 32,
+        allowed_roots=(r"C:\repo", r"D:\work"),
+    )
+
+    assert result.started
+    assert process.environment is not None
+    assert process.environment.values["CODEX_BRIDGE_ALLOWED_ROOTS"] == (
+        r"C:\repo" + __import__("os").pathsep + r"D:\work"
+    )
+
+
 def test_launcher_close_does_not_terminate_detached_process() -> None:
     _application()
     process = FakeProcess()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication
@@ -104,8 +105,14 @@ class FakeLauncher:
         self.closes = 0
 
     def launch(
-        self, *, codex_executable: str, ui_port: int, control_token: str
+        self,
+        *,
+        codex_executable: str,
+        ui_port: int,
+        control_token: str,
+        allowed_roots: tuple[str, ...] = (),
     ) -> DetachedLaunchResult:
+        del allowed_roots
         self.calls.append((codex_executable, ui_port))
         self.control_tokens.append(control_token)
         return DetachedLaunchResult(self.started, 1234 if self.started else None)
@@ -162,7 +169,7 @@ def _application() -> QApplication:
 
 
 def _config() -> ConsoleConfig:
-    return ConsoleConfig()
+    return ConsoleConfig(allowed_roots=(str(Path.cwd()),))
 
 
 def _item(item_id: str, item_type: str, **fields: object) -> dict[str, object]:
@@ -193,6 +200,54 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.history_pane is not None
     assert window.activity_pane is not None
     assert "CodexBridge is not available" in window.history_pane._empty_label.text()
+    assert window.stream_status_label.text() == "Stream: idle"
+    window.close()
+
+
+def test_ready_bridge_with_no_threads_has_non_error_empty_state() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    client.result("threads", {"threads": []})
+    window.select_thread(None)
+
+    assert window.history_pane._empty_label.text() == "No threads found."
+    assert window.activity_pane.state_label.text() == "No thread selected."
+    assert window.stream_status_label.text() == "Stream: idle"
+    window.close()
+
+
+def test_ready_bridge_with_threads_and_no_selection_prompts_selection() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread(None)
+
+    assert window.history_pane._empty_label.text() == "Select a thread to view history."
+    assert window.activity_pane.state_label.text() == "Select a thread to view activity."
+    window.close()
+
+
+def test_deselect_does_not_restore_bridge_unavailable_after_ready_thread() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    client.result("threads", {"threads": [{"id": "thread-a"}]})
+    window.select_thread("thread-a")
+    window.select_thread(None)
+
+    assert "not available" not in window.history_pane._empty_label.text()
+    assert window.stream_status_label.text() == "Stream: idle"
     window.close()
 
 
@@ -408,6 +463,20 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     window.close()
 
 
+def test_empty_allowed_roots_keep_start_disabled_even_with_codex_resolution() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    window = MainWindow(ConsoleConfig(), api_client=client, codex_probe=probe, tray_available=False)
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert not window.start_bridge_button.isEnabled()
+    assert "roots" in window.config_status_label.text().casefold()
+    window.close()
+
+
 def test_start_bridge_is_detached_once_and_readiness_marks_console_started() -> None:
     _application()
     client = FakeClient()
@@ -518,6 +587,11 @@ def test_close_aborts_probe_and_readiness_only_without_stopping_bridge() -> None
 
     window.close()
 
+    assert client.control_requests
+    assert not client.aborted_all
+    client.control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
     assert client.aborted_all
     assert probe.aborts == 1
     assert launcher.closes == 1

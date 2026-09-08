@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication
@@ -54,6 +55,9 @@ class FakeClient:
         self.control_requests.append((token, key))
         self.events.append("control.post")
         return True
+
+    def failure(self, key: str, message: str) -> None:
+        self.json_failed.emit(key, message)
 
 
 class FakeProbe:
@@ -163,6 +167,7 @@ class FakeTray:
         self.menu = None
         self.shown = 0
         self.hidden = 0
+        self.messages: list[tuple[str, str]] = []
 
     def setContextMenu(self, menu: object) -> None:
         self.menu = menu
@@ -175,6 +180,12 @@ class FakeTray:
 
     def hide(self) -> None:
         self.hidden += 1
+
+    def setIcon(self, icon: object) -> None:
+        self.icon = icon
+
+    def showMessage(self, title: str, message: str) -> None:
+        self.messages.append((title, message))
 
 
 def _application() -> QApplication:
@@ -201,7 +212,7 @@ def _window(
         events=events,
     )
     window = MainWindow(
-        ConsoleConfig(),
+        ConsoleConfig(allowed_roots=(str(Path.cwd()),)),
         api_client=client,
         codex_probe=probe,
         runtime_launcher=launcher,
@@ -301,7 +312,43 @@ def test_available_tray_close_hides_without_cleanup_or_tunnel_stop() -> None:
     assert launcher.closed == 0
     assert supervisor.close_calls == 0
     assert quit_calls == []
+    assert len(tray.messages) == 1
+    window.close()
+    assert len(tray.messages) == 1
     window._begin_exit()
+
+
+def test_sigint_uses_external_bridge_safe_graceful_exit_path() -> None:
+    quit_calls: list[str] = []
+    window, client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=False,
+        quit_calls=quit_calls,
+    )
+
+    window.request_sigint()
+    window._on_signal_tick()
+
+    assert supervisor.close_calls == 1
+    assert client.control_requests == []
+    assert quit_calls == ["quit"]
+
+
+def test_exit_watchdog_is_bounded_and_idempotent_for_delayed_tunnel() -> None:
+    quit_calls: list[str] = []
+    window, client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=False,
+        quit_calls=quit_calls,
+        delayed_close=True,
+    )
+
+    window._begin_exit()
+    window._on_exit_timeout()
+    supervisor.complete_close()
+    window._on_exit_timeout()
+
+    assert supervisor.close_calls == 1
+    assert client.aborted == 1
+    assert quit_calls == ["quit"]
 
 
 def test_tray_actions_call_same_tunnel_operations_as_window_controls() -> None:
@@ -419,6 +466,33 @@ def test_tray_exit_cleans_up_and_quits_after_tunnel_close() -> None:
     window.close()
 
 
+def test_exit_stops_tunnel_before_console_owned_bridge() -> None:
+    tray = FakeTray()
+    quit_calls: list[str] = []
+    window, client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=quit_calls,
+        tray=tray,
+    )
+    supervisor.emit_state("ready")
+    supervisor.controls(TunnelActionState(False, True, True))
+    window._runtime_state = "console_started"
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._detached_launch_started = True
+    window._control_token = "A" * 32
+
+    window._begin_exit()
+
+    assert supervisor.close_calls == 1
+    assert client.control_requests == [("A" * 32, "control:shutdown")]
+    assert quit_calls == []
+    window._apply_control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    assert quit_calls == ["quit"]
+
+
 def test_unavailable_tray_uses_explicit_exit_cleanup_on_window_close() -> None:
     quit_calls: list[str] = []
     window, client, probe, launcher, supervisor, _tray = _window(
@@ -447,15 +521,17 @@ def test_unavailable_tray_close_waits_for_async_tunnel_cleanup() -> None:
     assert not window.close()
 
     assert supervisor.close_calls == 1
-    assert client.aborted == 1
+    assert client.aborted == 0
     assert probe.aborted == 1
-    assert launcher.closed == 1
+    assert launcher.closed == 0
     assert window._closing
     assert not window.isVisible()
     assert quit_calls == []
 
     supervisor.complete_close()
 
+    assert client.aborted == 1
+    assert launcher.closed == 1
     assert quit_calls == ["quit"]
     supervisor.complete_close()
     assert quit_calls == ["quit"]

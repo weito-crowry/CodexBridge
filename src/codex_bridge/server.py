@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.routing import Mount
@@ -13,10 +14,11 @@ from starlette.routing import Mount
 from .activity import ActivityStore
 from .app_server import AppServerClient
 from .bridge import Bridge
-from .config import BridgeConfig, ConfigurationError
+from .codex_resolver import CodexResolutionError, resolve_codex_executable
+from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .logging_utils import log_event
 from .models import ApprovalDecision
-from .paths import AllowedPathPolicy
+from .paths import AllowedPathPolicy, PathPolicyError
 from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
@@ -56,11 +58,29 @@ class BridgeRuntime:
         log_event("bridge.shutdown")
 
 
+def prepare_config(config: BridgeConfig) -> BridgeConfig:
+    allowed_roots = validate_allowed_roots(config.allowed_roots)
+    configured_executable = (
+        config.codex_executable if config.codex_executable_source != "default" else None
+    )
+    try:
+        resolution = resolve_codex_executable(config_executable=configured_executable)
+    except CodexResolutionError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    return replace(
+        config,
+        allowed_roots=allowed_roots,
+        codex_executable=resolution.path,
+        codex_executable_source=resolution.source,
+    )
+
+
 def build_runtime(
     config: BridgeConfig,
     *,
     shutdown_callback: ShutdownCallback | None = None,
 ) -> BridgeRuntime:
+    config = prepare_config(config)
     state = StateStore()
     activity_store = ActivityStore()
     app_server = AppServerClient(config.codex_executable)
@@ -104,6 +124,16 @@ def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | Non
     )
 
 
+async def _run_tool(operation: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+    try:
+        return await operation()
+    except PathPolicyError as exc:
+        message = "cwd is outside CODEX_BRIDGE_ALLOWED_ROOTS" if "outside" in str(exc) else str(exc)
+        raise ToolError(message) from None
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+
+
 def create_app(
     config: BridgeConfig,
     *,
@@ -122,41 +152,41 @@ def create_app(
     @mcp.tool()
     async def codex_start(cwd: str, prompt: str) -> dict[str, Any]:
         """Start a native Codex thread and its first turn without waiting for completion."""
-        return await bridge().start(cwd, prompt)
+        return await _run_tool(lambda: bridge().start(cwd, prompt))
 
     @mcp.tool()
     async def codex_continue(thread_id: str, prompt: str) -> dict[str, Any]:
         """Continue a native Codex thread, resuming it when needed."""
-        return await bridge().continue_thread(thread_id, prompt)
+        return await _run_tool(lambda: bridge().continue_thread(thread_id, prompt))
 
     @mcp.tool()
     async def codex_wait(
         thread_id: str, turn_id: str, timeout_seconds: float | None = None
     ) -> dict[str, Any]:
         """Wait for a bounded Codex turn state change or terminal state."""
-        return await bridge().wait(thread_id, turn_id, timeout_seconds)
+        return await _run_tool(lambda: bridge().wait(thread_id, turn_id, timeout_seconds))
 
     @mcp.tool()
     async def codex_steer(thread_id: str, turn_id: str, prompt: str) -> dict[str, Any]:
         """Send additional input to the expected active Codex turn."""
-        return await bridge().steer(thread_id, turn_id, prompt)
+        return await _run_tool(lambda: bridge().steer(thread_id, turn_id, prompt))
 
     @mcp.tool()
     async def codex_approval(request_id: int | str, decision: ApprovalDecision) -> dict[str, Any]:
         """Resolve one pending Codex command, file, or permission approval request."""
-        return await bridge().approve(request_id, decision)
+        return await _run_tool(lambda: bridge().approve(request_id, decision))
 
     @mcp.tool()
     async def codex_user_input(
         request_id: int | str, answers: dict[str, list[str]]
     ) -> dict[str, Any]:
         """Resolve one pending Codex user-input request by exact question IDs."""
-        return await bridge().answer_user_input(request_id, answers)
+        return await _run_tool(lambda: bridge().answer_user_input(request_id, answers))
 
     @mcp.tool()
     async def codex_interrupt(thread_id: str, turn_id: str) -> dict[str, Any]:
         """Request interruption of a running Codex turn."""
-        return await bridge().interrupt(thread_id, turn_id)
+        return await _run_tool(lambda: bridge().interrupt(thread_id, turn_id))
 
     @mcp.tool()
     async def codex_threads(
@@ -166,11 +196,13 @@ def create_app(
         cursor: str | None = None,
     ) -> dict[str, Any]:
         """List native Codex threads or read one native thread's bounded history."""
-        return await bridge().threads(
-            thread_id,
-            include_history=include_history,
-            limit=limit,
-            cursor=cursor,
+        return await _run_tool(
+            lambda: bridge().threads(
+                thread_id,
+                include_history=include_history,
+                limit=limit,
+                cursor=cursor,
+            )
         )
 
     @mcp.tool()
@@ -178,7 +210,7 @@ def create_app(
         thread_id: str, turn_id: str | None = None, activity_limit: int = 20
     ) -> dict[str, Any]:
         """Return the current safe state and recent activities for a native Codex turn."""
-        return await bridge().status(thread_id, turn_id, activity_limit)
+        return await _run_tool(lambda: bridge().status(thread_id, turn_id, activity_limit))
 
     security = _transport_security(config)
     transport_app = mcp.streamable_http_app(
@@ -218,6 +250,7 @@ def create_app(
 async def run_server(config: BridgeConfig) -> None:
     import uvicorn
 
+    config = prepare_config(config)
     controller = UvicornShutdownController()
     app = create_app(config, shutdown_callback=controller.request_shutdown)
     server = uvicorn.Server(uvicorn.Config(app, host=config.host, port=config.port))

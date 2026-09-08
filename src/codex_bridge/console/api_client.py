@@ -280,7 +280,7 @@ class ApiClient(QObject):
         reply.abort()
         reply.deleteLater()
         if generation is not None:
-            self.stream_state_changed.emit(generation, "disconnected")
+            self.stream_state_changed.emit(generation, "idle")
 
     def abort_all(self) -> None:
         for reply in tuple(self._json_replies.values()):

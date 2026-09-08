@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Any
 
 from .models import NormalizedState, PendingRequest, RequestId, ThreadState, TurnState
@@ -8,6 +9,13 @@ from .models import NormalizedState, PendingRequest, RequestId, ThreadState, Tur
 _MAX_MESSAGE_CHARS = 16_000
 _MAX_DIFF_CHARS = 32_000
 _MAX_EVENTS = 32
+_MAX_THREAD_METADATA_CHARS = 512
+_THREAD_METADATA_KEYS = {
+    "model_provider": "modelProvider",
+    "model": "model",
+    "reasoning_effort": "reasoningEffort",
+    "cli_version": "cliVersion",
+}
 
 
 class StateStore:
@@ -55,10 +63,26 @@ class StateStore:
             return None
         return next(reversed(thread.turns))
 
-    def mark_loaded(self, thread_id: str, validated_cwd: str) -> None:
+    def mark_loaded(
+        self,
+        thread_id: str,
+        validated_cwd: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         thread = self._threads.setdefault(thread_id, ThreadState(thread_id=thread_id))
         thread.loaded = True
         thread.validated_cwd = validated_cwd
+        if metadata is not None:
+            self.update_thread_metadata(thread_id, metadata)
+
+    def update_thread_metadata(self, thread_id: str, metadata: Mapping[str, Any]) -> None:
+        thread = self._threads.setdefault(thread_id, ThreadState(thread_id=thread_id))
+        for target, source in _THREAD_METADATA_KEYS.items():
+            if source in metadata:
+                value = metadata[source]
+                thread.thread_metadata[target] = (
+                    value[:_MAX_THREAD_METADATA_CHARS] if isinstance(value, str) else None
+                )
 
     def active_turns(self) -> tuple[tuple[str, str], ...]:
         active: list[tuple[str, str]] = []
@@ -168,6 +192,7 @@ class StateStore:
         return {
             "thread_id": turn.thread_id,
             "turn_id": turn.turn_id,
+            "thread_metadata": dict(self._threads[turn.thread_id].thread_metadata),
             "state": turn.state,
             "latest_agent_message": turn.latest_agent_message,
             "current_diff": turn.current_diff,

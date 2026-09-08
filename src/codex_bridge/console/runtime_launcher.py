@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,12 +38,15 @@ class BridgeRuntimeLauncher:
         codex_executable: str,
         ui_port: int,
         control_token: str,
+        allowed_roots: tuple[str, ...] = (),
     ) -> DetachedLaunchResult:
         process = self._process_factory()
         environment = self._environment_factory()
         environment.insert("CODEX_BRIDGE_CODEX_EXECUTABLE", codex_executable)
         environment.insert("CODEX_BRIDGE_UI_PORT", str(ui_port))
         environment.insert("CODEX_BRIDGE_CONTROL_TOKEN", control_token)
+        if allowed_roots:
+            environment.insert("CODEX_BRIDGE_ALLOWED_ROOTS", os.pathsep.join(allowed_roots))
         process.setProgram(sys.executable)
         process.setArguments(["-m", "codex_bridge"])
         process.setProcessEnvironment(environment)

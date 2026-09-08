@@ -63,3 +63,25 @@ def test_zero_pending_request_id_is_exposed_in_snapshot() -> None:
     store.put_pending_request(pending)
 
     assert store.snapshot("thread", "turn")["pending_request"] == pending
+
+
+def test_thread_metadata_is_bounded_to_safe_known_fields() -> None:
+    store = StateStore()
+    store.ensure_turn("thread", "turn")
+    store.update_thread_metadata(
+        "thread",
+        {
+            "modelProvider": "openai",
+            "model": "gpt-5",
+            "reasoningEffort": "high",
+            "cliVersion": "0.1.2",
+            "apiKey": "must not appear",
+        },
+    )
+
+    assert store.snapshot("thread", "turn")["thread_metadata"] == {
+        "model_provider": "openai",
+        "model": "gpt-5",
+        "reasoning_effort": "high",
+        "cli_version": "0.1.2",
+    }

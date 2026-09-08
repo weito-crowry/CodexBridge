@@ -14,7 +14,6 @@ def test_readme_documents_phase3_console_launch_and_boundaries() -> None:
         "uv run codex-bridge",
         "uv run codex-bridge-console",
         "read-only",
-        "Console close",
         "127.0.0.1",
         "not a Tunnel target",
     ):
@@ -51,15 +50,18 @@ def test_phase4b_docs_describe_tunnel_supervision_tray_and_boundaries() -> None:
         "CODEX_BRIDGE_TUNNEL_PROFILE",
         "Tunnel profile creation remains external",
         "Tunnel secrets/identity are not stored by CodexBridge",
-        "window close minimizes/hides to tray when available",
-        "explicit Exit stops Console-owned Tunnel",
-        "Bridge remains running on Console Exit",
-        "external Tunnel is never discovered/taken over",
         "automatic Tunnel restart is disabled",
         "Bridge Stop/Restart is Phase 4C",
     ):
         assert text in readme
         assert text in spec
+    for text in (
+        "same non-null Qt standard icon",
+        "external Tunnel is never discovered/taken over",
+        "Console Exit uses the same order",
+        ">= 0.0.14",
+    ):
+        assert text in readme
 
 
 def test_phase4c_docs_describe_authenticated_graceful_bridge_control() -> None:
@@ -77,11 +79,11 @@ def test_phase4c_docs_describe_authenticated_graceful_bridge_control() -> None:
         "POST /ui-api/control/shutdown",
         "external Bridge is never taken over",
         "Stopping or restarting Bridge may interrupt active Codex turns.",
-        "Bridge remains running on Console Exit",
         "exactly nine tools",
     ):
         assert text in readme
         assert text in spec
+    assert "Console Exit uses the same order" in readme
 
 
 def test_console_source_contains_no_mutation_or_process_ownership_operations() -> None:

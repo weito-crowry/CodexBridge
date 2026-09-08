@@ -196,6 +196,10 @@ class ThreadListPane(QWidget):
         self._threads = [dict(thread) for thread in threads]
         self._render()
 
+    @property
+    def thread_count(self) -> int:
+        return len(self._threads)
+
     def _render(self) -> None:
         query = self.filter_edit.text().casefold()
         self.list_widget.clear()

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_bridge.config import BridgeConfig, ConfigurationError
+from codex_bridge.paths import PathPolicyError
 from codex_bridge.server import build_runtime, create_app
 
 
 @dataclass
 class FakeBridge:
-    pass
+    error: Exception | None = None
+
+    async def start(self, _cwd: str, _prompt: str) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        return {"ok": True}
 
 
 class FakeRuntime:
@@ -69,6 +77,32 @@ async def test_lifespan_starts_and_shutdowns_one_runtime(tmp_path) -> None:
         assert runtime.start_count == 1
         assert app.state.bridge is runtime.bridge
     assert runtime.shutdown_count == 1
+
+
+@pytest.mark.asyncio
+async def test_expected_path_errors_are_mcp_tool_errors(tmp_path) -> None:
+    runtime = FakeRuntime()
+    runtime.bridge.error = PathPolicyError("cwd is outside CODEX_BRIDGE_ALLOWED_ROOTS")
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tools = app.state.mcp_server._tool_manager.list_tools()
+    tool = next(tool for tool in tools if tool.name == "codex_start")
+
+    async with app.router.lifespan_context(app):
+        with pytest.raises(ToolError, match="CODEX_BRIDGE_ALLOWED_ROOTS"):
+            await tool.fn(str(tmp_path), "prompt")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_tool_errors_are_not_silently_downgraded(tmp_path) -> None:
+    runtime = FakeRuntime()
+    runtime.bridge.error = RuntimeError("unexpected")
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tools = app.state.mcp_server._tool_manager.list_tools()
+    tool = next(tool for tool in tools if tool.name == "codex_start")
+
+    async with app.router.lifespan_context(app):
+        with pytest.raises(RuntimeError, match="unexpected"):
+            await tool.fn(str(tmp_path), "prompt")
 
 
 def test_configured_host_security_is_exposed_on_app(tmp_path) -> None:

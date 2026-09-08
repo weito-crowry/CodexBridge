@@ -390,6 +390,11 @@ class Bridge:
             raise BridgeError("thread response did not return a cwd")
         return self._path_policy.validate_cwd(cwd)
 
+    def _remember_thread_metadata(self, thread: Mapping[str, Any]) -> None:
+        thread_id = thread.get("id")
+        if isinstance(thread_id, str):
+            self._state.update_thread_metadata(thread_id, thread)
+
     async def _start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
         response = await self._app_server.request(
             "turn/start",
@@ -438,7 +443,7 @@ class Bridge:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
-        self._state.mark_loaded(thread_id, canonical_cwd)
+        self._state.mark_loaded(thread_id, canonical_cwd, thread)
         log_event("thread.start", thread_id=thread_id)
         return await self._start_turn(thread_id, prompt)
 
@@ -458,7 +463,7 @@ class Bridge:
                 raise BridgeError("thread/resume returned a malformed cwd")
             if self._path_policy.validate_cwd(resumed_cwd) != validated_cwd:
                 raise BridgeError("thread/resume returned a mismatched cwd")
-            self._state.mark_loaded(thread_id, validated_cwd)
+            self._state.mark_loaded(thread_id, validated_cwd, resumed_thread)
             log_event("thread.resume", thread_id=thread_id)
         return await self._start_turn(thread_id, prompt)
 
@@ -631,6 +636,7 @@ class Bridge:
             )
             thread = self._thread_from_response(metadata)
             validated_cwd = self._validate_thread_metadata(thread, thread_id)
+            self._remember_thread_metadata(thread)
             response = metadata
             if include_history:
                 response = await self._app_server.request(
@@ -639,6 +645,7 @@ class Bridge:
                 history_thread = self._thread_from_response(response)
                 if self._validate_thread_metadata(history_thread, thread_id) != validated_cwd:
                     raise BridgeError("thread history returned a mismatched cwd")
+                self._remember_thread_metadata(history_thread)
             return {"thread": _sanitize_thread_history(response.get("thread", {}))}
         params: dict[str, Any] = {"limit": limit}
         if cursor:
@@ -654,6 +661,7 @@ class Bridge:
                     self._validate_thread_metadata(row, row["id"])
                 except (BridgeError, ValueError):
                     continue
+                self._remember_thread_metadata(row)
                 visible.append(_sanitize(row))
         return {
             "threads": visible,
@@ -667,6 +675,7 @@ class Bridge:
         )
         thread = self._thread_from_response(response)
         validated_cwd = self._validate_thread_metadata(thread, thread_id)
+        self._remember_thread_metadata(thread)
         mode = thread.get("historyMode")
         history_mode = mode if mode == "paginated" else "legacy"
         return response, history_mode, validated_cwd
@@ -1042,6 +1051,12 @@ class Bridge:
         return {
             "thread_id": thread_id,
             "turn_id": turn_id,
+            "thread_metadata": {
+                "model_provider": None,
+                "model": None,
+                "reasoning_effort": None,
+                "cli_version": None,
+            },
             "state": "not_loaded",
             "latest_agent_message": "",
             "current_diff": "",

@@ -29,10 +29,24 @@ class FakeAppServer:
         self.methods.append(method)
         self.calls.append((method, params))
         if method == "thread/start":
-            return {"thread": {"id": "native-thread"}}
+            return {
+                "thread": {
+                    "id": "native-thread",
+                    "modelProvider": "openai",
+                    "model": "gpt-5",
+                    "reasoningEffort": "high",
+                    "cliVersion": "0.1.2",
+                }
+            }
         if method == "thread/resume":
             return {
-                "thread": {"id": params["threadId"]},
+                "thread": {
+                    "id": params["threadId"],
+                    "modelProvider": "openai",
+                    "model": "gpt-5",
+                    "reasoningEffort": "medium",
+                    "cliVersion": "0.1.2",
+                },
                 "cwd": self.thread_cwds[params["threadId"]],
             }
         if method == "turn/start":
@@ -104,6 +118,12 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
     assert result["thread_id"] == "native-thread"
     assert result["turn_id"] == "native-turn"
     assert result["state"] == "in_progress"
+    assert result["thread_metadata"] == {
+        "model_provider": "openai",
+        "model": "gpt-5",
+        "reasoning_effort": "high",
+        "cli_version": "0.1.2",
+    }
     assert app.methods == ["thread/start", "turn/start"]
     assert app.calls[1][1]["input"] == [{"type": "text", "text": "inspect this"}]
 
@@ -993,6 +1013,12 @@ async def test_status_for_unknown_thread_returns_not_loaded_without_state_creati
     assert result == {
         "thread_id": "unknown-thread",
         "turn_id": None,
+        "thread_metadata": {
+            "model_provider": None,
+            "model": None,
+            "reasoning_effort": None,
+            "cli_version": None,
+        },
         "state": "not_loaded",
         "latest_agent_message": "",
         "current_diff": "",

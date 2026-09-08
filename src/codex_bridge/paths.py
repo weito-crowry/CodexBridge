@@ -48,7 +48,7 @@ class AllowedPathPolicy:
                     return os.fspath(canonical)
             except ValueError:
                 continue
-        raise PathPolicyError("cwd is outside the allowed roots")
+        raise PathPolicyError("cwd is outside CODEX_BRIDGE_ALLOWED_ROOTS")
 
     def safe_relative_path(self, path: str) -> str:
         """Return an allowed-root-relative display path without exposing outside paths."""

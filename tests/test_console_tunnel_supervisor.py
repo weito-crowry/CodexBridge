@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtNetwork import QNetworkRequest
 from PySide6.QtWidgets import QApplication
 
-from codex_bridge.console.tunnel_supervisor import TunnelSupervisor
+from codex_bridge.console.tunnel_supervisor import TunnelSupervisor, parse_tunnel_version
 
 
 class Signal:
@@ -126,6 +127,72 @@ def _doctor(
     )
     supervisor.set_bridge_ready(True)
     return supervisor
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [(b"0.0.14\n", "0.0.14"), (b"tunnel-client 0.0.15\n", "0.0.15")],
+)
+def test_tunnel_version_parser_uses_leading_semantic_version(output, expected) -> None:
+    assert parse_tunnel_version(output) == expected
+
+
+@pytest.mark.parametrize("output", [b"", b"version unknown", b"0.0", b"0.0.13\n"])
+def test_tunnel_version_parser_rejects_malformed_or_old_versions(output) -> None:
+    with pytest.raises(ValueError):
+        parse_tunnel_version(output, minimum="0.0.14")
+
+
+def test_version_preflight_runs_before_doctor_and_rejects_old_client() -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    processes = [version, doctor]
+    supervisor = TunnelSupervisor(
+        executable="C:/tools/tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+
+    supervisor.set_bridge_ready(True)
+
+    assert version.arguments == ["--version"]
+    assert doctor.start_calls == 0
+    version.stdout = b"tunnel-client 0.0.9\n"
+    version.readyReadStandardOutput.emit()
+    version.finished.emit(0, 0)
+
+    assert supervisor.state == "failed"
+    assert supervisor.client_version is None
+    assert doctor.start_calls == 0
+    supervisor.close()
+
+
+def test_version_preflight_allows_supported_future_client_then_runs_doctor() -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    processes = [version, doctor]
+    supervisor = TunnelSupervisor(
+        executable="C:/tools/tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+
+    supervisor.set_bridge_ready(True)
+    version.stdout = b"tunnel-client 0.0.99\n"
+    version.readyReadStandardOutput.emit()
+    version.finished.emit(0, 0)
+
+    assert supervisor.client_version == "0.0.99"
+    assert doctor.arguments[:2] == ["doctor", "--profile"]
+    supervisor.close()
 
 
 def test_doctor_uses_direct_process_with_profile_and_ephemeral_health_option() -> None:

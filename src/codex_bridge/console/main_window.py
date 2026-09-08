@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from secrets import token_urlsafe
 from time import monotonic
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QStyle,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -47,6 +49,7 @@ _READINESS_INTERVAL_MS = 350
 _READINESS_TIMEOUT_SECONDS = 10.0
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
+_EXIT_TIMEOUT_SECONDS = 12.0
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
     "external": "Runtime: external",
@@ -90,11 +93,17 @@ class MainWindow(QMainWindow):
         self._tray_available = (
             QSystemTrayIcon.isSystemTrayAvailable() if tray_available is None else tray_available
         )
-        self._tray_factory = tray_factory or (lambda owner: QSystemTrayIcon(QIcon(), owner))
+        self._window_icon = self._standard_icon()
+        self.setWindowIcon(self._window_icon)
+        self._tray_factory = tray_factory or (
+            lambda owner: QSystemTrayIcon(self._window_icon, owner)
+        )
         self._quit_application = quit_application or self._quit_qapplication
         self.tray_icon: Any | None = None
         self.tray_menu: QMenu | None = None
         self._tray_actions: dict[str, QAction] = {}
+        self._tray_usable = False
+        self._tray_notified = False
         self._closing = False
         self._exit_finished = False
         self._selection_generation = 0
@@ -130,6 +139,10 @@ class MainWindow(QMainWindow):
         self._readiness_health_ok = False
         self._readiness_bridge_ready = False
         self._readiness_app_server_ready = False
+        self._exit_shutdown_pending = False
+        self._exit_deadline = 0.0
+        self._sigint_requested = False
+        self._tunnel_resolution_error: str | None = None
 
         self.setWindowTitle("CodexBridge Console")
         self.resize(1_400, 850)
@@ -138,6 +151,7 @@ class MainWindow(QMainWindow):
         self._build_timers()
         self._connect_runtime()
         self._build_tray()
+        self._update_tunnel_client_status()
         self._sync_tunnel_controls()
         self._sync_bridge_controls()
         self._set_unavailable_state()
@@ -149,34 +163,65 @@ class MainWindow(QMainWindow):
         return self._runtime_state
 
     def _new_codex_probe(self) -> CodexVersionProbe:
+        environ = dict(os.environ)
+        config_executable = None
+        if self._config.codex_executable_source in {"explicit", "environment"}:
+            if self._config.codex_executable is not None:
+                environ["CODEX_BRIDGE_CODEX_EXECUTABLE"] = self._config.codex_executable
+        elif self._config.codex_executable_source == "config":
+            config_executable = self._config.codex_executable
         try:
-            candidates = enumerate_candidates()
+            candidates = enumerate_candidates(environ, config_executable=config_executable)
         except CodexResolutionError:
             candidates = ()
         return CodexVersionProbe(candidates, parent=self)
 
     def _new_tunnel_supervisor(self) -> TunnelSupervisor:
-        environ = {}
-        if self._config.tunnel_executable is not None:
-            environ["CODEX_BRIDGE_TUNNEL_EXECUTABLE"] = self._config.tunnel_executable
+        environ: dict[str, str] = {}
+        config_executable = None
+        if self._config.tunnel_executable_source in {"explicit", "environment"}:
+            if self._config.tunnel_executable is not None:
+                environ["CODEX_BRIDGE_TUNNEL_EXECUTABLE"] = self._config.tunnel_executable
+        elif self._config.tunnel_executable_source == "config":
+            config_executable = self._config.tunnel_executable
         try:
-            candidates = enumerate_tunnel_candidates(environ=environ)
-        except TunnelResolutionError:
+            candidates = enumerate_tunnel_candidates(
+                environ=environ,
+                config_executable=config_executable,
+            )
+        except TunnelResolutionError as exc:
             candidates = ()
+            self._tunnel_resolution_error = str(exc)
         executable = candidates[0].path if candidates else None
         return TunnelSupervisor(
             executable=executable,
             profile=self._config.tunnel_profile,
+            resolution_source=candidates[0].source if candidates else "unavailable",
+            validate_version=True,
             parent=self,
         )
+
+    def _standard_icon(self) -> QIcon:
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            icon = application.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            if not icon.isNull():
+                return icon
+        return QIcon()
 
     def _build_ui(self) -> None:
         self.bridge_status_label = QLabel("Bridge: disconnected")
         self.app_server_status_label = QLabel("App Server: failed")
-        self.stream_status_label = QLabel("Stream: disconnected")
+        self.stream_status_label = QLabel("Stream: idle")
         self.codex_status_label = QLabel("Codex: checking")
         self.runtime_status_label = QLabel("Runtime: unavailable")
         self.tunnel_status_label = QLabel("Tunnel: unavailable")
+        self.tunnel_client_status_label = QLabel("Tunnel Client: unavailable")
+        config_state = "ready" if self._config.roots_ready else "error"
+        self.config_status_label = QLabel(
+            f"Config: {config_state} · roots {self._config.roots_count}"
+        )
+        self.config_status_label.setToolTip(self._config.roots_error or "Allowed roots are ready")
         self.start_bridge_button = QPushButton("Start Bridge")
         self.stop_bridge_button = QPushButton("Stop Bridge")
         self.restart_bridge_button = QPushButton("Restart Bridge")
@@ -195,6 +240,8 @@ class MainWindow(QMainWindow):
             self.codex_status_label,
             self.runtime_status_label,
             self.tunnel_status_label,
+            self.tunnel_client_status_label,
+            self.config_status_label,
         ):
             label.setObjectName("topStatus")
 
@@ -207,6 +254,8 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self.codex_status_label)
         status_bar.addWidget(self.runtime_status_label)
         status_bar.addWidget(self.tunnel_status_label)
+        status_bar.addWidget(self.tunnel_client_status_label)
+        status_bar.addWidget(self.config_status_label)
         status_bar.addWidget(self.start_bridge_button)
         status_bar.addWidget(self.stop_bridge_button)
         status_bar.addWidget(self.restart_bridge_button)
@@ -294,10 +343,19 @@ class MainWindow(QMainWindow):
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
 
     def _build_tray(self) -> None:
-        if not self._tray_available:
+        if not self._tray_available or self._window_icon.isNull():
             return
-        self.tray_icon = self._tray_factory(self)
-        self.tray_icon.setToolTip("CodexBridge Console")
+        try:
+            self.tray_icon = self._tray_factory(self)
+            set_icon = getattr(self.tray_icon, "setIcon", None)
+            if not callable(set_icon):
+                self.tray_icon = None
+                return
+            set_icon(self._window_icon)
+            self.tray_icon.setToolTip("CodexBridge Console")
+        except Exception:
+            self.tray_icon = None
+            return
         menu = QMenu(self)
         self.tray_menu = menu
         for text, callback in (
@@ -333,9 +391,16 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self._begin_exit)
         menu.addAction(exit_action)
         self._tray_actions["Exit"] = exit_action
-        self.tray_icon.setContextMenu(menu)
-        self.tray_icon.activated.connect(self._on_tray_activated)
-        self.tray_icon.show()
+        try:
+            self.tray_icon.setContextMenu(menu)
+            self.tray_icon.activated.connect(self._on_tray_activated)
+            self.tray_icon.show()
+        except Exception:
+            self.tray_icon = None
+            self.tray_menu = None
+            self._tray_actions.clear()
+            return
+        self._tray_usable = True
 
     def _show_console(self) -> None:
         self.show()
@@ -365,13 +430,44 @@ class MainWindow(QMainWindow):
         self.stop_confirmation_timer = QTimer(self)
         self.stop_confirmation_timer.setInterval(_STOP_CONFIRMATION_INTERVAL_MS)
         self.stop_confirmation_timer.timeout.connect(self._on_stop_confirmation_tick)
+        self.exit_timer = QTimer(self)
+        self.exit_timer.setSingleShot(True)
+        self.exit_timer.setInterval(int(_EXIT_TIMEOUT_SECONDS * 1_000))
+        self.exit_timer.timeout.connect(self._on_exit_timeout)
+        self.signal_timer = QTimer(self)
+        self.signal_timer.setInterval(50)
+        self.signal_timer.timeout.connect(self._on_signal_tick)
         self.health_timer.start()
         self.thread_timer.start()
+        self.signal_timer.start()
+
+    def request_sigint(self) -> None:
+        self._sigint_requested = True
+
+    def _on_signal_tick(self) -> None:
+        if self._sigint_requested:
+            self._sigint_requested = False
+            self._begin_exit()
 
     def _apply_tunnel_state(self, state: str) -> None:
         if not self._closing:
             self.tunnel_status_label.setText(tunnel_state_label(state))
+            self._update_tunnel_client_status()
             self._update_bridge_controls()
+
+    def _update_tunnel_client_status(self) -> None:
+        version = getattr(self._tunnel, "client_version", None)
+        source = getattr(self._tunnel, "resolution_source", "unavailable")
+        executable = getattr(self._tunnel, "executable", None)
+        if version is None:
+            text = "Tunnel Client: unavailable"
+        else:
+            text = f"Tunnel Client: {version} · {source}"
+        self.tunnel_client_status_label.setText(text)
+        if executable is not None:
+            self.tunnel_client_status_label.setToolTip(executable)
+        if self._tunnel_resolution_error is not None:
+            self.tunnel_client_status_label.setToolTip(self._tunnel_resolution_error)
 
     def _apply_tunnel_message(self, message: str) -> None:
         if not self._closing:
@@ -440,12 +536,25 @@ class MainWindow(QMainWindow):
     def _restart_tunnel(self) -> None:
         self._tunnel.restart()
 
+    def _sync_empty_state(self) -> None:
+        if not self._bridge_ready:
+            location = f"{self._config.host}:{self._config.port}"
+            self.history_pane.set_empty_state(
+                f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
+            )
+            self.activity_pane.set_empty_state("Bridge unavailable")
+            return
+        if getattr(self.thread_pane, "thread_count", 0) == 0:
+            self.history_pane.set_empty_state("No threads found.")
+            self.activity_pane.set_empty_state("No thread selected.")
+            return
+        if self._selected_thread_id is None:
+            self.history_pane.set_empty_state("Select a thread to view history.")
+            self.activity_pane.set_empty_state("Select a thread to view activity.")
+
     def _set_unavailable_state(self) -> None:
-        location = f"{self._config.host}:{self._config.port}"
-        self.history_pane.set_empty_state(
-            f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
-        )
-        self.activity_pane.set_empty_state("Bridge unavailable")
+        self._bridge_ready = False
+        self._sync_empty_state()
 
     def refresh(self) -> None:
         self._request_health()
@@ -476,6 +585,7 @@ class MainWindow(QMainWindow):
     def _update_start_button(self) -> None:
         enabled = (
             not self._closing
+            and self._config.roots_ready
             and self._codex_resolution is not None
             and self._health_observed
             and self._status_observed
@@ -523,6 +633,7 @@ class MainWindow(QMainWindow):
                 codex_executable=codex_executable,
                 ui_port=self._config.port,
                 control_token=control_token,
+                allowed_roots=self._config.allowed_roots,
             )
         except Exception:
             self._launch_in_progress = False
@@ -653,8 +764,12 @@ class MainWindow(QMainWindow):
     def _on_tunnel_stopped_for_bridge(self) -> None:
         self._request_bridge_shutdown()
 
-    def _request_bridge_shutdown(self) -> None:
-        if self._closing or self._control_request_pending or self._stop_confirmation_active:
+    def _request_bridge_shutdown(self, *, allow_closing: bool = False) -> None:
+        if (
+            (self._closing and not allow_closing)
+            or self._control_request_pending
+            or self._stop_confirmation_active
+        ):
             return
         token = self._control_token
         if token is None:
@@ -684,6 +799,9 @@ class MainWindow(QMainWindow):
         self._control_request_pending = False
         self._stop_confirmation_active = False
         self.stop_confirmation_timer.stop()
+        if self._exit_shutdown_pending:
+            self._finish_exit()
+            return
         self._bridge_transition = False
         self._set_runtime_state("control_failed")
         self.bottom_status_label.setText("Bridge control request failed")
@@ -694,6 +812,9 @@ class MainWindow(QMainWindow):
             and self._stop_confirmation_health_unavailable
             and self._stop_confirmation_status_unavailable
         ):
+            if self._exit_shutdown_pending:
+                self._finish_exit()
+                return
             self._confirm_bridge_stopped()
 
     def _on_stop_confirmation_tick(self) -> None:
@@ -704,10 +825,16 @@ class MainWindow(QMainWindow):
             self._stop_confirmation_health_unavailable
             and self._stop_confirmation_status_unavailable
         ):
+            if self._exit_shutdown_pending:
+                self._finish_exit()
+                return
             self._confirm_bridge_stopped()
         elif monotonic() >= self._stop_confirmation_deadline:
             self._stop_confirmation_active = False
             self.stop_confirmation_timer.stop()
+            if self._exit_shutdown_pending:
+                self._finish_exit()
+                return
             self._bridge_transition = False
             self._stop_outcome_uncertain = True
             self._health_observed = False
@@ -848,7 +975,8 @@ class MainWindow(QMainWindow):
         self._client.stop_stream()
         self.selected_status_timer.stop()
         if thread_id is None:
-            self._set_unavailable_state()
+            self.stream_status_label.setText("Stream: idle")
+            self._sync_empty_state()
             return
         self.history_pane.set_empty_state("Loading history…")
         self.activity_pane.set_empty_state("Loading activity…")
@@ -890,6 +1018,7 @@ class MainWindow(QMainWindow):
             if self._health_ok:
                 self.bottom_status_label.setText("Bridge reachable")
             self._apply_runtime_observation()
+            self._sync_empty_state()
             return
         if key == "bridge-status":
             self._status_observed = True
@@ -911,6 +1040,7 @@ class MainWindow(QMainWindow):
                 self.bridge_status_label.setText("Bridge: disconnected")
                 self.app_server_status_label.setText("App Server: failed")
                 self._apply_runtime_observation()
+            self._sync_empty_state()
             return
         if key == "launch:health":
             self._apply_launch_health(payload)
@@ -924,6 +1054,7 @@ class MainWindow(QMainWindow):
                 self.thread_pane.set_threads(threads)
                 if not threads:
                     self.thread_pane.set_empty_state("No threads found.")
+                self._sync_empty_state()
             return
 
         selection = self._is_current_selection(key)
@@ -1030,8 +1161,7 @@ class MainWindow(QMainWindow):
             self.app_server_status_label.setText("App Server: failed")
             self.bottom_status_label.setText(message)
             self._apply_runtime_observation()
-            if self._selected_thread_id is None:
-                self._set_unavailable_state()
+            self._sync_empty_state()
             return
         selection = self._is_current_selection(key)
         if selection is None:
@@ -1059,7 +1189,10 @@ class MainWindow(QMainWindow):
     def _apply_stream_state(self, generation: int, state: str) -> None:
         if self._closing or generation != self._selection_generation:
             return
-        self.stream_status_label.setText(f"Stream: {state}")
+        if state == "disconnected" and self._selected_thread_id is None:
+            self.stream_status_label.setText("Stream: idle")
+        else:
+            self.stream_status_label.setText(f"Stream: {state}")
         if state == "disconnected" and self._selected_thread_id is not None:
             self._schedule_reconnect(generation)
 
@@ -1085,8 +1218,19 @@ class MainWindow(QMainWindow):
         if self._closing:
             event.accept()
             return
-        if self._tray_available:
+        if self._tray_usable:
             self.hide()
+            if not self._tray_notified and self.tray_icon is not None:
+                show_message = getattr(self.tray_icon, "showMessage", None)
+                if callable(show_message):
+                    try:
+                        show_message(
+                            "CodexBridge Console",
+                            "Console is still running in the system tray.",
+                        )
+                    except Exception:
+                        pass
+                self._tray_notified = True
             event.ignore()
             return
         self._begin_exit()
@@ -1103,14 +1247,37 @@ class MainWindow(QMainWindow):
         self.readiness_timer.stop()
         self.stop_confirmation_timer.stop()
         self._codex_probe.abort()
-        self._launcher.close()
-        self._client.abort_all()
-        self._tunnel.close(on_finished=self._finish_exit)
+        self._exit_deadline = monotonic() + _EXIT_TIMEOUT_SECONDS
+        self.exit_timer.start()
+        self._tunnel.close(on_finished=self._on_exit_tunnel_stopped)
+
+    def _on_exit_tunnel_stopped(self) -> None:
+        if self._exit_finished or self._exit_shutdown_pending:
+            return
+        if self._detached_launch_started and self._control_token is not None:
+            self._exit_shutdown_pending = True
+            self._request_bridge_shutdown(allow_closing=True)
+            return
+        self._finish_exit()
+
+    def _on_exit_timeout(self) -> None:
+        self._finish_exit()
 
     def _finish_exit(self) -> None:
         if self._exit_finished:
             return
         self._exit_finished = True
+        self.exit_timer.stop()
+        self.signal_timer.stop()
+        self.stop_confirmation_timer.stop()
+        self._client.abort_all()
+        self._launcher.close()
         if self.tray_icon is not None:
-            self.tray_icon.hide()
+            try:
+                self.tray_icon.hide()
+                delete_later = getattr(self.tray_icon, "deleteLater", None)
+                if callable(delete_later):
+                    delete_later()
+            except Exception:
+                pass
         self._quit_application()
