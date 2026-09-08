@@ -60,11 +60,17 @@ class BridgeRuntime:
 
 def prepare_config(config: BridgeConfig) -> BridgeConfig:
     allowed_roots = validate_allowed_roots(config.allowed_roots)
+    explicit_executable = (
+        config.codex_executable if config.codex_executable_source == "explicit" else None
+    )
     configured_executable = (
-        config.codex_executable if config.codex_executable_source != "default" else None
+        config.codex_executable if config.codex_executable_source == "config" else None
     )
     try:
-        resolution = resolve_codex_executable(config_executable=configured_executable)
+        resolution = resolve_codex_executable(
+            explicit_executable=explicit_executable,
+            config_executable=configured_executable,
+        )
     except CodexResolutionError as exc:
         raise ConfigurationError(str(exc)) from exc
     return replace(

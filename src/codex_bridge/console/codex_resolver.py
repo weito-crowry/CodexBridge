@@ -35,12 +35,14 @@ __all__ = [
 def enumerate_candidates(
     environ: Mapping[str, str] | None = None,
     *,
+    explicit_executable: str | None = None,
     config_executable: str | None = None,
     platform: str | None = None,
     which: Callable[[str], str | None] | None = None,
 ) -> tuple[CodexCandidate, ...]:
     return _enumerate_candidates(
         environ,
+        explicit_executable=explicit_executable,
         config_executable=config_executable,
         platform=platform,
         which=which or shutil.which,

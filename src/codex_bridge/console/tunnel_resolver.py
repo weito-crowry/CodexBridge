@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sys
+import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,7 +78,15 @@ def _checkout_root(repository_root: str | os.PathLike[str] | None) -> Path | Non
         if repository_root is not None
         else Path(__file__).resolve().parents[3]
     )
-    if not ((root / "pyproject.toml").is_file() or (root / "src" / "codex_bridge").is_dir()):
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file() or not (root / "src" / "codex_bridge").is_dir():
+        return None
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    project = document.get("project")
+    if not isinstance(project, dict) or project.get("name") != "codexbridge":
         return None
     return root
 

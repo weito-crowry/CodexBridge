@@ -8,7 +8,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_bridge.config import BridgeConfig, ConfigurationError
 from codex_bridge.paths import PathPolicyError
-from codex_bridge.server import build_runtime, create_app
+from codex_bridge.server import build_runtime, create_app, prepare_config
 
 
 @dataclass
@@ -47,6 +47,24 @@ def config(tmp_path) -> BridgeConfig:
         wait_max_seconds=30.0,
         shutdown_grace_seconds=3.0,
     )
+
+
+def test_prepare_config_keeps_cli_codex_before_process_environment(tmp_path, monkeypatch) -> None:
+    cli_executable = tmp_path / "cli-codex.exe"
+    env_executable = tmp_path / "env-codex.exe"
+    cli_executable.write_bytes(b"")
+    env_executable.write_bytes(b"")
+    monkeypatch.setenv("CODEX_BRIDGE_CODEX_EXECUTABLE", str(env_executable))
+
+    settings = BridgeConfig.from_sources(
+        explicit_allowed_roots=(str(tmp_path),),
+        explicit_codex_executable=str(cli_executable),
+        environ={},
+    )
+
+    prepared = prepare_config(settings)
+
+    assert prepared.codex_executable == str(cli_executable)
 
 
 def test_server_registers_exactly_nine_tools(tmp_path) -> None:

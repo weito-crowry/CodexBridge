@@ -85,6 +85,7 @@ def test_tunnel_resolver_uses_checkout_local_before_path_and_skips_unrelated_pro
     local.parent.mkdir(parents=True)
     local.write_bytes(b"")
     (repo / "pyproject.toml").write_text("[project]\nname='codexbridge'\n", encoding="utf-8")
+    (repo / "src" / "codex_bridge").mkdir(parents=True)
     unrelated = tmp_path / "other" / ".tools" / "tunnel-client" / "tunnel-client.exe"
     unrelated.parent.mkdir(parents=True)
     unrelated.write_bytes(b"")
@@ -99,6 +100,45 @@ def test_tunnel_resolver_uses_checkout_local_before_path_and_skips_unrelated_pro
 
     assert candidates[0] == TunnelCandidate(str(local), "local")
     assert all(str(unrelated) != candidate.path for candidate in candidates)
+
+
+@pytest.mark.parametrize(
+    "marker_setup",
+    [
+        pytest.param(
+            lambda repo: (repo / "pyproject.toml").write_text(
+                "[project]\nname='other-project'\n", encoding="utf-8"
+            ),
+            id="wrong-project-name",
+        ),
+        pytest.param(
+            lambda repo: (repo / "src" / "codex_bridge").mkdir(parents=True),
+            id="src-only",
+        ),
+        pytest.param(
+            lambda repo: (repo / "pyproject.toml").write_text("[project\n", encoding="utf-8"),
+            id="invalid-pyproject",
+        ),
+    ],
+)
+def test_checkout_local_requires_codexbridge_markers_and_falls_back_to_path(
+    tmp_path: Path, marker_setup
+) -> None:
+    repo = tmp_path / "repo"
+    local = repo / ".tools" / "tunnel-client" / "tunnel-client.exe"
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"")
+    marker_setup(repo)
+    path_candidate = tmp_path / "path-tunnel.exe"
+    path_candidate.write_bytes(b"")
+
+    candidates = enumerate_candidates(
+        repository_root=repo,
+        platform="win32",
+        which=lambda _name: str(path_candidate),
+    )
+
+    assert candidates == (TunnelCandidate(str(path_candidate), "path"),)
 
 
 def test_invalid_config_tunnel_path_fails_without_path_fallback(tmp_path: Path) -> None:

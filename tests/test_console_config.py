@@ -35,6 +35,16 @@ def test_cli_port_has_priority_over_environment() -> None:
     assert config.port == 8124
 
 
+def test_cli_codex_executable_has_priority_over_environment() -> None:
+    config = ConsoleConfig.from_sources(
+        explicit_codex_executable="cli-codex",
+        environ={"CODEX_BRIDGE_CODEX_EXECUTABLE": "env-codex"},
+    )
+
+    assert config.codex_executable == "cli-codex"
+    assert config.codex_executable_source == "explicit"
+
+
 @pytest.mark.parametrize("value", [0, -1, 65536, "not-a-port", True, None])
 def test_invalid_console_ports_are_rejected(value) -> None:
     with pytest.raises(ConsoleConfigurationError):

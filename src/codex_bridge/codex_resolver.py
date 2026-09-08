@@ -121,12 +121,19 @@ def _native_app_candidates(local_app_data: str, *, windows: bool) -> list[CodexC
 def enumerate_candidates(
     environ: Mapping[str, str] | None = None,
     *,
+    explicit_executable: str | None = None,
     config_executable: str | None = None,
     platform: str | None = None,
     which: Callable[[str], str | None] = shutil.which,
 ) -> tuple[CodexCandidate, ...]:
     values = os.environ if environ is None else environ
     windows = _is_windows(platform)
+    if explicit_executable is not None:
+        return (
+            _explicit_candidate(
+                explicit_executable, source="explicit", windows=windows, which=which
+            ),
+        )
     if _CODEX_OVERRIDE in values:
         return (
             _explicit_candidate(
@@ -168,6 +175,7 @@ def enumerate_candidates(
 
 def resolve_codex_executable(
     *,
+    explicit_executable: str | None = None,
     config_executable: str | None,
     environ: Mapping[str, str] | None = None,
     platform: str | None = None,
@@ -175,6 +183,7 @@ def resolve_codex_executable(
 ) -> CodexResolution:
     candidates = enumerate_candidates(
         environ,
+        explicit_executable=explicit_executable,
         config_executable=config_executable,
         platform=platform,
         which=which,

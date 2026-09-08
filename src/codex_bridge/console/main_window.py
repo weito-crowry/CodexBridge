@@ -164,14 +164,21 @@ class MainWindow(QMainWindow):
 
     def _new_codex_probe(self) -> CodexVersionProbe:
         environ = dict(os.environ)
+        explicit_executable = None
         config_executable = None
-        if self._config.codex_executable_source in {"explicit", "environment"}:
+        if self._config.codex_executable_source == "explicit":
+            explicit_executable = self._config.codex_executable
+        elif self._config.codex_executable_source == "environment":
             if self._config.codex_executable is not None:
                 environ["CODEX_BRIDGE_CODEX_EXECUTABLE"] = self._config.codex_executable
         elif self._config.codex_executable_source == "config":
             config_executable = self._config.codex_executable
         try:
-            candidates = enumerate_candidates(environ, config_executable=config_executable)
+            candidates = enumerate_candidates(
+                environ,
+                explicit_executable=explicit_executable,
+                config_executable=config_executable,
+            )
         except CodexResolutionError:
             candidates = ()
         return CodexVersionProbe(candidates, parent=self)
