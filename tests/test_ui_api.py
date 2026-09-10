@@ -62,6 +62,10 @@ class FakeBridge:
             "backwards_cursor": "back",
         }
 
+    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]:
+        self.calls.append(("rename_thread", (thread_id, name), {}))
+        return {"thread": {"id": thread_id, "name": name}}
+
     async def read_thread_turns(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("turns", args, kwargs))
         return {
@@ -118,11 +122,12 @@ def _request(
     *,
     method: str = "GET",
     authorization: str | None = None,
+    body: bytes = b"",
 ) -> Request:
     headers = [(b"host", host.encode())]
     if authorization is not None:
         headers.append((b"authorization", authorization.encode()))
-    return Request(
+    request = Request(
         {
             "type": "http",
             "method": method,
@@ -132,6 +137,8 @@ def _request(
             "path_params": path_params or {},
         }
     )
+    request._body = body
+    return request
 
 
 def _route(app, path: str):
@@ -197,6 +204,27 @@ async def test_ui_api_get_endpoints_delegate_to_read_only_bridge(tmp_path) -> No
         "items",
         "status",
     ]
+
+
+@pytest.mark.asyncio
+async def test_ui_api_rename_delegates_target_and_name_to_bridge(tmp_path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _route(app, "/ui-api/threads/{thread_id}/name").endpoint(
+        _request(
+            "/ui-api/threads/thread-b/name",
+            path_params={"thread_id": "thread-b"},
+            method="POST",
+            body=b'{"name":"Renamed"}',
+        )
+    )
+
+    assert response.status_code == 200
+    assert await _json_response(response) == {
+        "thread_id": "thread-b",
+        "name": "Renamed",
+    }
+    assert bridge.calls[-1] == ("rename_thread", ("thread-b", "Renamed"), {})
 
 
 @pytest.mark.asyncio
@@ -344,13 +372,16 @@ async def test_ui_status_reports_failed_app_server_without_diagnostics(tmp_path)
     }
 
 
-def test_ui_app_has_only_get_routes_and_no_mcp_route(tmp_path) -> None:
+def test_ui_app_has_only_read_routes_plus_thread_rename_and_no_mcp_route(tmp_path) -> None:
     app = create_ui_app(FakeBridge(), ActivityStore(), config(tmp_path))
 
     route_paths = {route.path for route in app.routes if hasattr(route, "path")}
     assert "/mcp" not in route_paths
     assert all(
-        route.methods <= {"GET", "HEAD"} for route in app.routes if hasattr(route, "methods")
+        route.methods <= {"GET", "HEAD"}
+        or (route.path == "/ui-api/threads/{thread_id}/name" and route.methods == {"POST"})
+        for route in app.routes
+        if hasattr(route, "methods")
     )
     assert all(middleware.cls.__name__ != "CORSMiddleware" for middleware in app.user_middleware)
 

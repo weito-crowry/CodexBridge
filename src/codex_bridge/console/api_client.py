@@ -109,6 +109,27 @@ class ApiClient(QObject):
         reply.finished.connect(lambda key=key, reply=reply: self._finish_json(key, reply))
         return True
 
+    def post_json(
+        self,
+        path: str,
+        payload: Mapping[str, object],
+        *,
+        key: str,
+    ) -> bool:
+        if key in self._json_replies:
+            return False
+        try:
+            request = self._request(self._url(path))
+            request.setRawHeader(b"Content-Type", b"application/json")
+            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            reply = self._manager.post(request, body)
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.json_failed.emit(key, "Request failed")
+            return False
+        self._json_replies[key] = reply
+        reply.finished.connect(lambda key=key, reply=reply: self._finish_json(key, reply))
+        return True
+
     def _finish_json(self, key: str, reply: Any) -> None:
         active_reply = self._json_replies.get(key)
         if active_reply is None or active_reply is not reply:

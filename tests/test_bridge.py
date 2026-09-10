@@ -58,6 +58,8 @@ class FakeAppServer:
             return {"turnId": params["expectedTurnId"]}
         if method == "turn/interrupt":
             return {}
+        if method == "thread/name/set":
+            return {"thread": {"id": params["threadId"], "name": params["name"]}}
         if method == "thread/list":
             return {"data": self.thread_list}
         if method == "thread/read":
@@ -260,6 +262,19 @@ async def test_threads_list_and_read_are_bounded_and_sanitized(allowed_dir) -> N
         "cwd": str(allowed_dir.resolve()),
         "turns": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_calls_native_name_set_for_supplied_thread(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    result = await bridge.rename_thread("right-clicked", "Renamed")
+
+    assert result == {"thread": {"id": "right-clicked", "name": "Renamed"}}
+    assert app.calls[-1] == (
+        "thread/name/set",
+        {"threadId": "right-clicked", "name": "Renamed"},
+    )
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QSplitter
@@ -40,9 +41,14 @@ class FakeClient:
         self.stopped_streams = 0
         self.aborted_all = False
         self.control_requests: list[tuple[str, str]] = []
+        self.json_posts: list[tuple[str, str, dict[str, object]]] = []
 
     def get_json(self, path: str, *, key: str, query: dict[str, object] | None = None) -> bool:
         self.requests.append((key, path, query))
+        return True
+
+    def post_json(self, path: str, payload: dict[str, object], *, key: str) -> bool:
+        self.json_posts.append((key, path, payload))
         return True
 
     def abort_json_group(self, prefix: str) -> None:
@@ -306,6 +312,54 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     assert current.data(Qt.ItemDataRole.UserRole) == "thread-a"
     assert current.text() == "Renamed"
     assert current.font().weight() == active_weight
+    window.close()
+
+
+def test_rename_uses_right_clicked_thread_and_updates_after_success(monkeypatch) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result(
+        "threads",
+        {
+            "threads": [
+                {"id": "thread-a", "name": "A"},
+                {"id": "thread-b", "name": "B"},
+            ]
+        },
+    )
+    window.select_thread("thread-a")
+    monkeypatch.setattr(
+        "codex_bridge.console.main_window.QInputDialog.getText",
+        lambda *args: ("Renamed", True),
+    )
+
+    window.thread_pane.thread_rename_requested.emit("thread-b")
+
+    assert window._selected_thread_id == "thread-a"
+    assert client.json_posts == [
+        ("rename:thread-b", "/ui-api/threads/thread-b/name", {"name": "Renamed"})
+    ]
+    client.result("rename:thread-b", {})
+
+    assert window.thread_pane.list_widget.item(1).text() == "Renamed"
+    window.close()
+
+
+@pytest.mark.parametrize("dialog_result", [("", False), ("   ", True)])
+def test_rename_cancel_or_blank_does_not_call_api(monkeypatch, dialog_result) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("threads", {"threads": [{"id": "thread-b", "name": "B"}]})
+    monkeypatch.setattr(
+        "codex_bridge.console.main_window.QInputDialog.getText",
+        lambda *args: dialog_result,
+    )
+
+    window.thread_pane.thread_rename_requested.emit("thread-b")
+
+    assert client.json_posts == []
     window.close()
 
 

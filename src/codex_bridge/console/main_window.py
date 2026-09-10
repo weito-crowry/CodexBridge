@@ -12,7 +12,9 @@ from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QPushButton,
@@ -163,6 +165,7 @@ class MainWindow(QMainWindow):
         self._turn_model_metadata: dict[str, Mapping[str, object]] = {}
         self._turn_statuses: dict[str, str] = {}
         self._active_thread_ids: set[str] = set()
+        self._pending_rename_names: dict[str, str] = {}
         self._next_cursor: str | None = None
         self._stream_sync_pending = False
         self._reconnect_scheduled = False
@@ -390,6 +393,7 @@ class MainWindow(QMainWindow):
         self._client.control_failed.connect(self._apply_control_failure)
         self.thread_pane.refresh_requested.connect(self.refresh)
         self.thread_pane.thread_selected.connect(self.select_thread)
+        self.thread_pane.thread_rename_requested.connect(self._rename_thread)
         self.history_pane.older_requested.connect(self.load_older)
 
     def _connect_runtime(self) -> None:
@@ -994,6 +998,26 @@ class MainWindow(QMainWindow):
     def _request_threads(self) -> None:
         self._client.get_json("/ui-api/threads", key="threads", query={"limit": 100})
 
+    def _rename_thread(self, thread_id: str) -> None:
+        name, accepted = QInputDialog.getText(
+            self,
+            "名前を変更",
+            "名前:",
+            QLineEdit.EchoMode.Normal,
+            self.thread_pane.thread_name(thread_id),
+        )
+        if not accepted or not name.strip():
+            return
+        key = f"rename:{thread_id}"
+        if key in self._pending_rename_names:
+            return
+        if self._client.post_json(
+            f"/ui-api/threads/{quote(thread_id, safe='')}/name",
+            {"name": name},
+            key=key,
+        ):
+            self._pending_rename_names[key] = name
+
     def _thread_path(self, suffix: str = "") -> str:
         assert self._selected_thread_id is not None
         return f"/ui-api/threads/{quote(self._selected_thread_id, safe='')}{suffix}"
@@ -1064,6 +1088,11 @@ class MainWindow(QMainWindow):
         return parsed
 
     def apply_json_result(self, key: str, payload: object) -> None:
+        if key.startswith("rename:"):
+            name = self._pending_rename_names.pop(key, None)
+            if name is not None:
+                self.thread_pane.update_thread_name(key.removeprefix("rename:"), name)
+            return
         if self._stop_confirmation_active and key in {"health", "bridge-status"}:
             if key == "health":
                 self._health_observed = True
@@ -1220,6 +1249,9 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_json_error(self, key: str, message: str) -> None:
+        if key.startswith("rename:"):
+            self._pending_rename_names.pop(key, None)
+            return
         if key == "launch:health":
             self._readiness_health_ok = False
             return

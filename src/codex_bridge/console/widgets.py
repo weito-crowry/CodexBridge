@@ -4,15 +4,17 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QFont, QPalette
+from PySide6.QtCore import QDir, QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -203,6 +205,7 @@ def activity_row(activity: Mapping[str, object]) -> str:
 class ThreadListPane(QWidget):
     refresh_requested = Signal()
     thread_selected = Signal(str)
+    thread_rename_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -218,6 +221,8 @@ class ThreadListPane(QWidget):
         self.filter_edit.textChanged.connect(self._render)
         self.list_widget.itemActivated.connect(self._emit_selected)
         self.list_widget.itemClicked.connect(self._emit_selected)
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
         header = QHBoxLayout()
         header.addWidget(title)
         header.addStretch(1)
@@ -285,6 +290,106 @@ class ThreadListPane(QWidget):
         thread_id = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(thread_id, str):
             self.thread_selected.emit(thread_id)
+
+    def _thread_for_id(self, thread_id: str) -> dict[str, object] | None:
+        for thread in self._threads:
+            if thread.get("id") == thread_id:
+                return thread
+        return None
+
+    def thread_name(self, thread_id: str) -> str:
+        thread = self._thread_for_id(thread_id)
+        return _safe_text(thread.get("name")) if thread is not None else ""
+
+    def update_thread_name(self, thread_id: str, name: str) -> None:
+        thread = self._thread_for_id(thread_id)
+        if thread is None:
+            return
+        thread["name"] = name
+        self._render()
+
+    @staticmethod
+    def _cached_cwd(value: object) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value
+
+    @staticmethod
+    def _openable_cwd(value: object) -> str | None:
+        cwd = ThreadListPane._cached_cwd(value)
+        if cwd is None:
+            return None
+        if not QDir.isAbsolutePath(cwd) or not QDir(cwd).exists():
+            return None
+        return cwd
+
+    def _thread_info_text(self, thread_id: str) -> str | None:
+        thread = self._thread_for_id(thread_id)
+        if thread is None:
+            return None
+        lines = [
+            f"Name: {_safe_text(thread.get('name')) or 'New スレッド'}",
+            f"Thread ID: {thread_id}",
+        ]
+        cwd = self._cached_cwd(thread.get("cwd"))
+        if cwd is not None:
+            lines.append(f"CWD: {cwd}")
+        lines.append(f"Status: {'active' if thread_id in self._active_thread_ids else 'inactive'}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _copy_text(text: str) -> None:
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            application.clipboard().setText(text)
+
+    def _open_cwd(self, thread_id: str) -> None:
+        thread = self._thread_for_id(thread_id)
+        cwd = self._openable_cwd(thread.get("cwd") if thread is not None else None)
+        if cwd is None:
+            return
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(cwd))
+        except Exception:
+            return
+
+    def _context_menu_for_item(self, item: QListWidgetItem) -> QMenu:
+        menu = QMenu(self)
+        thread_id = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(thread_id, str):
+            return menu
+
+        rename_action = menu.addAction("名前を変更...")
+        rename_action.triggered.connect(
+            lambda _checked=False, thread_id=thread_id: self.thread_rename_requested.emit(thread_id)
+        )
+        copy_id_action = menu.addAction("スレッドIDをコピー")
+        copy_id_action.triggered.connect(
+            lambda _checked=False, thread_id=thread_id: self._copy_text(thread_id)
+        )
+        copy_info_action = menu.addAction("スレッド情報をコピー")
+        copy_info_action.triggered.connect(
+            lambda _checked=False, thread_id=thread_id: self._copy_text(
+                self._thread_info_text(thread_id) or ""
+            )
+        )
+        menu.addSeparator()
+        open_cwd_action = menu.addAction("作業フォルダを開く")
+        thread = self._thread_for_id(thread_id)
+        open_cwd_action.setEnabled(
+            self._openable_cwd(thread.get("cwd") if thread is not None else None) is not None
+        )
+        open_cwd_action.triggered.connect(
+            lambda _checked=False, thread_id=thread_id: self._open_cwd(thread_id)
+        )
+        return menu
+
+    def _show_context_menu(self, position: QPoint) -> None:
+        item = self.list_widget.itemAt(position)
+        if item is None:
+            return
+        menu = self._context_menu_for_item(item)
+        menu.exec(self.list_widget.viewport().mapToGlobal(position))
 
     def set_empty_state(self, text: str) -> None:
         self.list_widget.clear()

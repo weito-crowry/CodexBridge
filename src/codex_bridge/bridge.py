@@ -694,6 +694,13 @@ class Bridge:
             "backwards_cursor": response.get("backwardsCursor"),
         }
 
+    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("name must not be blank")
+        return await self._app_server.request(
+            "thread/name/set", {"threadId": thread_id, "name": name}
+        )
+
     async def _history_metadata(self, thread_id: str) -> tuple[dict[str, Any], str, str]:
         response = await self._app_server.request(
             "thread/read", {"threadId": thread_id, "includeTurns": False}

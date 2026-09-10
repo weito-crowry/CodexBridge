@@ -74,6 +74,82 @@ def test_thread_list_refresh_preserves_selected_thread_id() -> None:
     assert current.font().weight() > pane.list_widget.item(0).font().weight()
 
 
+def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "selected", "name": "Selected", "cwd": str(tmp_path / "selected")},
+            {
+                "id": "target",
+                "name": "Target",
+                "cwd": str(tmp_path),
+                "preview": "must not copy",
+            },
+        ],
+        active_thread_ids={"target"},
+    )
+    pane.list_widget.setCurrentRow(0)
+    renamed: list[str] = []
+    pane.thread_rename_requested.connect(renamed.append)
+
+    menu = pane._context_menu_for_item(pane.list_widget.item(1))
+    actions = menu.actions()
+
+    assert [action.text() for action in actions] == [
+        "名前を変更...",
+        "スレッドIDをコピー",
+        "スレッド情報をコピー",
+        "",
+        "作業フォルダを開く",
+    ]
+    actions[0].trigger()
+    assert renamed == ["target"]
+
+    actions[1].trigger()
+    assert application.clipboard().text() == "target"
+    application.processEvents()
+
+    actions[2].trigger()
+    assert application.clipboard().text() == (
+        f"Name: Target\nThread ID: target\nCWD: {tmp_path}\nStatus: active"
+    )
+    assert "must not copy" not in application.clipboard().text()
+    assert pane.list_widget.currentItem().data(Qt.ItemDataRole.UserRole) == "selected"
+
+
+def test_thread_context_menu_disables_folder_action_without_valid_cwd(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "target", "name": "Target"}])
+
+    menu = pane._context_menu_for_item(pane.list_widget.item(0))
+
+    assert menu.actions()[-1].text() == "作業フォルダを開く"
+    assert not menu.actions()[-1].isEnabled()
+
+
+def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
+    tmp_path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    missing_cwd = str(tmp_path / "not-created")
+    pane.set_threads([{"id": "target", "name": "Target", "cwd": missing_cwd}])
+
+    menu = pane._context_menu_for_item(pane.list_widget.item(0))
+    copied: list[str] = []
+    monkeypatch.setattr(pane, "_copy_text", copied.append)
+    menu.actions()[2].trigger()
+
+    assert len(copied) == 1
+    assert f"CWD: {missing_cwd}" in copied[0]
+    assert not menu.actions()[-1].isEnabled()
+
+
 def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:
     payload = {
         "items": [
