@@ -153,6 +153,7 @@ def test_history_pane_shows_turn_status_in_separator() -> None:
     assert any("Turn · Model: unavailable" in label.text() for label in pane.findChildren(QLabel))
     assert any("Turn · completed" in label.text() for label in pane.findChildren(QLabel))
 
+
 def test_history_pane_adds_model_metadata_to_each_turn_header_only() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
