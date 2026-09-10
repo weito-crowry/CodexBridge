@@ -6,9 +6,10 @@ from typing import Any
 import pytest
 from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QSplitter
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QPushButton, QSplitter
 
 from codex_bridge.console.codex_resolver import CodexResolution
+from codex_bridge.console.codex_updates import CodexUpdateInfo
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.runtime_launcher import DetachedLaunchResult
@@ -102,6 +103,55 @@ class FakeCodexProbe:
 
     def failure(self, message: str = "Codex version could not be verified") -> None:
         self.failed.emit(message)
+
+
+class FakeCodexUpdateProbe:
+    def __init__(self) -> None:
+        self.check_succeeded = Signal()
+        self.check_failed = Signal()
+        self.update_succeeded = Signal()
+        self.update_failed = Signal()
+        self.busy_changed = Signal()
+        self.check_calls: list[CodexResolution] = []
+        self.update_calls: list[CodexResolution] = []
+        self.busy = False
+
+    def check_for_updates(self, resolution: CodexResolution) -> bool:
+        self.check_calls.append(resolution)
+        self.busy = True
+        self.busy_changed.emit(True)
+        return True
+
+    def update(self, resolution: CodexResolution) -> bool:
+        self.update_calls.append(resolution)
+        self.busy = True
+        self.busy_changed.emit(True)
+        return True
+
+    def abort(self) -> None:
+        if self.busy:
+            self.busy = False
+            self.busy_changed.emit(False)
+
+    def result(self, info: CodexUpdateInfo) -> None:
+        self.busy = False
+        self.busy_changed.emit(False)
+        self.check_succeeded.emit(info)
+
+    def failure(self, message: str = "Codex update check failed") -> None:
+        self.busy = False
+        self.busy_changed.emit(False)
+        self.check_failed.emit(message)
+
+    def update_success(self) -> None:
+        self.busy = False
+        self.busy_changed.emit(False)
+        self.update_succeeded.emit()
+
+    def update_failure(self, message: str = "Codex update failed") -> None:
+        self.busy = False
+        self.busy_changed.emit(False)
+        self.update_failed.emit(message)
 
 
 class FakeLauncher:
@@ -241,6 +291,328 @@ def test_generic_refresh_does_not_reload_usage() -> None:
     window.refresh()
 
     assert not any(key == "usage" for key, _, _ in client.requests)
+    window.close()
+
+
+def test_force_usage_does_not_change_mode_of_in_flight_initial_request() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._begin_usage_sequence()
+    window._on_usage_initial_timeout()
+
+    window._request_usage(force=True)
+
+    assert window._usage_request_mode == "initial"
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    window.close()
+
+
+def test_ready_usage_waits_before_first_request() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert not any(key == "usage" for key, _, _ in client.requests)
+    assert window.usage_initial_timer.isActive()
+    assert window.usage_initial_timer.interval() == 1_500
+
+    window._on_usage_initial_timeout()
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    window.close()
+
+
+def test_initial_usage_failure_retries_only_after_delay_and_stops_at_three_attempts() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    window._on_usage_initial_timeout()
+    client.failure("usage", "Bridge unavailable")
+
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    assert window.usage_retry_timer.isActive()
+    assert window.usage_retry_timer.interval() == 3_000
+
+    window._on_usage_retry_timeout()
+    client.failure("usage", "Bridge unavailable")
+    window._on_usage_retry_timeout()
+    client.failure("usage", "Bridge unavailable")
+
+    assert sum(key == "usage" for key, _, _ in client.requests) == 3
+    assert not window.usage_retry_timer.isActive()
+    window.close()
+
+
+def test_ready_loss_invalidates_pending_usage_retry() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    window._on_usage_initial_timeout()
+    client.failure("usage", "Bridge unavailable")
+    client.result("bridge-status", {"bridge": "ready", "app_server": "failed"})
+
+    request_count = sum(key == "usage" for key, _, _ in client.requests)
+    window._on_usage_retry_timeout()
+
+    assert sum(key == "usage" for key, _, _ in client.requests) == request_count
+    assert not window.usage_retry_timer.isActive()
+    window.close()
+
+
+def test_periodic_usage_is_ready_only_and_generic_refresh_does_not_request_it() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    window._on_usage_initial_timeout()
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 10}}},
+    )
+    client.requests.clear()
+
+    window.refresh()
+    assert not any(key == "usage" for key, _, _ in client.requests)
+
+    window._on_usage_poll_timeout()
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    client.result("bridge-status", {"bridge": "ready", "app_server": "failed"})
+    client.requests.clear()
+    window._on_usage_poll_timeout()
+    assert not any(key == "usage" for key, _, _ in client.requests)
+    window.close()
+
+
+def test_periodic_usage_failure_keeps_last_known_display() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}},
+    )
+    known = window.usage_status_label.text()
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._on_usage_poll_timeout()
+    client.failure("usage", "Bridge unavailable")
+
+    assert window.usage_status_label.text() == known
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week —"
+    window.close()
+
+
+def test_codex_status_shows_update_check_controls_before_first_check() -> None:
+    _application()
+    window = MainWindow(_config(), api_client=FakeClient(), tray_available=False)
+
+    labels = {label.text() for label in window.status_dialog.findChildren(QLabel)}
+    buttons = {button.text() for button in window.status_dialog.findChildren(QPushButton)}
+
+    assert "Not checked" in labels
+    assert "Check for updates" in buttons
+    assert "Update" in buttons
+    window.close()
+
+
+def test_auto_update_check_runs_once_after_ready_and_resolved_codex() -> None:
+    _application()
+    client = FakeClient()
+    codex_probe = FakeCodexProbe()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=codex_probe,
+        codex_update_probe=updates,
+        tray_available=False,
+    )
+    resolution = CodexResolution("C:/Codex/codex.exe", "1.2.3", "path")
+    codex_probe.result(resolution)
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window.codex_update_auto_timer.isActive()
+    assert window.codex_update_auto_timer.interval() == 5_000
+    assert updates.check_calls == []
+
+    window._on_codex_update_auto_timeout()
+    assert updates.check_calls == [resolution]
+    updates.result(_available_update())
+    client.result("bridge-status", {"bridge": "ready", "app_server": "failed"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    window._on_codex_update_auto_timeout()
+    assert updates.check_calls == [resolution]
+    window.close()
+
+
+def test_auto_update_timeout_during_not_ready_waits_for_next_ready() -> None:
+    _application()
+    client = FakeClient()
+    codex_probe = FakeCodexProbe()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=codex_probe,
+        codex_update_probe=updates,
+        tray_available=False,
+    )
+    resolution = CodexResolution("C:/Codex/codex.exe", "1.2.3", "path")
+    codex_probe.result(resolution)
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "failed"})
+
+    window._on_codex_update_auto_timeout()
+
+    assert not window._codex_update_auto_check_started
+    assert updates.check_calls == []
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    assert window.codex_update_auto_timer.isActive()
+    window._on_codex_update_auto_timeout()
+    assert updates.check_calls == [resolution]
+    window.close()
+
+
+def _available_update() -> CodexUpdateInfo:
+    return CodexUpdateInfo(
+        current_version="1.2.3",
+        latest_version="1.3.0",
+        latest_status="ok",
+        update_action="codex update",
+        last_checked_at="2030-01-02T03:04:05Z",
+        doctor_version="1.2.3",
+    )
+
+
+def test_update_available_shows_main_notification_and_enables_update() -> None:
+    _application()
+    client = FakeClient()
+    codex_probe = FakeCodexProbe()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=codex_probe,
+        codex_update_probe=updates,
+        tray_available=False,
+    )
+    resolution = CodexResolution("C:/Codex/codex.exe", "1.2.3", "codex_app")
+    codex_probe.result(resolution)
+
+    window.codex_update_check_button.click()
+    assert updates.check_calls == [resolution]
+    assert not window.codex_update_button.isEnabled()
+
+    updates.result(_available_update())
+
+    assert window.codex_latest_label.text() == "1.3.0"
+    assert window.codex_update_status_label.text() == "Update available"
+    assert window.codex_update_button.isEnabled()
+    assert window.codex_update_banner_label.text() == "↑ Codex update available"
+    assert not window.codex_update_banner_label.isHidden()
+    window.close()
+
+
+def test_update_button_stays_disabled_without_update_action_or_new_version() -> None:
+    _application()
+    client = FakeClient()
+    codex_probe = FakeCodexProbe()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=codex_probe,
+        codex_update_probe=updates,
+        tray_available=False,
+    )
+    codex_probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    window.codex_update_check_button.click()
+    updates.result(CodexUpdateInfo("1.2.3", "1.3.0", "ok", "manual or unknown", None, "1.2.3"))
+    assert not window.codex_update_button.isEnabled()
+    assert not window.codex_update_banner_label.isHidden()
+
+    window.codex_update_check_button.click()
+    updates.result(CodexUpdateInfo("1.2.3", "1.2.3", "ok", "codex update", None, "1.2.3"))
+    assert window.codex_update_status_label.text() == "Up to date"
+    assert not window.codex_update_button.isEnabled()
+    window.close()
+
+
+def test_update_check_and_update_cannot_be_started_twice(monkeypatch) -> None:
+    _application()
+    client = FakeClient()
+    codex_probe = FakeCodexProbe()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=codex_probe,
+        codex_update_probe=updates,
+        tray_available=False,
+    )
+    codex_probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+
+    window.codex_update_check_button.click()
+    window.codex_update_check_button.click()
+    assert len(updates.check_calls) == 1
+    updates.result(_available_update())
+
+    monkeypatch.setattr(
+        "codex_bridge.console.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.codex_update_button.click()
+    window.codex_update_button.click()
+    assert len(updates.update_calls) == 1
+    window.close()
+
+
+def test_update_failure_and_success_are_shown_without_restart(monkeypatch) -> None:
+    _application()
+    client = FakeClient()
+    codex_probe = FakeCodexProbe()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=codex_probe,
+        codex_update_probe=updates,
+        tray_available=False,
+    )
+    codex_probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    window.codex_update_check_button.click()
+    updates.result(_available_update())
+    monkeypatch.setattr(
+        "codex_bridge.console.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.codex_update_button.click()
+    updates.update_failure("Codex update failed")
+    assert window.codex_update_status_label.text() == "Update failed"
+    assert window.codex_update_message_label.text() == "Codex update failed"
+    assert window.codex_update_button.isEnabled()
+
+    window.codex_update_button.click()
+    updates.update_success()
+    assert window.codex_update_status_label.text() == "Update completed; restart required"
+    assert not window.codex_update_button.isEnabled()
+    assert window.codex_update_banner_label.isHidden()
     window.close()
 
 

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -36,6 +37,7 @@ from .codex_resolver import (
     CodexVersionProbe,
     enumerate_candidates,
 )
+from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
 from .config import ConsoleConfig
 from .runtime_launcher import BridgeRuntimeLauncher
 from .tunnel_resolver import TunnelResolutionError
@@ -60,6 +62,10 @@ from .widgets import (
 _RECONNECT_MS = 1_500
 _READINESS_INTERVAL_MS = 350
 _READINESS_TIMEOUT_SECONDS = 10.0
+_USAGE_INITIAL_DELAY_MS = 1_500
+_USAGE_RETRY_DELAY_MS = 3_000
+_USAGE_POLL_INTERVAL_MS = 5 * 60 * 1_000
+_USAGE_MAX_ATTEMPTS = 3
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
@@ -138,6 +144,7 @@ class MainWindow(QMainWindow):
         *,
         api_client: Any | None = None,
         codex_probe: Any | None = None,
+        codex_update_probe: Any | None = None,
         runtime_launcher: Any | None = None,
         tunnel_supervisor: Any | None = None,
         tray_factory: Callable[[QWidget], Any] | None = None,
@@ -148,6 +155,9 @@ class MainWindow(QMainWindow):
         self._config = config
         self._client = api_client or ApiClient(config.base_url, self)
         self._codex_probe = codex_probe if codex_probe is not None else self._new_codex_probe()
+        self._codex_update_probe = (
+            codex_update_probe if codex_update_probe is not None else CodexUpdateProbe(parent=self)
+        )
         self._launcher = (
             runtime_launcher if runtime_launcher is not None else BridgeRuntimeLauncher()
         )
@@ -182,7 +192,13 @@ class MainWindow(QMainWindow):
         self._reconnect_scheduled = False
         self._runtime_state = "unavailable"
         self._usage = CodexUsage()
-        self._usage_attempted = False
+        self._usage_sequence_active = False
+        self._usage_attempts = 0
+        self._usage_request_in_flight = False
+        self._usage_request_mode: str | None = None
+        self._codex_update_info: CodexUpdateInfo | None = None
+        self._codex_update_busy = False
+        self._codex_update_auto_check_started = False
         self._codex_resolution: CodexResolution | None = None
         self._bridge_seen_ready = False
         self._health_observed = False
@@ -303,6 +319,8 @@ class MainWindow(QMainWindow):
         self.config_status_label.setToolTip(self._config.roots_error or "Allowed roots are ready")
         self.overall_status_label = QLabel("● Disconnected")
         self.usage_status_label = QLabel(format_codex_usage(self._usage))
+        self.codex_update_banner_label = QLabel("")
+        self.codex_update_banner_label.setVisible(False)
         self.status_button = QPushButton("Status")
         self.start_bridge_button = QPushButton("Start Bridge")
         self.stop_bridge_button = QPushButton("Stop Bridge")
@@ -332,6 +350,19 @@ class MainWindow(QMainWindow):
 
         self.usage_detail_label = QLabel(format_codex_usage_detail(self._usage))
         self.usage_detail_label.setWordWrap(True)
+        self.codex_latest_label = QLabel("Not checked")
+        self.codex_update_status_label = QLabel("Not checked")
+        self.codex_update_message_label = QLabel("")
+        self.codex_update_message_label.setWordWrap(True)
+        self.codex_update_check_button = QPushButton("Check for updates")
+        self.codex_update_button = QPushButton("Update")
+        self.codex_update_check_button.setEnabled(False)
+        self.codex_update_button.setEnabled(False)
+        codex_update_controls = QWidget(self)
+        codex_update_controls_layout = QHBoxLayout(codex_update_controls)
+        codex_update_controls_layout.setContentsMargins(0, 0, 0, 0)
+        codex_update_controls_layout.addWidget(self.codex_update_check_button)
+        codex_update_controls_layout.addWidget(self.codex_update_button)
         self.status_refresh_button = QPushButton("Refresh")
         self.status_close_button = QPushButton("Close")
 
@@ -357,7 +388,14 @@ class MainWindow(QMainWindow):
         )
         add_section(
             "Codex",
-            [("Version", self.codex_status_label), ("Runtime", self.runtime_status_label)],
+            [
+                ("Version", self.codex_status_label),
+                ("Latest", self.codex_latest_label),
+                ("Update", self.codex_update_status_label),
+                ("", codex_update_controls),
+                ("Status", self.codex_update_message_label),
+                ("Runtime", self.runtime_status_label),
+            ],
         )
         add_section("Usage", [("Codex Usage", self.usage_detail_label)])
         add_section(
@@ -390,6 +428,7 @@ class MainWindow(QMainWindow):
         status_bar = QHBoxLayout()
         status_bar.addWidget(self.overall_status_label)
         status_bar.addStretch(1)
+        status_bar.addWidget(self.codex_update_banner_label)
         status_bar.addWidget(self.usage_status_label)
         status_bar.addWidget(self.status_button)
 
@@ -475,6 +514,11 @@ class MainWindow(QMainWindow):
     def _connect_runtime(self) -> None:
         self._codex_probe.resolved.connect(self._apply_codex_resolution)
         self._codex_probe.failed.connect(self._apply_codex_probe_error)
+        self._codex_update_probe.check_succeeded.connect(self._apply_codex_update_check)
+        self._codex_update_probe.check_failed.connect(self._apply_codex_update_check_error)
+        self._codex_update_probe.update_succeeded.connect(self._apply_codex_update_success)
+        self._codex_update_probe.update_failed.connect(self._apply_codex_update_failure)
+        self._codex_update_probe.busy_changed.connect(self._apply_codex_update_busy)
         self.start_bridge_button.clicked.connect(self._start_bridge)
         self.stop_bridge_button.clicked.connect(self._stop_bridge)
         self.restart_bridge_button.clicked.connect(self._restart_bridge)
@@ -487,6 +531,8 @@ class MainWindow(QMainWindow):
         self.status_button.clicked.connect(self._show_status)
         self.status_refresh_button.clicked.connect(self._refresh_status)
         self.status_close_button.clicked.connect(self.status_dialog.close)
+        self.codex_update_check_button.clicked.connect(self._check_codex_updates)
+        self.codex_update_button.clicked.connect(self._update_codex)
 
     def _show_status(self) -> None:
         self.status_dialog.show()
@@ -582,6 +628,21 @@ class MainWindow(QMainWindow):
         self.readiness_timer = QTimer(self)
         self.readiness_timer.setInterval(_READINESS_INTERVAL_MS)
         self.readiness_timer.timeout.connect(self._on_readiness_tick)
+        self.usage_initial_timer = QTimer(self)
+        self.usage_initial_timer.setSingleShot(True)
+        self.usage_initial_timer.setInterval(_USAGE_INITIAL_DELAY_MS)
+        self.usage_initial_timer.timeout.connect(self._on_usage_initial_timeout)
+        self.usage_retry_timer = QTimer(self)
+        self.usage_retry_timer.setSingleShot(True)
+        self.usage_retry_timer.setInterval(_USAGE_RETRY_DELAY_MS)
+        self.usage_retry_timer.timeout.connect(self._on_usage_retry_timeout)
+        self.usage_poll_timer = QTimer(self)
+        self.usage_poll_timer.setInterval(_USAGE_POLL_INTERVAL_MS)
+        self.usage_poll_timer.timeout.connect(self._on_usage_poll_timeout)
+        self.codex_update_auto_timer = QTimer(self)
+        self.codex_update_auto_timer.setSingleShot(True)
+        self.codex_update_auto_timer.setInterval(5_000)
+        self.codex_update_auto_timer.timeout.connect(self._on_codex_update_auto_timeout)
         self.stop_confirmation_timer = QTimer(self)
         self.stop_confirmation_timer.setInterval(_STOP_CONFIRMATION_INTERVAL_MS)
         self.stop_confirmation_timer.timeout.connect(self._on_stop_confirmation_tick)
@@ -724,6 +785,8 @@ class MainWindow(QMainWindow):
         self._codex_resolution = resolution
         self.codex_status_label.setText(f"Codex: {resolution.version} · {resolution.source}")
         self._update_start_button()
+        self._sync_codex_update_controls()
+        self._schedule_codex_update_auto_check()
 
     def _apply_codex_probe_error(self, _message: str) -> None:
         if self._closing:
@@ -731,6 +794,127 @@ class MainWindow(QMainWindow):
         self._codex_resolution = None
         self.codex_status_label.setText("Codex: not found")
         self._update_start_button()
+        self._sync_codex_update_controls()
+
+    def _sync_codex_update_controls(self) -> None:
+        has_resolution = self._codex_resolution is not None
+        self.codex_update_check_button.setEnabled(has_resolution and not self._codex_update_busy)
+        can_update = (
+            self._codex_update_info is not None
+            and self._codex_update_info.can_update
+            and not self._codex_update_busy
+        )
+        self.codex_update_button.setEnabled(can_update)
+
+    def _schedule_codex_update_auto_check(self) -> None:
+        if (
+            self._closing
+            or self._codex_update_auto_check_started
+            or not self._usage_ready
+            or self._codex_resolution is None
+        ):
+            return
+        if not self.codex_update_auto_timer.isActive():
+            self.codex_update_auto_timer.start()
+
+    def _on_codex_update_auto_timeout(self) -> None:
+        if self._codex_update_auto_check_started:
+            return
+        if not self._usage_ready or self._codex_resolution is None:
+            return
+        self._codex_update_auto_check_started = True
+        self._check_codex_updates()
+
+    def _apply_codex_update_busy(self, busy: bool) -> None:
+        if self._closing:
+            return
+        self._codex_update_busy = busy
+        self._sync_codex_update_controls()
+
+    def _check_codex_updates(self) -> None:
+        resolution = self._codex_resolution
+        if self._closing or resolution is None or self._codex_update_busy:
+            return
+        self._codex_update_busy = True
+        self.codex_update_status_label.setText("Checking…")
+        self.codex_update_message_label.setText("")
+        self._sync_codex_update_controls()
+        if not self._codex_update_probe.check_for_updates(resolution):
+            self._apply_codex_update_check_error("Codex update check failed")
+
+    def _apply_codex_update_check(self, payload: object) -> None:
+        if self._closing or self._codex_resolution is None:
+            return
+        info = (
+            payload
+            if isinstance(payload, CodexUpdateInfo)
+            else parse_codex_update_info(
+                payload, current_version=self._codex_resolution.version or ""
+            )
+        )
+        self._codex_update_info = info
+        self.codex_latest_label.setText(info.latest_version or "Unavailable")
+        self.codex_update_status_label.setText(info.display_status)
+        self.codex_update_message_label.setText(
+            f"Last checked: {info.last_checked_at}" if info.last_checked_at else ""
+        )
+        self.codex_update_banner_label.setText(
+            "↑ Codex update available" if info.update_available else ""
+        )
+        self.codex_update_banner_label.setVisible(info.update_available)
+        self._sync_codex_update_controls()
+
+    def _apply_codex_update_check_error(self, message: str) -> None:
+        if self._closing:
+            return
+        self._codex_update_busy = False
+        self._codex_update_info = None
+        self.codex_latest_label.setText("Unavailable")
+        self.codex_update_status_label.setText("Unavailable")
+        self.codex_update_message_label.setText(message)
+        self.codex_update_banner_label.clear()
+        self.codex_update_banner_label.setVisible(False)
+        self._sync_codex_update_controls()
+
+    def _update_codex(self) -> None:
+        resolution = self._codex_resolution
+        info = self._codex_update_info
+        if self._closing or resolution is None or info is None or not info.can_update:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Update Codex",
+            "Install the available Codex update now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._codex_update_busy = True
+        self.codex_update_status_label.setText("Updating…")
+        self.codex_update_message_label.setText("")
+        self._sync_codex_update_controls()
+        if not self._codex_update_probe.update(resolution):
+            self._apply_codex_update_failure("Codex update failed")
+
+    def _apply_codex_update_success(self) -> None:
+        if self._closing:
+            return
+        self._codex_update_busy = False
+        self._codex_update_info = None
+        self.codex_update_status_label.setText("Update completed; restart required")
+        self.codex_update_message_label.setText("")
+        self.codex_update_banner_label.clear()
+        self.codex_update_banner_label.setVisible(False)
+        self._sync_codex_update_controls()
+
+    def _apply_codex_update_failure(self, message: str) -> None:
+        if self._closing:
+            return
+        self._codex_update_busy = False
+        self.codex_update_status_label.setText("Update failed")
+        self.codex_update_message_label.setText(message)
+        self._sync_codex_update_controls()
 
     def _set_runtime_state(self, state: str, *, label: str | None = None) -> None:
         self._runtime_state = state
@@ -742,11 +926,67 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if force:
-            self._usage_attempted = False
-        if self._usage_attempted:
+            if self._usage_request_in_flight:
+                return
+            self.usage_initial_timer.stop()
+            self.usage_retry_timer.stop()
+            self._usage_sequence_active = False
+            self._usage_attempts = 0
+            self._usage_request_mode = "manual"
+            self._start_usage_request("manual")
             return
+        self._start_usage_request("initial")
+
+    @property
+    def _usage_ready(self) -> bool:
+        return self._bridge_ready and self._app_server_ready
+
+    def _begin_usage_sequence(self) -> None:
+        self._usage_sequence_active = True
+        self._usage_attempts = 0
+        self._usage_request_mode = None
+        self.usage_initial_timer.start()
+        self.usage_retry_timer.stop()
+        self.usage_poll_timer.start()
+
+    def _invalidate_usage_sequence(self) -> None:
+        self._usage_sequence_active = False
+        self._usage_attempts = 0
+        self.usage_initial_timer.stop()
+        self.usage_retry_timer.stop()
+        self.usage_poll_timer.stop()
+        if self._usage_request_in_flight:
+            self._client.abort_json_group("usage")
+        self._usage_request_in_flight = False
+        self._usage_request_mode = None
+
+    def _start_usage_request(self, mode: str) -> None:
+        if self._closing or self._usage_request_in_flight:
+            return
+        if mode != "manual" and not self._usage_ready:
+            return
+        if mode == "initial":
+            if not self._usage_sequence_active or self._usage_attempts >= _USAGE_MAX_ATTEMPTS:
+                return
+            self._usage_attempts += 1
         if self._client.get_json("/ui-api/account/rate-limits", key="usage"):
-            self._usage_attempted = True
+            self._usage_request_in_flight = True
+            self._usage_request_mode = mode
+        elif mode == "initial":
+            self._usage_attempts -= 1
+
+    def _on_usage_initial_timeout(self) -> None:
+        self.usage_initial_timer.stop()
+        self._start_usage_request("initial")
+
+    def _on_usage_retry_timeout(self) -> None:
+        self.usage_retry_timer.stop()
+        if self._usage_sequence_active:
+            self._start_usage_request("initial")
+
+    def _on_usage_poll_timeout(self) -> None:
+        if self._usage_ready:
+            self._start_usage_request("periodic")
 
     def _apply_usage(self, payload: object) -> None:
         self._usage = parse_codex_usage(payload)
@@ -1271,16 +1511,23 @@ class MainWindow(QMainWindow):
                 self.bridge_status_label.setText("Bridge: disconnected")
                 self.app_server_status_label.setText("App Server: failed")
                 self._apply_runtime_observation()
-            ready = self._bridge_ready and self._app_server_ready
-            if ready and not was_ready and not self._usage_attempted:
-                self._request_usage()
+            ready = self._usage_ready
+            if ready and not was_ready:
+                self._begin_usage_sequence()
+                self._schedule_codex_update_auto_check()
             elif not ready:
-                self._usage_attempted = False
+                self._invalidate_usage_sequence()
             self._sync_overall_status()
             self._sync_empty_state()
             return
         if key == "usage":
-            self._usage_attempted = True
+            self._usage_request_in_flight = False
+            self._usage_request_mode = None
+            self._usage_sequence_active = False
+            self.usage_initial_timer.stop()
+            self.usage_retry_timer.stop()
+            if self._usage_ready:
+                self.usage_poll_timer.start()
             self._apply_usage(payload)
             return
         if key == "launch:health":
@@ -1429,6 +1676,7 @@ class MainWindow(QMainWindow):
                 self._status_observed = True
                 self._bridge_ready = False
                 self._app_server_ready = False
+                self._invalidate_usage_sequence()
             self.bridge_status_label.setText("Bridge: disconnected")
             self.app_server_status_label.setText("App Server: failed")
             self.bottom_status_label.setText(message)
@@ -1437,8 +1685,20 @@ class MainWindow(QMainWindow):
             self._sync_empty_state()
             return
         if key == "usage":
-            self._usage_attempted = True
-            self._apply_usage({})
+            if not self._usage_request_in_flight:
+                return
+            mode = self._usage_request_mode
+            self._usage_request_in_flight = False
+            self._usage_request_mode = None
+            if (
+                mode == "initial"
+                and self._usage_sequence_active
+                and self._usage_ready
+                and self._usage_attempts < _USAGE_MAX_ATTEMPTS
+            ):
+                self.usage_retry_timer.start()
+            else:
+                self._usage_sequence_active = False
             return
         selection = self._is_current_selection(key)
         if selection is None:
@@ -1569,6 +1829,10 @@ class MainWindow(QMainWindow):
         self.exit_timer.stop()
         self.signal_timer.stop()
         self.stop_confirmation_timer.stop()
+        self._invalidate_usage_sequence()
+        abort_update = getattr(self._codex_update_probe, "abort", None)
+        if callable(abort_update):
+            abort_update()
         self._client.abort_all()
         self._launcher.close()
         if self.tray_icon is not None:
