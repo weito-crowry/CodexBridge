@@ -29,6 +29,7 @@ from .models import (
     UserInputQuestion,
 )
 from .paths import AllowedPathPolicy
+from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unavailable_metadata
 from .state import StateStore
 
 
@@ -42,6 +43,30 @@ class AppServerPort(Protocol):
 
 class BridgeError(RuntimeError):
     """Raised when a native App Server response cannot be used safely."""
+
+
+def _with_turn_model_metadata(
+    result: dict[str, object], thread_response: Mapping[str, Any]
+) -> dict[str, object]:
+    thread = thread_response.get("thread")
+    rollout_path = thread.get("path") if isinstance(thread, Mapping) else None
+    try:
+        resolved = read_turn_model_metadata(rollout_path)
+    except Exception:
+        resolved = {}
+
+    metadata: dict[str, TurnModelMetadata] = {}
+    items = result.get("items")
+    if isinstance(items, list):
+        for entry in items:
+            if not isinstance(entry, Mapping):
+                continue
+            turn_id = entry.get("turn_id")
+            if not isinstance(turn_id, str) or turn_id in metadata:
+                continue
+            metadata[turn_id] = resolved.get(turn_id, unavailable_metadata())
+    result["turn_model_metadata"] = metadata
+    return result
 
 
 _APPROVAL_METHODS = {
@@ -742,7 +767,7 @@ class Bridge:
     ) -> dict[str, Any]:
         limit, sort_direction = validate_history_query(limit, sort_direction)
         validate_cursor(cursor)
-        _, history_mode, validated_cwd = await self._history_metadata(thread_id)
+        metadata_response, history_mode, validated_cwd = await self._history_metadata(thread_id)
         if history_mode == "paginated":
             params: dict[str, Any] = {
                 "threadId": thread_id,
@@ -755,20 +780,21 @@ class Bridge:
                 params["cursor"] = cursor
             response = await self._app_server.request("thread/items/list", params)
             try:
-                return project_items_response(
+                result = project_items_response(
                     thread_id,
                     turn_id,
                     response,
                     policy=self._path_policy,
                     limit=limit,
                 )
+                return _with_turn_model_metadata(result, metadata_response)
             except HistoryValidationError as exc:
                 raise BridgeError("malformed thread items response") from exc
 
         validate_legacy_cursor(cursor)
         response = await self._legacy_history_response(thread_id, validated_cwd)
         try:
-            return project_legacy_items_response(
+            result = project_legacy_items_response(
                 thread_id,
                 turn_id,
                 response,
@@ -777,6 +803,7 @@ class Bridge:
                 sort_direction=sort_direction,
                 cursor=cursor,
             )
+            return _with_turn_model_metadata(result, metadata_response)
         except HistoryValidationError as exc:
             raise BridgeError("malformed legacy thread history response") from exc
 

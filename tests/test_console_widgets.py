@@ -150,4 +150,93 @@ def test_history_pane_shows_turn_status_in_separator() -> None:
 
     pane.set_timeline(entries, turn_statuses={"turn-2": "completed"})
 
+    assert any("Turn · Model: unavailable" in label.text() for label in pane.findChildren(QLabel))
     assert any("Turn · completed" in label.text() for label in pane.findChildren(QLabel))
+
+def test_history_pane_adds_model_metadata_to_each_turn_header_only() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entries = (
+        TimelineEntry("turn", "agent", "Agent", "Agent", "answer", None, ()),
+        TimelineEntry("turn", "user", "User", "User", "question", None, ()),
+    )
+
+    pane.set_timeline(
+        entries,
+        turn_statuses={"turn": "completed"},
+        turn_model_metadata={
+            "turn": {
+                "model_candidates": [
+                    {"model": "gpt-5", "reasoning_effort": "high"},
+                ],
+                "model_resolution_status": "resolved",
+            }
+        },
+    )
+
+    headers = {label.text() for label in pane._content.findChildren(QLabel)}
+    assert "Turn · completed · Model: gpt-5 (high)" in headers
+    assert "Agent · Model: gpt-5 · Reasoning: high" not in headers
+    assert "User" in headers
+
+
+def test_history_pane_formats_missing_effort_and_missing_status() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+
+    pane.set_timeline(
+        (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
+        turn_model_metadata={
+            "turn": {
+                "model_candidates": [{"model": "gpt-5", "reasoning_effort": None}],
+                "model_resolution_status": "resolved",
+            }
+        },
+    )
+
+    assert "Turn · Model: gpt-5" in {label.text() for label in pane._content.findChildren(QLabel)}
+
+
+def test_history_pane_formats_multiple_candidates_in_source_order() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+
+    pane.set_timeline(
+        (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
+        turn_model_metadata={
+            "turn": {
+                "model_candidates": [
+                    {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
+                    {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+                ],
+                "model_resolution_status": "multiple",
+            }
+        },
+    )
+
+    assert "Turn · Models: gpt-5.6-luna (xhigh) / gpt-5.6-sol (high)" in {
+        label.text() for label in pane._content.findChildren(QLabel)
+    }
+
+
+def test_history_pane_formats_unavailable_model() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+
+    pane.set_timeline(
+        (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
+        turn_model_metadata={
+            "turn": {
+                "model_candidates": [],
+                "model_resolution_status": "unavailable",
+            }
+        },
+    )
+
+    assert "Turn · Model: unavailable" in {
+        label.text() for label in pane._content.findChildren(QLabel)
+    }

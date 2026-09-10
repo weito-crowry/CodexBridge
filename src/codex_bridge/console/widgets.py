@@ -40,6 +40,40 @@ def _safe_status(value: object) -> str | None:
     return value if isinstance(value, str) and len(value) <= 128 else None
 
 
+def _model_summary(metadata: Mapping[str, object] | None) -> str:
+    if not isinstance(metadata, Mapping):
+        return "Model: unavailable"
+    raw_candidates = metadata.get("model_candidates")
+    if not isinstance(raw_candidates, list):
+        return "Model: unavailable"
+    candidates: list[str] = []
+    for raw_candidate in raw_candidates:
+        if not isinstance(raw_candidate, Mapping):
+            continue
+        model = raw_candidate.get("model")
+        if not isinstance(model, str) or not model:
+            continue
+        effort = raw_candidate.get("reasoning_effort")
+        rendered = model[:512]
+        if isinstance(effort, str) and effort:
+            rendered += f" ({effort[:512]})"
+        candidates.append(rendered)
+    status = metadata.get("model_resolution_status")
+    if status == "unavailable" or not candidates:
+        return "Model: unavailable"
+    label = "Models" if status == "multiple" or len(candidates) > 1 else "Model"
+    return f"{label}: {' / '.join(candidates)}"
+
+
+def _turn_header(status: object, metadata: Mapping[str, object] | None) -> str:
+    parts = ["Turn"]
+    safe_status = _safe_status(status)
+    if safe_status:
+        parts.append(safe_status)
+    parts.append(_model_summary(metadata))
+    return " · ".join(parts)
+
+
 def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
     item_id = item.get("id")
     item_type = item.get("type")
@@ -266,14 +300,15 @@ class HistoryPane(QWidget):
         *,
         has_older: bool = False,
         turn_statuses: Mapping[str, str] | None = None,
+        turn_model_metadata: Mapping[str, Mapping[str, object]] | None = None,
     ) -> None:
         self._clear_cards()
         previous_turn: str | None = None
         for entry in entries:
-            if previous_turn is not None and previous_turn != entry.turn_id:
+            if previous_turn is None or previous_turn != entry.turn_id:
                 turn_status = turn_statuses.get(entry.turn_id) if turn_statuses else None
-                separator_text = "Turn" if not turn_status else f"Turn · {turn_status}"
-                separator = QLabel(f"────────  {separator_text}  ────────")
+                metadata = turn_model_metadata.get(entry.turn_id) if turn_model_metadata else None
+                separator = QLabel(_turn_header(turn_status, metadata))
                 separator.setObjectName("turnSeparator")
                 self._content_layout.addWidget(separator)
             self._content_layout.addWidget(self._card(entry))
@@ -287,8 +322,10 @@ class HistoryPane(QWidget):
         card.setObjectName("historyCard")
         card.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(card)
-        header = entry.title if entry.status is None else f"{entry.title} · {entry.status}"
-        layout.addWidget(QLabel(header))
+        header_parts = [entry.title]
+        if entry.status is not None:
+            header_parts.append(entry.status)
+        layout.addWidget(QLabel(" · ".join(header_parts)))
         if entry.body:
             body = QTextEdit()
             body.setReadOnly(True)

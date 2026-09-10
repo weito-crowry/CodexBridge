@@ -5,7 +5,7 @@ from typing import Any
 
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import QApplication, QSplitter
+from PySide6.QtWidgets import QApplication, QLabel, QSplitter
 
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.config import ConsoleConfig
@@ -285,6 +285,47 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     window.close()
 
 
+def test_history_header_includes_turn_model_metadata() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    items_key = next(key for key, _, _ in client.requests if key.endswith(":items"))
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-a",
+            "thread_metadata": {"model": "gpt-5", "reasoning_effort": "high"},
+            "state": "completed",
+            "recent_activities": [],
+        },
+    )
+    client.result(
+        items_key,
+        {
+            "items": [
+                {
+                    "turn_id": "turn-1",
+                    "item": {"id": "agent-1", "type": "agentMessage", "text": "answer"},
+                }
+            ],
+            "turn_model_metadata": {
+                "turn-1": {
+                    "model_candidates": [{"model": "gpt-5", "reasoning_effort": "high"}],
+                    "model_resolution_status": "resolved",
+                }
+            },
+        },
+    )
+
+    headers = {label.text() for label in window.history_pane._content.findChildren(QLabel)}
+    assert "Turn · Model: gpt-5 (high)" in headers
+    assert "Agent · Model: gpt-5 · Reasoning: high" not in headers
+    window.close()
+
+
 def test_health_poll_also_refreshes_bridge_status_and_recovers_without_refresh() -> None:
     _application()
     client = FakeClient()
@@ -344,6 +385,12 @@ def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
         {
             "items": [{"turn_id": "t2", "item": _item("new", "agentMessage", text="new")}],
             "next_cursor": "older",
+            "turn_model_metadata": {
+                "t2": {
+                    "model_candidates": [{"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"}],
+                    "model_resolution_status": "resolved",
+                }
+            },
         },
     )
     window.history_pane.older_requested.emit()
@@ -356,12 +403,74 @@ def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
                 {"turn_id": "t1", "item": _item("old", "agentMessage", text="old")},
             ],
             "next_cursor": None,
+            "turn_model_metadata": {
+                "t2": {
+                    "model_candidates": [{"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"}],
+                    "model_resolution_status": "resolved",
+                },
+                "t1": {
+                    "model_candidates": [{"model": "gpt-5.6-sol", "reasoning_effort": "high"}],
+                    "model_resolution_status": "resolved",
+                },
+            },
         },
     )
 
     assert window.history_pane.load_older_button.isVisible() is False
     assert len(window._timeline_entries) == 2
     assert [entry.item_id for entry in window._timeline_entries] == ["old", "new"]
+    assert set(window._turn_model_metadata) == {"t1", "t2"}
+    window.close()
+
+
+def test_main_window_resets_turn_model_metadata_when_selection_changes() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    window.select_thread("thread-a")
+    client.result(
+        "selection:1:items",
+        {
+            "items": [],
+            "turn_model_metadata": {
+                "turn-a": {
+                    "model_candidates": [{"model": "gpt-5", "reasoning_effort": None}],
+                    "model_resolution_status": "resolved",
+                }
+            },
+        },
+    )
+    assert "turn-a" in window._turn_model_metadata
+
+    window.select_thread("thread-b")
+
+    assert window._turn_model_metadata == {}
+    window.close()
+
+
+def test_main_window_keeps_history_when_turn_model_metadata_is_unavailable() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    window.select_thread("thread-a")
+    client.result(
+        "selection:1:items",
+        {
+            "items": [
+                {"turn_id": "turn-1", "item": _item("agent-1", "agentMessage", text="answer")}
+            ],
+            "turn_model_metadata": {
+                "turn-1": {
+                    "model_candidates": [],
+                    "model_resolution_status": "unavailable",
+                }
+            },
+        },
+    )
+
+    assert any(label.text() == "answer" for label in window.history_pane.findChildren(QLabel))
     window.close()
 
 

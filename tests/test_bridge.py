@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,6 +23,7 @@ class FakeAppServer:
         self.thread_cwds: dict[str, str] = {}
         self.thread_histories: dict[str, list[dict[str, Any]]] = {}
         self.thread_history_modes: dict[str, str] = {}
+        self.thread_paths: dict[str, str] = {}
         self.thread_list: list[dict[str, Any]] = []
         self.turns_response: dict[str, Any] = {"data": []}
         self.items_response: dict[str, Any] = {"data": []}
@@ -70,6 +73,8 @@ class FakeAppServer:
                 thread["turns"] = self.thread_histories[params["threadId"]]
             if params["threadId"] in self.thread_history_modes:
                 thread["historyMode"] = self.thread_history_modes[params["threadId"]]
+            if params["threadId"] in self.thread_paths:
+                thread["path"] = self.thread_paths[params["threadId"]]
             return {"thread": thread}
         if method == "thread/turns/list":
             return self.turns_response
@@ -107,6 +112,10 @@ def make_activity_bridge(allowed_dir) -> tuple[Bridge, FakeAppServer, StateStore
         activity_store=activities,
     )
     return bridge, app, store, activities
+
+
+def write_rollout(path: Path, *records: dict[str, Any]) -> None:
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -367,6 +376,121 @@ async def test_read_thread_items_preflights_metadata_and_preserves_entry_turn_id
     assert result["items"][0]["turn_id"] == "turn-1"
     assert result["next_cursor"] == "next"
     assert result["backwards_cursor"] == "back"
+
+
+@pytest.mark.asyncio
+async def test_read_thread_items_adds_turn_model_metadata_from_thread_read_path(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["paginated-thread"] = str(allowed_dir)
+    app.thread_history_modes["paginated-thread"] = "paginated"
+    rollout_path = allowed_dir / "rollout.jsonl"
+    write_rollout(
+        rollout_path,
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna", "effort": "xhigh"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna", "effort": "xhigh"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-sol", "effort": "high"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "orphan", "model": "gpt-5.5", "effort": "medium"},
+        },
+    )
+    app.thread_paths["paginated-thread"] = str(rollout_path)
+    app.items_response = {
+        "data": [
+            {
+                "turnId": "turn-1",
+                "item": {"id": "agent-1", "type": "agentMessage", "text": "hello"},
+            },
+            {
+                "turnId": "turn-2",
+                "item": {"id": "user-1", "type": "userMessage", "content": []},
+            },
+        ],
+        "nextCursor": None,
+        "backwardsCursor": None,
+    }
+
+    result = await bridge.read_thread_items("paginated-thread")
+
+    assert app.methods == ["thread/read", "thread/items/list"]
+    assert result["turn_model_metadata"] == {
+        "turn-1": {
+            "model_candidates": [
+                {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
+                {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+            ],
+            "model_resolution_status": "multiple",
+        },
+        "turn-2": {
+            "model_candidates": [],
+            "model_resolution_status": "unavailable",
+        },
+    }
+    assert "orphan" not in result["turn_model_metadata"]
+    assert str(rollout_path) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_read_thread_items_does_not_use_thread_list_path_for_metadata(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["paginated-thread"] = str(allowed_dir)
+    app.thread_history_modes["paginated-thread"] = "paginated"
+    listed_rollout = allowed_dir / "listed-rollout.jsonl"
+    write_rollout(
+        listed_rollout,
+        {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna"}},
+    )
+    app.thread_list = [{"id": "paginated-thread", "path": str(listed_rollout)}]
+    app.items_response = {
+        "data": [
+            {
+                "turnId": "turn-1",
+                "item": {"id": "item-1", "type": "agentMessage", "text": "safe"},
+            }
+        ]
+    }
+
+    result = await bridge.read_thread_items("paginated-thread")
+
+    assert result["turn_model_metadata"]["turn-1"]["model_resolution_status"] == "unavailable"
+    assert app.methods == ["thread/read", "thread/items/list"]
+
+
+@pytest.mark.asyncio
+async def test_read_legacy_items_adds_turn_model_metadata_and_fails_soft(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["legacy-thread"] = str(allowed_dir)
+    app.thread_histories["legacy-thread"] = [
+        {
+            "id": "turn-1",
+            "items": [{"id": "item-1", "type": "agentMessage", "text": "safe"}],
+        },
+        {
+            "id": "turn-2",
+            "items": [{"id": "item-2", "type": "agentMessage", "text": "older"}],
+        },
+    ]
+    app.thread_paths["legacy-thread"] = str(allowed_dir / "missing-rollout.jsonl")
+
+    result = await bridge.read_thread_items("legacy-thread")
+
+    assert [entry["turn_id"] for entry in result["items"]] == ["turn-2", "turn-1"]
+    assert result["turn_model_metadata"] == {
+        "turn-2": {"model_candidates": [], "model_resolution_status": "unavailable"},
+        "turn-1": {"model_candidates": [], "model_resolution_status": "unavailable"},
+    }
+    assert app.methods == ["thread/read", "thread/read"]
 
 
 @pytest.mark.asyncio
