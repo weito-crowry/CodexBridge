@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QSplitter
 
 from codex_bridge.console.codex_resolver import CodexResolution
@@ -201,6 +202,19 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.activity_pane is not None
     assert "CodexBridge is not available" in window.history_pane._empty_label.text()
     assert window.stream_status_label.text() == "Stream: idle"
+    window.close()
+
+
+def test_main_window_uses_the_application_icon() -> None:
+    application = _application()
+    pixmap = QPixmap(16, 16)
+    pixmap.fill()
+    icon = QIcon(pixmap)
+    application.setWindowIcon(icon)
+
+    window = MainWindow(_config(), api_client=FakeClient(), tray_available=False)
+
+    assert window.windowIcon().cacheKey() == icon.cacheKey()
     window.close()
 
 

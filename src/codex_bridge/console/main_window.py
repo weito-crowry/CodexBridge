@@ -211,6 +211,9 @@ class MainWindow(QMainWindow):
     def _standard_icon(self) -> QIcon:
         application = QApplication.instance()
         if isinstance(application, QApplication):
+            application_icon = application.windowIcon()
+            if not application_icon.isNull():
+                return application_icon
             icon = application.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
             if not icon.isNull():
                 return icon
