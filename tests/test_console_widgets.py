@@ -1,15 +1,77 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication, QLabel, QTextEdit
 
 from codex_bridge.console.widgets import (
     ActivityPane,
     HistoryPane,
+    ThreadListPane,
     TimelineEntry,
     activity_row,
     timeline_entries,
 )
+
+
+def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+
+    pane.set_threads(
+        [
+            {"id": "named", "name": "Named thread", "preview": "Preview text"},
+            {"id": "missing", "preview": "Preview text"},
+            {"id": "empty", "name": "", "preview": "Preview text"},
+            {"id": "invalid", "name": 42, "preview": "Preview text"},
+        ]
+    )
+
+    assert [pane.list_widget.item(index).text() for index in range(4)] == [
+        "Named thread",
+        "New スレッド",
+        "New スレッド",
+        "New スレッド",
+    ]
+    assert all("Preview text" not in pane.list_widget.item(index).text() for index in range(4))
+    for index, thread_id in enumerate(("named", "missing", "empty", "invalid")):
+        item = pane.list_widget.item(index)
+        assert item.data(Qt.ItemDataRole.UserRole) == thread_id
+        assert item.toolTip() == thread_id
+
+
+def test_thread_list_marks_active_threads_with_palette_color_and_bold_font() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+
+    pane.set_threads(
+        [{"id": "active", "name": "Active"}, {"id": "idle", "name": "Idle"}],
+        active_thread_ids={"active"},
+    )
+
+    active = pane.list_widget.item(0)
+    idle = pane.list_widget.item(1)
+    assert active.font().weight() > idle.font().weight()
+    assert active.foreground().color() == pane.list_widget.palette().color(QPalette.ColorRole.Link)
+    assert active.foreground().color() != idle.foreground().color()
+
+
+def test_thread_list_refresh_preserves_selected_thread_id() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    threads = [{"id": "thread-a", "name": "A"}, {"id": "thread-b", "name": "B"}]
+
+    pane.set_threads(threads)
+    pane.list_widget.setCurrentRow(1)
+    pane.set_threads(threads, active_thread_ids={"thread-b"})
+
+    current = pane.list_widget.currentItem()
+    assert current is not None
+    assert current.data(Qt.ItemDataRole.UserRole) == "thread-b"
+    assert current.font().weight() > pane.list_widget.item(0).font().weight()
 
 
 def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:

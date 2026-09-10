@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QSplitter
 
@@ -246,6 +246,118 @@ def test_ready_bridge_with_threads_and_no_selection_prompts_selection() -> None:
 
     assert window.history_pane._empty_label.text() == "Select a thread to view history."
     assert window.activity_pane.state_label.text() == "Select a thread to view activity."
+    window.close()
+
+
+def test_main_window_tracks_selected_turn_activity_without_refresh_fanout() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result(
+        "threads",
+        {"threads": [{"id": "thread-a", "name": "A", "preview": "ignored"}]},
+    )
+    window.thread_pane.list_widget.setCurrentRow(0)
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+
+    for state in ("in_progress", "needs_approval", "needs_user_input", "needs_input"):
+        client.result(
+            status_key,
+            {"thread_id": "thread-a", "state": state, "recent_activities": []},
+        )
+        assert "thread-a" in window._active_thread_ids
+
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "completed", "recent_activities": []},
+    )
+    assert "thread-a" not in window._active_thread_ids
+
+    client.requests.clear()
+    window.refresh()
+    assert sum(path.endswith("/turns") for _, path, _ in client.requests) == 1
+    window.close()
+
+
+def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("threads", {"threads": [{"id": "thread-a"}]})
+    window.thread_pane.list_widget.setCurrentRow(0)
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "in_progress", "recent_activities": []},
+    )
+
+    active_item = window.thread_pane.list_widget.item(0)
+    assert active_item.text() == "New スレッド"
+    active_weight = active_item.font().weight()
+
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "Renamed"}]})
+
+    current = window.thread_pane.list_widget.currentItem()
+    assert current is not None
+    assert current.data(Qt.ItemDataRole.UserRole) == "thread-a"
+    assert current.text() == "Renamed"
+    assert current.font().weight() == active_weight
+    window.close()
+
+
+def test_main_window_updates_active_threads_from_sse_lifecycle_events() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+
+    client.activity(
+        1,
+        {
+            "activity_id": "started",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_started",
+            "status": "in_progress",
+            "summary": "Turn started",
+            "details": {},
+        },
+    )
+    assert "thread-a" in window._active_thread_ids
+
+    client.activity(
+        1,
+        {
+            "activity_id": "finished",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+            "summary": "Turn completed",
+            "details": {},
+        },
+    )
+    assert "thread-a" not in window._active_thread_ids
+
+    for index, activity_type in enumerate(("approval_requested", "user_input_requested")):
+        client.activity(
+            1,
+            {
+                "activity_id": f"requested-{index}",
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+                "type": activity_type,
+                "status": "requested",
+                "summary": "Input requested",
+                "details": {},
+            },
+        )
+        assert "thread-a" in window._active_thread_ids
+
     window.close()
 
 

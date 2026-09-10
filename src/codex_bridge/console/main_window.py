@@ -50,6 +50,13 @@ _READINESS_TIMEOUT_SECONDS = 10.0
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
+_ACTIVE_TURN_STATES = {
+    "in_progress",
+    "needs_approval",
+    "needs_input",
+    "needs_user_input",
+}
+_TERMINAL_TURN_STATES = {"completed", "interrupted", "failed", "error"}
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
     "external": "Runtime: external",
@@ -155,6 +162,7 @@ class MainWindow(QMainWindow):
         self._timeline_entries: list[TimelineEntry] = []
         self._turn_model_metadata: dict[str, Mapping[str, object]] = {}
         self._turn_statuses: dict[str, str] = {}
+        self._active_thread_ids: set[str] = set()
         self._next_cursor: str | None = None
         self._stream_sync_pending = False
         self._reconnect_scheduled = False
@@ -1107,7 +1115,7 @@ class MainWindow(QMainWindow):
         if key == "threads":
             if isinstance(payload, Mapping) and isinstance(payload.get("threads"), list):
                 threads = [thread for thread in payload["threads"] if isinstance(thread, Mapping)]
-                self.thread_pane.set_threads(threads)
+                self.thread_pane.set_threads(threads, active_thread_ids=self._active_thread_ids)
                 if not threads:
                     self.thread_pane.set_empty_state("No threads found.")
                 self._sync_empty_state()
@@ -1128,6 +1136,9 @@ class MainWindow(QMainWindow):
                     and isinstance(turn.get("id"), str)
                     and isinstance(turn.get("status"), str)
                 }
+                if any(status in _ACTIVE_TURN_STATES for status in self._turn_statuses.values()):
+                    if self._selected_thread_id is not None:
+                        self._set_thread_active(self._selected_thread_id, True)
                 self._render_timeline()
             return
         if suffix == "items":
@@ -1171,11 +1182,30 @@ class MainWindow(QMainWindow):
     def _apply_status(self, payload: object) -> None:
         if not isinstance(payload, Mapping):
             return
+        thread_id = payload.get("thread_id")
+        if not isinstance(thread_id, str):
+            thread_id = self._selected_thread_id
+        state = payload.get("state")
+        if isinstance(thread_id, str) and isinstance(state, str):
+            self._update_thread_activity(thread_id, state)
         self.activity_pane.set_snapshot(payload)
         self.bottom_status_label.setText("Thread snapshot updated")
         if self._stream_sync_pending and self._selected_thread_id is not None:
             self._stream_sync_pending = False
             self._client.start_stream(self._selected_thread_id, self._selection_generation)
+
+    def _set_thread_active(self, thread_id: str, active: bool) -> None:
+        if active:
+            self._active_thread_ids.add(thread_id)
+        else:
+            self._active_thread_ids.discard(thread_id)
+        self.thread_pane.set_active_thread_ids(self._active_thread_ids)
+
+    def _update_thread_activity(self, thread_id: str, state: str) -> None:
+        if state in _ACTIVE_TURN_STATES:
+            self._set_thread_active(thread_id, True)
+        elif state in _TERMINAL_TURN_STATES or state == "not_loaded":
+            self._set_thread_active(thread_id, False)
 
     def load_older(self) -> None:
         if self._selected_thread_id is None or self._next_cursor is None:
@@ -1246,6 +1276,28 @@ class MainWindow(QMainWindow):
             or payload.get("thread_id") != self._selected_thread_id
         ):
             return
+        thread_id = payload.get("thread_id")
+        activity_type = payload.get("type")
+        activity_status = payload.get("status")
+        if isinstance(thread_id, str) and isinstance(activity_type, str):
+            if (
+                activity_type == "turn_started"
+                or activity_status == "in_progress"
+                or activity_type in {"approval_requested", "user_input_requested"}
+                and activity_status == "requested"
+            ):
+                self._set_thread_active(thread_id, True)
+            elif (
+                activity_type
+                in {
+                    "turn_completed",
+                    "turn_failed",
+                    "turn_interrupted",
+                    "error",
+                }
+                and activity_status in _TERMINAL_TURN_STATES
+            ):
+                self._set_thread_active(thread_id, False)
         self.activity_pane.append_activity(payload)
 
     def _apply_stream_state(self, generation: int, state: str) -> None:

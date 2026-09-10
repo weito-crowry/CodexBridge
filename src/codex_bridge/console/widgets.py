@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush, QFont, QPalette
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -206,6 +207,7 @@ class ThreadListPane(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._threads: list[dict[str, object]] = []
+        self._active_thread_ids: set[str] = set()
         title = QLabel("Threads")
         self.refresh_button = QPushButton("Refresh")
         self.filter_edit = QLineEdit()
@@ -225,8 +227,19 @@ class ThreadListPane(QWidget):
         layout.addWidget(self.filter_edit)
         layout.addWidget(self.list_widget, 1)
 
-    def set_threads(self, threads: Sequence[Mapping[str, object]]) -> None:
+    def set_threads(
+        self,
+        threads: Sequence[Mapping[str, object]],
+        *,
+        active_thread_ids: Collection[str] | None = None,
+    ) -> None:
         self._threads = [dict(thread) for thread in threads]
+        if active_thread_ids is not None:
+            self._active_thread_ids = set(active_thread_ids)
+        self._render()
+
+    def set_active_thread_ids(self, thread_ids: Collection[str]) -> None:
+        self._active_thread_ids = set(thread_ids)
         self._render()
 
     @property
@@ -235,6 +248,10 @@ class ThreadListPane(QWidget):
 
     def _render(self) -> None:
         query = self.filter_edit.text().casefold()
+        current_item = self.list_widget.currentItem()
+        selected_thread_id = (
+            current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+        )
         self.list_widget.clear()
         for thread in self._threads:
             thread_id = thread.get("id")
@@ -245,13 +262,24 @@ class ThreadListPane(QWidget):
             )
             if query and query not in searchable.casefold():
                 continue
-            title = _safe_text(thread.get("name")) or _safe_text(thread.get("preview")) or thread_id
-            preview = _safe_text(thread.get("preview"))
-            text = title if not preview or title == preview else f"{title}\n{preview}"
-            item = QListWidgetItem(text)
+            title = _safe_text(thread.get("name")) or "New スレッド"
+            item = QListWidgetItem(title)
             item.setData(Qt.ItemDataRole.UserRole, thread_id)
             item.setToolTip(thread_id)
+            if thread_id in self._active_thread_ids:
+                font = QFont(item.font())
+                font.setWeight(QFont.Weight.DemiBold)
+                item.setFont(font)
+                item.setForeground(
+                    QBrush(self.list_widget.palette().color(QPalette.ColorRole.Link))
+                )
             self.list_widget.addItem(item)
+        if isinstance(selected_thread_id, str):
+            for index in range(self.list_widget.count()):
+                item = self.list_widget.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == selected_thread_id:
+                    self.list_widget.setCurrentRow(index)
+                    break
 
     def _emit_selected(self, item: QListWidgetItem) -> None:
         thread_id = item.data(Qt.ItemDataRole.UserRole)
