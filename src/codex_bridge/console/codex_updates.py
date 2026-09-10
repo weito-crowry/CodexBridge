@@ -9,7 +9,9 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
-from ..codex_resolver import CodexResolution, _is_windows, resolve_cmd_executable
+from . import codex_resolver
+
+CodexResolution = codex_resolver.CodexResolution
 
 _MAX_DOCTOR_OUTPUT = 64 * 1024
 _VERSION_RE = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-+].*)?$")
@@ -117,7 +119,7 @@ class CodexUpdateProbe(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._windows = _is_windows(platform)
+        self._windows = codex_resolver._is_windows(platform)  # type: ignore[attr-defined]
         self._environ = os.environ if environ is None else environ
         self._which = which
         self._process_factory = process_factory or (lambda owner: QProcess(owner))
@@ -149,7 +151,9 @@ class CodexUpdateProbe(QObject):
             return False
         command = None
         if self._windows and resolution.path.casefold().endswith(".cmd"):
-            command = resolve_cmd_executable(self._environ, which=self._which)
+            command = codex_resolver.resolve_cmd_executable(  # type: ignore[attr-defined]
+                self._environ, which=self._which
+            )
             if command is None:
                 self._emit_failure(operation)
                 return False
