@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -327,15 +326,15 @@ class HistoryPane(QWidget):
             header_parts.append(entry.status)
         layout.addWidget(QLabel(" · ".join(header_parts)))
         if entry.body:
-            body = QTextEdit()
-            body.setReadOnly(True)
-            body.setPlainText(entry.body)
+            body = QLabel()
+            body.setTextFormat(Qt.TextFormat.PlainText)
+            body.setWordWrap(True)
+            body.setText(entry.body)
             body.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
                 | Qt.TextInteractionFlag.TextSelectableByKeyboard
             )
             body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-            body.setMinimumHeight(36)
             layout.addWidget(body)
         if entry.details:
             layout.addWidget(QLabel(" · ".join(entry.details)))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QLabel, QTextEdit
 
 from codex_bridge.console.widgets import (
     ActivityPane,
@@ -152,6 +153,23 @@ def test_history_pane_shows_turn_status_in_separator() -> None:
 
     assert any("Turn · Model: unavailable" in label.text() for label in pane.findChildren(QLabel))
     assert any("Turn · completed" in label.text() for label in pane.findChildren(QLabel))
+
+
+def test_history_pane_shows_each_message_in_full_without_inner_scroll() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    message = "first line\nsecond line with <literal> text"
+
+    pane.set_timeline((TimelineEntry("turn", "item", "Agent", "Agent", message, None, ()),))
+
+    body_labels = [label for label in pane.findChildren(QLabel) if label.text() == message]
+    assert len(body_labels) == 1
+    body = body_labels[0]
+    assert body.wordWrap() is True
+    assert body.textFormat() == Qt.TextFormat.PlainText
+    assert body.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+    assert not pane.findChildren(QTextEdit)
 
 
 def test_history_pane_adds_model_metadata_to_each_turn_header_only() -> None:
