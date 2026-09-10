@@ -27,6 +27,12 @@ class FakeAppServer:
         self.thread_list: list[dict[str, Any]] = []
         self.turns_response: dict[str, Any] = {"data": []}
         self.items_response: dict[str, Any] = {"data": []}
+        self.rate_limits_response: dict[str, Any] = {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
+            }
+        }
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
@@ -82,6 +88,8 @@ class FakeAppServer:
             return self.turns_response
         if method == "thread/items/list":
             return self.items_response
+        if method == "account/rateLimits/read":
+            return self.rate_limits_response
         raise AssertionError(f"unexpected method {method}")
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
@@ -118,6 +126,16 @@ def make_activity_bridge(allowed_dir) -> tuple[Bridge, FakeAppServer, StateStore
 
 def write_rollout(path: Path, *records: dict[str, Any]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_rate_limits_uses_the_formal_app_server_request(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    result = await bridge.rate_limits()
+
+    assert result["rateLimits"]["primary"]["windowDurationMins"] == 300
+    assert app.calls == [("account/rateLimits/read", {})]
 
 
 @pytest.mark.asyncio

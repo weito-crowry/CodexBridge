@@ -8,9 +8,12 @@ from typing import Any
 from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from PySide6.QtGui import QAction, QCloseEvent, QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -38,6 +41,14 @@ from .runtime_launcher import BridgeRuntimeLauncher
 from .tunnel_resolver import TunnelResolutionError
 from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
 from .tunnel_supervisor import TunnelSupervisor, tunnel_state_label
+from .usage import (
+    CodexUsage,
+    format_codex_usage,
+    format_codex_usage_detail,
+    format_codex_usage_tooltip,
+    parse_codex_usage,
+    usage_level,
+)
 from .widgets import (
     ActivityPane,
     HistoryPane,
@@ -170,6 +181,8 @@ class MainWindow(QMainWindow):
         self._stream_sync_pending = False
         self._reconnect_scheduled = False
         self._runtime_state = "unavailable"
+        self._usage = CodexUsage()
+        self._usage_attempted = False
         self._codex_resolution: CodexResolution | None = None
         self._bridge_seen_ready = False
         self._health_observed = False
@@ -201,8 +214,8 @@ class MainWindow(QMainWindow):
         self._tunnel_resolution_error: str | None = None
 
         self.setWindowTitle("CodexBridge Console")
-        self.resize(1_400, 850)
         self._build_ui()
+        self._set_initial_size()
         self._connect_client()
         self._build_timers()
         self._connect_runtime()
@@ -288,6 +301,9 @@ class MainWindow(QMainWindow):
             f"Config: {config_state} · roots {self._config.roots_count}"
         )
         self.config_status_label.setToolTip(self._config.roots_error or "Allowed roots are ready")
+        self.overall_status_label = QLabel("● Disconnected")
+        self.usage_status_label = QLabel(format_codex_usage(self._usage))
+        self.status_button = QPushButton("Status")
         self.start_bridge_button = QPushButton("Start Bridge")
         self.stop_bridge_button = QPushButton("Stop Bridge")
         self.restart_bridge_button = QPushButton("Restart Bridge")
@@ -309,25 +325,73 @@ class MainWindow(QMainWindow):
             self.tunnel_client_status_label,
             self.config_status_label,
         ):
-            label.setObjectName("topStatus")
+            label.setObjectName("detailStatus")
+        self.overall_status_label.setObjectName("topStatus")
+        self.usage_status_label.setObjectName("topStatus")
+        self.usage_status_label.setToolTip(format_codex_usage_tooltip(self._usage))
+
+        self.usage_detail_label = QLabel(format_codex_usage_detail(self._usage))
+        self.usage_detail_label.setWordWrap(True)
+        self.status_refresh_button = QPushButton("Refresh")
+        self.status_close_button = QPushButton("Close")
+
+        self.status_dialog = QDialog(self)
+        self.status_dialog.setWindowTitle("CodexBridge Status")
+        self.status_dialog.setModal(False)
+        dialog_layout = QVBoxLayout(self.status_dialog)
+
+        def add_section(title: str, rows: list[tuple[str, QWidget]]) -> None:
+            group = QGroupBox(title, self.status_dialog)
+            form = QFormLayout(group)
+            for name, widget in rows:
+                form.addRow(name, widget)
+            dialog_layout.addWidget(group)
+
+        add_section(
+            "Connection",
+            [
+                ("Bridge", self.bridge_status_label),
+                ("App Server", self.app_server_status_label),
+                ("Stream", self.stream_status_label),
+            ],
+        )
+        add_section(
+            "Codex",
+            [("Version", self.codex_status_label), ("Runtime", self.runtime_status_label)],
+        )
+        add_section("Usage", [("Codex Usage", self.usage_detail_label)])
+        add_section(
+            "Tunnel",
+            [
+                ("Tunnel", self.tunnel_status_label),
+                ("Client", self.tunnel_client_status_label),
+            ],
+        )
+        add_section("Configuration", [("Config", self.config_status_label)])
+
+        bridge_controls = QHBoxLayout()
+        for button in (
+            self.start_bridge_button,
+            self.stop_bridge_button,
+            self.restart_bridge_button,
+            self.start_tunnel_button,
+            self.stop_tunnel_button,
+            self.restart_tunnel_button,
+        ):
+            bridge_controls.addWidget(button)
+        dialog_layout.addLayout(bridge_controls)
+        dialog_buttons = QHBoxLayout()
+        dialog_buttons.addStretch(1)
+        dialog_buttons.addWidget(self.status_refresh_button)
+        dialog_buttons.addWidget(self.status_close_button)
+        dialog_layout.addLayout(dialog_buttons)
+        self.status_dialog.adjustSize()
 
         status_bar = QHBoxLayout()
-        status_bar.addWidget(QLabel("CodexBridge Console"))
+        status_bar.addWidget(self.overall_status_label)
         status_bar.addStretch(1)
-        status_bar.addWidget(self.bridge_status_label)
-        status_bar.addWidget(self.app_server_status_label)
-        status_bar.addWidget(self.stream_status_label)
-        status_bar.addWidget(self.codex_status_label)
-        status_bar.addWidget(self.runtime_status_label)
-        status_bar.addWidget(self.tunnel_status_label)
-        status_bar.addWidget(self.tunnel_client_status_label)
-        status_bar.addWidget(self.config_status_label)
-        status_bar.addWidget(self.start_bridge_button)
-        status_bar.addWidget(self.stop_bridge_button)
-        status_bar.addWidget(self.restart_bridge_button)
-        status_bar.addWidget(self.start_tunnel_button)
-        status_bar.addWidget(self.stop_tunnel_button)
-        status_bar.addWidget(self.restart_tunnel_button)
+        status_bar.addWidget(self.usage_status_label)
+        status_bar.addWidget(self.status_button)
 
         self.thread_pane = ThreadListPane()
         self.history_pane = HistoryPane()
@@ -378,6 +442,18 @@ class MainWindow(QMainWindow):
             """
         )
 
+    def _set_initial_size(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        available_width = available.width()
+        available_height = available.height()
+        width = min(1_400, available_width, max(480, available_width - 32))
+        height = min(850, available_height, max(480, available_height - 64))
+        self.setMinimumSize(0, 0)
+        self.resize(width, height)
+
     @staticmethod
     def _quit_qapplication() -> None:
         application = QApplication.instance()
@@ -408,6 +484,18 @@ class MainWindow(QMainWindow):
         self.start_tunnel_button.clicked.connect(self._start_tunnel)
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
+        self.status_button.clicked.connect(self._show_status)
+        self.status_refresh_button.clicked.connect(self._refresh_status)
+        self.status_close_button.clicked.connect(self.status_dialog.close)
+
+    def _show_status(self) -> None:
+        self.status_dialog.show()
+        self.status_dialog.raise_()
+        self.status_dialog.activateWindow()
+
+    def _refresh_status(self) -> None:
+        self._request_usage(force=True)
+        self.refresh()
 
     def _build_tray(self) -> None:
         if not self._tray_available or self._window_icon.isNull():
@@ -621,6 +709,7 @@ class MainWindow(QMainWindow):
 
     def _set_unavailable_state(self) -> None:
         self._bridge_ready = False
+        self._sync_overall_status()
         self._sync_empty_state()
 
     def refresh(self) -> None:
@@ -648,6 +737,53 @@ class MainWindow(QMainWindow):
         self.runtime_status_label.setText(label or _RUNTIME_LABELS.get(state, f"Runtime: {state}"))
         self._update_start_button()
         self._update_bridge_controls()
+
+    def _request_usage(self, *, force: bool = False) -> None:
+        if self._closing:
+            return
+        if force:
+            self._usage_attempted = False
+        if self._usage_attempted:
+            return
+        if self._client.get_json("/ui-api/account/rate-limits", key="usage"):
+            self._usage_attempted = True
+
+    def _apply_usage(self, payload: object) -> None:
+        self._usage = parse_codex_usage(payload)
+        self.usage_status_label.setText(format_codex_usage(self._usage))
+        self.usage_status_label.setToolTip(format_codex_usage_tooltip(self._usage))
+        self.usage_detail_label.setText(format_codex_usage_detail(self._usage))
+        level = usage_level(self._usage)
+        font = self.usage_status_label.font()
+        font.setBold(level != "normal")
+        if level == "error":
+            font.setWeight(QFont.Weight.Bold)
+        elif level == "warning":
+            font.setWeight(QFont.Weight.DemiBold)
+        else:
+            font.setWeight(QFont.Weight.Normal)
+        self.usage_status_label.setFont(font)
+        palette = self.usage_status_label.palette()
+        role = {
+            "normal": QPalette.ColorRole.Text,
+            "warning": QPalette.ColorRole.Link,
+            "error": QPalette.ColorRole.BrightText,
+        }[level]
+        palette.setColor(QPalette.ColorRole.WindowText, palette.color(role))
+        self.usage_status_label.setPalette(palette)
+
+    def _sync_overall_status(self) -> None:
+        if self._health_ok and self._bridge_ready and self._app_server_ready:
+            text = "● Ready"
+        elif self._health_observed or self._status_observed:
+            text = (
+                "● Warning"
+                if self._health_ok or self._bridge_ready or self._app_server_ready
+                else "● Disconnected"
+            )
+        else:
+            text = "● Disconnected"
+        self.overall_status_label.setText(text)
 
     def _update_start_button(self) -> None:
         enabled = (
@@ -1111,10 +1247,12 @@ class MainWindow(QMainWindow):
             if self._health_ok:
                 self.bottom_status_label.setText("Bridge reachable")
             self._apply_runtime_observation()
+            self._sync_overall_status()
             self._sync_empty_state()
             return
         if key == "bridge-status":
             self._status_observed = True
+            was_ready = self._bridge_ready and self._app_server_ready
             if isinstance(payload, Mapping):
                 bridge = payload.get("bridge")
                 app_server = payload.get("app_server")
@@ -1133,7 +1271,17 @@ class MainWindow(QMainWindow):
                 self.bridge_status_label.setText("Bridge: disconnected")
                 self.app_server_status_label.setText("App Server: failed")
                 self._apply_runtime_observation()
+            ready = self._bridge_ready and self._app_server_ready
+            if ready and not was_ready and not self._usage_attempted:
+                self._request_usage()
+            elif not ready:
+                self._usage_attempted = False
+            self._sync_overall_status()
             self._sync_empty_state()
+            return
+        if key == "usage":
+            self._usage_attempted = True
+            self._apply_usage(payload)
             return
         if key == "launch:health":
             self._apply_launch_health(payload)
@@ -1285,7 +1433,12 @@ class MainWindow(QMainWindow):
             self.app_server_status_label.setText("App Server: failed")
             self.bottom_status_label.setText(message)
             self._apply_runtime_observation()
+            self._sync_overall_status()
             self._sync_empty_state()
+            return
+        if key == "usage":
+            self._usage_attempted = True
+            self._apply_usage({})
             return
         selection = self._is_current_selection(key)
         if selection is None:

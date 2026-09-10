@@ -701,6 +701,9 @@ class Bridge:
             "thread/name/set", {"threadId": thread_id, "name": name}
         )
 
+    async def rate_limits(self) -> dict[str, Any]:
+        return await self._app_server.request("account/rateLimits/read", {})
+
     async def _history_metadata(self, thread_id: str) -> tuple[dict[str, Any], str, str]:
         response = await self._app_server.request(
             "thread/read", {"threadId": thread_id, "includeTurns": False}

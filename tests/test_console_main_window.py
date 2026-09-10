@@ -208,6 +208,97 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.activity_pane is not None
     assert "CodexBridge is not available" in window.history_pane._empty_label.text()
     assert window.stream_status_label.text() == "Stream: idle"
+    assert window.overall_status_label.text() == "● Disconnected"
+    assert window.usage_status_label.text() == "Codex Usage  unavailable"
+    assert window.bridge_status_label.window() is window.status_dialog
+    window.close()
+
+
+def test_status_button_opens_detail_dialog_and_refresh_reloads_usage() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    window.status_button.click()
+    assert window.status_dialog.isVisible()
+
+    client.requests.clear()
+    window.status_refresh_button.click()
+
+    assert any(
+        key == "usage" and path == "/ui-api/account/rate-limits" for key, path, _ in client.requests
+    )
+    window.status_dialog.close()
+    window.close()
+
+
+def test_generic_refresh_does_not_reload_usage() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.requests.clear()
+    window.refresh()
+
+    assert not any(key == "usage" for key, _, _ in client.requests)
+    window.close()
+
+
+def test_usage_failure_is_not_retried_while_connection_stays_ready() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    client.requests.clear()
+    client.failure("usage", "Bridge unavailable")
+
+    assert window.usage_status_label.text() == "Codex Usage  unavailable"
+    assert not any(key == "usage" for key, _, _ in client.requests)
+    window.close()
+
+
+def test_partial_connection_state_uses_warning_marker() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "failed"})
+
+    assert window.overall_status_label.text() == "● Warning"
+    window.close()
+
+
+def test_main_window_usage_renders_remaining_values_and_reset_tooltip() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    client.result(
+        "usage",
+        {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {
+                        "windowDurationMins": 10080,
+                        "usedPercent": 39,
+                        "resetsAt": "2030-01-09T03:04:05Z",
+                    },
+                    "secondary": {
+                        "windowDurationMins": 300,
+                        "usedPercent": 28,
+                        "resetsAt": "2030-01-02T03:04:05Z",
+                    },
+                }
+            }
+        },
+    )
+
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week 61%"
+    assert "5h: 72% left" in window.usage_status_label.toolTip()
+    assert "2030-01-02 " in window.usage_detail_label.text()
     window.close()
 
 

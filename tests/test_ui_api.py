@@ -98,6 +98,15 @@ class FakeBridge:
             "recent_activities": [],
         }
 
+    async def rate_limits(self) -> dict[str, Any]:
+        self.calls.append(("rate_limits", (), {}))
+        return {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
+            }
+        }
+
 
 def config(tmp_path) -> BridgeConfig:
     return BridgeConfig(
@@ -225,6 +234,20 @@ async def test_ui_api_rename_delegates_target_and_name_to_bridge(tmp_path) -> No
         "name": "Renamed",
     }
     assert bridge.calls[-1] == ("rename_thread", ("thread-b", "Renamed"), {})
+
+
+@pytest.mark.asyncio
+async def test_ui_api_rate_limits_delegates_to_read_only_bridge(tmp_path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+
+    response = await _route(app, "/ui-api/account/rate-limits").endpoint(
+        _request("/ui-api/account/rate-limits")
+    )
+
+    assert response.status_code == 200
+    assert (await _json_response(response))["rateLimits"]["primary"]["usedPercent"] == 28
+    assert bridge.calls[-1] == ("rate_limits", (), {})
 
 
 @pytest.mark.asyncio

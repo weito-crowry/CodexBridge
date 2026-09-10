@@ -58,6 +58,8 @@ class UiBridge(Protocol):
         activity_limit: int = 20,
     ) -> dict[str, Any]: ...
 
+    async def rate_limits(self) -> dict[str, Any]: ...
+
 
 ShutdownCallback = Callable[[], Awaitable[None] | None]
 
@@ -249,6 +251,12 @@ def create_ui_app(
         except Exception as exc:
             return _error_response(exc)
 
+    async def rate_limits(request: Request) -> Response:
+        try:
+            return JSONResponse(await bridge.rate_limits())
+        except Exception as exc:
+            return _error_response(exc)
+
     async def events(request: Request) -> Response:
         thread_id = request.query_params.get("thread_id") or None
         if thread_id is not None:
@@ -314,6 +322,7 @@ def create_ui_app(
         Route("/ui-api/threads/{thread_id}/turns", turns),
         Route("/ui-api/threads/{thread_id}/items", items),
         Route("/ui-api/threads/{thread_id}/status", thread_status),
+        Route("/ui-api/account/rate-limits", rate_limits),
         Route("/ui-api/events", events),
     ]
     if config.control_token is not None and shutdown_callback is not None:
