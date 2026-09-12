@@ -448,6 +448,7 @@ class HistoryPane(QWidget):
         self._empty_label.setVisible(not entries)
         self._scroll.setVisible(bool(entries))
         self.load_older_button.setVisible(has_older)
+        self._content.adjustSize()
 
     def _card(self, entry: TimelineEntry) -> QWidget:
         card = QFrame()

@@ -397,3 +397,35 @@ def test_history_pane_formats_unavailable_model() -> None:
     assert "Turn · Model: unavailable" in {
         label.text() for label in pane._content.findChildren(QLabel)
     }
+
+
+def test_history_pane_shrinks_scroll_content_after_long_timeline_is_replaced() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(900, 600)
+    long_body = "line " * 2000
+    long_entries = tuple(
+        TimelineEntry("long", "item", "Agent", "Agent", long_body, None, ()) for _ in range(8)
+    )
+    pane.set_timeline(long_entries)
+    pane.show()
+    application.processEvents()
+    assert pane._content.height() > pane._scroll.viewport().height()
+    pane._scroll.verticalScrollBar().setValue(pane._scroll.verticalScrollBar().maximum())
+    application.processEvents()
+
+    pane.set_timeline((TimelineEntry("short", "item", "Agent", "Agent", "short", None, ()),))
+    application.processEvents()
+
+    last_widget = pane._content_layout.itemAt(pane._content_layout.count() - 1).widget()
+    assert last_widget is not None
+    scrollbar = pane._scroll.verticalScrollBar()
+    diagnostics = (
+        f"content_height={pane._content.height()} "
+        f"content_size_hint={pane._content.sizeHint().height()} "
+        f"last_bottom={last_widget.geometry().bottom()} "
+        f"maximum={scrollbar.maximum()} page_step={scrollbar.pageStep()}"
+    )
+    assert pane._content.height() <= pane._scroll.viewport().height(), diagnostics
+    assert scrollbar.maximum() == 0, diagnostics
