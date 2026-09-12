@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import QCoreApplication, Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QPushButton, QSplitter
 
@@ -233,6 +233,13 @@ class LifecycleTunnel(StableTunnel):
     def emit_state(self, state: str) -> None:
         self.state = state
         self.state_changed.emit(state)
+
+
+class RecoveringLifecycleTunnel(LifecycleTunnel):
+    def __init__(self, state: str = "failed") -> None:
+        super().__init__(state)
+        self.recovery_timer = QTimer()
+        self.recovery_timer.setSingleShot(True)
 
 
 def _application() -> QApplication:
@@ -1535,10 +1542,12 @@ def test_overall_is_ready_only_when_bridge_app_server_and_tunnel_are_usable() ->
 
 def test_tunnel_failure_with_local_bridge_ready_is_degraded() -> None:
     _application()
+    tunnel = RecoveringLifecycleTunnel("failed")
+    tunnel.recovery_timer.start(60_000)
     window = MainWindow(
         _config(),
         api_client=FakeClient(),
-        tunnel_supervisor=LifecycleTunnel("failed"),
+        tunnel_supervisor=tunnel,
         tray_available=False,
     )
 

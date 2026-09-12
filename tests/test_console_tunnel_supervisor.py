@@ -466,6 +466,35 @@ def test_retry_now_attempts_immediately_when_bridge_and_preflight_are_ready() ->
     supervisor.close()
 
 
+def test_retry_now_restarts_failed_validate_version_preflight() -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    retry_version = FakeProcess()
+    retry_doctor = FakeProcess()
+    processes = [version, doctor, retry_version, retry_doctor]
+    supervisor = TunnelSupervisor(
+        executable="tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+    supervisor.set_bridge_ready(True)
+    version.stdout = b"tunnel-client 0.0.99\n"
+    version.readyReadStandardOutput.emit()
+    version.finished.emit(0, 0)
+    doctor.exit_code = 1
+    doctor.finished.emit(1, 0)
+
+    assert supervisor.state == "failed"
+    assert supervisor.retry_now()
+    assert retry_version.start_calls == 1
+    assert retry_doctor.start_calls == 0
+    supervisor.close()
+
+
 def test_stop_terminates_then_kills_after_bounded_timeout() -> None:
     _application()
     doctor = FakeProcess()

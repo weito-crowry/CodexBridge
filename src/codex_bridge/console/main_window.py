@@ -1056,14 +1056,10 @@ class MainWindow(QMainWindow):
 
     def _sync_overall_status(self) -> None:
         bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
-        recovery_timer = getattr(self._tunnel, "recovery_timer", None)
-        tunnel_recovery_active = bool(recovery_timer is not None and recovery_timer.isActive())
         if bridge_ready:
             if self._tunnel_state == "ready":
                 state = "Ready"
             elif self._tunnel_state in {"checking", "starting", "running", "stopping"}:
-                state = "Starting"
-            elif tunnel_recovery_active:
                 state = "Starting"
             else:
                 state = "Degraded"

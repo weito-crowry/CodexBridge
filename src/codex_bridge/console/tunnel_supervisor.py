@@ -340,6 +340,7 @@ class TunnelSupervisor(QObject):
         self._doctor_passed = False
         if self._validate_version:
             self._version_checked = False
+            self._doctor_started = False
             self._start_version_once()
             return self._version_process is not None
         self._doctor_started = False
