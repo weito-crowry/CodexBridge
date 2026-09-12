@@ -1292,6 +1292,7 @@ class MainWindow(QMainWindow):
         self._set_runtime_state("console_started", label="Runtime: started by Console")
         self.bottom_status_label.setText("Bridge started by Console")
         self._tunnel.set_bridge_ready(True)
+        self._begin_usage_sequence()
         self._restore_restarted_tunnel()
 
     def _restore_restarted_tunnel(self) -> None:

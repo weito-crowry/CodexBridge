@@ -1298,6 +1298,19 @@ def test_start_bridge_is_detached_once_and_readiness_marks_console_started() -> 
     window.close()
 
 
+def test_managed_launch_readiness_starts_usage_sequence() -> None:
+    window, client, _launcher = _owned_window()
+
+    assert window._usage_ready
+    assert window.usage_initial_timer.isActive()
+    assert window.usage_poll_timer.isActive()
+
+    window._on_usage_initial_timeout()
+
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    window.close()
+
+
 def test_successful_detached_launch_never_reenables_after_temporary_unavailable() -> None:
     _application()
     client = FakeClient()
