@@ -20,6 +20,8 @@ _STOP_TIMEOUT_MS = 2_000
 _STARTUP_INTERVAL_MS = 350
 _STEADY_INTERVAL_MS = 5_000
 _STARTUP_TIMEOUT_SECONDS = 10.0
+_TUNNEL_RECOVERY_DELAYS_MS = (1_000, 3_000, 10_000, 30_000)
+_TUNNEL_RECOVERY_FALLBACK_MS = 60_000
 _HEALTH_HOST = "127.0.0.1"
 MIN_SUPPORTED_TUNNEL_VERSION = "0.0.14"
 _TUNNEL_VERSION_PATTERN = re.compile(
@@ -146,6 +148,7 @@ class TunnelSupervisor(QObject):
         self._version_process: Any | None = None
         self._version_output = bytearray()
         self._version_checked = False
+        self._recovery_index = 0
 
         self._doctor_timer = QTimer(self)
         self._doctor_timer.setSingleShot(True)
@@ -160,6 +163,10 @@ class TunnelSupervisor(QObject):
         self._health_timer = QTimer(self)
         self._health_timer.setInterval(_STARTUP_INTERVAL_MS)
         self._health_timer.timeout.connect(self._on_health_poll_tick)
+
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.timeout.connect(self._on_recovery_timeout)
 
     @property
     def state(self) -> str:
@@ -176,6 +183,10 @@ class TunnelSupervisor(QObject):
     @property
     def client_version(self) -> str | None:
         return self._client_version
+
+    @property
+    def recovery_timer(self) -> QTimer:
+        return self._recovery_timer
 
     @property
     def action_state(self) -> TunnelActionState:
@@ -200,7 +211,11 @@ class TunnelSupervisor(QObject):
         if self._closed:
             return
         self._bridge_ready = ready
-        if ready:
+        if not ready:
+            self._cancel_recovery()
+        elif self._doctor_passed:
+            self._maybe_start_process()
+        elif ready:
             if self._validate_version:
                 self._start_version_once()
             else:
@@ -210,9 +225,11 @@ class TunnelSupervisor(QObject):
     def start(self) -> bool:
         if not self.action_state.start_enabled:
             return False
+        self._cancel_recovery()
         return self._start_process()
 
     def stop(self, *, on_finished: Callable[[], None] | None = None) -> bool:
+        self._cancel_recovery()
         if self._process is None:
             if on_finished is not None:
                 on_finished()
@@ -239,6 +256,7 @@ class TunnelSupervisor(QObject):
             return
         self._closed = True
         self._doctor_timer.stop()
+        self._cancel_recovery()
         version_process, self._version_process = self._version_process, None
         if version_process is not None:
             version_process.kill()
@@ -266,6 +284,67 @@ class TunnelSupervisor(QObject):
             actions.stop_enabled,
             actions.restart_enabled,
         )
+
+    def _cancel_recovery(self) -> None:
+        self._recovery_timer.stop()
+        self._recovery_index = 0
+
+    def _schedule_recovery(self) -> None:
+        if (
+            self._closed
+            or not self._bridge_ready
+            or not self._doctor_passed
+            or self._process is not None
+        ):
+            return
+        if self._recovery_index < len(_TUNNEL_RECOVERY_DELAYS_MS):
+            interval = _TUNNEL_RECOVERY_DELAYS_MS[self._recovery_index]
+            self._recovery_index += 1
+        else:
+            interval = _TUNNEL_RECOVERY_FALLBACK_MS
+        self._recovery_timer.start(interval)
+
+    def _on_recovery_timeout(self) -> None:
+        if (
+            self._closed
+            or not self._bridge_ready
+            or not self._doctor_passed
+            or self._process is not None
+        ):
+            return
+        self._start_process()
+
+    def _maybe_start_process(self) -> bool:
+        if (
+            self._closed
+            or not self._bridge_ready
+            or not self._doctor_passed
+            or self._process is not None
+        ):
+            return False
+        return self._start_process()
+
+    def retry_now(self) -> bool:
+        if self._closed:
+            return False
+        self._cancel_recovery()
+        if (
+            self._process is not None
+            or self._doctor_process is not None
+            or self._version_process is not None
+            or not self._bridge_ready
+        ):
+            return False
+        if self._doctor_passed:
+            return self._start_process()
+        self._doctor_passed = False
+        if self._validate_version:
+            self._version_checked = False
+            self._start_version_once()
+            return self._version_process is not None
+        self._doctor_started = False
+        self._start_doctor_once()
+        return self._doctor_process is not None
 
     def _start_version_once(self) -> None:
         if (
@@ -444,7 +523,10 @@ class TunnelSupervisor(QObject):
             return
         if exit_code == 0:
             self._doctor_passed = True
-            self._set_state("ready_to_start" if self._bridge_ready else "unavailable")
+            if self._bridge_ready:
+                self._start_process()
+            else:
+                self._set_state("unavailable")
         else:
             self._fail_doctor(None)
 
@@ -506,6 +588,7 @@ class TunnelSupervisor(QObject):
             if process is not None:
                 process.deleteLater()
             self._set_state("failed")
+            self._schedule_recovery()
             return False
 
     def _on_process_started(self, process: Any) -> None:
@@ -582,6 +665,7 @@ class TunnelSupervisor(QObject):
         active_process: Any = process
         active_process.deleteLater()
         self._set_state("failed")
+        self._schedule_recovery()
 
     def _on_health_poll_tick(self) -> None:
         if self._process is None or self._closed:
@@ -661,6 +745,7 @@ class TunnelSupervisor(QObject):
         if self._process is None or self._closed:
             return
         if 200 <= status <= 299:
+            self._cancel_recovery()
             self._health_timer.setInterval(_STEADY_INTERVAL_MS)
             self._set_state("ready")
         elif self._state == "ready":
