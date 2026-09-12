@@ -220,6 +220,21 @@ class ManagedTunnel(StableTunnel):
         return True
 
 
+class LifecycleTunnel(StableTunnel):
+    def __init__(self, state: str = "unavailable") -> None:
+        super().__init__()
+        self.state = state
+        self.retry_calls = 0
+
+    def retry_now(self) -> bool:
+        self.retry_calls += 1
+        return True
+
+    def emit_state(self, state: str) -> None:
+        self.state = state
+        self.state_changed.emit(state)
+
+
 def _application() -> QApplication:
     application = QCoreApplication.instance()
     return application if isinstance(application, QApplication) else QApplication([])
@@ -258,7 +273,7 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.activity_pane is not None
     assert "CodexBridge is not available" in window.history_pane._empty_label.text()
     assert window.stream_status_label.text() == "Stream: idle"
-    assert window.overall_status_label.text() == "● Disconnected"
+    assert window.overall_status_label.text() == "● Starting"
     assert window.usage_status_label.text() == "Codex Usage  unavailable"
     assert window.bridge_status_label.window() is window.status_dialog
     window.close()
@@ -631,7 +646,7 @@ def test_usage_failure_is_not_retried_while_connection_stays_ready() -> None:
     window.close()
 
 
-def test_partial_connection_state_uses_warning_marker() -> None:
+def test_partial_connection_state_uses_error_marker() -> None:
     _application()
     client = FakeClient()
     window = MainWindow(_config(), api_client=client, tray_available=False)
@@ -639,7 +654,7 @@ def test_partial_connection_state_uses_warning_marker() -> None:
     client.result("health", {"status": "ok"})
     client.result("bridge-status", {"bridge": "ready", "app_server": "failed"})
 
-    assert window.overall_status_label.text() == "● Warning"
+    assert window.overall_status_label.text() == "● Error"
     window.close()
 
 
@@ -1260,6 +1275,7 @@ def test_start_bridge_is_detached_once_and_readiness_marks_console_started() -> 
     assert window.runtime_state == "launching"
     assert window.runtime_status_label.text() == "Runtime: launching"
     assert not window.start_bridge_button.isEnabled()
+    assert not window.retry_now_button.isEnabled()
     assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
     assert [key for key, _, _ in client.requests if key.startswith("launch:")] == [
         "launch:health",
@@ -1464,6 +1480,202 @@ def test_retry_now_cancels_managed_bridge_wait_and_attempts_immediately() -> Non
     assert len(launcher.calls) == 2
     assert not window.bridge_start_retry_timer.isActive()
     assert window.runtime_state == "launching"
+    window.close()
+
+
+def _set_ready_components(window: MainWindow, tunnel_state: str = "ready") -> None:
+    window._health_ok = True
+    window._health_observed = True
+    window._status_observed = True
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._runtime_state = "external"
+    window._tunnel_state = tunnel_state
+
+
+def test_overall_is_starting_during_managed_start_or_tunnel_recovery() -> None:
+    _application()
+    tunnel = LifecycleTunnel("starting")
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        tunnel_supervisor=tunnel,
+        tray_available=False,
+    )
+
+    _set_ready_components(window, tunnel_state="starting")
+    window._sync_overall_status()
+    assert window.overall_status_label.text() == "● Starting"
+
+    window._runtime_state = "launching"
+    window._health_ok = False
+    window._sync_overall_status()
+    assert window.overall_status_label.text() == "● Starting"
+    window.close()
+
+
+def test_overall_is_ready_only_when_bridge_app_server_and_tunnel_are_usable() -> None:
+    _application()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        tunnel_supervisor=LifecycleTunnel("ready"),
+        tray_available=False,
+    )
+
+    _set_ready_components(window)
+    window._sync_overall_status()
+    assert window.overall_status_label.text() == "● Ready"
+
+    window._app_server_ready = False
+    window._sync_overall_status()
+    assert window.overall_status_label.text() != "● Ready"
+    window.close()
+
+
+def test_tunnel_failure_with_local_bridge_ready_is_degraded() -> None:
+    _application()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        tunnel_supervisor=LifecycleTunnel("failed"),
+        tray_available=False,
+    )
+
+    _set_ready_components(window, tunnel_state="failed")
+    window._runtime_state = "console_started"
+    window._sync_overall_status()
+
+    assert window.overall_status_label.text() == "● Degraded"
+    window.close()
+
+
+def test_usage_failure_does_not_change_ready_to_degraded() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tunnel_supervisor=LifecycleTunnel("ready"),
+        tray_available=False,
+    )
+    _set_ready_components(window)
+    window._sync_overall_status()
+
+    client.failure("usage", "Usage unavailable")
+
+    assert window.overall_status_label.text() == "● Ready"
+    window.close()
+
+
+def test_update_check_failure_does_not_change_ready_to_degraded() -> None:
+    _application()
+    updates = FakeCodexUpdateProbe()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_update_probe=updates,
+        tunnel_supervisor=LifecycleTunnel("ready"),
+        tray_available=False,
+    )
+    _set_ready_components(window)
+    window._sync_overall_status()
+
+    updates.failure()
+
+    assert window.overall_status_label.text() == "● Ready"
+    window.close()
+
+
+def test_retry_now_routes_to_bridge_when_bridge_unavailable() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher(started=False)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tunnel_supervisor=LifecycleTunnel("unavailable"),
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    assert len(launcher.calls) == 1
+
+    window._retry_now()
+
+    assert len(launcher.calls) == 2
+    window.close()
+
+
+def test_retry_now_routes_to_tunnel_when_bridge_ready_but_tunnel_unavailable() -> None:
+    _application()
+    tunnel = LifecycleTunnel("failed")
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        tunnel_supervisor=tunnel,
+        tray_available=False,
+    )
+    _set_ready_components(window, tunnel_state="failed")
+    window._runtime_state = "external"
+    window._sync_overall_status()
+
+    window._retry_now()
+
+    assert tunnel.retry_calls == 1
+    window.close()
+
+
+def test_restart_codexbridge_uses_existing_managed_restart_path() -> None:
+    window, client, launcher = _owned_window()
+
+    assert window.restart_codexbridge_button.isEnabled()
+    window.restart_codexbridge_button.click()
+
+    assert window.runtime_state == "restarting"
+    assert not window.retry_now_button.isEnabled()
+    assert len(client.control_requests) == 1
+    assert len(launcher.calls) == 1
+    window.close()
+
+
+def test_restart_codexbridge_is_disabled_for_ready_external_bridge() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        tunnel_supervisor=LifecycleTunnel("ready"),
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert not window.restart_codexbridge_button.isEnabled()
+    assert "external" in window.restart_codexbridge_button.toolTip().casefold()
+    window.close()
+
+
+def test_advanced_controls_are_hidden_by_default_and_preserve_individual_actions() -> None:
+    _application()
+    window = MainWindow(_config(), api_client=FakeClient(), tray_available=False)
+
+    assert window.advanced_controls.isHidden()
+    assert window.start_bridge_button.parentWidget() is window.advanced_controls
+    assert window.start_tunnel_button.parentWidget() is window.advanced_controls
+
+    window.advanced_toggle_button.click()
+
+    assert not window.advanced_controls.isHidden()
+    assert window.start_bridge_button.text() == "Start Bridge"
+    assert window.stop_tunnel_button.text() == "Stop Tunnel"
     window.close()
 
 

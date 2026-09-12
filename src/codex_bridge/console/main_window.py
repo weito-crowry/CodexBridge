@@ -234,6 +234,7 @@ class MainWindow(QMainWindow):
         self._exit_deadline = 0.0
         self._sigint_requested = False
         self._tunnel_resolution_error: str | None = None
+        self._tunnel_state = getattr(self._tunnel, "state", "unavailable")
 
         self.setWindowTitle("CodexBridge Console")
         self._build_ui()
@@ -323,11 +324,16 @@ class MainWindow(QMainWindow):
             f"Config: {config_state} · roots {self._config.roots_count}"
         )
         self.config_status_label.setToolTip(self._config.roots_error or "Allowed roots are ready")
-        self.overall_status_label = QLabel("● Disconnected")
+        self.overall_status_label = QLabel("● Starting")
+        self.overall_detail_label = QLabel("● Starting")
         self.usage_status_label = QLabel(format_codex_usage(self._usage))
         self.codex_update_banner_label = QLabel("")
         self.codex_update_banner_label.setVisible(False)
         self.status_button = QPushButton("Status")
+        self.retry_now_button = QPushButton("Retry now")
+        self.restart_codexbridge_button = QPushButton("Restart CodexBridge")
+        self.advanced_toggle_button = QPushButton("Advanced")
+        self.advanced_toggle_button.setCheckable(True)
         self.start_bridge_button = QPushButton("Start Bridge")
         self.stop_bridge_button = QPushButton("Stop Bridge")
         self.restart_bridge_button = QPushButton("Restart Bridge")
@@ -339,6 +345,8 @@ class MainWindow(QMainWindow):
         self.restart_bridge_button.setEnabled(False)
         self.stop_tunnel_button.setEnabled(False)
         self.restart_tunnel_button.setEnabled(False)
+        self.retry_now_button.setEnabled(False)
+        self.restart_codexbridge_button.setEnabled(False)
         for label in (
             self.bridge_status_label,
             self.app_server_status_label,
@@ -351,6 +359,7 @@ class MainWindow(QMainWindow):
         ):
             label.setObjectName("detailStatus")
         self.overall_status_label.setObjectName("topStatus")
+        self.overall_detail_label.setObjectName("detailStatus")
         self.usage_status_label.setObjectName("topStatus")
         self.usage_status_label.setToolTip(format_codex_usage_tooltip(self._usage))
 
@@ -384,6 +393,7 @@ class MainWindow(QMainWindow):
                 form.addRow(name, widget)
             dialog_layout.addWidget(group)
 
+        add_section("Overall", [("State", self.overall_detail_label)])
         add_section(
             "Connection",
             [
@@ -413,7 +423,15 @@ class MainWindow(QMainWindow):
         )
         add_section("Configuration", [("Config", self.config_status_label)])
 
-        bridge_controls = QHBoxLayout()
+        lifecycle_controls = QHBoxLayout()
+        lifecycle_controls.addWidget(self.retry_now_button)
+        lifecycle_controls.addWidget(self.restart_codexbridge_button)
+        dialog_layout.addLayout(lifecycle_controls)
+        dialog_layout.addWidget(self.advanced_toggle_button)
+
+        self.advanced_controls = QWidget(self.status_dialog)
+        bridge_controls = QHBoxLayout(self.advanced_controls)
+        bridge_controls.setContentsMargins(0, 0, 0, 0)
         for button in (
             self.start_bridge_button,
             self.stop_bridge_button,
@@ -423,7 +441,8 @@ class MainWindow(QMainWindow):
             self.restart_tunnel_button,
         ):
             bridge_controls.addWidget(button)
-        dialog_layout.addLayout(bridge_controls)
+        dialog_layout.addWidget(self.advanced_controls)
+        self.advanced_controls.setVisible(False)
         dialog_buttons = QHBoxLayout()
         dialog_buttons.addStretch(1)
         dialog_buttons.addWidget(self.status_refresh_button)
@@ -539,6 +558,9 @@ class MainWindow(QMainWindow):
         self.status_close_button.clicked.connect(self.status_dialog.close)
         self.codex_update_check_button.clicked.connect(self._check_codex_updates)
         self.codex_update_button.clicked.connect(self._update_codex)
+        self.retry_now_button.clicked.connect(self._retry_now)
+        self.restart_codexbridge_button.clicked.connect(self._restart_codexbridge)
+        self.advanced_toggle_button.toggled.connect(self.advanced_controls.setVisible)
 
     def _show_status(self) -> None:
         self.status_dialog.show()
@@ -675,10 +697,12 @@ class MainWindow(QMainWindow):
             self._begin_exit()
 
     def _apply_tunnel_state(self, state: str) -> None:
+        self._tunnel_state = state
         if not self._closing:
             self.tunnel_status_label.setText(tunnel_state_label(state))
             self._update_tunnel_client_status()
             self._update_bridge_controls()
+            self._sync_overall_status()
 
     def _update_tunnel_client_status(self) -> None:
         version = getattr(self._tunnel, "client_version", None)
@@ -732,6 +756,13 @@ class MainWindow(QMainWindow):
         )
         self.stop_bridge_button.setEnabled(enabled)
         self.restart_bridge_button.setEnabled(enabled)
+        self.restart_codexbridge_button.setEnabled(enabled)
+        if self._runtime_state == "external" and self._bridge_ready and self._app_server_ready:
+            self.restart_codexbridge_button.setToolTip(
+                "Disabled while the Bridge is managed externally."
+            )
+        else:
+            self.restart_codexbridge_button.setToolTip("Restart the Console-managed Bridge.")
         for name in ("Stop Bridge", "Restart Bridge"):
             action = self._tray_actions.get(name)
             if action is not None:
@@ -931,6 +962,7 @@ class MainWindow(QMainWindow):
         self.runtime_status_label.setText(label or _RUNTIME_LABELS.get(state, f"Runtime: {state}"))
         self._update_start_button()
         self._update_bridge_controls()
+        self._sync_overall_status()
 
     def _request_usage(self, *, force: bool = False) -> None:
         if self._closing:
@@ -1023,23 +1055,62 @@ class MainWindow(QMainWindow):
         self.usage_status_label.setPalette(palette)
 
     def _sync_overall_status(self) -> None:
-        if self._health_ok and self._bridge_ready and self._app_server_ready:
-            text = "● Ready"
-        elif self._health_observed or self._status_observed:
-            text = (
-                "● Warning"
-                if self._health_ok or self._bridge_ready or self._app_server_ready
-                else "● Disconnected"
-            )
+        bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
+        recovery_timer = getattr(self._tunnel, "recovery_timer", None)
+        tunnel_recovery_active = bool(recovery_timer is not None and recovery_timer.isActive())
+        if bridge_ready:
+            if self._tunnel_state == "ready":
+                state = "Ready"
+            elif self._tunnel_state in {"checking", "starting", "running", "stopping"}:
+                state = "Starting"
+            elif tunnel_recovery_active:
+                state = "Starting"
+            else:
+                state = "Degraded"
+        elif (
+            self._launch_in_progress
+            or self._bridge_transition
+            or self._managed_start_active
+            or self._runtime_state
+            in {
+                "launching",
+                "restarting",
+                "stopping",
+                "external_unreachable",
+                "console_started_unreachable",
+            }
+        ):
+            state = "Starting"
+        elif self._bridge_start_retry_exhausted or self._runtime_state in {
+            "launch_failed",
+            "control_failed",
+            "stop_timed_out",
+        }:
+            state = "Error"
+        elif not self._health_observed and not self._status_observed:
+            state = "Starting"
         else:
-            text = "● Disconnected"
+            state = "Error"
+        text = f"● {state}"
         self.overall_status_label.setText(text)
+        self.overall_detail_label.setText(text)
 
     def _update_start_button(self) -> None:
         self.start_bridge_button.setEnabled(self._can_start_bridge())
         start_action = self._tray_actions.get("Start Bridge")
         if start_action is not None:
             start_action.setEnabled(self.start_bridge_button.isEnabled())
+        self._update_lifecycle_controls()
+
+    def _update_lifecycle_controls(self) -> None:
+        bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
+        retry_enabled = (
+            not self._closing
+            and not self._launch_in_progress
+            and not self._bridge_transition
+            and (not bridge_ready or self._tunnel_state != "ready")
+        )
+        self.retry_now_button.setEnabled(retry_enabled)
 
     def _can_start_bridge(self) -> bool:
         return (
@@ -1070,7 +1141,13 @@ class MainWindow(QMainWindow):
         self._start_bridge(managed=True)
 
     def _retry_now(self) -> None:
-        if self._closing:
+        if self._closing or self._launch_in_progress or self._bridge_transition:
+            return
+        bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
+        if bridge_ready and self._tunnel_state != "ready":
+            retry_now = getattr(self._tunnel, "retry_now", None)
+            if callable(retry_now):
+                retry_now()
             return
         self.bridge_start_retry_timer.stop()
         self._bridge_start_retry_index = 0
@@ -1078,6 +1155,9 @@ class MainWindow(QMainWindow):
         self._managed_start_active = True
         if self._can_start_bridge():
             self._start_bridge(managed=True)
+
+    def _restart_codexbridge(self) -> None:
+        self._restart_bridge()
 
     def _schedule_managed_bridge_retry(self) -> None:
         if self._closing or not self._managed_start_active:
@@ -1447,9 +1527,7 @@ class MainWindow(QMainWindow):
         self._bridge_loss_count = _BRIDGE_LOSS_THRESHOLD
         if self._detached_launch_started and self._control_token is not None:
             self._managed_start_active = True
-            self._begin_bridge_transition(
-                "restart", tunnel_running=self._tunnel_owned_running()
-            )
+            self._begin_bridge_transition("restart", tunnel_running=self._tunnel_owned_running())
             return
         self._bridge_seen_ready = False
         self._runtime_state = "unavailable"
@@ -1603,9 +1681,7 @@ class MainWindow(QMainWindow):
                 self.bridge_status_label.setText("Bridge: disconnected")
                 self.app_server_status_label.setText("App Server: failed")
                 self._apply_runtime_observation()
-            self._record_bridge_status_observation(
-                self._bridge_ready and self._app_server_ready
-            )
+            self._record_bridge_status_observation(self._bridge_ready and self._app_server_ready)
             ready = self._usage_ready
             if ready and not was_ready:
                 self._begin_usage_sequence()
