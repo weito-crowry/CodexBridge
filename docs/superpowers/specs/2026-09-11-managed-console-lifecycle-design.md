@@ -80,7 +80,9 @@ Statusに通常ユーザー向けの `Restart CodexBridge` を1つ設ける。
 - App Server Readyを待つ。
 - Tunnel preflight後にTunnelを起動する。
 - Readyまで自動遷移する。
-- external Bridgeを使用中の場合はexternal processを停止せず、Console-managed stackを新規に確立する方向とする。
+- external Bridgeが現在Readyな間は、同一UI portに並列Bridgeを起動できないため `Restart CodexBridge` は無効化し、tooltipで外部管理中であることを示す。
+- external Bridgeそのものは停止しない。
+- external Bridgeが喪失した場合は既定の自動takeoverによりConsole-owned Bridgeを起動し、以後 `Restart CodexBridge` を利用可能にする。
 
 ## Status UI
 メイン画面は概ね以下に簡略化する。
