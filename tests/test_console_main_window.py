@@ -1219,8 +1219,9 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     client.failure("bridge-status", "Bridge unavailable")
 
     assert window.codex_status_label.text() == "Codex: 1.2.3 · path"
-    assert window.runtime_state == "unavailable"
-    assert window.start_bridge_button.isEnabled()
+    assert window.runtime_state == "launching"
+    assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
+    assert not window.start_bridge_button.isEnabled()
     window.close()
 
 
@@ -1301,7 +1302,7 @@ def test_successful_detached_launch_never_reenables_after_temporary_unavailable(
     window.close()
 
 
-def test_launch_readiness_timeout_does_not_retry_or_enable_start() -> None:
+def test_managed_launch_readiness_timeout_schedules_retry() -> None:
     _application()
     client = FakeClient()
     probe = FakeCodexProbe()
@@ -1316,16 +1317,15 @@ def test_launch_readiness_timeout_does_not_retry_or_enable_start() -> None:
     probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     client.failure("health", "Bridge unavailable")
     client.failure("bridge-status", "Bridge unavailable")
-    window.start_bridge_button.click()
     window._readiness_deadline = 0.0
     window._on_readiness_tick()
 
-    assert window.runtime_state == "launch_timed_out"
-    assert window.runtime_status_label.text() == "Runtime: launch timed out"
+    assert window.runtime_state == "launch_failed"
+    assert window.runtime_status_label.text() == "Runtime: launch failed"
     assert not window.start_bridge_button.isEnabled()
     assert len(launcher.calls) == 1
-    client.failure("health", "Bridge unavailable")
-    assert window.runtime_status_label.text() == "Runtime: launch timed out"
+    assert window.bridge_start_retry_timer.isActive()
+    assert window.bridge_start_retry_timer.interval() == 2_000
     window.close()
 
 
@@ -1377,7 +1377,93 @@ def test_start_stays_disabled_until_both_bridge_observations_confirm_unavailable
     client.failure("health", "Bridge unavailable")
     assert not window.start_bridge_button.isEnabled()
     client.failure("bridge-status", "Bridge unavailable")
-    assert window.start_bridge_button.isEnabled()
+    assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
+    assert not window.start_bridge_button.isEnabled()
+    window.close()
+
+
+def test_unavailable_bridge_with_valid_config_auto_starts_once() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
+
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
+    assert window.runtime_state == "launching"
+    window.close()
+
+
+def test_managed_bridge_launch_failures_use_bounded_retry_schedule() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher(started=False)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
+
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert len(launcher.calls) == 1
+    assert window.bridge_start_retry_timer.isActive()
+    assert window.bridge_start_retry_timer.interval() == 2_000
+
+    window._on_bridge_start_retry_timeout()
+    assert len(launcher.calls) == 2
+    assert window.bridge_start_retry_timer.interval() == 5_000
+
+    window._on_bridge_start_retry_timeout()
+    assert len(launcher.calls) == 3
+    assert window.bridge_start_retry_timer.interval() == 10_000
+
+    window._on_bridge_start_retry_timeout()
+    assert len(launcher.calls) == 4
+    assert not window.bridge_start_retry_timer.isActive()
+    assert window.runtime_state == "launch_failed"
+    window.close()
+
+
+def test_retry_now_cancels_managed_bridge_wait_and_attempts_immediately() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher(started=False)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
+
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    assert window.bridge_start_retry_timer.isActive()
+
+    launcher.started = True
+    window._retry_now()
+
+    assert len(launcher.calls) == 2
+    assert not window.bridge_start_retry_timer.isActive()
+    assert window.runtime_state == "launching"
     window.close()
 
 

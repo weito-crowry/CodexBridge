@@ -62,6 +62,8 @@ from .widgets import (
 _RECONNECT_MS = 1_500
 _READINESS_INTERVAL_MS = 350
 _READINESS_TIMEOUT_SECONDS = 10.0
+_BRIDGE_START_RETRY_DELAYS_MS = (2_000, 5_000, 10_000)
+_BRIDGE_LOSS_THRESHOLD = 2
 _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 5 * 60 * 1_000
@@ -207,6 +209,9 @@ class MainWindow(QMainWindow):
         self._bridge_ready = False
         self._app_server_ready = False
         self._launch_in_progress = False
+        self._managed_start_active = False
+        self._bridge_start_retry_index = 0
+        self._bridge_start_retry_exhausted = False
         self._detached_launch_started = False
         self._detached_pid: int | None = None
         self._control_token: str | None = None
@@ -628,6 +633,9 @@ class MainWindow(QMainWindow):
         self.readiness_timer = QTimer(self)
         self.readiness_timer.setInterval(_READINESS_INTERVAL_MS)
         self.readiness_timer.timeout.connect(self._on_readiness_tick)
+        self.bridge_start_retry_timer = QTimer(self)
+        self.bridge_start_retry_timer.setSingleShot(True)
+        self.bridge_start_retry_timer.timeout.connect(self._on_bridge_start_retry_timeout)
         self.usage_initial_timer = QTimer(self)
         self.usage_initial_timer.setSingleShot(True)
         self.usage_initial_timer.setInterval(_USAGE_INITIAL_DELAY_MS)
@@ -787,6 +795,7 @@ class MainWindow(QMainWindow):
         self._update_start_button()
         self._sync_codex_update_controls()
         self._schedule_codex_update_auto_check()
+        self._maybe_auto_start_bridge()
 
     def _apply_codex_probe_error(self, _message: str) -> None:
         if self._closing:
@@ -1026,7 +1035,13 @@ class MainWindow(QMainWindow):
         self.overall_status_label.setText(text)
 
     def _update_start_button(self) -> None:
-        enabled = (
+        self.start_bridge_button.setEnabled(self._can_start_bridge())
+        start_action = self._tray_actions.get("Start Bridge")
+        if start_action is not None:
+            start_action.setEnabled(self.start_bridge_button.isEnabled())
+
+    def _can_start_bridge(self) -> bool:
+        return (
             not self._closing
             and self._config.roots_ready
             and self._codex_resolution is not None
@@ -1040,25 +1055,57 @@ class MainWindow(QMainWindow):
             and not self._detached_launch_started
             and not self._bridge_transition
             and not self._tunnel_is_transitioning()
+            and not self.bridge_start_retry_timer.isActive()
+            and not self._bridge_start_retry_exhausted
             and self._runtime_state in {"unavailable", "stopped", "launch_failed"}
         )
-        self.start_bridge_button.setEnabled(enabled)
-        start_action = self._tray_actions.get("Start Bridge")
-        if start_action is not None:
-            start_action.setEnabled(enabled)
 
-    def _start_bridge(self) -> None:
-        resolution = self._codex_resolution
-        if (
-            resolution is None
-            or self._bridge_ready
-            or self._bridge_seen_ready
-            or self._launch_in_progress
-            or self._detached_launch_started
-            or self._bridge_transition
-            or self._closing
-        ):
+    def _maybe_auto_start_bridge(self) -> None:
+        if self._bridge_start_retry_exhausted or self._managed_start_active:
             return
+        if not self._can_start_bridge():
+            return
+        self._managed_start_active = True
+        self._start_bridge(managed=True)
+
+    def _retry_now(self) -> None:
+        if self._closing:
+            return
+        self.bridge_start_retry_timer.stop()
+        self._bridge_start_retry_index = 0
+        self._bridge_start_retry_exhausted = False
+        self._managed_start_active = True
+        if self._can_start_bridge():
+            self._start_bridge(managed=True)
+
+    def _schedule_managed_bridge_retry(self) -> None:
+        if self._closing or not self._managed_start_active:
+            return
+        if self._bridge_start_retry_index >= len(_BRIDGE_START_RETRY_DELAYS_MS):
+            self._bridge_start_retry_exhausted = True
+            self._managed_start_active = False
+            self._update_start_button()
+            return
+        delay = _BRIDGE_START_RETRY_DELAYS_MS[self._bridge_start_retry_index]
+        self._bridge_start_retry_index += 1
+        self.bridge_start_retry_timer.setInterval(delay)
+        self.bridge_start_retry_timer.start()
+
+    def _on_bridge_start_retry_timeout(self) -> None:
+        self.bridge_start_retry_timer.stop()
+        if self._closing or self._bridge_start_retry_exhausted:
+            return
+        if self._can_start_bridge():
+            self._start_bridge(managed=True)
+        else:
+            self._managed_start_active = False
+
+    def _start_bridge(self, *, managed: bool = False) -> None:
+        resolution = self._codex_resolution
+        if resolution is None or not self._can_start_bridge():
+            return
+        if managed:
+            self._managed_start_active = True
         self._pending_bridge_action = None
         self._restart_tunnel_was_running = False
         self._bridge_transition = True
@@ -1084,6 +1131,7 @@ class MainWindow(QMainWindow):
             self._bridge_transition = False
             self._set_runtime_state("launch_failed")
             self.bottom_status_label.setText("Bridge launch failed")
+            self._schedule_managed_bridge_retry()
             return
         if not result.started:
             self._launch_in_progress = False
@@ -1091,6 +1139,7 @@ class MainWindow(QMainWindow):
             self._bridge_transition = False
             self._set_runtime_state("launch_failed")
             self.bottom_status_label.setText("Bridge launch failed")
+            self._schedule_managed_bridge_retry()
             return
         self._detached_launch_started = True
         self._detached_pid = result.pid
@@ -1115,8 +1164,12 @@ class MainWindow(QMainWindow):
             self.readiness_timer.stop()
             self._launch_in_progress = False
             self._bridge_transition = False
-            self._set_runtime_state("launch_timed_out")
+            if self._managed_start_active:
+                self._set_runtime_state("launch_failed")
+            else:
+                self._set_runtime_state("launch_timed_out")
             self.bottom_status_label.setText("Bridge launch timed out; it may still be starting")
+            self._schedule_managed_bridge_retry()
             return
         self._request_launch_readiness()
 
@@ -1153,6 +1206,10 @@ class MainWindow(QMainWindow):
         self._bridge_ready = True
         self._app_server_ready = True
         self._bridge_seen_ready = True
+        self.bridge_start_retry_timer.stop()
+        self._bridge_start_retry_index = 0
+        self._bridge_start_retry_exhausted = False
+        self._managed_start_active = False
         self._bridge_transition = False
         self._set_runtime_state("console_started", label="Runtime: started by Console")
         self.bottom_status_label.setText("Bridge started by Console")
@@ -1341,6 +1398,10 @@ class MainWindow(QMainWindow):
                 return
         self._tunnel.set_bridge_ready(ready)
         if ready:
+            self.bridge_start_retry_timer.stop()
+            self._bridge_start_retry_index = 0
+            self._bridge_start_retry_exhausted = False
+            self._managed_start_active = False
             self._bridge_seen_ready = True
             if self._detached_launch_started:
                 self._launch_in_progress = False
@@ -1363,6 +1424,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self._set_runtime_state("unavailable")
+        self._maybe_auto_start_bridge()
 
     def _request_health(self) -> None:
         self._client.get_json("/healthz", key="health")
@@ -1804,6 +1866,7 @@ class MainWindow(QMainWindow):
         self.thread_timer.stop()
         self.selected_status_timer.stop()
         self.readiness_timer.stop()
+        self.bridge_start_retry_timer.stop()
         self.stop_confirmation_timer.stop()
         self._codex_probe.abort()
         self._exit_deadline = monotonic() + _EXIT_TIMEOUT_SECONDS
