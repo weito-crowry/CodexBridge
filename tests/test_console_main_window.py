@@ -1535,6 +1535,78 @@ def test_external_bridge_keeps_bridge_controls_disabled() -> None:
     window.close()
 
 
+def _fail_bridge_observation(client: FakeClient) -> None:
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+
+def test_one_failed_bridge_status_observation_does_not_restart_owned_bridge() -> None:
+    window, client, launcher = _owned_window()
+
+    client.failure("health", "Bridge unavailable")
+    assert window._bridge_loss_count == 0
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert window._bridge_loss_count == 1
+    assert client.control_requests == []
+    assert len(launcher.calls) == 1
+    window.close()
+
+
+def test_two_failed_bridge_status_observations_restart_owned_bridge() -> None:
+    window, client, launcher = _owned_window()
+
+    _fail_bridge_observation(client)
+    _fail_bridge_observation(client)
+
+    assert window._bridge_loss_count == 2
+    assert window.runtime_state == "restarting"
+    assert len(client.control_requests) == 1
+    assert len(launcher.calls) == 1
+    window.close()
+
+
+def test_successful_bridge_status_observation_resets_loss_counter() -> None:
+    window, client, _launcher = _owned_window()
+
+    _fail_bridge_observation(client)
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    _fail_bridge_observation(client)
+
+    assert window._bridge_loss_count == 1
+    assert client.control_requests == []
+    window.close()
+
+
+def test_two_failed_external_bridge_status_observations_take_over_without_shutdown() -> None:
+    _application()
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.result("health", {"status": "ok"})
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    _fail_bridge_observation(client)
+    _fail_bridge_observation(client)
+
+    assert window._bridge_loss_count == 2
+    assert window.runtime_state == "launching"
+    assert len(launcher.calls) == 1
+    assert client.control_requests == []
+    assert window._detached_launch_started
+    window.close()
+
+
 def test_stop_requires_bridge_disappearance_after_202_and_clears_ownership() -> None:
     window, client, launcher = _owned_window()
     old_token = launcher.control_tokens[0]
@@ -1598,10 +1670,11 @@ def test_launch_timeout_recovers_to_owned_ready_on_late_normal_poll() -> None:
     window._readiness_deadline = 0.0
     window._on_readiness_tick()
 
-    assert window.runtime_state == "launch_timed_out"
+    assert window.runtime_state == "launch_failed"
     assert not window._bridge_transition
     assert not window.start_bridge_button.isEnabled()
     assert len(launcher.calls) == 1
+    assert window.bridge_start_retry_timer.isActive()
 
     client.result("health", {"status": "ok"})
     client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})

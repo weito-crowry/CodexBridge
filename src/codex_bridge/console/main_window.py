@@ -208,6 +208,7 @@ class MainWindow(QMainWindow):
         self._health_ok = False
         self._bridge_ready = False
         self._app_server_ready = False
+        self._bridge_loss_count = 0
         self._launch_in_progress = False
         self._managed_start_active = False
         self._bridge_start_retry_index = 0
@@ -1206,6 +1207,7 @@ class MainWindow(QMainWindow):
         self._bridge_ready = True
         self._app_server_ready = True
         self._bridge_seen_ready = True
+        self._bridge_loss_count = 0
         self.bridge_start_retry_timer.stop()
         self._bridge_start_retry_index = 0
         self._bridge_start_retry_exhausted = False
@@ -1357,6 +1359,7 @@ class MainWindow(QMainWindow):
         self._detached_pid = None
         self._detached_launch_started = False
         self._bridge_seen_ready = False
+        self._bridge_loss_count = 0
         self._launch_in_progress = False
         self._tunnel.set_bridge_ready(False)
         self._pending_bridge_action = None
@@ -1424,6 +1427,33 @@ class MainWindow(QMainWindow):
             )
         else:
             self._set_runtime_state("unavailable")
+        self._maybe_auto_start_bridge()
+
+    def _record_bridge_status_observation(self, available: bool) -> None:
+        if available:
+            self._bridge_loss_count = 0
+            return
+        self._bridge_loss_count += 1
+        if (
+            self._bridge_loss_count < _BRIDGE_LOSS_THRESHOLD
+            or self._closing
+            or self._bridge_transition
+            or self._launch_in_progress
+        ):
+            return
+        self._recover_bridge_after_loss()
+
+    def _recover_bridge_after_loss(self) -> None:
+        self._bridge_loss_count = _BRIDGE_LOSS_THRESHOLD
+        if self._detached_launch_started and self._control_token is not None:
+            self._managed_start_active = True
+            self._begin_bridge_transition(
+                "restart", tunnel_running=self._tunnel_owned_running()
+            )
+            return
+        self._bridge_seen_ready = False
+        self._runtime_state = "unavailable"
+        self._update_start_button()
         self._maybe_auto_start_bridge()
 
     def _request_health(self) -> None:
@@ -1573,6 +1603,9 @@ class MainWindow(QMainWindow):
                 self.bridge_status_label.setText("Bridge: disconnected")
                 self.app_server_status_label.setText("App Server: failed")
                 self._apply_runtime_observation()
+            self._record_bridge_status_observation(
+                self._bridge_ready and self._app_server_ready
+            )
             ready = self._usage_ready
             if ready and not was_ready:
                 self._begin_usage_sequence()
@@ -1743,6 +1776,8 @@ class MainWindow(QMainWindow):
             self.app_server_status_label.setText("App Server: failed")
             self.bottom_status_label.setText(message)
             self._apply_runtime_observation()
+            if key == "bridge-status":
+                self._record_bridge_status_observation(False)
             self._sync_overall_status()
             self._sync_empty_state()
             return
