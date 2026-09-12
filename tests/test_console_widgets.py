@@ -4,6 +4,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication, QLabel, QTextEdit
 
+from codex_bridge.console.config import ConsoleConfig
+from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.widgets import (
     ActivityPane,
     HistoryPane,
@@ -12,6 +14,7 @@ from codex_bridge.console.widgets import (
     activity_row,
     timeline_entries,
 )
+from tests.test_console_main_window import FakeClient
 
 
 def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
@@ -429,3 +432,57 @@ def test_history_pane_shrinks_scroll_content_after_long_timeline_is_replaced() -
     )
     assert pane._content.height() <= pane._scroll.viewport().height(), diagnostics
     assert scrollbar.maximum() == 0, diagnostics
+
+
+def test_history_pane_has_no_scrollable_blank_space_after_initial_long_timeline() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    items: list[dict[str, object]] = [
+        {
+            "turn_id": "turn-1",
+            "item": {
+                "id": "agent-long",
+                "type": "agentMessage",
+                "text": "word " * 150,
+            },
+        }
+    ]
+    for index in range(1, 45):
+        item_type = ("userMessage", "agentMessage", "commandExecution")[index % 3]
+        item: dict[str, object] = {
+            "id": f"item-{index}",
+            "type": item_type,
+            "text": "word " * (8 + index % 8),
+        }
+        if item_type == "commandExecution":
+            item["command"] = item.pop("text")
+            item["status"] = "completed"
+            item["exit_code"] = 0
+        items.append({"turn_id": "turn-1" if index < 23 else "turn-2", "item": item})
+
+    window = MainWindow(ConsoleConfig(), api_client=FakeClient(), tray_available=False)
+    window.resize(1400, 850)
+    window.history_pane.set_timeline(timeline_entries({"items": items}))
+    window.show()
+    application.processEvents()
+    scrollbar = window.history_pane._scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
+    application.processEvents()
+
+    last_item = window.history_pane._content_layout.itemAt(
+        window.history_pane._content_layout.count() - 1
+    )
+    last_widget = last_item.widget() if last_item is not None else None
+    assert last_widget is not None
+    viewport = window.history_pane._scroll.viewport()
+    blank_space = scrollbar.value() + viewport.height() - last_widget.geometry().bottom() - 1
+    diagnostics = (
+        f"content={window.history_pane._content.geometry().getRect()} "
+        f"content_minimum={window.history_pane._content.minimumSizeHint().height()} "
+        f"last={last_widget.geometry().getRect()} "
+        f"maximum={scrollbar.maximum()} page_step={scrollbar.pageStep()} "
+        f"blank_space={blank_space}"
+    )
+    window.close()
+
+    assert blank_space <= 32, diagnostics

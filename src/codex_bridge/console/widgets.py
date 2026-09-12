@@ -4,8 +4,8 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QDir, QPoint, Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette
+from PySide6.QtCore import QDir, QPoint, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -396,6 +396,22 @@ class ThreadListPane(QWidget):
         self.list_widget.addItem(text)
 
 
+class _HistoryContent(QWidget):
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        layout = self.layout()
+        if layout is None or self.width() <= 0:
+            return hint
+        height = (
+            layout.heightForWidth(self.width()) if layout.hasHeightForWidth() else hint.height()
+        )
+        return QSize(hint.width(), height)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.updateGeometry()
+
+
 class HistoryPane(QWidget):
     older_requested = Signal()
 
@@ -406,7 +422,7 @@ class HistoryPane(QWidget):
         self.load_older_button.hide()
         self._empty_label = QLabel("Select a thread to view history.")
         self._empty_label.setWordWrap(True)
-        self._content = QWidget()
+        self._content = _HistoryContent()
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._scroll = QScrollArea()
@@ -448,7 +464,7 @@ class HistoryPane(QWidget):
         self._empty_label.setVisible(not entries)
         self._scroll.setVisible(bool(entries))
         self.load_older_button.setVisible(has_older)
-        self._content.adjustSize()
+        self._content.updateGeometry()
 
     def _card(self, entry: TimelineEntry) -> QWidget:
         card = QFrame()
@@ -480,6 +496,7 @@ class HistoryPane(QWidget):
         self._empty_label.show()
         self._scroll.hide()
         self.load_older_button.hide()
+        self._content.updateGeometry()
 
     def set_error(self, text: str) -> None:
         self.set_empty_state(text)
