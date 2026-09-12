@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, QTimer
 from PySide6.QtWidgets import QApplication
 
 from codex_bridge.console.config import ConsoleConfig
@@ -104,6 +104,8 @@ class FakeTunnelSupervisor:
         self._close_callback: Any | None = None
         self._stop_callback: Any | None = None
         self.events = events if events is not None else []
+        self.recovery_timer = QTimer()
+        self.recovery_timer.setSingleShot(True)
 
     @property
     def state(self) -> str:
@@ -132,6 +134,7 @@ class FakeTunnelSupervisor:
 
     def close(self, *, on_finished=None) -> None:
         self.close_calls += 1
+        self.recovery_timer.stop()
         if on_finished is not None:
             if self._delayed_close:
                 self._close_callback = on_finished
@@ -490,6 +493,45 @@ def test_exit_stops_tunnel_before_console_owned_bridge() -> None:
     window._apply_control_success("control:shutdown")
     client.failure("health", "Bridge unavailable")
     client.failure("bridge-status", "Bridge unavailable")
+    assert quit_calls == ["quit"]
+
+
+def test_tray_exit_never_requests_shutdown_for_explicit_external_bridge() -> None:
+    tray = FakeTray()
+    quit_calls: list[str] = []
+    window, client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=quit_calls,
+        tray=tray,
+    )
+    window._runtime_state = "external"
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._detached_launch_started = False
+    window._control_token = None
+
+    window._begin_exit()
+
+    assert supervisor.close_calls == 1
+    assert client.control_requests == []
+    assert quit_calls == ["quit"]
+
+
+def test_tray_exit_cancels_pending_bridge_and_tunnel_recovery_timers() -> None:
+    tray = FakeTray()
+    quit_calls: list[str] = []
+    window, _client, _probe, _launcher, supervisor, _tray = _window(
+        tray_available=True,
+        quit_calls=quit_calls,
+        tray=tray,
+    )
+    window.bridge_start_retry_timer.start(2_000)
+    supervisor.recovery_timer.start(60_000)
+
+    window._begin_exit()
+
+    assert not window.bridge_start_retry_timer.isActive()
+    assert not supervisor.recovery_timer.isActive()
     assert quit_calls == ["quit"]
 
 
