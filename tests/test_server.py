@@ -128,6 +128,27 @@ def test_codex_wait_description_explains_bounded_long_poll(tmp_path) -> None:
     assert "in_progress" in description
 
 
+def test_codex_continue_description_explains_new_turn_on_existing_thread(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_continue"
+    )
+
+    description = tool.description
+
+    assert description is not None
+    description = description.casefold()
+    assert "new turn" in description
+    assert "existing" in description
+    assert "thread" in description
+    assert "resum" in description
+    assert "additional input" not in description
+    assert "active turn" not in description
+
+
 @pytest.mark.asyncio
 async def test_lifespan_starts_and_shutdowns_one_runtime(tmp_path) -> None:
     runtime = FakeRuntime()

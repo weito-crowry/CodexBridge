@@ -167,7 +167,7 @@ def create_app(
 
     @mcp.tool()
     async def codex_continue(thread_id: str, prompt: str) -> dict[str, Any]:
-        """Continue a native Codex thread, resuming it when needed."""
+        """Start a new turn on an existing Codex thread, resuming the thread when needed."""
         return await _run_tool(lambda: bridge().continue_thread(thread_id, prompt))
 
     @mcp.tool()
