@@ -86,6 +86,48 @@ def test_server_registers_exactly_nine_tools(tmp_path) -> None:
     }
 
 
+def test_server_publishes_codex_delegation_instructions(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+
+    instructions = app.state.mcp_server.instructions
+
+    assert instructions is not None
+    for anchor in (
+        "delegation interface",
+        "codex_start",
+        "codex_wait",
+        "state=in_progress",
+        "codex_continue",
+        "codex_steer",
+        "approved specification",
+        "final review",
+    ):
+        assert anchor in instructions
+
+    initialization_options = app.state.mcp_server._lowlevel_server.create_initialization_options()
+    assert initialization_options.instructions == instructions
+
+
+def test_codex_wait_description_explains_bounded_long_poll(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_wait"
+    )
+
+    description = tool.description
+
+    assert description is not None
+    description = description.casefold()
+    assert "long-poll" in description
+    assert "terminal" in description
+    assert "intervention" in description
+    assert "in_progress" in description
+
+
 @pytest.mark.asyncio
 async def test_lifespan_starts_and_shutdowns_one_runtime(tmp_path) -> None:
     runtime = FakeRuntime()

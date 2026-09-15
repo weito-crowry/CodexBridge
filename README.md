@@ -14,6 +14,10 @@ The Streamable HTTP MCP server owns one ASGI lifespan. Startup creates exactly o
 
 The bridge does not create a session ID or database. Codex's native `thread.id` is returned unchanged as `thread_id`; persistence and resume are delegated to Codex rollout/history data.
 
+## MCP Server Instructions
+
+CodexBridge publishes MCP Server Instructions for ChatGPT. The recommended flow is one complete `codex_start`, repeated `codex_wait` calls as needed, and ChatGPT review after completion. When `codex_wait` returns `state=in_progress`, call `codex_wait` again instead of creating an additional Codex turn; use `codex_continue` or `codex_steer` only when review or active-turn correction requires it.
+
 ## Requirements
 
 - Python 3.11+

@@ -19,6 +19,7 @@ from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .logging_utils import log_event
 from .models import ApprovalDecision
 from .paths import AllowedPathPolicy, PathPolicyError
+from .server_instructions import MCP_SERVER_INSTRUCTIONS
 from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
@@ -146,7 +147,11 @@ def create_app(
     runtime_factory: Callable[[BridgeConfig], RuntimeLike] | None = None,
     shutdown_callback: ShutdownCallback | None = None,
 ) -> Starlette:
-    mcp = MCPServer("CodexBridge", version="0.1.0")
+    mcp = MCPServer(
+        "CodexBridge",
+        version="0.1.0",
+        instructions=MCP_SERVER_INSTRUCTIONS,
+    )
     runtime_holder: dict[str, RuntimeLike | None] = {"runtime": None}
 
     def bridge() -> Bridge:
@@ -169,7 +174,9 @@ def create_app(
     async def codex_wait(
         thread_id: str, turn_id: str, timeout_seconds: float | None = None
     ) -> dict[str, Any]:
-        """Wait for a bounded Codex turn state change or terminal state."""
+        """Long-poll a Codex turn for a bounded duration; return immediately on terminal
+        or intervention state, otherwise return the current in_progress snapshot on
+        timeout."""
         return await _run_tool(lambda: bridge().wait(thread_id, turn_id, timeout_seconds))
 
     @mcp.tool()
