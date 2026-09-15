@@ -3,9 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from mcp import types
+from mcp import MCPError, types
 from mcp.server import MCPServer, ServerRequestContext
-from mcp.server.mcpserver.exceptions import ToolError
 
 from .config import GitHubMcpConfig
 from .logging_utils import log_event
@@ -110,6 +109,10 @@ class ToolRouter:
             "mcp.tools.list",
             provider="codexbridge",
             total_tool_count=snapshot.total_tool_count,
+            catalog_sha256=snapshot.catalog_sha256,
+            serialized_schema_bytes=snapshot.serialized_schema_bytes,
+            native_tool_count=snapshot.native_tool_count,
+            exposed_remote_tool_count=snapshot.exposed_remote_tool_count,
         )
         return CatalogListToolsResult.model_construct(
             meta=None,
@@ -127,7 +130,10 @@ class ToolRouter:
     ) -> types.CallToolResult | types.InputRequiredResult:
         route = self._routes.get(params.name)
         if route is None:
-            raise ToolError(f"Unknown tool: {params.name}")
+            raise MCPError(
+                code=types.INVALID_PARAMS,
+                message=f"Unknown tool: {params.name}",
+            ) from None
         if route.provider == "native":
             arguments = params.arguments or {}
             if context is None:

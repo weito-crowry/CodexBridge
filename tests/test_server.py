@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+import anyio
 import pytest
-from mcp import types
+from mcp import ClientSession, MCPError, types
+from mcp.server.lowlevel import Server as LowLevelServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_bridge.config import BridgeConfig, ConfigurationError, GitHubMcpConfig
@@ -119,6 +121,34 @@ async def test_server_uses_low_level_router_for_wire_tools_list(tmp_path) -> Non
 
     native_names = [tool.name for tool in app.state.mcp_server._tool_manager.list_tools()]
     assert [tool.name for tool in result.tools] == native_names
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_is_invalid_params_at_low_level_client_boundary(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+
+    async with app.router.lifespan_context(app):
+        client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream(0)
+        server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream(0)
+        wire_server: LowLevelServer = app.state.mcp_lowlevel_server
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                wire_server.run,
+                client_to_server_receive,
+                server_to_client_send,
+                wire_server.create_initialization_options(),
+            )
+            async with ClientSession(server_to_client_receive, client_to_server_send) as client:
+                await client.initialize()
+                with pytest.raises(MCPError) as exc_info:
+                    await client.call_tool("missing", {})
+
+                assert exc_info.value.code == types.INVALID_PARAMS
+                assert exc_info.value.code != types.INTERNAL_ERROR
+                assert "missing" in exc_info.value.message
+            task_group.cancel_scope.cancel()
 
 
 @pytest.mark.asyncio

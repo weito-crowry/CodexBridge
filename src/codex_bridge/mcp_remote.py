@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from time import perf_counter
 from typing import Any, cast
 
-from mcp import Client, types
+from mcp import Client, MCPError, types
 from mcp.client.streamable_http import (  # type: ignore[attr-defined]
     create_mcp_http_client,
     streamable_http_client,
@@ -18,6 +18,35 @@ from .logging_utils import log_event
 
 class RemoteMcpError(RuntimeError):
     """Raised for a safe, user-facing Remote MCP lifecycle or call failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: int | None = None,
+        error_data: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.error_data = error_data
+
+
+def _redact_secret(value: Any, secret: str | None) -> Any:
+    if not secret:
+        return value
+    if isinstance(value, str):
+        return value.replace(secret, "[redacted]")
+    if isinstance(value, Mapping):
+        return {
+            _redact_secret(key, secret): _redact_secret(item, secret) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secret(item, secret) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_secret(item, secret) for item in value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value).replace(secret, "[redacted]")
 
 
 class RemoteMcpProvider:
@@ -167,6 +196,45 @@ class RemoteMcpProvider:
                     meta=meta,
                     allow_input_required=True,
                 )
+            except MCPError as exc:
+                if exc.code == types.CONNECTION_CLOSED:
+                    self._mark_disconnected("connection_closed")
+                    log_event(
+                        "mcp.mount.call.error",
+                        provider="github",
+                        tool_name=upstream_name,
+                        duration=perf_counter() - started,
+                        error_category="outcome_unknown",
+                    )
+                    raise RemoteMcpError(
+                        "GitHub Remote MCP call outcome unknown; the request was not retried"
+                    ) from None
+                if exc.code == types.REQUEST_TIMEOUT:
+                    log_event(
+                        "mcp.mount.call.error",
+                        provider="github",
+                        tool_name=upstream_name,
+                        duration=perf_counter() - started,
+                        error_category="outcome_unknown",
+                    )
+                    raise RemoteMcpError(
+                        "GitHub Remote MCP call outcome unknown; the request was not retried"
+                    ) from None
+
+                safe_message = _redact_secret(exc.message, self.config.pat)
+                safe_data = _redact_secret(exc.data, self.config.pat)
+                log_event(
+                    "mcp.mount.call.error",
+                    provider="github",
+                    tool_name=upstream_name,
+                    duration=perf_counter() - started,
+                    error_category="upstream_error",
+                )
+                raise RemoteMcpError(
+                    f"GitHub Remote MCP error ({exc.code}): {safe_message}",
+                    error_code=exc.code,
+                    error_data=safe_data,
+                ) from None
             except Exception:
                 self._mark_disconnected("outcome_unknown")
                 log_event(

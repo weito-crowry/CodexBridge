@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
-from mcp import types
+from mcp import MCPError, types
 from mcp.server import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_bridge.config import GitHubMcpConfig
 from codex_bridge.mcp_remote import RemoteMcpError
@@ -141,8 +141,9 @@ async def test_router_unknown_and_remote_execution_errors_use_expected_protocol_
     router = ToolRouter(native_server(), remote)
     await router.start()
 
-    with pytest.raises(ToolError, match="Unknown tool"):
+    with pytest.raises(MCPError, match="Unknown tool") as exc_info:
         await router.call_tool(None, types.CallToolRequestParams(name="missing", arguments={}))
+    assert exc_info.value.code == types.INVALID_PARAMS
 
     remote.error = RemoteMcpError("GitHub Remote MCP is disconnected")
     result = await router.call_tool(
@@ -165,6 +166,25 @@ async def test_router_unknown_and_remote_execution_errors_use_expected_protocol_
         "native_echo",
         "github_read_tool",
     ]
+    await router.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_router_list_tools_logs_catalog_fingerprint(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="codex_bridge")
+    remote = FakeRemote(remote_config(), (upstream_tool("read_tool"),))
+    router = ToolRouter(native_server(), remote)
+
+    await router.start()
+    await router.list_tools(None, None)
+
+    assert router.snapshot is not None
+    assert "mcp.tools.list" in caplog.text
+    assert f"total_tool_count={router.snapshot.total_tool_count}" in caplog.text
+    assert f"catalog_sha256={router.snapshot.catalog_sha256}" in caplog.text
+    assert f"serialized_schema_bytes={router.snapshot.serialized_schema_bytes}" in caplog.text
+    assert f"native_tool_count={router.snapshot.native_tool_count}" in caplog.text
+    assert f"exposed_remote_tool_count={router.snapshot.exposed_remote_tool_count}" in caplog.text
     await router.shutdown()
 
 

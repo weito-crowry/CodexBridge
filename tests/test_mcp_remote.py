@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import pytest
-from mcp import types
+from mcp import MCPError, types
 from mcp.client.streamable_http import create_mcp_http_client
 
 from codex_bridge.config import GitHubMcpConfig
@@ -329,6 +329,77 @@ async def test_call_error_after_send_is_not_retried() -> None:
         await provider.call_tool("write_tool", {})
 
     assert len(FakeSession.instances) == 1
+    assert len(FakeSession.instances[0].calls) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_mcp_error_is_known_failure_without_disconnect_or_unknown() -> None:
+    FakeSession.call_error = MCPError(
+        code=types.INVALID_PARAMS,
+        message="invalid request secret-pat",
+        data={"detail": "secret-pat"},
+    )
+    provider = RemoteMcpProvider(
+        settings(),
+        http_client_factory=lambda **kwargs: FakeHttpClient(kwargs["headers"]),
+        transport_factory=fake_transport,
+        client_factory=FakeClient,
+    )
+    await provider.start()
+
+    with pytest.raises(RemoteMcpError) as exc_info:
+        await provider.call_tool("read_tool", {})
+
+    error = exc_info.value
+    assert error.error_code == types.INVALID_PARAMS
+    assert error.error_data == {"detail": "[redacted]"}
+    assert "outcome unknown" not in str(error)
+    assert "secret-pat" not in str(error)
+    assert provider.connected is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_request_timeout_is_outcome_unknown_without_retry_or_disconnect() -> None:
+    FakeSession.call_error = MCPError(
+        code=types.REQUEST_TIMEOUT,
+        message="request timed out",
+    )
+    provider = RemoteMcpProvider(
+        settings(),
+        http_client_factory=lambda **kwargs: FakeHttpClient(kwargs["headers"]),
+        transport_factory=fake_transport,
+        client_factory=FakeClient,
+    )
+    await provider.start()
+
+    with pytest.raises(RemoteMcpError, match="outcome unknown"):
+        await provider.call_tool("read_tool", {})
+
+    assert provider.connected is True
+    assert len(FakeSession.instances[0].calls) == 1
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_closed_is_outcome_unknown_and_disconnects_without_retry() -> None:
+    FakeSession.call_error = MCPError(
+        code=types.CONNECTION_CLOSED,
+        message="connection closed",
+    )
+    provider = RemoteMcpProvider(
+        settings(),
+        http_client_factory=lambda **kwargs: FakeHttpClient(kwargs["headers"]),
+        transport_factory=fake_transport,
+        client_factory=FakeClient,
+    )
+    await provider.start()
+
+    with pytest.raises(RemoteMcpError, match="outcome unknown"):
+        await provider.call_tool("read_tool", {})
+
+    assert provider.connected is False
     assert len(FakeSession.instances[0].calls) == 1
     await provider.close()
 
