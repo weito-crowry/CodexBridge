@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .config_file import ConfigFileError, load_user_config
 
@@ -84,6 +85,166 @@ def _positive_float(name: str, default: float, environ: Mapping[str, str]) -> fl
     return value
 
 
+def _boolean(value: object, source: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ConfigurationError(f"{source} must be a boolean")
+
+
+def _patterns(value: object, source: str, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    if isinstance(value, str):
+        parts: Sequence[object] = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        parts = value
+    else:
+        raise ConfigurationError(f"{source} must be comma-separated patterns or an array")
+
+    normalized: list[str] = []
+    for item in parts:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigurationError(f"{source} contains an empty pattern")
+        pattern = item.strip()
+        if "\x00" in pattern:
+            raise ConfigurationError(f"{source} contains an invalid pattern")
+        bracket_depth = 0
+        for character in pattern:
+            if character == "[":
+                bracket_depth += 1
+            elif character == "]":
+                if bracket_depth == 0:
+                    raise ConfigurationError(f"{source} contains an invalid pattern")
+                bracket_depth -= 1
+        if bracket_depth:
+            raise ConfigurationError(f"{source} contains an invalid pattern")
+        normalized.append(pattern)
+    return tuple(normalized)
+
+
+def _github_url(value: object, source: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{source} must be an HTTP(S) URL")
+    url = value.strip()
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ConfigurationError(f"{source} must be an HTTP(S) URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or (parsed_port is not None and not 1 <= parsed_port <= 65_535)
+    ):
+        raise ConfigurationError(f"{source} must be an HTTP(S) URL")
+    return url
+
+
+def _github_prefix(value: object, source: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigurationError(f"{source} must not be empty")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None:
+        raise ConfigurationError(f"{source} contains unsupported tool-name characters")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubMcpConfig:
+    enabled: bool = False
+    url: str = "https://api.githubcopilot.com/mcp/x/all"
+    prefix: str = "github_"
+    include: tuple[str, ...] = ("*",)
+    exclude: tuple[str, ...] = ()
+    max_tools: int = 0
+    pat: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigurationError("github_mcp.enabled must be a boolean")
+        _github_url(self.url, "github_mcp.url")
+        _github_prefix(self.prefix, "github_mcp.prefix")
+        _patterns(self.include, "github_mcp.include", default=("*",))
+        _patterns(self.exclude, "github_mcp.exclude", default=())
+        if isinstance(self.max_tools, bool) or not isinstance(self.max_tools, int):
+            raise ConfigurationError("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS must be an integer")
+        if self.max_tools < 0:
+            raise ConfigurationError("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS must be zero or greater")
+        if self.enabled and not self.pat:
+            raise ConfigurationError(
+                "CODEX_BRIDGE_GITHUB_PAT is required when GitHub MCP is enabled"
+            )
+
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        environ: Mapping[str, str],
+        config_data: Mapping[str, Any],
+    ) -> GitHubMcpConfig:
+        def setting(name: str, key: str, default: object) -> object:
+            return environ[name] if name in environ else config_data.get(key, default)
+
+        enabled = _boolean(
+            setting("CODEX_BRIDGE_GITHUB_MCP_ENABLED", "enabled", False),
+            "CODEX_BRIDGE_GITHUB_MCP_ENABLED",
+        )
+        url = _github_url(
+            setting(
+                "CODEX_BRIDGE_GITHUB_MCP_URL",
+                "url",
+                "https://api.githubcopilot.com/mcp/x/all",
+            ),
+            "CODEX_BRIDGE_GITHUB_MCP_URL",
+        )
+        prefix = _github_prefix(
+            setting("CODEX_BRIDGE_GITHUB_MCP_PREFIX", "prefix", "github_"),
+            "CODEX_BRIDGE_GITHUB_MCP_PREFIX",
+        )
+        include = _patterns(
+            setting("CODEX_BRIDGE_GITHUB_MCP_INCLUDE", "include", ("*",)),
+            "CODEX_BRIDGE_GITHUB_MCP_INCLUDE",
+            default=("*",),
+        )
+        exclude = _patterns(
+            setting("CODEX_BRIDGE_GITHUB_MCP_EXCLUDE", "exclude", ()),
+            "CODEX_BRIDGE_GITHUB_MCP_EXCLUDE",
+            default=(),
+        )
+        raw_max_tools = setting("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS", "max_tools", 0)
+        if isinstance(raw_max_tools, str):
+            try:
+                max_tools = int(raw_max_tools.strip())
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS must be an integer"
+                ) from exc
+        elif isinstance(raw_max_tools, int) and not isinstance(raw_max_tools, bool):
+            max_tools = raw_max_tools
+        else:
+            raise ConfigurationError("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS must be an integer")
+        pat = environ.get("CODEX_BRIDGE_GITHUB_PAT") or None
+        return cls(
+            enabled=enabled,
+            url=url,
+            prefix=prefix,
+            include=include,
+            exclude=exclude,
+            max_tools=max_tools,
+            pat=pat,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class BridgeConfig:
     host: str
@@ -98,6 +259,7 @@ class BridgeConfig:
     shutdown_grace_seconds: float
     control_token: str | None = None
     codex_executable_source: str = "default"
+    github_mcp: GitHubMcpConfig = field(default_factory=GitHubMcpConfig)
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -117,7 +279,12 @@ class BridgeConfig:
         file_config = _config(values, config_data)
         bridge_config = file_config.get("bridge", {})
         console_config = file_config.get("console", {})
-        if not isinstance(bridge_config, Mapping) or not isinstance(console_config, Mapping):
+        github_mcp_config = file_config.get("github_mcp", {})
+        if (
+            not isinstance(bridge_config, Mapping)
+            or not isinstance(console_config, Mapping)
+            or not isinstance(github_mcp_config, Mapping)
+        ):
             raise ConfigurationError("CodexBridge configuration sections are malformed")
 
         wait_max = _positive_float("CODEX_BRIDGE_WAIT_MAX_SECONDS", WAIT_HARD_MAX_SECONDS, values)
@@ -194,4 +361,8 @@ class BridgeConfig:
             ),
             control_token=_control_token(values),
             codex_executable_source=executable_source,
+            github_mcp=GitHubMcpConfig.from_sources(
+                environ=values,
+                config_data=github_mcp_config,
+            ),
         )

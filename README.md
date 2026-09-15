@@ -3,10 +3,12 @@
 CodexBridge is a thin single-user bridge for this path:
 
 ```text
-ChatGPT -> Remote MCP -> CodexBridge -> codex app-server -> Codex
+ChatGPT -> CodexBridge MCP -> native Codex tools / GitHub Remote MCP
 ```
 
-It exposes only thread/turn control and approval or user-input forwarding. Shell execution, file changes, Git, sandbox policy, authentication, reasoning, commit, and push remain owned by Codex.
+By default it exposes only thread/turn control and approval or user-input forwarding. When enabled,
+it also transparently mounts the GitHub Remote MCP tool catalog. Shell execution, file changes, Git,
+sandbox policy, authentication, reasoning, commit, and push remain owned by Codex or the upstream MCP.
 
 ## Architecture
 
@@ -59,12 +61,22 @@ ui_port = 8001
 [tunnel]
 # executable = "C:\\Users\\you\\Documents\\src\\CodexBridge\\.tools\\tunnel-client\\tunnel-client.exe"
 profile = "codex-bridge"
+
+[github_mcp]
+enabled = false
+url = "https://api.githubcopilot.com/mcp/x/all"
+prefix = "github_"
+include = ["*"]
+exclude = []
+max_tools = 0
 ```
 
 Configuration precedence is explicit CLI option, environment variable, user config file,
 then the existing default. `CODEX_BRIDGE_ALLOWED_ROOTS` remains an `os.pathsep`-separated
 environment value; the TOML form is an array of strings. The config file does not accept
 API keys, control-plane keys, or runtime control tokens.
+The GitHub Remote MCP PAT is never accepted in TOML and must be supplied only through
+`CODEX_BRIDGE_GITHUB_PAT` when the mount is enabled.
 
 The MCP endpoint is:
 
@@ -104,6 +116,24 @@ for absolute, existing, directory, and canonicalizable paths.
 | `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `50` | Default long-poll duration. |
 | `CODEX_BRIDGE_WAIT_MAX_SECONDS` | `55` | Configured maximum long-poll duration; values above 55 are rejected. |
 | `CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS` | `3` | Shutdown grace period for the App Server child. |
+| `CODEX_BRIDGE_GITHUB_MCP_ENABLED` | `false` | Enable the GitHub Remote MCP tools mount. Enabled startup fails closed. |
+| `CODEX_BRIDGE_GITHUB_MCP_URL` | `https://api.githubcopilot.com/mcp/x/all` | GitHub Remote MCP Streamable HTTP endpoint. |
+| `CODEX_BRIDGE_GITHUB_MCP_PREFIX` | `github_` | Prefix applied to exposed remote tool names. |
+| `CODEX_BRIDGE_GITHUB_MCP_INCLUDE` | `*` | Comma-separated upstream tool-name globs included before exclusion. |
+| `CODEX_BRIDGE_GITHUB_MCP_EXCLUDE` | empty | Comma-separated upstream tool-name globs excluded after inclusion. |
+| `CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS` | `0` | Maximum exposed remote tools after stable sorting; `0` means unlimited. |
+| `CODEX_BRIDGE_GITHUB_PAT` | unset | Dedicated GitHub Remote MCP bearer token; environment-only and never logged or returned. |
+
+### GitHub Remote MCP mount
+
+When enabled, startup connects to the configured endpoint, performs `initialize`, fetches every
+`tools/list` page, applies include → exclude → name sort → `max_tools`, and exposes the resulting
+tools with the configured prefix in the same MCP namespace as the native tools. The snapshot stays
+fixed for the process lifetime. The startup catalog records native/upstream/exposed/total counts,
+serialized catalog bytes, and a deterministic SHA-256 fingerprint. A later upstream disconnect does
+not remove the catalog; calls fail explicitly, and only a call begun while disconnected may reconnect
+before its one request. A communication error after sending a call is returned as outcome unknown and
+is never retried.
 
 ### Tunnel Host configuration
 
@@ -120,7 +150,9 @@ Only use the actual host and origin values supplied by the tunnel/client deploym
 
 ## MCP tools
 
-The server publishes exactly nine tools:
+The server publishes the native CodexBridge tool set. When the GitHub Remote MCP mount is enabled,
+its filtered tools are added to the same MCP namespace with the `github_` prefix:
+The tracked native baseline remains exactly nine tools before optional mounts.
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
@@ -223,7 +255,7 @@ Phase 4C adds `Start Bridge`, `Stop Bridge`, and `Restart Bridge` to the Console
 
 The authenticated control surface is only the fixed-loopback UI route `POST /ui-api/control/shutdown`. It is not present on the MCP port or Tunnel target. `Authorization: Bearer <token>` is checked with constant-time comparison; missing, malformed, and wrong credentials return a fixed `403`, while a valid request returns fixed `202` JSON and schedules the outer Uvicorn graceful-exit request after the response. The outer lifecycle then runs the existing Starlette lifespan cleanup and `BridgeRuntime.shutdown()` ordering. Stopping or restarting Bridge may interrupt active Codex turns.
 
-Stop first stops the Console-owned Tunnel when it is running, then posts the Bridge control request and waits asynchronously until both UI health/status endpoints become unreachable. Only confirmed disappearance changes the state to `Runtime: stopped`, clears the old token/PID/launch guard, and permits a new Start Bridge. A control failure or roughly ten-second stop timeout is fail closed: no retry, duplicate launch, PID kill, taskkill, OS signal, or force-kill fallback is used. Restart remembers whether the Console-owned Tunnel was running, performs the same graceful Bridge stop, launches with a fresh token, waits for readiness, and starts that Tunnel once only after the new Bridge is ready. Console Exit uses the same order and a separate bounded twelve-second watchdog; an external Bridge is left running. The MCP surface remains exactly nine tools and no dependency is added.
+Stop first stops the Console-owned Tunnel when it is running, then posts the Bridge control request and waits asynchronously until both UI health/status endpoints become unreachable. Only confirmed disappearance changes the state to `Runtime: stopped`, clears the old token/PID/launch guard, and permits a new Start Bridge. A control failure or roughly ten-second stop timeout is fail closed: no retry, duplicate launch, PID kill, taskkill, OS signal, or force-kill fallback is used. Restart remembers whether the Console-owned Tunnel was running, performs the same graceful Bridge stop, launches with a fresh token, waits for readiness, and starts that Tunnel once only after the new Bridge is ready. Console Exit uses the same order and a separate bounded twelve-second watchdog; an external Bridge is left running. The MCP surface retains the native tool set and may include the fixed GitHub Remote MCP catalog described above.
 
 ## Shutdown behavior
 

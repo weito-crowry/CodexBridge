@@ -141,6 +141,30 @@ def test_user_config_file_supplies_bridge_values(tmp_path, monkeypatch) -> None:
     assert config.ui_port == 8123
 
 
+def test_user_config_file_supplies_non_secret_github_mcp_values(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[github_mcp]\n"
+        "enabled = false\n"
+        'url = "https://example.test/mcp"\n'
+        'prefix = "gh_"\n'
+        'include = ["get_*"]\n'
+        'exclude = ["*_secret"]\n'
+        "max_tools = 25\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_BRIDGE_CONFIG", str(config_path))
+
+    config = BridgeConfig.from_env()
+
+    assert config.github_mcp.enabled is False
+    assert config.github_mcp.url == "https://example.test/mcp"
+    assert config.github_mcp.prefix == "gh_"
+    assert config.github_mcp.include == ("get_*",)
+    assert config.github_mcp.exclude == ("*_secret",)
+    assert config.github_mcp.max_tools == 25
+
+
 def test_config_precedence_is_explicit_then_environment_then_file_then_default(
     tmp_path,
 ) -> None:
@@ -205,3 +229,82 @@ def test_empty_and_invalid_allowed_roots_fail_preflight(tmp_path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     assert validate_allowed_roots((str(root),)) == (str(root.resolve()).casefold(),)
+
+
+def test_github_mcp_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "CODEX_BRIDGE_GITHUB_MCP_ENABLED",
+        "CODEX_BRIDGE_GITHUB_MCP_URL",
+        "CODEX_BRIDGE_GITHUB_MCP_PREFIX",
+        "CODEX_BRIDGE_GITHUB_MCP_INCLUDE",
+        "CODEX_BRIDGE_GITHUB_MCP_EXCLUDE",
+        "CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS",
+        "CODEX_BRIDGE_GITHUB_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = BridgeConfig.from_env()
+
+    assert config.github_mcp.enabled is False
+    assert config.github_mcp.url == "https://api.githubcopilot.com/mcp/x/all"
+    assert config.github_mcp.prefix == "github_"
+    assert config.github_mcp.include == ("*",)
+    assert config.github_mcp.exclude == ()
+    assert config.github_mcp.max_tools == 0
+
+
+def test_github_mcp_enabled_requires_dedicated_pat(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_ENABLED", "true")
+    monkeypatch.delenv("CODEX_BRIDGE_GITHUB_PAT", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-be-used")
+
+    with pytest.raises(ConfigurationError, match="CODEX_BRIDGE_GITHUB_PAT"):
+        BridgeConfig.from_env()
+
+
+@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
+def test_github_mcp_rejects_invalid_max_tools(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS", value)
+
+    with pytest.raises(ConfigurationError, match="MAX_TOOLS"):
+        BridgeConfig.from_env()
+
+
+def test_github_mcp_reads_all_supported_environment_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_ENABLED", "on")
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_URL", "https://example.test/mcp")
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_PREFIX", "gh_")
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_INCLUDE", "get_*, list_*")
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_EXCLUDE", "*_secret")
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS", "25")
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_PAT", "do-not-echo")
+
+    config = BridgeConfig.from_env()
+
+    assert config.github_mcp.enabled is True
+    assert config.github_mcp.url == "https://example.test/mcp"
+    assert config.github_mcp.prefix == "gh_"
+    assert config.github_mcp.include == ("get_*", "list_*")
+    assert config.github_mcp.exclude == ("*_secret",)
+    assert config.github_mcp.max_tools == 25
+    assert "do-not-echo" not in repr(config)
+
+
+@pytest.mark.parametrize("value", ["get_[", "get_]", "get_*,,list_*"])
+def test_github_mcp_rejects_malformed_glob_patterns(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_INCLUDE", value)
+
+    with pytest.raises(ConfigurationError, match="pattern"):
+        BridgeConfig.from_env()
+
+
+@pytest.mark.parametrize("url", ["http://[invalid", "https://:443/mcp", "https://host:bad/mcp"])
+def test_github_mcp_rejects_malformed_url(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_URL", url)
+
+    with pytest.raises(ConfigurationError, match=r"HTTP\(S\) URL"):
+        BridgeConfig.from_env()

@@ -16,6 +16,14 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
     "bridge": {"allowed_roots": list, "codex_executable": str},
     "console": {"ui_port": int},
     "tunnel": {"executable": str, "profile": str},
+    "github_mcp": {
+        "enabled": bool,
+        "url": str,
+        "prefix": str,
+        "include": list,
+        "exclude": list,
+        "max_tools": int,
+    },
 }
 _SECRET_TERMS = ("key", "token", "secret", "password", "credential")
 

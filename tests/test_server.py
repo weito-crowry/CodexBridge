@@ -4,9 +4,10 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
+from mcp import types
 from mcp.server.mcpserver.exceptions import ToolError
 
-from codex_bridge.config import BridgeConfig, ConfigurationError
+from codex_bridge.config import BridgeConfig, ConfigurationError, GitHubMcpConfig
 from codex_bridge.paths import PathPolicyError
 from codex_bridge.server import build_runtime, create_app, prepare_config
 
@@ -32,6 +33,25 @@ class FakeRuntime:
 
     async def shutdown(self) -> None:
         self.shutdown_count += 1
+
+
+class FakeRemoteProvider:
+    def __init__(self, settings: GitHubMcpConfig) -> None:
+        self.config = settings
+        self.upstream_tools = (
+            types.Tool(name="get_file_contents", inputSchema={"type": "object"}),
+        )
+        self.start_count = 0
+        self.close_count = 0
+
+    async def start(self) -> None:
+        self.start_count += 1
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+    async def call_tool(self, _name: str, _arguments: dict[str, Any]):
+        return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
 
 
 def config(tmp_path) -> BridgeConfig:
@@ -84,6 +104,44 @@ def test_server_registers_exactly_nine_tools(tmp_path) -> None:
         "codex_threads",
         "codex_status",
     }
+
+
+@pytest.mark.asyncio
+async def test_server_uses_low_level_router_for_wire_tools_list(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+
+    assert app.state.mcp_lowlevel_server.get_request_handler("tools/list") is not None
+    assert app.state.mcp_lowlevel_server.get_request_handler("tools/call") is not None
+
+    async with app.router.lifespan_context(app):
+        result = await app.state.mcp_router.list_tools(None, None)
+
+    native_names = [tool.name for tool in app.state.mcp_server._tool_manager.list_tools()]
+    assert [tool.name for tool in result.tools] == native_names
+
+
+@pytest.mark.asyncio
+async def test_enabled_github_mount_starts_before_runtime_and_closes_afterwards(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = FakeRuntime()
+    settings = replace(
+        config(tmp_path),
+        github_mcp=GitHubMcpConfig(enabled=True, pat="secret"),
+    )
+    provider = FakeRemoteProvider(settings.github_mcp)
+    monkeypatch.setattr("codex_bridge.server.RemoteMcpProvider", lambda _settings: provider)
+    app = create_app(settings, runtime_factory=lambda _: runtime)
+
+    async with app.router.lifespan_context(app):
+        assert provider.start_count == 1
+        assert runtime.start_count == 1
+        result = await app.state.mcp_router.list_tools(None, None)
+        assert "github_get_file_contents" in {tool.name for tool in result.tools}
+
+    assert provider.close_count == 1
+    assert runtime.shutdown_count == 1
 
 
 def test_server_publishes_codex_delegation_instructions(tmp_path) -> None:

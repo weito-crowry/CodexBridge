@@ -5,15 +5,27 @@ from typing import Any
 
 logger = logging.getLogger("codex_bridge")
 _SAFE_FIELDS = {
+    "catalog_sha256",
     "codex_version",
     "decision",
+    "duration",
+    "error_category",
     "error_type",
+    "exposed_remote_tool_count",
     "exit_code",
     "method",
+    "native_tool_count",
+    "notification",
+    "page",
+    "provider",
     "request_id",
+    "serialized_schema_bytes",
     "state",
     "thread_id",
+    "tool_name",
+    "total_tool_count",
     "turn_id",
+    "upstream_tool_count",
 }
 
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from mcp.server import MCPServer
+from mcp.server.lowlevel import Server as LowLevelServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -18,6 +19,8 @@ from .bridge import Bridge
 from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .logging_utils import log_event
+from .mcp_remote import RemoteMcpProvider
+from .mcp_router import ToolRouter
 from .models import ApprovalDecision
 from .observability import MCPObservabilityMiddleware, ObservabilityLogger
 from .paths import AllowedPathPolicy, PathPolicyError
@@ -229,8 +232,18 @@ def create_app(
         """Return the current safe state and recent activities for a native Codex turn."""
         return await _run_tool(lambda: bridge().status(thread_id, turn_id, activity_limit))
 
+    remote_provider = RemoteMcpProvider(config.github_mcp)
+    router = ToolRouter(mcp, remote_provider)
+    wire_server = LowLevelServer(
+        "CodexBridge",
+        version="0.1.0",
+        instructions=MCP_SERVER_INSTRUCTIONS,
+        on_list_tools=router.list_tools,
+        on_call_tool=router.call_tool,
+    )
+
     security = _transport_security(config)
-    transport_app = mcp.streamable_http_app(
+    transport_app = wire_server.streamable_http_app(
         streamable_http_path="/mcp",
         transport_security=security,
         host=config.host,
@@ -240,7 +253,7 @@ def create_app(
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         observer.server_start()
         try:
-            async with mcp.session_manager.run():
+            async with wire_server.session_manager.run():
                 runtime: RuntimeLike
                 if runtime_factory is None:
                     runtime = build_runtime(config, shutdown_callback=shutdown_callback)
@@ -249,11 +262,16 @@ def create_app(
                 runtime_holder["runtime"] = runtime
                 app.state.runtime = runtime
                 app.state.bridge = runtime.bridge
+                runtime_started = False
                 try:
+                    await router.start()
                     await runtime.start()
+                    runtime_started = True
                     yield
                 finally:
-                    await runtime.shutdown()
+                    if runtime_started:
+                        await runtime.shutdown()
+                    await router.shutdown()
                     runtime_holder["runtime"] = None
                     app.state.runtime = None
                     app.state.bridge = None
@@ -266,6 +284,8 @@ def create_app(
         middleware=[Middleware(MCPObservabilityMiddleware, observer=observer)],
     )
     app.state.mcp_server = mcp
+    app.state.mcp_lowlevel_server = wire_server
+    app.state.mcp_router = router
     app.state.transport_security = security
     app.state.observability = observer
     app.state.runtime = None
