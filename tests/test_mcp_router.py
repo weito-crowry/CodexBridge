@@ -19,7 +19,7 @@ class FakeRemote:
     upstream_tools: tuple[types.Tool, ...]
     start_count: int = 0
     close_count: int = 0
-    calls: list[tuple[str, dict[str, Any]]] | None = None
+    calls: list[tuple[str, dict[str, Any] | None, dict[str, Any]]] | None = None
     error: Exception | None = None
 
     def __post_init__(self) -> None:
@@ -31,9 +31,27 @@ class FakeRemote:
     async def close(self) -> None:
         self.close_count += 1
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]):
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        input_responses: object = None,
+        request_state: str | None = None,
+        meta: object = None,
+    ):
         assert self.calls is not None
-        self.calls.append((name, arguments))
+        self.calls.append(
+            (
+                name,
+                arguments,
+                {
+                    "input_responses": input_responses,
+                    "request_state": request_state,
+                    "meta": meta,
+                },
+            )
+        )
         if self.error is not None:
             raise self.error
         return types.CallToolResult(content=[types.TextContent(type="text", text="remote-result")])
@@ -93,18 +111,32 @@ async def test_router_dispatches_native_and_original_remote_name() -> None:
     remote_result = await router.call_tool(
         None,
         types.CallToolRequestParams(
-            name="github_get_file_contents", arguments={"path": "README.md"}
+            name="github_get_file_contents",
+            arguments={"path": "README.md"},
+            input_responses={},
+            request_state="resume-state",
+            meta={"request": "metadata"},
         ),
     )
 
     assert native_result.structured_content == {"value": "native"}
     assert remote_result.content[0].text == "remote-result"
-    assert remote.calls == [("get_file_contents", {"path": "README.md"})]
+    assert remote.calls == [
+        (
+            "get_file_contents",
+            {"path": "README.md"},
+            {
+                "input_responses": {},
+                "request_state": "resume-state",
+                "meta": {"request": "metadata"},
+            },
+        )
+    ]
     await router.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_router_unknown_and_disconnected_remote_calls_are_tool_errors() -> None:
+async def test_router_unknown_and_remote_execution_errors_use_expected_protocol_shapes() -> None:
     remote = FakeRemote(remote_config(), (upstream_tool("read_tool"),))
     router = ToolRouter(native_server(), remote)
     await router.start()
@@ -113,10 +145,21 @@ async def test_router_unknown_and_disconnected_remote_calls_are_tool_errors() ->
         await router.call_tool(None, types.CallToolRequestParams(name="missing", arguments={}))
 
     remote.error = RemoteMcpError("GitHub Remote MCP is disconnected")
-    with pytest.raises(ToolError, match="disconnected"):
-        await router.call_tool(
-            None, types.CallToolRequestParams(name="github_read_tool", arguments={})
-        )
+    result = await router.call_tool(
+        None, types.CallToolRequestParams(name="github_read_tool", arguments={})
+    )
+    assert isinstance(result, types.CallToolResult)
+    assert result.is_error is True
+    assert "disconnected" in result.content[0].text
+
+    remote.error = RemoteMcpError("GitHub Remote MCP call outcome unknown: secret")
+    outcome = await router.call_tool(
+        None, types.CallToolRequestParams(name="github_read_tool", arguments={})
+    )
+    assert isinstance(outcome, types.CallToolResult)
+    assert outcome.is_error is True
+    assert "outcome unknown" in outcome.content[0].text
+    assert "secret" not in outcome.content[0].text
     assert router.snapshot is not None
     assert [tool.name for tool in router.snapshot.tools] == [
         "native_echo",

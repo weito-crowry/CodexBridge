@@ -25,7 +25,13 @@ class RemoteProviderLike(Protocol):
     async def close(self) -> None: ...
 
     async def call_tool(
-        self, upstream_name: str, arguments: dict[str, Any]
+        self,
+        upstream_name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        input_responses: types.InputResponses | None = None,
+        request_state: str | None = None,
+        meta: types.RequestParamsMeta | None = None,
     ) -> types.CallToolResult | types.InputRequiredResult: ...
 
 
@@ -122,12 +128,28 @@ class ToolRouter:
         route = self._routes.get(params.name)
         if route is None:
             raise ToolError(f"Unknown tool: {params.name}")
-        arguments = params.arguments or {}
         if route.provider == "native":
+            arguments = params.arguments or {}
             if context is None:
                 return await self.native_server.call_tool(route.upstream_name, arguments)
             return await self.native_server._handle_call_tool(context, params)
+        request_meta = params.meta
+        if request_meta is None and context is not None:
+            request_meta = context.meta
         try:
-            return await self.remote_provider.call_tool(route.upstream_name, arguments)
+            return await self.remote_provider.call_tool(
+                route.upstream_name,
+                params.arguments,
+                input_responses=params.input_responses,
+                request_state=params.request_state,
+                meta=request_meta,
+            )
         except RemoteMcpError as exc:
-            raise ToolError(str(exc)) from None
+            message = str(exc) or "GitHub Remote MCP call failed"
+            pat = self.remote_provider.config.pat
+            if pat:
+                message = message.replace(pat, "[redacted]")
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=message)],
+                is_error=True,
+            )

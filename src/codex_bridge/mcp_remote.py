@@ -6,9 +6,11 @@ from contextlib import AsyncExitStack
 from time import perf_counter
 from typing import Any, cast
 
-import httpx2
-from mcp import ClientSession, types
-from mcp.client.streamable_http import streamable_http_client
+from mcp import Client, types
+from mcp.client.streamable_http import (  # type: ignore[attr-defined]
+    create_mcp_http_client,
+    streamable_http_client,
+)
 
 from .config import GitHubMcpConfig
 from .logging_utils import log_event
@@ -25,15 +27,16 @@ class RemoteMcpProvider:
         self,
         config: GitHubMcpConfig,
         *,
-        http_client_factory: Callable[..., Any] = httpx2.AsyncClient,
+        http_client_factory: Callable[..., Any] | None = None,
         transport_factory: Callable[..., Any] = streamable_http_client,
-        session_factory: Callable[..., Any] = ClientSession,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.config = config
-        self._http_client_factory = http_client_factory
+        self._http_client_factory = http_client_factory or create_mcp_http_client
         self._transport_factory = transport_factory
-        self._session_factory = session_factory
+        self._client_factory = client_factory or Client
         self._stack: AsyncExitStack | None = None
+        self._client: Any | None = None
         self._session: Any | None = None
         self._upstream_tools: tuple[types.Tool, ...] = ()
         self._connected = False
@@ -67,30 +70,29 @@ class RemoteMcpProvider:
     async def _open(self, *, fetch_tools: bool) -> None:
         await self._close_stack()
         stack = AsyncExitStack()
-        http_client: Any | None = None
         try:
             http_client = await stack.enter_async_context(
                 self._http_client_factory(
                     headers={"Authorization": f"Bearer {self.config.pat}"},
                 )
             )
-            read_stream, write_stream = await stack.enter_async_context(
-                self._transport_factory(
-                    self.config.url,
-                    http_client=http_client,
-                    terminate_on_close=True,
-                )
+            transport = self._transport_factory(
+                self.config.url,
+                http_client=http_client,
+                terminate_on_close=True,
             )
-            session = self._session_factory(
-                read_stream,
-                write_stream,
+            client = self._client_factory(
+                transport,
+                mode="auto",
                 message_handler=self._on_message,
+                cache=None,
             )
-            await stack.enter_async_context(session)
-            await session.initialize()
+            await stack.enter_async_context(client)
+            session = client.session
             if fetch_tools:
                 self._upstream_tools = await self._fetch_all_tools(session)
             self._stack = stack
+            self._client = client
             self._session = session
             self._connected = True
             self._disconnect_logged = False
@@ -128,7 +130,13 @@ class RemoteMcpProvider:
             cursor = next_cursor
 
     async def call_tool(
-        self, upstream_name: str, arguments: dict[str, Any]
+        self,
+        upstream_name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        input_responses: types.InputResponses | None = None,
+        request_state: str | None = None,
+        meta: types.RequestParamsMeta | None = None,
     ) -> types.CallToolResult | types.InputRequiredResult:
         if not self.config.enabled:
             raise RemoteMcpError("GitHub Remote MCP is disabled")
@@ -151,7 +159,14 @@ class RemoteMcpProvider:
                 tool_name=upstream_name,
             )
             try:
-                result = await session.call_tool(upstream_name, arguments)
+                result = await session.call_tool(
+                    upstream_name,
+                    arguments,
+                    input_responses=input_responses,
+                    request_state=request_state,
+                    meta=meta,
+                    allow_input_required=True,
+                )
             except Exception:
                 self._mark_disconnected("outcome_unknown")
                 log_event(
@@ -196,6 +211,7 @@ class RemoteMcpProvider:
     async def _close_stack(self) -> None:
         stack = self._stack
         self._stack = None
+        self._client = None
         self._session = None
         if stack is not None:
             try:

@@ -126,14 +126,16 @@ for absolute, existing, directory, and canonicalizable paths.
 
 ### GitHub Remote MCP mount
 
-When enabled, startup connects to the configured endpoint, performs `initialize`, fetches every
-`tools/list` page, applies include → exclude → name sort → `max_tools`, and exposes the resulting
-tools with the configured prefix in the same MCP namespace as the native tools. The snapshot stays
-fixed for the process lifetime. The startup catalog records native/upstream/exposed/total counts,
-serialized catalog bytes, and a deterministic SHA-256 fingerprint. A later upstream disconnect does
-not remove the catalog; calls fail explicitly, and only a call begun while disconnected may reconnect
-before its one request. A communication error after sending a call is returned as outcome unknown and
-is never retried.
+When enabled, startup connects to the configured endpoint through the SDK v2 auto-negotiating
+`Client` (modern discovery with legacy `initialize` fallback), fetches every `tools/list` page,
+applies include → exclude → name sort → `max_tools`, and exposes the resulting tools with the
+configured prefix in the same MCP namespace as the native tools. The snapshot stays fixed for the
+process lifetime. The startup catalog records native/upstream/exposed/total counts, serialized
+catalog bytes, and a deterministic SHA-256 fingerprint. A later upstream disconnect does not remove
+the catalog; calls fail explicitly, and only a call begun while disconnected may reconnect before its
+one request. Multi-round-trip fields and `InputRequiredResult` are passed through unchanged. Remote
+execution failures are returned as `isError` tool results. A communication error after sending a call
+is returned as outcome unknown and is never retried.
 
 ### Tunnel Host configuration
 
