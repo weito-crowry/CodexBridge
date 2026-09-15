@@ -14,6 +14,9 @@ class ConfigurationError(ValueError):
     """Raised when an environment setting cannot be used safely."""
 
 
+WAIT_HARD_MAX_SECONDS = 55.0
+
+
 def validate_allowed_roots(allowed_roots: tuple[str, ...]) -> tuple[str, ...]:
     if not allowed_roots:
         raise ConfigurationError(
@@ -117,10 +120,12 @@ class BridgeConfig:
         if not isinstance(bridge_config, Mapping) or not isinstance(console_config, Mapping):
             raise ConfigurationError("CodexBridge configuration sections are malformed")
 
-        wait_max = _positive_float("CODEX_BRIDGE_WAIT_MAX_SECONDS", 30.0, values)
-        wait_default = _positive_float("CODEX_BRIDGE_WAIT_DEFAULT_SECONDS", 18.0, values)
-        if wait_max > 30.0:
-            raise ConfigurationError("maximum wait must not exceed 30 seconds")
+        wait_max = _positive_float("CODEX_BRIDGE_WAIT_MAX_SECONDS", WAIT_HARD_MAX_SECONDS, values)
+        wait_default = _positive_float("CODEX_BRIDGE_WAIT_DEFAULT_SECONDS", 50.0, values)
+        if wait_max > WAIT_HARD_MAX_SECONDS:
+            raise ConfigurationError(
+                f"maximum wait must not exceed {WAIT_HARD_MAX_SECONDS:g} seconds"
+            )
         if wait_default > wait_max:
             raise ConfigurationError(
                 "default wait cannot exceed the configured default wait maximum"

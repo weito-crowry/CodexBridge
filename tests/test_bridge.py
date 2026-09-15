@@ -689,6 +689,106 @@ async def test_wait_wakes_when_matching_turn_completes(allowed_dir) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_uses_fifty_second_default(allowed_dir, monkeypatch) -> None:
+    bridge, _, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+    observed_timeouts: list[float] = []
+
+    async def wait_for_change(_thread_id: str, _turn_id: str, timeout: float) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(store, "wait_for_change", wait_for_change)
+
+    result = await bridge.wait("thread", "turn")
+
+    assert observed_timeouts == pytest.approx([50.0], abs=0.01)
+    assert result["state"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_wait_request_is_capped_at_fifty_five_seconds(allowed_dir, monkeypatch) -> None:
+    bridge, _, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+    observed_timeouts: list[float] = []
+
+    async def wait_for_change(_thread_id: str, _turn_id: str, timeout: float) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(store, "wait_for_change", wait_for_change)
+
+    result = await bridge.wait("thread", "turn", 60.0)
+
+    assert observed_timeouts == pytest.approx([55.0], abs=0.01)
+    assert result["state"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_active_wait_timeout_returns_in_progress_without_rpc(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    result = await bridge.wait("thread", "turn", 0.01)
+
+    assert result["state"] == "in_progress"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_same_active_turn_can_be_waited_on_repeatedly(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    first = await bridge.wait("thread", "turn", 0)
+    second = await bridge.wait("thread", "turn", 0)
+
+    assert first["state"] == "in_progress"
+    assert second["state"] == "in_progress"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_for_pending_approval(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    await bridge.handle_server_request(
+        {
+            "id": "approval-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "thread", "turnId": "turn"},
+        }
+    )
+
+    result = await asyncio.wait_for(bridge.wait("thread", "turn", 50.0), timeout=0.5)
+
+    assert result["state"] == "needs_approval"
+    assert result["pending_request"]["request_id"] == "approval-1"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_for_pending_user_input(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    await bridge.handle_server_request(
+        {
+            "id": "input-1",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "questions": [{"header": "Choice", "id": "choice", "question": "Pick one"}],
+            },
+        }
+    )
+
+    result = await asyncio.wait_for(bridge.wait("thread", "turn", 50.0), timeout=0.5)
+
+    assert result["state"] == "needs_input"
+    assert result["pending_request"]["request_id"] == "input-1"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
 async def test_terminal_statuses_are_normalized(allowed_dir) -> None:
     bridge, _, store = make_bridge(allowed_dir)
     for native, expected in (
@@ -726,6 +826,20 @@ async def test_agent_delta_and_diff_are_retained(allowed_dir) -> None:
     snapshot = store.snapshot("thread", "turn")
     assert snapshot["latest_agent_message"] == "hello"
     assert snapshot["current_diff"] == "diff"
+
+    public_snapshot = await bridge.wait("thread", "turn", 0)
+    assert {
+        "state",
+        "latest_agent_message",
+        "current_diff",
+        "pending_request",
+        "error",
+    }.issubset(public_snapshot)
+    assert public_snapshot["state"] == "in_progress"
+    assert public_snapshot["latest_agent_message"] == "hello"
+    assert public_snapshot["current_diff"] == "diff"
+    assert public_snapshot["pending_request"] is None
+    assert public_snapshot["error"] is None
 
 
 @pytest.mark.asyncio

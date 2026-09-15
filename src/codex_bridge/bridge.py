@@ -7,6 +7,7 @@ from copy import deepcopy
 from typing import Any, Protocol
 
 from .activity import ActivityStatus, ActivityStore, ActivityType
+from .config import WAIT_HARD_MAX_SECONDS
 from .history import (
     HistoryValidationError,
     project_items_response,
@@ -274,15 +275,15 @@ class Bridge:
         path_policy: AllowedPathPolicy,
         *,
         activity_store: ActivityStore | None = None,
-        wait_default_seconds: float = 18.0,
-        wait_max_seconds: float = 30.0,
+        wait_default_seconds: float = 50.0,
+        wait_max_seconds: float = WAIT_HARD_MAX_SECONDS,
     ) -> None:
         self._app_server = app_server
         self._state = state
         self._path_policy = path_policy
         self._activities = activity_store if activity_store is not None else ActivityStore()
         self._wait_default_seconds = wait_default_seconds
-        self._wait_max_seconds = min(wait_max_seconds, 30.0)
+        self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:

@@ -97,8 +97,8 @@ for absolute, existing, directory, and canonicalizable paths.
 | `CODEX_BRIDGE_CONTROL_TOKEN` | unset | Optional per-launch ASCII URL-safe control token; Console-launched values are process-local and never persisted. |
 | `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | resolver | Optional explicit `tunnel-client` executable override; an invalid explicit value fails closed. |
 | `CODEX_BRIDGE_TUNNEL_PROFILE` | `codex-bridge` | Existing Secure MCP Tunnel profile name; valid values are 1–64 ASCII letters, digits, `.`, `_`, or `-`. |
-| `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `18` | Default long-poll duration. |
-| `CODEX_BRIDGE_WAIT_MAX_SECONDS` | `30` | Hard maximum long-poll duration. |
+| `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `50` | Default long-poll duration. |
+| `CODEX_BRIDGE_WAIT_MAX_SECONDS` | `55` | Configured maximum long-poll duration; values above 55 are rejected. |
 | `CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS` | `3` | Shutdown grace period for the App Server child. |
 
 ### Tunnel Host configuration
@@ -122,7 +122,7 @@ The server publishes exactly nine tools:
 | --- | --- | --- |
 | `codex_start` | `cwd`, `prompt` | Native `thread_id`, `turn_id`, `in_progress` state, and safe `thread_metadata`; does not wait for completion. |
 | `codex_continue` | `thread_id`, `prompt` | Starts a new turn, calling `thread/resume` first when the thread is not loaded in this process. |
-| `codex_wait` | `thread_id`, `turn_id`, optional `timeout_seconds` | Bounded normalized state, latest agent message, latest diff, pending request, error, and retained `thread_metadata`. |
+| `codex_wait` | `thread_id`, `turn_id`, optional `timeout_seconds` | Waits up to the configured bound, then returns the normalized state, latest agent message, latest diff, pending request, error, and retained `thread_metadata`. Terminal states and pending approval/user-input requests return immediately; an active turn returns `in_progress` on timeout. Repeating the same IDs is supported and does not start or change a Codex turn. |
 | `codex_steer` | `thread_id`, `turn_id`, `prompt` | Uses `turn/steer` with `expectedTurnId` equal to the supplied turn ID. |
 | `codex_approval` | `request_id`, `decision` | Resolves one pending approval. Decisions are `accept`, `acceptForSession`, `decline`, or `cancel`. |
 | `codex_user_input` | `request_id`, `answers` | Resolves one pending user-input request keyed by exact question IDs. |

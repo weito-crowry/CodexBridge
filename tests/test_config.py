@@ -17,6 +17,7 @@ def test_config_parses_host_origin_and_bounded_wait(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ROOTS", r"C:\work;D:\repo")
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_HOSTS", "bridge.example.com, bridge.example.com:*")
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ORIGINS", "https://chat.example.com")
+    monkeypatch.setenv("CODEX_BRIDGE_WAIT_DEFAULT_SECONDS", "20")
     monkeypatch.setenv("CODEX_BRIDGE_WAIT_MAX_SECONDS", "29")
 
     config = BridgeConfig.from_env()
@@ -27,11 +28,30 @@ def test_config_parses_host_origin_and_bounded_wait(monkeypatch: pytest.MonkeyPa
     assert config.wait_max_seconds == 29.0
 
 
+def test_wait_defaults_match_operational_long_poll_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_BRIDGE_WAIT_DEFAULT_SECONDS", raising=False)
+    monkeypatch.delenv("CODEX_BRIDGE_WAIT_MAX_SECONDS", raising=False)
+
+    config = BridgeConfig.from_env()
+
+    assert config.wait_default_seconds == 50.0
+    assert config.wait_max_seconds == 55.0
+
+
 def test_default_wait_cannot_exceed_maximum(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CODEX_BRIDGE_WAIT_DEFAULT_SECONDS", "31")
     monkeypatch.setenv("CODEX_BRIDGE_WAIT_MAX_SECONDS", "30")
 
     with pytest.raises(ConfigurationError, match="default wait"):
+        BridgeConfig.from_env()
+
+
+def test_wait_maximum_cannot_exceed_hard_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_WAIT_MAX_SECONDS", "56")
+
+    with pytest.raises(ConfigurationError, match="55 seconds"):
         BridgeConfig.from_env()
 
 
