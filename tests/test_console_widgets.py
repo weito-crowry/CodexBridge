@@ -96,12 +96,15 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
     pane.list_widget.setCurrentRow(0)
     renamed: list[str] = []
     pane.thread_rename_requested.connect(renamed.append)
+    opened: list[str] = []
+    pane.thread_open_requested.connect(opened.append)
 
     menu = pane._context_menu_for_item(pane.list_widget.item(1))
     actions = menu.actions()
 
     assert [action.text() for action in actions] == [
         "名前を変更...",
+        "Open in Codex App",
         "スレッドIDをコピー",
         "スレッド情報をコピー",
         "",
@@ -111,10 +114,13 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
     assert renamed == ["target"]
 
     actions[1].trigger()
+    assert opened == ["target"]
+
+    actions[2].trigger()
     assert application.clipboard().text() == "target"
     application.processEvents()
 
-    actions[2].trigger()
+    actions[3].trigger()
     assert application.clipboard().text() == (
         f"Name: Target\nThread ID: target\nCWD: {tmp_path}\nStatus: active"
     )
@@ -146,7 +152,7 @@ def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
     menu = pane._context_menu_for_item(pane.list_widget.item(0))
     copied: list[str] = []
     monkeypatch.setattr(pane, "_copy_text", copied.append)
-    menu.actions()[2].trigger()
+    menu.actions()[3].trigger()
 
     assert len(copied) == 1
     assert f"CWD: {missing_cwd}" in copied[0]

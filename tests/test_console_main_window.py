@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import QCoreApplication, Qt, QTimer
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QPushButton, QSplitter
 
 from codex_bridge.console.codex_resolver import CodexResolution
@@ -844,6 +844,99 @@ def test_rename_cancel_or_blank_does_not_call_api(monkeypatch, dialog_result) ->
 
     window.thread_pane.thread_rename_requested.emit("thread-b")
 
+    assert client.json_posts == []
+    window.close()
+
+
+def test_open_in_codex_app_uses_right_clicked_thread_id_and_preserves_selection() -> None:
+    _application()
+    client = FakeClient()
+    opened: list[str] = []
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        codex_uri_opener=lambda uri: opened.append(uri) or True,
+    )
+    client.result(
+        "threads",
+        {
+            "threads": [
+                {"id": "thread-a", "name": "A"},
+                {"id": "thread-b", "name": "B"},
+            ]
+        },
+    )
+    window.select_thread("thread-a")
+    window.thread_pane.list_widget.setCurrentRow(0)
+
+    menu = window.thread_pane._context_menu_for_item(window.thread_pane.list_widget.item(1))
+    action = next(action for action in menu.actions() if action.text() == "Open in Codex App")
+    action.trigger()
+
+    assert opened == ["codex://threads/thread-b"]
+    assert window._selected_thread_id == "thread-a"
+    current = window.thread_pane.list_widget.currentItem()
+    assert current is not None
+    assert current.data(Qt.ItemDataRole.UserRole) == "thread-a"
+    assert client.json_posts == []
+    window.close()
+
+
+def test_open_in_codex_app_default_helper_passes_exact_uri_to_qt_shell(monkeypatch) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread("thread-a")
+
+    actions = window.thread_pane._context_menu_for_item(
+        window.thread_pane.list_widget.item(0)
+    ).actions()
+    assert "Open in Codex App" in [action.text() for action in actions]
+    opened: list[str] = []
+    monkeypatch.setattr(
+        QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toString()) or True,
+    )
+
+    action = next(action for action in actions if action.text() == "Open in Codex App")
+    action.trigger()
+
+    assert opened == ["codex://threads/thread-a"]
+    window.close()
+
+
+def _raise_uri_error(_uri: str) -> bool:
+    raise OSError("shell unavailable")
+
+
+@pytest.mark.parametrize("opener", [lambda _uri: False, _raise_uri_error])
+def test_open_in_codex_app_failure_is_visible_without_changing_thread_state(opener) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        codex_uri_opener=opener,
+    )
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread("thread-a")
+    window._active_thread_ids.add("thread-a")
+    initial_title = window.thread_pane.thread_name("thread-a")
+    initial_generation = window._selection_generation
+
+    menu = window.thread_pane._context_menu_for_item(window.thread_pane.list_widget.item(0))
+    action = next(action for action in menu.actions() if action.text() == "Open in Codex App")
+    action.trigger()
+
+    assert "Could not open thread in Codex App" in window.bottom_status_label.text()
+    assert window._selected_thread_id == "thread-a"
+    assert window._selection_generation == initial_generation
+    assert window.thread_pane.thread_name("thread-a") == initial_title
+    assert "thread-a" in window._active_thread_ids
     assert client.json_posts == []
     window.close()
 

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from .api_client import ApiClient
+from .codex_links import codex_thread_uri, open_codex_uri
 from .codex_resolver import (
     CodexResolution,
     CodexResolutionError,
@@ -152,6 +153,7 @@ class MainWindow(QMainWindow):
         tray_factory: Callable[[QWidget], Any] | None = None,
         tray_available: bool | None = None,
         quit_application: Callable[[], None] | None = None,
+        codex_uri_opener: Callable[[str], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -175,6 +177,7 @@ class MainWindow(QMainWindow):
             lambda owner: QSystemTrayIcon(self._window_icon, owner)
         )
         self._quit_application = quit_application or self._quit_qapplication
+        self._codex_uri_opener = codex_uri_opener or open_codex_uri
         self.tray_icon: Any | None = None
         self.tray_menu: QMenu | None = None
         self._tray_actions: dict[str, QAction] = {}
@@ -534,6 +537,7 @@ class MainWindow(QMainWindow):
         self.thread_pane.refresh_requested.connect(self.refresh)
         self.thread_pane.thread_selected.connect(self.select_thread)
         self.thread_pane.thread_rename_requested.connect(self._rename_thread)
+        self.thread_pane.thread_open_requested.connect(self._open_thread_in_codex)
         self.history_pane.older_requested.connect(self.load_older)
 
     def _connect_runtime(self) -> None:
@@ -1560,6 +1564,17 @@ class MainWindow(QMainWindow):
             key=key,
         ):
             self._pending_rename_names[key] = name
+
+    def _open_thread_in_codex(self, thread_id: str) -> None:
+        try:
+            opened = self._codex_uri_opener(codex_thread_uri(thread_id))
+        except Exception:
+            opened = False
+        if not opened:
+            self.bottom_status_label.setText(
+                "Could not open thread in Codex App. "
+                "Check that the codex:// URI handler is available."
+            )
 
     def _thread_path(self, suffix: str = "") -> str:
         assert self._selected_thread_id is not None

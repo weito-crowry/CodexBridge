@@ -206,6 +206,7 @@ class ThreadListPane(QWidget):
     refresh_requested = Signal()
     thread_selected = Signal(str)
     thread_rename_requested = Signal(str)
+    thread_open_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -362,6 +363,10 @@ class ThreadListPane(QWidget):
         rename_action = menu.addAction("名前を変更...")
         rename_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self.thread_rename_requested.emit(thread_id)
+        )
+        open_codex_action = menu.addAction("Open in Codex App")
+        open_codex_action.triggered.connect(
+            lambda _checked=False, thread_id=thread_id: self.thread_open_requested.emit(thread_id)
         )
         copy_id_action = menu.addAction("スレッドIDをコピー")
         copy_id_action.triggered.connect(
