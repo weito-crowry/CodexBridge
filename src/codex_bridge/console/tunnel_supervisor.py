@@ -14,6 +14,8 @@ from PySide6.QtNetwork import (
     QTcpServer,
 )
 
+from ..observability import get_observer
+
 _DOCTOR_TIMEOUT_MS = 10_000
 _MAX_DOCTOR_OUTPUT = 8 * 1024
 _STOP_TIMEOUT_MS = 2_000
@@ -98,6 +100,14 @@ def default_health_port_provider() -> int:
     if not 1 <= port <= 65_535:
         raise RuntimeError("Tunnel health port unavailable")
     return port
+
+
+def _process_exit_code(process: Any) -> int | None:
+    try:
+        value = process.exitCode()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class TunnelSupervisor(QObject):
@@ -303,6 +313,7 @@ class TunnelSupervisor(QObject):
         else:
             interval = _TUNNEL_RECOVERY_FALLBACK_MS
         self._recovery_timer.start(interval)
+        get_observer().tunnel_recovery()
 
     def _on_recovery_timeout(self) -> None:
         if (
@@ -582,6 +593,7 @@ class TunnelSupervisor(QObject):
                 ]
             )
             process.start()
+            get_observer().tunnel_start()
             return True
         except Exception:
             process = self._process
@@ -645,6 +657,7 @@ class TunnelSupervisor(QObject):
         self._stop_timer.stop()
         self._stop_health_poll()
         self._process = None
+        get_observer().tunnel_exit(_process_exit_code(process))
         active_process: Any = process
         active_process.deleteLater()
         callbacks = self._stop_callbacks
@@ -663,6 +676,7 @@ class TunnelSupervisor(QObject):
         self._stop_timer.stop()
         self._stop_health_poll()
         self._process = None
+        get_observer().tunnel_exit(_process_exit_code(process))
         active_process: Any = process
         active_process.deleteLater()
         self._set_state("failed")

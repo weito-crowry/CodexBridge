@@ -328,6 +328,41 @@ def test_unexpected_exit_fails_without_automatic_restart() -> None:
     supervisor.close()
 
 
+def test_tunnel_lifecycle_and_recovery_are_observed(monkeypatch) -> None:
+    from codex_bridge.console import tunnel_supervisor as tunnel_module
+
+    class RecordingObserver:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def tunnel_start(self) -> None:
+            self.events.append("tunnel.start")
+
+        def tunnel_exit(self, exit_code: int | None = None) -> None:
+            del exit_code
+            self.events.append("tunnel.exit")
+
+        def tunnel_recovery(self) -> None:
+            self.events.append("tunnel.recovery")
+
+    _application()
+    observer = RecordingObserver()
+    monkeypatch.setattr(tunnel_module, "get_observer", lambda: observer, raising=False)
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+
+    doctor.finished.emit(0, 0)
+    tunnel.finished.emit(1, 0)
+
+    assert observer.events == [
+        "tunnel.start",
+        "tunnel.exit",
+        "tunnel.recovery",
+    ]
+    supervisor.close()
+
+
 def _managed_supervisor(processes: list[FakeProcess]) -> TunnelSupervisor:
     supervisor = TunnelSupervisor(
         executable="tunnel-client.exe",

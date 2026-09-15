@@ -9,6 +9,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.routing import Mount
 
 from .activity import ActivityStore
@@ -18,6 +19,7 @@ from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .logging_utils import log_event
 from .models import ApprovalDecision
+from .observability import MCPObservabilityMiddleware, ObservabilityLogger
 from .paths import AllowedPathPolicy, PathPolicyError
 from .server_instructions import MCP_SERVER_INSTRUCTIONS
 from .state import StateStore
@@ -146,12 +148,14 @@ def create_app(
     *,
     runtime_factory: Callable[[BridgeConfig], RuntimeLike] | None = None,
     shutdown_callback: ShutdownCallback | None = None,
+    observability: ObservabilityLogger | None = None,
 ) -> Starlette:
     mcp = MCPServer(
         "CodexBridge",
         version="0.1.0",
         instructions=MCP_SERVER_INSTRUCTIONS,
     )
+    observer = observability or ObservabilityLogger()
     runtime_holder: dict[str, RuntimeLike | None] = {"runtime": None}
 
     def bridge() -> Bridge:
@@ -234,27 +238,36 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        async with mcp.session_manager.run():
-            runtime: RuntimeLike
-            if runtime_factory is None:
-                runtime = build_runtime(config, shutdown_callback=shutdown_callback)
-            else:
-                runtime = runtime_factory(config)
-            runtime_holder["runtime"] = runtime
-            app.state.runtime = runtime
-            app.state.bridge = runtime.bridge
-            try:
-                await runtime.start()
-                yield
-            finally:
-                await runtime.shutdown()
-                runtime_holder["runtime"] = None
-                app.state.runtime = None
-                app.state.bridge = None
+        observer.server_start()
+        try:
+            async with mcp.session_manager.run():
+                runtime: RuntimeLike
+                if runtime_factory is None:
+                    runtime = build_runtime(config, shutdown_callback=shutdown_callback)
+                else:
+                    runtime = runtime_factory(config)
+                runtime_holder["runtime"] = runtime
+                app.state.runtime = runtime
+                app.state.bridge = runtime.bridge
+                try:
+                    await runtime.start()
+                    yield
+                finally:
+                    await runtime.shutdown()
+                    runtime_holder["runtime"] = None
+                    app.state.runtime = None
+                    app.state.bridge = None
+        finally:
+            observer.server_shutdown()
 
-    app = Starlette(routes=[Mount("/", app=transport_app)], lifespan=lifespan)
+    app = Starlette(
+        routes=[Mount("/", app=transport_app)],
+        lifespan=lifespan,
+        middleware=[Middleware(MCPObservabilityMiddleware, observer=observer)],
+    )
     app.state.mcp_server = mcp
     app.state.transport_security = security
+    app.state.observability = observer
     app.state.runtime = None
     app.state.bridge = None
     return app
