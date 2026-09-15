@@ -51,8 +51,10 @@ async def test_server_lifecycle_persists_observability_events(tmp_path, monkeypa
     async with app.router.lifespan_context(app):
         pass
 
-    log_path = local_app_data / "CodexBridge" / "logs" / "observability.jsonl"
+    log_path = local_app_data / "CodexBridge" / "logs" / "bridge-observability.jsonl"
+    console_log_path = local_app_data / "CodexBridge" / "logs" / "console-observability.jsonl"
     assert log_path.exists()
+    assert not console_log_path.exists()
     records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
     assert [record["event"] for record in records] == [
@@ -61,17 +63,37 @@ async def test_server_lifecycle_persists_observability_events(tmp_path, monkeypa
     ]
 
 
-def test_windows_local_app_data_resolves_outside_repository(tmp_path) -> None:
-    from codex_bridge.observability import default_log_path
+def test_windows_local_app_data_resolves_separate_bridge_and_console_paths(tmp_path) -> None:
+    from codex_bridge.observability import bridge_log_path, console_log_path
 
     local_app_data = tmp_path / "local-app-data"
 
-    path = default_log_path(
+    bridge_path = bridge_log_path(
+        {"LOCALAPPDATA": str(local_app_data)},
+        platform="win32",
+    )
+    console_path = console_log_path(
         {"LOCALAPPDATA": str(local_app_data)},
         platform="win32",
     )
 
-    assert path == local_app_data / "CodexBridge" / "logs" / "observability.jsonl"
+    assert bridge_path == local_app_data / "CodexBridge" / "logs" / "bridge-observability.jsonl"
+    assert console_path == local_app_data / "CodexBridge" / "logs" / "console-observability.jsonl"
+    assert bridge_path != console_path
+
+
+def test_get_observer_uses_console_log_path(tmp_path, monkeypatch) -> None:
+    from codex_bridge import observability as observability_module
+
+    local_app_data = tmp_path / "local-app-data"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setattr(observability_module, "_observer", None)
+
+    observer = observability_module.get_observer()
+
+    assert observer.log_path == (
+        local_app_data / "CodexBridge" / "logs" / "console-observability.jsonl"
+    )
 
 
 def test_emit_writes_safe_jsonl_record(tmp_path) -> None:

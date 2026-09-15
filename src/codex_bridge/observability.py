@@ -15,7 +15,8 @@ from time import monotonic
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-_LOG_FILE_NAME = "observability.jsonl"
+BRIDGE_LOG_FILE_NAME = "bridge-observability.jsonl"
+CONSOLE_LOG_FILE_NAME = "console-observability.jsonl"
 _DEFAULT_MAX_BYTES = 1 * 1024 * 1024
 _DEFAULT_BACKUP_COUNT = 3
 _PROTOCOL_VERSION_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
@@ -37,6 +38,7 @@ def default_log_path(
     environ: Mapping[str, str] | None = None,
     *,
     platform: str | None = None,
+    file_name: str = BRIDGE_LOG_FILE_NAME,
 ) -> Path:
     values = os.environ if environ is None else environ
     platform_name = sys.platform if platform is None else platform
@@ -46,7 +48,23 @@ def default_log_path(
     else:
         state_home = values.get("XDG_STATE_HOME")
         root = Path(state_home) if state_home else Path.home() / ".local" / "state"
-    return root / "CodexBridge" / "logs" / _LOG_FILE_NAME
+    return root / "CodexBridge" / "logs" / file_name
+
+
+def bridge_log_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    platform: str | None = None,
+) -> Path:
+    return default_log_path(environ, platform=platform, file_name=BRIDGE_LOG_FILE_NAME)
+
+
+def console_log_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    platform: str | None = None,
+) -> Path:
+    return default_log_path(environ, platform=platform, file_name=CONSOLE_LOG_FILE_NAME)
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,5 +291,5 @@ def _protocol_version(scope: Scope) -> str | None:
 def get_observer() -> ObservabilityLogger:
     global _observer
     if _observer is None:
-        _observer = ObservabilityLogger()
+        _observer = ObservabilityLogger(log_path=console_log_path())
     return _observer
