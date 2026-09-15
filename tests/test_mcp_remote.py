@@ -151,10 +151,30 @@ async def test_start_initializes_and_fetches_all_tool_pages() -> None:
     assert FakeSession.instances[0].initialize_count == 1
     assert FakeClient.instances[0].kwargs["mode"] == "auto"
     assert FakeHttpClient.instances[0].headers == {"Authorization": "Bearer secret-pat"}
+    assert "X-MCP-Toolsets" not in FakeHttpClient.instances[0].headers
     assert [item.name for item in provider.upstream_tools] == ["a", "b"]
 
     await provider.close()
     assert FakeSession.instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_start_adds_configured_toolsets_to_http_headers() -> None:
+    provider = RemoteMcpProvider(
+        settings(toolsets=("context", "repos", "issues")),
+        http_client_factory=lambda **kwargs: FakeHttpClient(kwargs["headers"]),
+        transport_factory=fake_transport,
+        client_factory=FakeClient,
+    )
+
+    await provider.start()
+
+    assert FakeHttpClient.instances[0].headers == {
+        "Authorization": "Bearer secret-pat",
+        "X-MCP-Toolsets": "context,repos,issues",
+    }
+
+    await provider.close()
 
 
 @pytest.mark.asyncio

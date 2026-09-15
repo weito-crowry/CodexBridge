@@ -100,9 +100,12 @@ class RemoteMcpProvider:
         await self._close_stack()
         stack = AsyncExitStack()
         try:
+            headers = {"Authorization": f"Bearer {self.config.pat}"}
+            if self.config.toolsets:
+                headers["X-MCP-Toolsets"] = ",".join(self.config.toolsets)
             http_client = await stack.enter_async_context(
                 self._http_client_factory(
-                    headers={"Authorization": f"Bearer {self.config.pat}"},
+                    headers=headers,
                 )
             )
             transport = self._transport_factory(

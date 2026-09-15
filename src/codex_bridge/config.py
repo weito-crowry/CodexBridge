@@ -128,6 +128,24 @@ def _patterns(value: object, source: str, *, default: tuple[str, ...]) -> tuple[
     return tuple(normalized)
 
 
+def _toolsets(value: object, source: str) -> tuple[str, ...]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ()
+    if isinstance(value, str):
+        parts: Sequence[object] = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        parts = value
+    else:
+        raise ConfigurationError(f"{source} must be comma-separated toolsets or an array")
+
+    normalized: list[str] = []
+    for item in parts:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigurationError(f"{source} contains an empty toolset")
+        normalized.append(item.strip())
+    return tuple(normalized)
+
+
 def _github_url(value: object, source: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationError(f"{source} must be an HTTP(S) URL")
@@ -166,6 +184,7 @@ class GitHubMcpConfig:
     prefix: str = "github_"
     include: tuple[str, ...] = ("*",)
     exclude: tuple[str, ...] = ()
+    toolsets: tuple[str, ...] = ()
     max_tools: int = 0
     pat: str | None = field(default=None, repr=False, compare=False)
 
@@ -176,6 +195,7 @@ class GitHubMcpConfig:
         _github_prefix(self.prefix, "github_mcp.prefix")
         _patterns(self.include, "github_mcp.include", default=("*",))
         _patterns(self.exclude, "github_mcp.exclude", default=())
+        object.__setattr__(self, "toolsets", _toolsets(self.toolsets, "github_mcp.toolsets"))
         if isinstance(self.max_tools, bool) or not isinstance(self.max_tools, int):
             raise ConfigurationError("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS must be an integer")
         if self.max_tools < 0:
@@ -221,6 +241,10 @@ class GitHubMcpConfig:
             "CODEX_BRIDGE_GITHUB_MCP_EXCLUDE",
             default=(),
         )
+        toolsets = _toolsets(
+            setting("CODEX_BRIDGE_GITHUB_MCP_TOOLSETS", "toolsets", ()),
+            "CODEX_BRIDGE_GITHUB_MCP_TOOLSETS",
+        )
         raw_max_tools = setting("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS", "max_tools", 0)
         if isinstance(raw_max_tools, str):
             try:
@@ -240,6 +264,7 @@ class GitHubMcpConfig:
             prefix=prefix,
             include=include,
             exclude=exclude,
+            toolsets=toolsets,
             max_tools=max_tools,
             pat=pat,
         )

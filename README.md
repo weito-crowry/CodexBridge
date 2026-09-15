@@ -68,6 +68,7 @@ url = "https://api.githubcopilot.com/mcp/x/all"
 prefix = "github_"
 include = ["*"]
 exclude = []
+toolsets = []
 max_tools = 0
 ```
 
@@ -121,13 +122,15 @@ for absolute, existing, directory, and canonicalizable paths.
 | `CODEX_BRIDGE_GITHUB_MCP_PREFIX` | `github_` | Prefix applied to exposed remote tool names. |
 | `CODEX_BRIDGE_GITHUB_MCP_INCLUDE` | `*` | Comma-separated upstream tool-name globs included before exclusion. |
 | `CODEX_BRIDGE_GITHUB_MCP_EXCLUDE` | empty | Comma-separated upstream tool-name globs excluded after inclusion. |
+| `CODEX_BRIDGE_GITHUB_MCP_TOOLSETS` | empty | Optional comma-separated GitHub upstream toolsets sent as `X-MCP-Toolsets`; empty preserves all upstream toolsets. |
 | `CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS` | `0` | Maximum exposed remote tools after stable sorting; `0` means unlimited. |
 | `CODEX_BRIDGE_GITHUB_PAT` | unset | Dedicated GitHub Remote MCP bearer token; environment-only and never logged or returned. |
 
 ### GitHub Remote MCP mount
 
 When enabled, startup connects to the configured endpoint through the SDK v2 auto-negotiating
-`Client` (modern discovery with legacy `initialize` fallback), fetches every `tools/list` page,
+`Client` (modern discovery with legacy `initialize` fallback), optionally sends the configured
+`X-MCP-Toolsets` header, fetches every `tools/list` page,
 applies include → exclude → name sort → `max_tools`, and exposes the resulting tools with the
 configured prefix in the same MCP namespace as the native tools. The snapshot stays fixed for the
 process lifetime. The startup catalog records native/upstream/exposed/total counts, serialized
@@ -136,6 +139,10 @@ the catalog; calls fail explicitly, and only a call begun while disconnected may
 one request. Multi-round-trip fields and `InputRequiredResult` are passed through unchanged. Remote
 execution failures are returned as `isError` tool results. A communication error after sending a call
 is returned as outcome unknown and is never retried.
+
+For schema-reduction dogfood, an example value is
+`CODEX_BRIDGE_GITHUB_MCP_TOOLSETS=context,repos,issues,pull_requests,actions`. This is optional
+and is not the default; leaving it unset preserves the `/mcp/x/all` all-toolsets behavior.
 
 ### Tunnel Host configuration
 

@@ -150,6 +150,7 @@ def test_user_config_file_supplies_non_secret_github_mcp_values(tmp_path, monkey
         'prefix = "gh_"\n'
         'include = ["get_*"]\n'
         'exclude = ["*_secret"]\n'
+        'toolsets = [" context ", "repos "]\n'
         "max_tools = 25\n",
         encoding="utf-8",
     )
@@ -162,6 +163,7 @@ def test_user_config_file_supplies_non_secret_github_mcp_values(tmp_path, monkey
     assert config.github_mcp.prefix == "gh_"
     assert config.github_mcp.include == ("get_*",)
     assert config.github_mcp.exclude == ("*_secret",)
+    assert config.github_mcp.toolsets == ("context", "repos")
     assert config.github_mcp.max_tools == 25
 
 
@@ -238,6 +240,7 @@ def test_github_mcp_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> N
         "CODEX_BRIDGE_GITHUB_MCP_PREFIX",
         "CODEX_BRIDGE_GITHUB_MCP_INCLUDE",
         "CODEX_BRIDGE_GITHUB_MCP_EXCLUDE",
+        "CODEX_BRIDGE_GITHUB_MCP_TOOLSETS",
         "CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS",
         "CODEX_BRIDGE_GITHUB_PAT",
     ):
@@ -250,6 +253,7 @@ def test_github_mcp_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> N
     assert config.github_mcp.prefix == "github_"
     assert config.github_mcp.include == ("*",)
     assert config.github_mcp.exclude == ()
+    assert config.github_mcp.toolsets == ()
     assert config.github_mcp.max_tools == 0
 
 
@@ -278,6 +282,10 @@ def test_github_mcp_reads_all_supported_environment_settings(
     monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_PREFIX", "gh_")
     monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_INCLUDE", "get_*, list_*")
     monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_EXCLUDE", "*_secret")
+    monkeypatch.setenv(
+        "CODEX_BRIDGE_GITHUB_MCP_TOOLSETS",
+        "context,repos,issues,pull_requests,actions",
+    )
     monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS", "25")
     monkeypatch.setenv("CODEX_BRIDGE_GITHUB_PAT", "do-not-echo")
 
@@ -288,8 +296,57 @@ def test_github_mcp_reads_all_supported_environment_settings(
     assert config.github_mcp.prefix == "gh_"
     assert config.github_mcp.include == ("get_*", "list_*")
     assert config.github_mcp.exclude == ("*_secret",)
+    assert config.github_mcp.toolsets == (
+        "context",
+        "repos",
+        "issues",
+        "pull_requests",
+        "actions",
+    )
     assert config.github_mcp.max_tools == 25
     assert "do-not-echo" not in repr(config)
+
+
+def test_github_mcp_trims_toolsets_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_TOOLSETS", "context, repos , issues")
+
+    config = BridgeConfig.from_env()
+
+    assert config.github_mcp.toolsets == ("context", "repos", "issues")
+
+
+def test_github_mcp_empty_toolsets_environment_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_TOOLSETS", "")
+
+    config = BridgeConfig.from_env()
+
+    assert config.github_mcp.toolsets == ()
+
+
+def test_github_mcp_environment_toolsets_override_config_file(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[github_mcp]\ntoolsets = ["context", "repos"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_BRIDGE_CONFIG", str(config_path))
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_TOOLSETS", "issues, pull_requests")
+
+    config = BridgeConfig.from_env()
+
+    assert config.github_mcp.toolsets == ("issues", "pull_requests")
+
+
+@pytest.mark.parametrize("value", ["context,,repos", "context, ,repos"])
+def test_github_mcp_rejects_empty_toolset_names(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CODEX_BRIDGE_GITHUB_MCP_TOOLSETS", value)
+
+    with pytest.raises(ConfigurationError, match="toolset"):
+        BridgeConfig.from_env()
 
 
 @pytest.mark.parametrize("value", ["get_[", "get_]", "get_*,,list_*"])

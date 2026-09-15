@@ -22,6 +22,7 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "prefix": str,
         "include": list,
         "exclude": list,
+        "toolsets": list,
         "max_tools": int,
     },
 }
