@@ -180,6 +180,16 @@ def timeline_entries(items_payload: Mapping[str, object]) -> tuple[TimelineEntry
     return tuple(entries)
 
 
+def format_thread_content(entries: Sequence[TimelineEntry]) -> str:
+    return "\n\n".join(f"{entry.title}:\n{entry.body}" for entry in entries)
+
+
+def copy_to_clipboard(text: str) -> None:
+    application = QApplication.instance()
+    if isinstance(application, QApplication):
+        application.clipboard().setText(text)
+
+
 def activity_row(activity: Mapping[str, object]) -> str:
     timestamp = _safe_text(activity.get("timestamp"), 128)
     activity_type = _safe_text(activity.get("type"), 128)
@@ -207,6 +217,7 @@ class ThreadListPane(QWidget):
     thread_selected = Signal(str)
     thread_rename_requested = Signal(str)
     thread_open_requested = Signal(str)
+    thread_copy_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -340,9 +351,7 @@ class ThreadListPane(QWidget):
 
     @staticmethod
     def _copy_text(text: str) -> None:
-        application = QApplication.instance()
-        if isinstance(application, QApplication):
-            application.clipboard().setText(text)
+        copy_to_clipboard(text)
 
     def _open_cwd(self, thread_id: str) -> None:
         thread = self._thread_for_id(thread_id)
@@ -377,6 +386,10 @@ class ThreadListPane(QWidget):
             lambda _checked=False, thread_id=thread_id: self._copy_text(
                 self._thread_info_text(thread_id) or ""
             )
+        )
+        copy_content_action = menu.addAction("Copy thread content")
+        copy_content_action.triggered.connect(
+            lambda _checked=False, thread_id=thread_id: self.thread_copy_requested.emit(thread_id)
         )
         menu.addSeparator()
         open_cwd_action = menu.addAction("作業フォルダを開く")
@@ -479,7 +492,17 @@ class HistoryPane(QWidget):
         header_parts = [entry.title]
         if entry.status is not None:
             header_parts.append(entry.status)
-        layout.addWidget(QLabel(" · ".join(header_parts)))
+        header = QHBoxLayout()
+        header.addWidget(QLabel(" · ".join(header_parts)))
+        if entry.kind in {"User", "Agent"}:
+            header.addStretch(1)
+            copy_button = QPushButton("Copy")
+            copy_button.setObjectName("copyMessageButton")
+            copy_button.clicked.connect(
+                lambda _checked=False, text=entry.body: copy_to_clipboard(text)
+            )
+            header.addWidget(copy_button)
+        layout.addLayout(header)
         if entry.body:
             body = QLabel()
             body.setTextFormat(Qt.TextFormat.PlainText)

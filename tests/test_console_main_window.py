@@ -883,6 +883,73 @@ def test_open_in_codex_app_uses_right_clicked_thread_id_and_preserves_selection(
     window.close()
 
 
+def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selection(
+    monkeypatch,
+) -> None:
+    application = _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    copied: list[str] = []
+    monkeypatch.setattr("codex_bridge.console.main_window.copy_to_clipboard", copied.append)
+    client.result(
+        "threads",
+        {
+            "threads": [
+                {"id": "thread-a", "name": "A"},
+                {"id": "thread-b", "name": "B"},
+            ]
+        },
+    )
+    window.select_thread("thread-a")
+    window._active_thread_ids.add("thread-a")
+    initial_generation = window._selection_generation
+    initial_selected = window._selected_thread_id
+    initial_active = set(window._active_thread_ids)
+
+    menu = window.thread_pane._context_menu_for_item(window.thread_pane.list_widget.item(1))
+    action = next(action for action in menu.actions() if action.text() == "Copy thread content")
+    action.trigger()
+
+    copy_key = next(key for key, _, _ in client.requests if key.startswith("copy-thread:"))
+    assert client.requests[-1] == (
+        copy_key,
+        "/ui-api/threads/thread-b/items",
+        {"limit": 100, "sort_direction": "desc"},
+    )
+    client.result(
+        copy_key,
+        {
+            "items": [
+                {"turn_id": "turn-b", "item": _item("agent-b", "agentMessage", text="Agent B")},
+                {"turn_id": "turn-b", "item": _item("user-b", "userMessage", text="User B")},
+            ],
+            "next_cursor": "older",
+        },
+    )
+    assert client.requests[-1] == (
+        copy_key,
+        "/ui-api/threads/thread-b/items",
+        {"limit": 100, "sort_direction": "desc", "cursor": "older"},
+    )
+    client.result(
+        copy_key,
+        {
+            "items": [
+                {"turn_id": "turn-a", "item": _item("agent-a", "agentMessage", text="Agent A")},
+                {"turn_id": "turn-a", "item": _item("user-a", "userMessage", text="User A")},
+            ],
+            "next_cursor": None,
+        },
+    )
+
+    application.processEvents()
+    assert copied == ["User:\nUser A\n\nAgent:\nAgent A\n\nUser:\nUser B\n\nAgent:\nAgent B"]
+    assert window._selected_thread_id == initial_selected
+    assert window._selection_generation == initial_generation
+    assert window._active_thread_ids == initial_active
+    window.close()
+
+
 def test_open_in_codex_app_default_helper_passes_exact_uri_to_qt_shell(monkeypatch) -> None:
     _application()
     client = FakeClient()

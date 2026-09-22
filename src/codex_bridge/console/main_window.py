@@ -57,6 +57,8 @@ from .widgets import (
     HistoryPane,
     ThreadListPane,
     TimelineEntry,
+    copy_to_clipboard,
+    format_thread_content,
     timeline_entries,
 )
 
@@ -192,6 +194,8 @@ class MainWindow(QMainWindow):
         self._turn_statuses: dict[str, str] = {}
         self._active_thread_ids: set[str] = set()
         self._pending_rename_names: dict[str, str] = {}
+        self._thread_copy_sequence = 0
+        self._pending_thread_copies: dict[str, tuple[str, list[TimelineEntry]]] = {}
         self._next_cursor: str | None = None
         self._stream_sync_pending = False
         self._reconnect_scheduled = False
@@ -538,6 +542,7 @@ class MainWindow(QMainWindow):
         self.thread_pane.thread_selected.connect(self.select_thread)
         self.thread_pane.thread_rename_requested.connect(self._rename_thread)
         self.thread_pane.thread_open_requested.connect(self._open_thread_in_codex)
+        self.thread_pane.thread_copy_requested.connect(self._copy_thread_content)
         self.history_pane.older_requested.connect(self.load_older)
 
     def _connect_runtime(self) -> None:
@@ -1576,6 +1581,47 @@ class MainWindow(QMainWindow):
                 "Check that the codex:// URI handler is available."
             )
 
+    def _copy_thread_content(self, thread_id: str) -> None:
+        self._thread_copy_sequence += 1
+        key = f"copy-thread:{self._thread_copy_sequence}"
+        self._pending_thread_copies[key] = (thread_id, [])
+        if not self._request_thread_copy_page(key, thread_id):
+            self._pending_thread_copies.pop(key, None)
+
+    def _request_thread_copy_page(
+        self, key: str, thread_id: str, cursor: str | None = None
+    ) -> bool:
+        query: dict[str, object] = {"limit": 100, "sort_direction": "desc"}
+        if cursor is not None:
+            query["cursor"] = cursor
+        return self._client.get_json(
+            f"/ui-api/threads/{quote(thread_id, safe='')}/items",
+            key=key,
+            query=query,
+        )
+
+    def _apply_thread_copy_page(self, key: str, payload: object) -> None:
+        pending = self._pending_thread_copies.get(key)
+        if pending is None or not isinstance(payload, Mapping):
+            self._pending_thread_copies.pop(key, None)
+            return
+        thread_id, entries = pending
+        existing = {(entry.turn_id, entry.item_id) for entry in entries}
+        page_entries = tuple(
+            entry
+            for entry in timeline_entries(payload)
+            if (entry.turn_id, entry.item_id) not in existing
+        )
+        entries[0:0] = page_entries
+        next_cursor = payload.get("next_cursor")
+        if isinstance(next_cursor, str) and next_cursor:
+            if self._request_thread_copy_page(key, thread_id, next_cursor):
+                return
+            self._pending_thread_copies.pop(key, None)
+            return
+        copy_to_clipboard(format_thread_content(entries))
+        self._pending_thread_copies.pop(key, None)
+
     def _thread_path(self, suffix: str = "") -> str:
         assert self._selected_thread_id is not None
         return f"/ui-api/threads/{quote(self._selected_thread_id, safe='')}{suffix}"
@@ -1646,6 +1692,9 @@ class MainWindow(QMainWindow):
         return parsed
 
     def apply_json_result(self, key: str, payload: object) -> None:
+        if key in self._pending_thread_copies:
+            self._apply_thread_copy_page(key, payload)
+            return
         if key.startswith("rename:"):
             name = self._pending_rename_names.pop(key, None)
             if name is not None:
@@ -1827,6 +1876,9 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_json_error(self, key: str, message: str) -> None:
+        if key in self._pending_thread_copies:
+            self._pending_thread_copies.pop(key, None)
+            return
         if key.startswith("rename:"):
             self._pending_rename_names.pop(key, None)
             return

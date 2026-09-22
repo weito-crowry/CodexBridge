@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import QApplication, QLabel, QTextEdit
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QTextEdit
 
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
@@ -12,6 +12,7 @@ from codex_bridge.console.widgets import (
     ThreadListPane,
     TimelineEntry,
     activity_row,
+    format_thread_content,
     timeline_entries,
 )
 from tests.test_console_main_window import FakeClient
@@ -98,6 +99,8 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
     pane.thread_rename_requested.connect(renamed.append)
     opened: list[str] = []
     pane.thread_open_requested.connect(opened.append)
+    copied_threads: list[str] = []
+    pane.thread_copy_requested.connect(copied_threads.append)
 
     menu = pane._context_menu_for_item(pane.list_widget.item(1))
     actions = menu.actions()
@@ -107,6 +110,7 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
         "Open in Codex App",
         "スレッドIDをコピー",
         "スレッド情報をコピー",
+        "Copy thread content",
         "",
         "作業フォルダを開く",
     ]
@@ -125,6 +129,10 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
         f"Name: Target\nThread ID: target\nCWD: {tmp_path}\nStatus: active"
     )
     assert "must not copy" not in application.clipboard().text()
+    assert pane.list_widget.currentItem().data(Qt.ItemDataRole.UserRole) == "selected"
+
+    actions[4].trigger()
+    assert copied_threads == ["target"]
     assert pane.list_widget.currentItem().data(Qt.ItemDataRole.UserRole) == "selected"
 
 
@@ -191,6 +199,46 @@ def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:
         TimelineEntry("turn-2", "agent-2", "Agent", "Agent", "new", None, ()),
     )
     assert "never" not in str(entries)
+
+
+def test_format_thread_content_preserves_order_roles_and_plain_bodies() -> None:
+    entries = (
+        TimelineEntry("turn-1", "user-1", "User", "User", "質問\n日本語", None, ()),
+        TimelineEntry("turn-1", "agent-1", "Agent", "Agent", "回答", "completed", ("exit 0",)),
+        TimelineEntry("turn-2", "user-2", "User", "User", "次の質問", None, ()),
+        TimelineEntry("turn-2", "agent-2", "Agent", "Agent", "次の回答", None, ()),
+    )
+
+    assert format_thread_content(entries) == (
+        "User:\n質問\n日本語\n\nAgent:\n回答\n\nUser:\n次の質問\n\nAgent:\n次の回答"
+    )
+    assert "completed" not in format_thread_content(entries)
+    assert "exit 0" not in format_thread_content(entries)
+
+
+def test_history_pane_adds_copy_action_only_to_user_and_agent_messages(monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.set_timeline(
+        (
+            TimelineEntry("turn", "user", "User", "User", "質問", None, ()),
+            TimelineEntry("turn", "command", "Command", "Command", "pytest", None, ()),
+            TimelineEntry("turn", "agent", "Agent", "Agent", "回答", None, ()),
+        )
+    )
+
+    buttons = [button for button in pane.findChildren(QPushButton) if button.text() == "Copy"]
+    copied: list[str] = []
+    monkeypatch.setattr("codex_bridge.console.widgets.copy_to_clipboard", copied.append)
+
+    assert len(buttons) == 2
+    buttons[0].click()
+    application.processEvents()
+    assert copied == ["質問"]
+    buttons[1].click()
+    application.processEvents()
+    assert copied == ["質問", "回答"]
 
 
 def test_timeline_renders_safe_work_fields_without_raw_dicts() -> None:
