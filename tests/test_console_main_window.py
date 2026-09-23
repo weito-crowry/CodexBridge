@@ -921,6 +921,15 @@ def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selecti
         {
             "items": [
                 {"turn_id": "turn-b", "item": _item("agent-b", "agentMessage", text="Agent B")},
+                {
+                    "turn_id": "turn-b",
+                    "item": _item(
+                        "commentary-b",
+                        "agentMessage",
+                        text="Progress B",
+                        phase="commentary",
+                    ),
+                },
                 {"turn_id": "turn-b", "item": _item("user-b", "userMessage", text="User B")},
             ],
             "next_cursor": "older",
@@ -943,7 +952,10 @@ def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selecti
     )
 
     application.processEvents()
-    assert copied == ["User:\nUser A\n\nAgent:\nAgent A\n\nUser:\nUser B\n\nAgent:\nAgent B"]
+    assert copied == [
+        "User:\nUser A\n\nAgent:\nAgent A\n\nUser:\nUser B"
+        "\n\nCommentary:\nProgress B\n\nAgent:\nAgent B"
+    ]
     assert window._selected_thread_id == initial_selected
     assert window._selection_generation == initial_generation
     assert window._active_thread_ids == initial_active
@@ -1093,6 +1105,86 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     assert "connected" in window.bridge_status_label.text().casefold()
     assert "ready" in window.app_server_status_label.text().casefold()
     assert client.streams == [("thread-a", 1)]
+    window.close()
+
+
+def test_historical_items_render_commentary_and_final_agent_separately() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+
+    window.select_thread("thread-a")
+    items_key = next(key for key, _, _ in client.requests if key.endswith(":items"))
+    client.result(
+        items_key,
+        {
+            "items": [
+                {
+                    "turn_id": "turn-1",
+                    "item": _item(
+                        "agent-final", "agentMessage", text="final answer", phase="final_answer"
+                    ),
+                },
+                {
+                    "turn_id": "turn-1",
+                    "item": _item(
+                        "agent-commentary",
+                        "agentMessage",
+                        text="progress update",
+                        phase="commentary",
+                    ),
+                },
+                {
+                    "turn_id": "turn-1",
+                    "item": _item("plan", "plan", text="planned work"),
+                },
+                {"turn_id": "turn-1", "item": _item("user", "userMessage", text="question")},
+            ]
+        },
+    )
+
+    assert [entry.title for entry in window._timeline_entries] == [
+        "User",
+        "Plan",
+        "Commentary",
+        "Agent",
+    ]
+    visible_text = [label.text() for label in window.history_pane._content.findChildren(QLabel)]
+    assert "Commentary" in visible_text
+    assert "Agent" in visible_text
+    window.close()
+
+
+def test_live_activity_rows_render_commentary_and_final_agent_separately() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+
+    client.activity(
+        1,
+        {
+            "activity_id": "commentary",
+            "thread_id": "thread-a",
+            "type": "agent_commentary",
+            "status": "completed",
+            "summary": "progress update",
+        },
+    )
+    client.activity(
+        1,
+        {
+            "activity_id": "final",
+            "thread_id": "thread-a",
+            "type": "agent_message",
+            "status": "completed",
+            "summary": "final answer",
+        },
+    )
+
+    rows = [window.activity_pane.activity_list.item(index).text() for index in range(2)]
+    assert "Commentary" in rows[0]
+    assert "Agent" in rows[1]
     window.close()
 
 

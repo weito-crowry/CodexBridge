@@ -170,7 +170,15 @@ def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
 def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:
     payload = {
         "items": [
-            {"turn_id": "turn-2", "item": {"id": "agent-2", "type": "agentMessage", "text": "new"}},
+            {
+                "turn_id": "turn-2",
+                "item": {
+                    "id": "agent-2",
+                    "type": "agentMessage",
+                    "text": "final answer",
+                    "phase": "final_answer",
+                },
+            },
             {
                 "turn_id": "turn-1",
                 "item": {
@@ -181,6 +189,16 @@ def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:
                     "exit_code": 0,
                 },
             },
+            {
+                "turn_id": "turn-1",
+                "item": {
+                    "id": "commentary-1",
+                    "type": "agentMessage",
+                    "text": "progress update",
+                    "phase": "commentary",
+                },
+            },
+            {"turn_id": "turn-1", "item": {"id": "plan-1", "type": "plan", "text": "safe plan"}},
             {"turn_id": "turn-1", "item": {"id": "secret", "type": "reasoning", "raw": "never"}},
             {
                 "turn_id": "turn-1",
@@ -193,10 +211,14 @@ def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:
 
     assert entries == (
         TimelineEntry("turn-1", "user-1", "User", "User", "hello <world>", None, ()),
+        TimelineEntry("turn-1", "plan-1", "Plan", "Plan", "safe plan", None, ()),
+        TimelineEntry(
+            "turn-1", "commentary-1", "Commentary", "Commentary", "progress update", None, ()
+        ),
         TimelineEntry(
             "turn-1", "command-1", "Command", "Command", "pytest", "completed", ("exit 0",)
         ),
-        TimelineEntry("turn-2", "agent-2", "Agent", "Agent", "new", None, ()),
+        TimelineEntry("turn-2", "agent-2", "Agent", "Agent", "final answer", None, ()),
     )
     assert "never" not in str(entries)
 
@@ -205,12 +227,14 @@ def test_format_thread_content_preserves_order_roles_and_plain_bodies() -> None:
     entries = (
         TimelineEntry("turn-1", "user-1", "User", "User", "質問\n日本語", None, ()),
         TimelineEntry("turn-1", "agent-1", "Agent", "Agent", "回答", "completed", ("exit 0",)),
+        TimelineEntry("turn-1", "progress-1", "Commentary", "Commentary", "進行中", None, ()),
         TimelineEntry("turn-2", "user-2", "User", "User", "次の質問", None, ()),
         TimelineEntry("turn-2", "agent-2", "Agent", "Agent", "次の回答", None, ()),
     )
 
     assert format_thread_content(entries) == (
-        "User:\n質問\n日本語\n\nAgent:\n回答\n\nUser:\n次の質問\n\nAgent:\n次の回答"
+        "User:\n質問\n日本語\n\nAgent:\n回答\n\nCommentary:\n進行中"
+        "\n\nUser:\n次の質問\n\nAgent:\n次の回答"
     )
     assert "completed" not in format_thread_content(entries)
     assert "exit 0" not in format_thread_content(entries)
@@ -223,6 +247,7 @@ def test_history_pane_adds_copy_action_only_to_user_and_agent_messages(monkeypat
     pane.set_timeline(
         (
             TimelineEntry("turn", "user", "User", "User", "質問", None, ()),
+            TimelineEntry("turn", "commentary", "Commentary", "Commentary", "進行中", None, ()),
             TimelineEntry("turn", "command", "Command", "Command", "pytest", None, ()),
             TimelineEntry("turn", "agent", "Agent", "Agent", "回答", None, ()),
         )
@@ -308,6 +333,18 @@ def test_activity_row_uses_only_allowlisted_details() -> None:
     assert "src/a.py" in row
     assert "accept" in row
     assert "secret" not in row
+
+
+def test_activity_rows_distinguish_commentary_from_final_agent_message() -> None:
+    commentary = activity_row(
+        {"type": "agent_commentary", "status": "completed", "summary": "progress update"}
+    )
+    final = activity_row(
+        {"type": "agent_message", "status": "completed", "summary": "final answer"}
+    )
+
+    assert "Commentary" in commentary
+    assert "Agent" in final
 
 
 def test_activity_pane_caps_rows_and_deduplicates_current_rows() -> None:

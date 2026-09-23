@@ -87,6 +87,16 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
             turn_id, item_id, "User", "User", _safe_text(item.get("text")), None, ()
         )
     if item_type == "agentMessage":
+        if item.get("phase") == "commentary":
+            return TimelineEntry(
+                turn_id,
+                item_id,
+                "Commentary",
+                "Commentary",
+                _safe_text(item.get("text")),
+                None,
+                (),
+            )
         return TimelineEntry(
             turn_id, item_id, "Agent", "Agent", _safe_text(item.get("text")), None, ()
         )
@@ -193,6 +203,10 @@ def copy_to_clipboard(text: str) -> None:
 def activity_row(activity: Mapping[str, object]) -> str:
     timestamp = _safe_text(activity.get("timestamp"), 128)
     activity_type = _safe_text(activity.get("type"), 128)
+    activity_type = {
+        "agent_commentary": "Commentary",
+        "agent_message": "Agent",
+    }.get(activity_type, activity_type)
     status = _safe_text(activity.get("status"), 128)
     summary = _safe_text(activity.get("summary"), 2_000)
     parts = [part for part in (timestamp, activity_type, status, summary) if part]

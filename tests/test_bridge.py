@@ -1115,15 +1115,35 @@ async def test_agent_deltas_update_state_but_create_one_completed_activity(allow
                 "threadId": "thread",
                 "turnId": "turn",
                 "completedAtMs": 1,
-                "item": {"id": "agent", "type": "agentMessage", "text": "final message"},
+                "item": {
+                    "id": "commentary",
+                    "type": "agentMessage",
+                    "text": "progress update",
+                    "phase": "commentary",
+                },
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 2,
+                "item": {
+                    "id": "agent",
+                    "type": "agentMessage",
+                    "text": "final message",
+                    "phase": "final_answer",
+                },
             },
         }
     )
 
     recent = activities.get_recent("thread", "turn")
-    assert len(recent) == 1
-    assert recent[0].type == "agent_message"
-    assert recent[0].summary == "final message"
+    assert [activity.type for activity in recent] == ["agent_commentary", "agent_message"]
+    assert [activity.summary for activity in recent] == ["progress update", "final message"]
 
 
 @pytest.mark.asyncio

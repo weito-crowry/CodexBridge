@@ -81,6 +81,15 @@ def test_project_items_allowlists_known_types_and_excludes_private_content(tmp_p
                 {
                     "turnId": "turn-1",
                     "item": {
+                        "id": "commentary-1",
+                        "type": "agentMessage",
+                        "text": "progress update",
+                        "phase": "commentary",
+                    },
+                },
+                {
+                    "turnId": "turn-1",
+                    "item": {
                         "id": "agent-1",
                         "type": "agentMessage",
                         "text": "hello agent",
@@ -174,6 +183,7 @@ def test_project_items_allowlists_known_types_and_excludes_private_content(tmp_p
     assert [entry["item"]["type"] for entry in items] == [
         "userMessage",
         "agentMessage",
+        "agentMessage",
         "plan",
         "commandExecution",
         "fileChange",
@@ -186,12 +196,18 @@ def test_project_items_allowlists_known_types_and_excludes_private_content(tmp_p
         "text": "hello user\n[image]",
     }
     assert items[1]["item"] == {
+        "id": "commentary-1",
+        "type": "agentMessage",
+        "text": "progress update",
+        "phase": "commentary",
+    }
+    assert items[2]["item"] == {
         "id": "agent-1",
         "type": "agentMessage",
         "text": "hello agent",
         "phase": "final_answer",
     }
-    assert items[3]["item"] == {
+    assert items[4]["item"] == {
         "id": "command-1",
         "type": "commandExecution",
         "command": "pytest tests",
@@ -199,13 +215,13 @@ def test_project_items_allowlists_known_types_and_excludes_private_content(tmp_p
         "exit_code": 0,
         "duration_ms": 12,
     }
-    assert items[4]["item"] == {
+    assert items[5]["item"] == {
         "id": "file-1",
         "type": "fileChange",
         "status": "completed",
         "paths": ["src/changed.py"],
     }
-    assert items[5]["item"] == {
+    assert items[6]["item"] == {
         "id": "mcp-1",
         "type": "mcpToolCall",
         "server": "server",
@@ -215,7 +231,7 @@ def test_project_items_allowlists_known_types_and_excludes_private_content(tmp_p
         "read_only_hint": True,
         "plugin_id": "plugin",
     }
-    assert items[6]["item"] == {
+    assert items[7]["item"] == {
         "id": "dynamic-1",
         "type": "dynamicToolCall",
         "namespace": "namespace",

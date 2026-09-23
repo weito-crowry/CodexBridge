@@ -392,11 +392,14 @@ class Bridge:
             text = item.get("text")
             if isinstance(text, str):
                 self._state.update_latest_message(thread_id, turn_id, text)
+                agent_activity_type: ActivityType = "agent_message"
+                if item.get("phase") == "commentary":
+                    agent_activity_type = "agent_commentary"
                 self._record_activity(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     item_id=item_id,
-                    type="agent_message",
+                    type=agent_activity_type,
                     status="completed",
                     summary=_bounded_text(text),
                 )
