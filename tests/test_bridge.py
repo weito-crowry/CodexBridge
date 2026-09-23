@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -280,6 +281,116 @@ async def test_threads_list_and_read_are_bounded_and_sanitized(allowed_dir) -> N
         "cwd": str(allowed_dir.resolve()),
         "turns": [],
     }
+
+
+def _write_local_thread_catalog(path: Path, rows: list[tuple[str, str, str]]) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE local_thread_catalog ("
+            "host_id TEXT NOT NULL, thread_id TEXT NOT NULL, display_title TEXT NOT NULL, "
+            "PRIMARY KEY (host_id, thread_id))"
+        )
+        connection.executemany(
+            "INSERT INTO local_thread_catalog (host_id, thread_id, display_title) VALUES (?, ?, ?)",
+            rows,
+        )
+
+
+@pytest.mark.asyncio
+async def test_threads_prefer_app_server_name_over_local_catalog_and_ignore_prompt_prefix(
+    allowed_dir, tmp_path, monkeypatch
+) -> None:
+    import codex_bridge.bridge as bridge_module
+
+    catalog = tmp_path / "codex-dev.db"
+    _write_local_thread_catalog(
+        catalog,
+        [
+            ("local", "existing", "Stale local title"),
+            ("local", "generated", "Generated title"),
+            ("local", "prompt", "Please diagnose this"),
+            ("remote", "remote-only", "Remote title"),
+        ],
+    )
+    monkeypatch.setattr(bridge_module, "_LOCAL_THREAD_CATALOG_PATH", catalog, raising=False)
+    bridge, app, _ = make_bridge(allowed_dir)
+    cwd = str(allowed_dir)
+    app.thread_list = [
+        {"id": "existing", "name": "Existing title", "cwd": cwd, "preview": "User request"},
+        {
+            "id": "generated",
+            "cwd": cwd,
+            "preview": "Please review the changes and summarize the findings.",
+        },
+        {"id": "prompt", "cwd": cwd, "preview": "Please diagnose this failure carefully."},
+        {"id": "remote-only", "cwd": cwd, "preview": "A local thread title is unavailable."},
+        {"id": "untitled", "cwd": cwd, "preview": "A request without a local title."},
+    ]
+
+    result = await bridge.threads(limit=5)
+
+    threads = {thread["id"]: thread for thread in result["threads"]}
+    assert threads["existing"]["name"] == "Existing title"
+    assert threads["generated"]["name"] == "Generated title"
+    assert "name" not in threads["prompt"]
+    assert "name" not in threads["remote-only"]
+    assert "name" not in threads["untitled"]
+    assert app.calls == [("thread/list", {"limit": 5})]
+
+
+@pytest.mark.asyncio
+async def test_threads_ignore_unavailable_local_catalog(allowed_dir, tmp_path, monkeypatch) -> None:
+    import codex_bridge.bridge as bridge_module
+
+    missing_catalog = tmp_path / "missing" / "codex-dev.db"
+    monkeypatch.setattr(bridge_module, "_LOCAL_THREAD_CATALOG_PATH", missing_catalog, raising=False)
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_list = [
+        {
+            "id": "no-catalog",
+            "cwd": str(allowed_dir),
+            "preview": "Do not use this request as a title.",
+        }
+    ]
+
+    result = await bridge.threads(limit=1)
+
+    assert "name" not in result["threads"][0]
+    assert app.calls == [("thread/list", {"limit": 1})]
+
+
+@pytest.mark.asyncio
+async def test_threads_pick_up_local_title_added_after_an_earlier_empty_refresh(
+    allowed_dir, tmp_path, monkeypatch
+) -> None:
+    import codex_bridge.bridge as bridge_module
+
+    catalog = tmp_path / "codex-dev.db"
+    _write_local_thread_catalog(catalog, [])
+    monkeypatch.setattr(bridge_module, "_LOCAL_THREAD_CATALOG_PATH", catalog, raising=False)
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_list = [
+        {
+            "id": "late-title",
+            "cwd": str(allowed_dir),
+            "preview": "This request is not a generated title.",
+        }
+    ]
+
+    first = await bridge.threads(limit=1)
+    with sqlite3.connect(catalog) as connection:
+        connection.execute(
+            "INSERT INTO local_thread_catalog (host_id, thread_id, display_title) VALUES (?, ?, ?)",
+            ("local", "late-title", "Generated title"),
+        )
+    second = await bridge.threads(limit=1)
+
+    assert "name" not in first["threads"][0]
+    assert second["threads"][0]["name"] == "Generated title"
+    assert app.calls == [
+        ("thread/list", {"limit": 1}),
+        ("thread/list", {"limit": 1}),
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Mapping
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Protocol
 
 from .activity import ActivityStatus, ActivityStore, ActivityType
@@ -82,6 +84,46 @@ _PERMISSION_METHOD = "item/permissions/requestApproval"
 _PERMISSION_TEXT_LIMIT = 16_000
 _ACTIVITY_LIMIT_MIN = 1
 _ACTIVITY_LIMIT_MAX = 100
+_LOCAL_THREAD_CATALOG_PATH = Path.home() / ".codex" / "sqlite" / "codex-dev.db"
+_LOCAL_THREAD_TITLE_MAX_CHARS = 200
+
+
+def _read_local_thread_titles(thread_ids: list[str]) -> dict[str, str]:
+    if not thread_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in thread_ids)
+    query = (
+        "SELECT thread_id, display_title FROM local_thread_catalog "
+        f"WHERE host_id = ? AND thread_id IN ({placeholders})"
+    )
+    try:
+        connection = sqlite3.connect(
+            f"{_LOCAL_THREAD_CATALOG_PATH.as_uri()}?mode=ro", uri=True, timeout=0.05
+        )
+        try:
+            rows = connection.execute(query, ("local", *thread_ids)).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        return {}
+    return {
+        thread_id: title
+        for thread_id, title in rows
+        if isinstance(thread_id, str) and isinstance(title, str) and title.strip()
+    }
+
+
+def _usable_local_display_title(value: object, preview: object) -> str | None:
+    if not isinstance(value, str) or not isinstance(preview, str) or not preview.strip():
+        return None
+    title = value.strip()
+    if not title or len(title) > _LOCAL_THREAD_TITLE_MAX_CHARS or "\n" in title or "\r" in title:
+        return None
+    normalized_title = " ".join(title.rstrip("…").split()).casefold()
+    normalized_preview = " ".join(preview.split()).casefold()
+    if not normalized_title or normalized_preview.startswith(normalized_title):
+        return None
+    return title
 
 
 def _native_state(value: object) -> NormalizedState:
@@ -682,6 +724,7 @@ class Bridge:
         response = await self._app_server.request("thread/list", params)
         rows = response.get("data")
         visible: list[object] = []
+        missing_title_rows: list[dict[str, object]] = []
         if isinstance(rows, list):
             for row in rows:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
@@ -691,7 +734,23 @@ class Bridge:
                 except (BridgeError, ValueError):
                     continue
                 self._remember_thread_metadata(row)
-                visible.append(_sanitize(row))
+                public_row = _sanitize(row)
+                visible.append(public_row)
+                if isinstance(public_row, dict) and not (
+                    isinstance(row.get("name"), str) and row["name"].strip()
+                ):
+                    missing_title_rows.append(public_row)
+        missing_title_ids = [
+            row_id for row in missing_title_rows if isinstance((row_id := row.get("id")), str)
+        ]
+        local_titles = _read_local_thread_titles(missing_title_ids)
+        for row in missing_title_rows:
+            row_id = row.get("id")
+            if not isinstance(row_id, str):
+                continue
+            title = _usable_local_display_title(local_titles.get(row_id), row.get("preview"))
+            if title is not None:
+                row["name"] = title
         return {
             "threads": visible,
             "next_cursor": response.get("nextCursor"),
