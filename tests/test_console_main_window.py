@@ -96,6 +96,20 @@ class FakeClient:
         self.activity_received.emit(generation, payload)
 
 
+class FakeDiagnosticsReader:
+    def __init__(self, batches: list[list[str]] | None = None) -> None:
+        self.batches = list(batches or [])
+        self.polls = 0
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
+    def poll(self) -> list[str]:
+        self.polls += 1
+        return self.batches.pop(0) if self.batches else []
+
+
 class FakeCodexProbe:
     def __init__(self) -> None:
         self.resolved = Signal()
@@ -322,6 +336,94 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.overall_status_label.text() == "● Starting"
     assert window.usage_status_label.text() == "Codex Usage  unavailable"
     assert window.bridge_status_label.window() is window.status_dialog
+    assert window.splitter.orientation() == Qt.Orientation.Horizontal
+    assert window.splitter.count() == 3
+    assert window.diagnostics_pane.isHidden()
+    assert not window.diagnostics_timer.isActive()
+    window.close()
+
+
+def test_diagnostics_toggle_refreshes_immediately_and_stops_timer_when_collapsed() -> None:
+    _application()
+    reader = FakeDiagnosticsReader([["[Bridge] server.start"]])
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        diagnostics_reader=reader,
+        tray_available=False,
+    )
+
+    window.diagnostics_toggle_button.click()
+
+    assert not window.diagnostics_pane.isHidden()
+    assert window.diagnostics_toggle_button.text() == "Hide Diagnostics"
+    assert reader.resets == 1
+    assert reader.polls == 1
+    assert "[Bridge] server.start" in window.diagnostics_text.toPlainText()
+    assert window.diagnostics_timer.isActive()
+    assert window.diagnostics_timer.interval() == 1000
+
+    window.diagnostics_toggle_button.click()
+
+    assert window.diagnostics_pane.isHidden()
+    assert window.diagnostics_toggle_button.text() == "Diagnostics"
+    assert not window.diagnostics_timer.isActive()
+    window.close()
+
+
+def test_diagnostics_clear_only_clears_widget_and_future_logs_return(tmp_path) -> None:
+    from codex_bridge.console.diagnostics import DiagnosticSource, DiagnosticsReader
+
+    _application()
+    path = tmp_path / "runtime.log"
+    path.write_text("first line\n", encoding="utf-8")
+    reader = DiagnosticsReader(
+        sources=(DiagnosticSource("Bridge stdout", path, False),),
+    )
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        diagnostics_reader=reader,
+        tray_available=False,
+    )
+    window.diagnostics_toggle_button.click()
+    original_contents = path.read_bytes()
+    assert "first line" in window.diagnostics_text.toPlainText()
+
+    window.diagnostics_clear_button.click()
+
+    assert window.diagnostics_text.toPlainText() == ""
+    assert path.read_bytes() == original_contents
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("after clear\n")
+    window._on_diagnostics_timeout()
+    assert "after clear" in window.diagnostics_text.toPlainText()
+    window.close()
+
+
+def test_diagnostics_widget_is_bounded_and_follows_only_when_at_bottom() -> None:
+    _application()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        tray_available=False,
+    )
+    widget = window.diagnostics_text
+    assert widget.isReadOnly()
+    assert widget.maximumBlockCount() == 2000
+
+    window._append_diagnostics_lines([f"line-{index}" for index in range(80)])
+    scrollbar = widget.verticalScrollBar()
+    scrollbar.setValue(0)
+    window._append_diagnostics_lines(["while-scrolled-up"])
+    assert scrollbar.value() == 0
+
+    scrollbar.setValue(scrollbar.maximum())
+    window._append_diagnostics_lines(["after-bottom"])
+    assert scrollbar.value() == scrollbar.maximum()
     window.close()
 
 

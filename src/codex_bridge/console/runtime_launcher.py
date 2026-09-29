@@ -4,9 +4,12 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QProcess, QProcessEnvironment
+from PySide6.QtCore import QIODevice, QProcess, QProcessEnvironment
+
+from ..observability import bridge_runtime_stderr_log_path, bridge_runtime_stdout_log_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +20,7 @@ class DetachedLaunchResult:
 
 ProcessFactory = Callable[[], Any]
 EnvironmentFactory = Callable[[], Any]
+_RUNTIME_LOG_MAX_BYTES = 2 * 1024 * 1024
 
 
 class BridgeRuntimeLauncher:
@@ -50,6 +54,7 @@ class BridgeRuntimeLauncher:
         process.setProgram(sys.executable)
         process.setArguments(["-m", "codex_bridge"])
         process.setProcessEnvironment(environment)
+        self._configure_output_redirects(process)
         self._process = process
         outcome = process.startDetached()
         if isinstance(outcome, tuple):
@@ -62,3 +67,33 @@ class BridgeRuntimeLauncher:
         """Release Console references without sending any child-process signal."""
 
         self._process = None
+
+    @staticmethod
+    def _configure_output_redirects(process: Any) -> None:
+        for path_factory, setter_name in (
+            (bridge_runtime_stdout_log_path, "setStandardOutputFile"),
+            (bridge_runtime_stderr_log_path, "setStandardErrorFile"),
+        ):
+            try:
+                path = path_factory()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                BridgeRuntimeLauncher._rotate_runtime_log(path)
+                setter = getattr(process, setter_name)
+                setter(os.fspath(path), QIODevice.OpenModeFlag.Append)
+            except Exception:
+                # Diagnostics setup must never prevent the detached Bridge launch.
+                continue
+
+    @staticmethod
+    def _rotate_runtime_log(path: Path) -> None:
+        try:
+            if path.stat().st_size <= _RUNTIME_LOG_MAX_BYTES:
+                return
+            backup = path.with_name(f"{path.name}.1")
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                return
+            path.replace(backup)
+        except OSError:
+            return

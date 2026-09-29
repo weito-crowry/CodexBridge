@@ -82,6 +82,23 @@ def test_windows_local_app_data_resolves_separate_bridge_and_console_paths(tmp_p
     assert bridge_path != console_path
 
 
+def test_windows_runtime_log_paths_share_existing_log_directory(tmp_path) -> None:
+    from codex_bridge.observability import (
+        bridge_runtime_stderr_log_path,
+        bridge_runtime_stdout_log_path,
+    )
+
+    local_app_data = tmp_path / "local-app-data"
+    environ = {"LOCALAPPDATA": str(local_app_data)}
+
+    stdout_path = bridge_runtime_stdout_log_path(environ, platform="win32")
+    stderr_path = bridge_runtime_stderr_log_path(environ, platform="win32")
+
+    log_directory = local_app_data / "CodexBridge" / "logs"
+    assert stdout_path == log_directory / "bridge-runtime-stdout.log"
+    assert stderr_path == log_directory / "bridge-runtime-stderr.log"
+
+
 def test_get_observer_uses_console_log_path(tmp_path, monkeypatch) -> None:
     from codex_bridge import observability as observability_module
 

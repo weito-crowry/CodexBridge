@@ -17,6 +17,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 BRIDGE_LOG_FILE_NAME = "bridge-observability.jsonl"
 CONSOLE_LOG_FILE_NAME = "console-observability.jsonl"
+BRIDGE_RUNTIME_STDOUT_FILE_NAME = "bridge-runtime-stdout.log"
+BRIDGE_RUNTIME_STDERR_FILE_NAME = "bridge-runtime-stderr.log"
 _DEFAULT_MAX_BYTES = 1 * 1024 * 1024
 _DEFAULT_BACKUP_COUNT = 3
 _PROTOCOL_VERSION_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
@@ -65,6 +67,30 @@ def console_log_path(
     platform: str | None = None,
 ) -> Path:
     return default_log_path(environ, platform=platform, file_name=CONSOLE_LOG_FILE_NAME)
+
+
+def bridge_runtime_stdout_log_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    platform: str | None = None,
+) -> Path:
+    return default_log_path(
+        environ,
+        platform=platform,
+        file_name=BRIDGE_RUNTIME_STDOUT_FILE_NAME,
+    )
+
+
+def bridge_runtime_stderr_log_path(
+    environ: Mapping[str, str] | None = None,
+    *,
+    platform: str | None = None,
+) -> Path:
+    return default_log_path(
+        environ,
+        platform=platform,
+        file_name=BRIDGE_RUNTIME_STDERR_FILE_NAME,
+    )
 
 
 @dataclass(frozen=True, slots=True)

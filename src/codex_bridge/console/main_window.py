@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QFont, QIcon, QPalette
+from PySide6.QtGui import QAction, QCloseEvent, QFont, QFontDatabase, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -42,6 +43,7 @@ from .codex_resolver import (
 )
 from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
 from .config import ConsoleConfig
+from .diagnostics import DiagnosticsReader
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .tunnel_resolver import TunnelResolutionError
@@ -78,6 +80,7 @@ _USAGE_MAX_ATTEMPTS = 3
 _USAGE_SNAPSHOT_DELAY_MS = 1_000
 _USAGE_SNAPSHOT_DEFER_MS = 500
 _USAGE_SNAPSHOT_MAX_ENTRIES = 500
+_DIAGNOSTICS_POLL_INTERVAL_MS = 1_000
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
@@ -158,6 +161,7 @@ class MainWindow(QMainWindow):
         codex_probe: Any | None = None,
         codex_update_probe: Any | None = None,
         runtime_launcher: Any | None = None,
+        diagnostics_reader: Any | None = None,
         tunnel_supervisor: Any | None = None,
         tray_factory: Callable[[QWidget], Any] | None = None,
         tray_available: bool | None = None,
@@ -173,6 +177,9 @@ class MainWindow(QMainWindow):
         )
         self._launcher = (
             runtime_launcher if runtime_launcher is not None else BridgeRuntimeLauncher()
+        )
+        self._diagnostics_reader = (
+            diagnostics_reader if diagnostics_reader is not None else DiagnosticsReader()
         )
         self._tunnel = (
             tunnel_supervisor if tunnel_supervisor is not None else self._new_tunnel_supervisor()
@@ -350,6 +357,8 @@ class MainWindow(QMainWindow):
         self.codex_update_banner_label = QLabel("")
         self.codex_update_banner_label.setVisible(False)
         self.status_button = QPushButton("Status")
+        self.diagnostics_toggle_button = QPushButton("Diagnostics")
+        self.diagnostics_clear_button = QPushButton("Clear")
         self.retry_now_button = QPushButton("Retry now")
         self.restart_codexbridge_button = QPushButton("Restart CodexBridge")
         self.advanced_toggle_button = QPushButton("Advanced")
@@ -489,6 +498,25 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(2, 0)
         self.splitter.setSizes([300, 760, 340])
 
+        self.diagnostics_pane = QWidget()
+        diagnostics_layout = QVBoxLayout(self.diagnostics_pane)
+        diagnostics_layout.setContentsMargins(0, 4, 0, 4)
+        diagnostics_header = QHBoxLayout()
+        self.diagnostics_title_label = QLabel("Diagnostics")
+        diagnostics_header.addWidget(self.diagnostics_title_label)
+        diagnostics_header.addStretch(1)
+        diagnostics_header.addWidget(self.diagnostics_clear_button)
+        diagnostics_layout.addLayout(diagnostics_header)
+        self.diagnostics_text = QPlainTextEdit()
+        self.diagnostics_text.setReadOnly(True)
+        self.diagnostics_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.diagnostics_text.setMaximumBlockCount(2000)
+        self.diagnostics_text.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        diagnostics_layout.addWidget(self.diagnostics_text)
+        self.diagnostics_pane.setVisible(False)
+        self.diagnostics_toggle_button.clicked.connect(lambda: self.toggle_diagnostics())
+        self.diagnostics_clear_button.clicked.connect(self.diagnostics_text.clear)
+
         self.bottom_status_label = QLabel("Starting…")
         self.bottom_status_label.setObjectName("bottomStatus")
         self.bottom_status_label.setSizePolicy(
@@ -499,7 +527,11 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.addLayout(status_bar)
         layout.addWidget(self.splitter, 1)
-        layout.addWidget(self.bottom_status_label)
+        layout.addWidget(self.diagnostics_pane)
+        bottom_bar = QHBoxLayout()
+        bottom_bar.addWidget(self.bottom_status_label, 1)
+        bottom_bar.addWidget(self.diagnostics_toggle_button)
+        layout.addLayout(bottom_bar)
         self.setCentralWidget(root)
         application = QApplication.instance()
         if isinstance(application, QApplication):
@@ -510,7 +542,7 @@ class MainWindow(QMainWindow):
             QLabel { color: #d8dbe0; }
             QLabel#topStatus { padding: 3px 8px; border: 1px solid #3c4043; border-radius: 3px; }
             QLabel#bottomStatus { color: #aeb4bd; padding: 4px 6px; border-top: 1px solid #3c4043; }
-            QLineEdit, QTreeWidget, QTextEdit {
+            QLineEdit, QTreeWidget, QTextEdit, QPlainTextEdit {
                 background: #292a2d; color: #f1f3f4; border: 1px solid #4a4d50;
             }
             QPushButton {
@@ -703,6 +735,9 @@ class MainWindow(QMainWindow):
         self.stop_confirmation_timer = QTimer(self)
         self.stop_confirmation_timer.setInterval(_STOP_CONFIRMATION_INTERVAL_MS)
         self.stop_confirmation_timer.timeout.connect(self._on_stop_confirmation_tick)
+        self.diagnostics_timer = QTimer(self)
+        self.diagnostics_timer.setInterval(_DIAGNOSTICS_POLL_INTERVAL_MS)
+        self.diagnostics_timer.timeout.connect(self._on_diagnostics_timeout)
         self.exit_timer = QTimer(self)
         self.exit_timer.setSingleShot(True)
         self.exit_timer.setInterval(int(_EXIT_TIMEOUT_SECONDS * 1_000))
@@ -713,6 +748,39 @@ class MainWindow(QMainWindow):
         self.health_timer.start()
         self.thread_timer.start()
         self.signal_timer.start()
+
+    def toggle_diagnostics(self) -> None:
+        self._set_diagnostics_visible(self.diagnostics_pane.isHidden())
+
+    def _set_diagnostics_visible(self, visible: bool) -> None:
+        self.diagnostics_pane.setVisible(visible)
+        self.diagnostics_toggle_button.setText("Hide Diagnostics" if visible else "Diagnostics")
+        if visible:
+            self._diagnostics_reader.reset()
+            self._on_diagnostics_timeout()
+            self.diagnostics_timer.start()
+        else:
+            self.diagnostics_timer.stop()
+
+    def _on_diagnostics_timeout(self) -> None:
+        try:
+            lines = self._diagnostics_reader.poll()
+        except Exception:
+            return
+        if lines:
+            self._append_diagnostics_lines(lines)
+
+    def _append_diagnostics_lines(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        scrollbar = self.diagnostics_text.verticalScrollBar()
+        follow = scrollbar.maximum() - scrollbar.value() <= 1
+        previous_value = scrollbar.value()
+        self.diagnostics_text.appendPlainText("\n".join(lines))
+        if follow:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(previous_value, scrollbar.maximum()))
 
     def request_sigint(self) -> None:
         self._sigint_requested = True
@@ -2174,6 +2242,7 @@ class MainWindow(QMainWindow):
         self.health_timer.stop()
         self.thread_timer.stop()
         self.selected_status_timer.stop()
+        self.diagnostics_timer.stop()
         self.readiness_timer.stop()
         self.bridge_start_retry_timer.stop()
         self.stop_confirmation_timer.stop()
@@ -2200,6 +2269,7 @@ class MainWindow(QMainWindow):
         self._exit_finished = True
         self.exit_timer.stop()
         self.signal_timer.stop()
+        self.diagnostics_timer.stop()
         self.stop_confirmation_timer.stop()
         self._invalidate_usage_sequence()
         abort_update = getattr(self._codex_update_probe, "abort", None)
