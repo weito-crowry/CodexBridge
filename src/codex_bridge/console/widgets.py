@@ -601,16 +601,19 @@ class ActivityPane(QWidget):
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
         self.state_label.setText(state)
         pending = snapshot.get("pending_request")
-        has_pending = isinstance(pending, Mapping)
-        self._pending_header.setVisible(has_pending)
-        self.pending_label.setVisible(has_pending)
-        if has_pending:
+        if isinstance(pending, Mapping):
+            has_pending = True
+            self._pending_header.show()
+            self.pending_label.show()
             label = "Approval required" if state == "needs_approval" else "Input required"
             summary = _safe_text(pending.get("summary"), 2_000) or _safe_text(
                 pending.get("reason"), 2_000
             )
             self.pending_label.setText(f"{label}\n{summary}".strip())
         else:
+            has_pending = False
+            self._pending_header.hide()
+            self.pending_label.hide()
             self.pending_label.setText("")
         error = _safe_text(snapshot.get("error"), 2_000)
         self._state_section.setVisible(state != "not_loaded" or has_pending or bool(error))
