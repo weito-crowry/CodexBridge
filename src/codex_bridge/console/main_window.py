@@ -756,6 +756,7 @@ class MainWindow(QMainWindow):
         self.diagnostics_pane.setVisible(visible)
         self.diagnostics_toggle_button.setText("Hide Diagnostics" if visible else "Diagnostics")
         if visible:
+            self.diagnostics_text.clear()
             self._diagnostics_reader.reset()
             self._on_diagnostics_timeout()
             self.diagnostics_timer.start()

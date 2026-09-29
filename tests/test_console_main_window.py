@@ -403,6 +403,43 @@ def test_diagnostics_clear_only_clears_widget_and_future_logs_return(tmp_path) -
     window.close()
 
 
+def test_diagnostics_reopen_rebuilds_recent_tail_without_duplicates(tmp_path) -> None:
+    from codex_bridge.console.diagnostics import DiagnosticSource, DiagnosticsReader
+
+    _application()
+    path = tmp_path / "runtime.log"
+    path.write_text("first\n", encoding="utf-8")
+    reader = DiagnosticsReader(
+        sources=(DiagnosticSource("Bridge stdout", path, False),),
+    )
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        diagnostics_reader=reader,
+        tray_available=False,
+    )
+
+    window.diagnostics_toggle_button.click()
+    assert not window.diagnostics_pane.isHidden()
+    assert window.diagnostics_timer.isActive()
+    assert window.diagnostics_text.toPlainText().count("[Bridge stdout] first") == 1
+
+    window.diagnostics_toggle_button.click()
+    assert window.diagnostics_pane.isHidden()
+    assert not window.diagnostics_timer.isActive()
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("second\n")
+
+    window.diagnostics_toggle_button.click()
+    text = window.diagnostics_text.toPlainText()
+    assert not window.diagnostics_pane.isHidden()
+    assert window.diagnostics_timer.isActive()
+    assert text.count("[Bridge stdout] first") == 1
+    assert text.count("[Bridge stdout] second") == 1
+    window.close()
+
+
 def test_diagnostics_widget_is_bounded_and_follows_only_when_at_bottom() -> None:
     _application()
     window = MainWindow(
