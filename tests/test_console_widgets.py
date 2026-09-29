@@ -15,7 +15,13 @@ from codex_bridge.console.widgets import (
     format_thread_content,
     timeline_entries,
 )
-from tests.test_console_main_window import FakeClient
+from tests.test_console_main_window import (
+    FakeClient,
+    FakeCodexProbe,
+    FakeCodexUpdateProbe,
+    FakeLauncher,
+    StableTunnel,
+)
 
 
 def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
@@ -746,3 +752,261 @@ def test_history_pane_has_no_scrollable_blank_space_after_initial_long_timeline(
     window.close()
 
     assert blank_space <= 32, diagnostics
+
+
+def _history_entries(start: int, count: int) -> tuple[TimelineEntry, ...]:
+    return tuple(
+        TimelineEntry(
+            "turn-1",
+            f"item-{index}",
+            "Agent",
+            "Agent",
+            f"entry-{index}\n" + "line\n" * 5,
+            None,
+            (),
+        )
+        for index in range(start, start + count)
+    )
+
+
+def _process_layout(application: QApplication) -> None:
+    application.processEvents()
+    application.processEvents()
+    application.processEvents()
+
+
+def _history_payload(thread_id: str, count: int) -> dict[str, object]:
+    return {
+        "items": [
+            {
+                "turn_id": f"{thread_id}-turn",
+                "item": {
+                    "id": f"{thread_id}-{index}",
+                    "type": "agentMessage",
+                    "text": f"{thread_id} entry {index}\n" + "line\n" * 5,
+                },
+            }
+            for index in range(count)
+        ]
+    }
+
+
+def test_history_pane_starts_at_bottom_after_initial_long_timeline() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+
+    pane.set_timeline(_history_entries(0, 18))
+    _process_layout(application)
+
+    scrollbar = pane._scroll.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    assert scrollbar.value() == scrollbar.maximum()
+
+
+def test_history_pane_follows_new_content_when_already_at_bottom() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 18))
+    _process_layout(application)
+
+    pane.set_timeline(_history_entries(0, 24))
+    _process_layout(application)
+
+    scrollbar = pane._scroll.verticalScrollBar()
+    assert scrollbar.value() == scrollbar.maximum()
+
+
+def test_history_pane_does_not_jump_to_bottom_after_user_scrolls_up() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 24))
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    old_value = scrollbar.value()
+
+    pane.set_timeline(_history_entries(0, 30))
+    _process_layout(application)
+
+    assert scrollbar.value() == old_value
+    assert scrollbar.value() < scrollbar.maximum()
+
+
+def test_history_pane_keeps_the_same_visible_card_after_normal_update() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 24))
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    anchor = pane._content_layout.itemAt(9).widget()
+    assert anchor is not None
+    old_viewport_y = anchor.geometry().top() - scrollbar.value()
+
+    pane.set_timeline(_history_entries(0, 30))
+    _process_layout(application)
+
+    anchor = pane._content_layout.itemAt(9).widget()
+    assert anchor is not None
+    assert anchor.geometry().top() - scrollbar.value() == old_viewport_y
+
+
+def test_history_pane_resumes_following_after_user_returns_to_bottom() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 24))
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    scrollbar.setValue(scrollbar.maximum())
+    _process_layout(application)
+
+    pane.set_timeline(_history_entries(0, 30))
+    _process_layout(application)
+
+    assert scrollbar.value() == scrollbar.maximum()
+
+
+def test_history_pane_shows_load_older_only_at_top() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 24), has_older=True)
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+
+    scrollbar.setValue(0)
+    _process_layout(application)
+    assert pane.load_older_button.isVisible()
+
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    assert not pane.load_older_button.isVisible()
+
+    scrollbar.setValue(0)
+    _process_layout(application)
+    assert pane.load_older_button.isVisible()
+
+
+def test_history_pane_keeps_viewport_anchor_when_prepending_older_entries() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    current = _history_entries(0, 18)
+    pane.set_timeline(current, has_older=True)
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    scrollbar.setValue(0)
+    _process_layout(application)
+    old_maximum = scrollbar.maximum()
+    old_value = scrollbar.value()
+    anchor = pane._content_layout.itemAt(1).widget()
+    assert anchor is not None
+    old_viewport_y = anchor.geometry().top() - old_value
+
+    pane.set_timeline(_history_entries(-5, 5) + current, has_older=True, prepend=True)
+    _process_layout(application)
+
+    anchor = pane._content_layout.itemAt(6).widget()
+    assert anchor is not None
+    new_viewport_y = anchor.geometry().top() - scrollbar.value()
+    assert abs(new_viewport_y - old_viewport_y) <= 2
+    assert scrollbar.maximum() > old_maximum
+    assert scrollbar.value() < scrollbar.maximum()
+    assert not pane.load_older_button.isVisible()
+
+
+def test_history_pane_does_not_jump_to_bottom_when_short_timeline_is_prepended() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    current = _history_entries(0, 1)
+    pane.set_timeline(current, has_older=True)
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    assert scrollbar.maximum() == 0
+    assert pane.load_older_button.isVisible()
+
+    pane.set_timeline(_history_entries(-8, 8) + current, has_older=True, prepend=True)
+    _process_layout(application)
+
+    assert scrollbar.maximum() > 0
+    assert scrollbar.value() == 0
+    assert scrollbar.value() < scrollbar.maximum()
+
+
+def test_history_pane_hides_load_older_when_no_older_page_exists() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 24), has_older=True)
+    _process_layout(application)
+    pane._scroll.verticalScrollBar().setValue(0)
+    _process_layout(application)
+    assert pane.load_older_button.isVisible()
+
+    pane.set_timeline(_history_entries(0, 24), has_older=False)
+    _process_layout(application)
+
+    assert not pane.load_older_button.isVisible()
+
+
+def test_history_pane_resets_follow_state_when_thread_selection_changes() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    client = FakeClient()
+    window = MainWindow(
+        ConsoleConfig(),
+        api_client=client,
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+        quit_application=lambda: None,
+    )
+    window.resize(900, 620)
+    window.show()
+
+    window.select_thread("thread-a")
+    client.result("selection:1:items", _history_payload("thread-a", 24))
+    _process_layout(application)
+    scrollbar = window.history_pane._scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    assert scrollbar.value() < scrollbar.maximum()
+
+    window.select_thread("thread-b")
+    _process_layout(application)
+    client.result("selection:2:items", _history_payload("thread-b", 24))
+    _process_layout(application)
+
+    assert scrollbar.maximum() > 0
+    assert scrollbar.value() == scrollbar.maximum()
+    window.close()

@@ -1825,14 +1825,15 @@ class MainWindow(QMainWindow):
             self._timeline_entries = list(new_entries)
         next_cursor = payload.get("next_cursor")
         self._next_cursor = next_cursor if isinstance(next_cursor, str) else None
-        self._render_timeline()
+        self._render_timeline(prepend=prepend)
 
-    def _render_timeline(self) -> None:
+    def _render_timeline(self, *, prepend: bool = False) -> None:
         self.history_pane.set_timeline(
             self._timeline_entries,
             has_older=self._next_cursor is not None,
             turn_statuses=self._turn_statuses,
             turn_model_metadata=self._turn_model_metadata,
+            prepend=prepend,
         )
 
     def _apply_status(self, payload: object) -> None:

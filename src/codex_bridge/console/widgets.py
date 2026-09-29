@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Any
 
-from PySide6.QtCore import QDir, QPoint, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QDir, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette, QResizeEvent, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
@@ -475,6 +475,8 @@ class _HistoryBody(QTextBrowser):
 
 class HistoryPane(QWidget):
     older_requested = Signal()
+    _BOTTOM_FOLLOW_THRESHOLD = 20
+    _TOP_THRESHOLD = 2
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -490,6 +492,17 @@ class HistoryPane(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setWidget(self._content)
+        self._follow_newest = True
+        self._has_older = False
+        self._scroll_update_pending = False
+        self._programmatic_scroll = False
+        self._render_generation = 0
+        self._scroll_restore_state: tuple[int, int, int, bool, bool, bool] | None = None
+        self._scroll_restore_stage = 0
+        self._scroll_restore_timer = QTimer(self)
+        self._scroll_restore_timer.setSingleShot(True)
+        self._scroll_restore_timer.timeout.connect(self._advance_timeline_scroll_restore)
+        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
         layout = QVBoxLayout(self)
         layout.addWidget(self.load_older_button)
         layout.addWidget(self._empty_label)
@@ -511,7 +524,19 @@ class HistoryPane(QWidget):
         has_older: bool = False,
         turn_statuses: Mapping[str, str] | None = None,
         turn_model_metadata: Mapping[str, Mapping[str, object]] | None = None,
+        prepend: bool = False,
     ) -> None:
+        scrollbar = self._scroll.verticalScrollBar()
+        old_value = scrollbar.value()
+        old_maximum = scrollbar.maximum()
+        should_follow = self._follow_newest
+        self._render_generation += 1
+        generation = self._render_generation
+        self._scroll_update_pending = True
+        self._has_older = has_older
+        if not prepend:
+            self._update_load_older_visibility()
+
         self._clear_cards()
         previous_turn: str | None = None
         for entry in entries:
@@ -525,8 +550,111 @@ class HistoryPane(QWidget):
             previous_turn = entry.turn_id
         self._empty_label.setVisible(not entries)
         self._scroll.setVisible(bool(entries))
-        self.load_older_button.setVisible(has_older)
+        if not entries:
+            should_follow = True
+            self._follow_newest = True
         self._content.updateGeometry()
+        self._scroll_restore_state = (
+            generation,
+            old_value,
+            old_maximum,
+            should_follow,
+            prepend,
+            bool(entries),
+        )
+        self._scroll_restore_stage = 0
+        self._scroll_restore_timer.start(0)
+
+    def _advance_timeline_scroll_restore(self) -> None:
+        state = self._scroll_restore_state
+        if state is None:
+            return
+        generation, old_value, old_maximum, should_follow, prepend, has_entries = state
+        if generation != self._render_generation:
+            return
+        if self._scroll_restore_stage == 0:
+            self._scroll_restore_stage = 1
+            self._scroll_restore_timer.start(0)
+            return
+        if self._scroll_restore_stage == 1:
+            self._restore_timeline_scroll(
+                generation,
+                old_value,
+                old_maximum,
+                should_follow,
+                prepend,
+                has_entries,
+            )
+            self._scroll_restore_stage = 2
+            self._scroll_restore_timer.start(0)
+            return
+        self._finish_timeline_scroll(generation, should_follow, prepend, has_entries)
+        self._scroll_restore_state = None
+        self._scroll_restore_stage = 0
+
+    def _restore_timeline_scroll(
+        self,
+        generation: int,
+        old_value: int,
+        old_maximum: int,
+        should_follow: bool,
+        prepend: bool,
+        has_entries: bool,
+    ) -> None:
+        if generation != self._render_generation:
+            return
+        scrollbar = self._scroll.verticalScrollBar()
+        if prepend:
+            if old_value <= self._TOP_THRESHOLD and old_maximum <= self._TOP_THRESHOLD:
+                target = 0
+            else:
+                target = old_value + (scrollbar.maximum() - old_maximum)
+        elif should_follow:
+            target = scrollbar.maximum()
+        else:
+            target = old_value
+        self._set_programmatic_scroll(target)
+        if prepend:
+            self._update_load_older_visibility()
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_timeline_scroll(generation, should_follow, prepend, has_entries),
+        )
+
+    def _finish_timeline_scroll(
+        self,
+        generation: int,
+        should_follow: bool,
+        prepend: bool,
+        has_entries: bool,
+    ) -> None:
+        if generation != self._render_generation:
+            return
+        if not prepend and should_follow and has_entries:
+            self._set_programmatic_scroll(self._scroll.verticalScrollBar().maximum())
+            self._follow_newest = True
+        elif not has_entries:
+            self._follow_newest = True
+        self._update_load_older_visibility()
+        self._scroll_update_pending = False
+
+    def _set_programmatic_scroll(self, value: int) -> None:
+        scrollbar = self._scroll.verticalScrollBar()
+        self._programmatic_scroll = True
+        scrollbar.setValue(max(scrollbar.minimum(), min(value, scrollbar.maximum())))
+        self._programmatic_scroll = False
+
+    def _on_scroll_value_changed(self, value: int) -> None:
+        if self._scroll_update_pending or self._programmatic_scroll:
+            return
+        scrollbar = self._scroll.verticalScrollBar()
+        self._follow_newest = scrollbar.maximum() - value <= self._BOTTOM_FOLLOW_THRESHOLD
+        self._update_load_older_visibility()
+
+    def _update_load_older_visibility(self) -> None:
+        scrollbar = self._scroll.verticalScrollBar()
+        at_top = scrollbar.value() <= self._TOP_THRESHOLD
+        self.load_older_button.setVisible(self._has_older and at_top)
 
     def _card(self, entry: TimelineEntry) -> QWidget:
         card = QFrame()
@@ -559,6 +687,14 @@ class HistoryPane(QWidget):
         return card
 
     def set_empty_state(self, text: str) -> None:
+        self._render_generation += 1
+        self._scroll_restore_timer.stop()
+        self._scroll_restore_state = None
+        self._scroll_restore_stage = 0
+        self._scroll_update_pending = False
+        self._follow_newest = True
+        self._has_older = False
+        self._set_programmatic_scroll(0)
         self._clear_cards()
         self._empty_label.setText(text)
         self._empty_label.show()
