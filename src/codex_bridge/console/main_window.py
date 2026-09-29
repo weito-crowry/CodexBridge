@@ -42,6 +42,7 @@ from .codex_resolver import (
 )
 from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
 from .config import ConsoleConfig
+from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .tunnel_resolver import TunnelResolutionError
 from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
@@ -509,7 +510,7 @@ class MainWindow(QMainWindow):
             QLabel { color: #d8dbe0; }
             QLabel#topStatus { padding: 3px 8px; border: 1px solid #3c4043; border-radius: 3px; }
             QLabel#bottomStatus { color: #aeb4bd; padding: 4px 6px; border-top: 1px solid #3c4043; }
-            QLineEdit, QListWidget, QTextEdit {
+            QLineEdit, QTreeWidget, QTextEdit {
                 background: #292a2d; color: #f1f3f4; border: 1px solid #4a4d50;
             }
             QPushButton {
@@ -1871,7 +1872,11 @@ class MainWindow(QMainWindow):
         if key == "threads":
             if isinstance(payload, Mapping) and isinstance(payload.get("threads"), list):
                 threads = [thread for thread in payload["threads"] if isinstance(thread, Mapping)]
-                self.thread_pane.set_threads(threads, active_thread_ids=self._active_thread_ids)
+                self.thread_pane.set_threads(
+                    threads,
+                    active_thread_ids=self._active_thread_ids,
+                    project_names=read_local_project_names(),
+                )
                 if not threads:
                     self.thread_pane.set_empty_state("No threads found.")
                 self._sync_empty_state()

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from inspect import signature
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette, QTextOption
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QTextBrowser
+import pytest
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QPalette, QTextOption
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QTextBrowser,
+    QTreeWidgetItem,
+)
 
 from codex_bridge.console import usage as usage_module
 from codex_bridge.console.config import ConsoleConfig
@@ -45,6 +54,20 @@ def _usage_snapshot() -> object:
     )
 
 
+def _thread_items(pane: ThreadListPane) -> list[QTreeWidgetItem]:
+    return [
+        pane.list_widget.topLevelItem(group_index).child(child_index)
+        for group_index in range(pane.list_widget.topLevelItemCount())
+        for child_index in range(pane.list_widget.topLevelItem(group_index).childCount())
+    ]
+
+
+def _thread_item(pane: ThreadListPane, thread_id: str) -> QTreeWidgetItem:
+    return next(
+        item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
+    )
+
+
 def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
@@ -59,17 +82,17 @@ def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
         ]
     )
 
-    assert [pane.list_widget.item(index).text() for index in range(4)] == [
+    assert [item.text(0) for item in _thread_items(pane)] == [
         "Named thread",
         "New スレッド",
         "New スレッド",
         "New スレッド",
     ]
-    assert all("Preview text" not in pane.list_widget.item(index).text() for index in range(4))
+    assert all("Preview text" not in item.text(0) for item in _thread_items(pane))
     for index, thread_id in enumerate(("named", "missing", "empty", "invalid")):
-        item = pane.list_widget.item(index)
-        assert item.data(Qt.ItemDataRole.UserRole) == thread_id
-        assert item.toolTip() == thread_id
+        item = _thread_items(pane)[index]
+        assert item.data(0, Qt.ItemDataRole.UserRole) == thread_id
+        assert item.toolTip(0) == thread_id
 
 
 def test_thread_list_marks_active_threads_with_palette_color_and_bold_font() -> None:
@@ -82,11 +105,11 @@ def test_thread_list_marks_active_threads_with_palette_color_and_bold_font() -> 
         active_thread_ids={"active"},
     )
 
-    active = pane.list_widget.item(0)
-    idle = pane.list_widget.item(1)
-    assert active.font().weight() > idle.font().weight()
-    assert active.foreground().color() == pane.list_widget.palette().color(QPalette.ColorRole.Link)
-    assert active.foreground().color() != idle.foreground().color()
+    active = _thread_item(pane, "active")
+    idle = _thread_item(pane, "idle")
+    assert active.font(0).weight() > idle.font(0).weight()
+    assert active.foreground(0).color() == pane.list_widget.palette().color(QPalette.ColorRole.Link)
+    assert active.foreground(0).color() != idle.foreground(0).color()
 
 
 def test_thread_list_keeps_running_indicator_through_selection_and_state_changes() -> None:
@@ -100,20 +123,20 @@ def test_thread_list_keeps_running_indicator_through_selection_and_state_changes
 
     pane.set_threads(threads, active_thread_ids={"active"})
 
-    assert pane.list_widget.item(0).text() == "\u25cf Active"
-    assert pane.list_widget.item(1).text() == "Idle"
-    pane.list_widget.setCurrentRow(0)
+    assert _thread_item(pane, "active").text(0) == "\u25cf Active"
+    assert _thread_item(pane, "idle").text(0) == "Idle"
+    pane.list_widget.setCurrentItem(_thread_item(pane, "active"))
     selected = pane.list_widget.currentItem()
     assert selected is not None
-    assert selected.text() == "\u25cf Active"
-    assert selected.data(Qt.ItemDataRole.UserRole) == "active"
+    assert selected.text(0) == "\u25cf Active"
+    assert selected.data(0, Qt.ItemDataRole.UserRole) == "active"
 
     pane.set_active_thread_ids(set())
 
     selected = pane.list_widget.currentItem()
     assert selected is not None
-    assert selected.text() == "Active"
-    assert selected.data(Qt.ItemDataRole.UserRole) == "active"
+    assert selected.text(0) == "Active"
+    assert selected.data(0, Qt.ItemDataRole.UserRole) == "active"
 
 
 def test_thread_list_refresh_preserves_selected_thread_id() -> None:
@@ -123,13 +146,224 @@ def test_thread_list_refresh_preserves_selected_thread_id() -> None:
     threads = [{"id": "thread-a", "name": "A"}, {"id": "thread-b", "name": "B"}]
 
     pane.set_threads(threads)
-    pane.list_widget.setCurrentRow(1)
+    pane.list_widget.setCurrentItem(_thread_item(pane, "thread-b"))
     pane.set_threads(threads, active_thread_ids={"thread-b"})
 
     current = pane.list_widget.currentItem()
     assert current is not None
-    assert current.data(Qt.ItemDataRole.UserRole) == "thread-b"
-    assert current.font().weight() > pane.list_widget.item(0).font().weight()
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "thread-b"
+    assert current.font(0).weight() > _thread_item(pane, "thread-a").font(0).weight()
+
+
+def test_refresh_does_not_restore_a_thread_after_it_was_removed() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "thread-a", "cwd": "/workspace/a"}])
+    pane.list_widget.setCurrentItem(_thread_item(pane, "thread-a"))
+
+    pane.set_threads([{"id": "thread-b", "cwd": "/workspace/b"}])
+    pane.set_threads([{"id": "thread-a", "cwd": "/workspace/a"}])
+
+    current = pane.list_widget.currentItem()
+    assert current is None or current.data(0, Qt.ItemDataRole.UserRole) != "thread-a"
+
+
+def test_threads_are_grouped_by_normalized_cwd_in_first_seen_order(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    pane = ThreadListPane()
+
+    pane.set_threads(
+        [
+            {"id": "a", "cwd": str(first)},
+            {"id": "b", "cwd": str(second)},
+            {"id": "c", "cwd": str(first)},
+        ]
+    )
+
+    assert pane.list_widget.topLevelItemCount() == 2
+    first_group = pane.list_widget.topLevelItem(0)
+    second_group = pane.list_widget.topLevelItem(1)
+    assert first_group.text(0) == "first"
+    assert second_group.text(0) == "second"
+    assert first_group.toolTip(0) == str(first)
+    assert [first_group.child(index).data(0, Qt.ItemDataRole.UserRole) for index in range(2)] == [
+        "a",
+        "c",
+    ]
+    assert second_group.child(0).data(0, Qt.ItemDataRole.UserRole) == "b"
+    assert first_group.data(0, Qt.ItemDataRole.UserRole) is None
+    assert pane.thread_count == 3
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows normcase is platform-specific")
+def test_windows_cwd_case_variants_share_a_parent() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "upper", "cwd": r"C:\Users\Example\Project"},
+            {"id": "lower", "cwd": r"c:\users\example\project"},
+        ]
+    )
+
+    assert pane.list_widget.topLevelItemCount() == 1
+    assert pane.list_widget.topLevelItem(0).childCount() == 2
+
+
+def test_parent_click_does_not_emit_thread_selection() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "a", "cwd": "/workspace/project"}])
+    selected: list[str] = []
+    pane.thread_selected.connect(selected.append)
+
+    parent = pane.list_widget.topLevelItem(0)
+    pane.list_widget.itemClicked.emit(parent, 0)
+    pane.list_widget.itemActivated.emit(parent, 0)
+
+    assert selected == []
+
+
+def test_child_click_emits_thread_id() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "thread-a", "cwd": "/workspace/project"}])
+    selected: list[str] = []
+    pane.thread_selected.connect(selected.append)
+
+    child = _thread_item(pane, "thread-a")
+    pane.list_widget.itemClicked.emit(child, 0)
+
+    assert selected == ["thread-a"]
+
+
+def test_thread_rename_keeps_cwd_group_and_selection(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "project")
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "a", "cwd": cwd}, {"id": "b", "name": "Before", "cwd": cwd}])
+    pane.list_widget.topLevelItem(0).setExpanded(False)
+    pane.list_widget.setCurrentItem(_thread_item(pane, "b"))
+
+    pane.update_thread_name("b", "After")
+
+    assert pane.list_widget.topLevelItemCount() == 1
+    assert not pane.list_widget.topLevelItem(0).isExpanded()
+    assert _thread_item(pane, "b").text(0) == "After"
+    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "b"
+
+
+def test_collapsed_groups_stay_collapsed_across_refresh_and_active_rerender(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "project")
+    threads = [{"id": "a", "cwd": cwd}, {"id": "b", "cwd": cwd}]
+    pane = ThreadListPane()
+    pane.set_threads(threads)
+    group = pane.list_widget.topLevelItem(0)
+    group.setExpanded(False)
+    assert not group.isExpanded()
+
+    pane.set_threads(threads)
+    assert not pane.list_widget.topLevelItem(0).isExpanded()
+    pane.set_active_thread_ids({"b"})
+    assert not pane.list_widget.topLevelItem(0).isExpanded()
+    assert _thread_item(pane, "b").text(0).startswith("\u25cf ")
+    pane.list_widget.topLevelItem(0).setExpanded(True)
+    assert pane.list_widget.topLevelItem(0).isExpanded()
+
+
+def test_filter_matches_children_and_cwd_and_temporarily_expands_groups(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "special-project")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "match-id", "name": "One", "cwd": cwd},
+            {"id": "other", "name": "Two", "cwd": cwd},
+            {"id": "third", "name": "Three", "cwd": str(tmp_path / "elsewhere")},
+        ]
+    )
+    first_group = pane.list_widget.topLevelItem(0)
+    first_group.setExpanded(False)
+
+    pane.filter_edit.setText("match-id")
+    assert pane.list_widget.topLevelItemCount() == 1
+    assert pane.list_widget.topLevelItem(0).childCount() == 1
+    assert pane.list_widget.topLevelItem(0).isExpanded()
+
+    pane.filter_edit.setText("special-project")
+    assert pane.list_widget.topLevelItemCount() == 1
+    assert pane.list_widget.topLevelItem(0).childCount() == 2
+    pane.filter_edit.clear()
+    assert pane.list_widget.topLevelItem(0).childCount() == 2
+    assert not pane.list_widget.topLevelItem(0).isExpanded()
+
+
+def test_friendly_project_label_requires_exact_normalized_root_match(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    root = str(tmp_path / "workspace" / "codexbridge")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [{"id": "exact", "cwd": root}, {"id": "nested", "cwd": root + "/child"}],
+        project_names={os.path.normcase(os.path.normpath(root)): "My Project"},
+    )
+
+    assert pane.list_widget.topLevelItem(0).text(0) == "My Project — codexbridge"
+    assert pane.list_widget.topLevelItem(1).text(0) == "child"
+    original_key = pane.list_widget.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole + 1)
+    pane.list_widget.setCurrentItem(_thread_item(pane, "exact"))
+    pane.set_threads(
+        [{"id": "exact", "cwd": root}],
+        project_names={original_key: "Renamed Project"},
+    )
+    assert pane.list_widget.topLevelItem(0).text(0) == "Renamed Project — codexbridge"
+    assert pane.list_widget.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole + 1) == original_key
+    assert pane.list_widget.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole) is None
+    assert _thread_item(pane, "exact").data(0, Qt.ItemDataRole.UserRole) == "exact"
+    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "exact"
+
+
+def test_missing_cwd_threads_are_kept_in_other_group() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "missing"}, {"id": "relative", "cwd": "relative/path"}])
+
+    assert pane.list_widget.topLevelItemCount() == 1
+    assert pane.list_widget.topLevelItem(0).text(0) == "Other"
+    assert pane.list_widget.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole) is None
+    assert [item.data(0, Qt.ItemDataRole.UserRole) for item in _thread_items(pane)] == [
+        "missing",
+        "relative",
+    ]
+
+    pane.list_widget.topLevelItem(0).setExpanded(False)
+    pane.set_threads([{"id": "missing"}, {"id": "relative", "cwd": "relative/path"}])
+    assert not pane.list_widget.topLevelItem(0).isExpanded()
+
+
+def test_parent_and_empty_placeholder_have_no_thread_context_menu(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "a", "cwd": str(tmp_path)}])
+
+    assert pane._context_menu_for_item(pane.list_widget.topLevelItem(0)) is None
+    pane.set_empty_state("No threads found.")
+    placeholder = pane.list_widget.topLevelItem(0)
+    assert not placeholder.flags() & Qt.ItemFlag.ItemIsSelectable
+    assert pane._context_menu_for_item(placeholder) is None
 
 
 def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path) -> None:
@@ -148,7 +382,7 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
         ],
         active_thread_ids={"target"},
     )
-    pane.list_widget.setCurrentRow(0)
+    pane.list_widget.setCurrentItem(_thread_item(pane, "selected"))
     renamed: list[str] = []
     pane.thread_rename_requested.connect(renamed.append)
     opened: list[str] = []
@@ -156,7 +390,7 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
     copied_threads: list[str] = []
     pane.thread_copy_requested.connect(copied_threads.append)
 
-    menu = pane._context_menu_for_item(pane.list_widget.item(1))
+    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
     actions = menu.actions()
 
     assert [action.text() for action in actions] == [
@@ -183,11 +417,11 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path)
         f"Name: Target\nThread ID: target\nCWD: {tmp_path}\nStatus: active"
     )
     assert "must not copy" not in application.clipboard().text()
-    assert pane.list_widget.currentItem().data(Qt.ItemDataRole.UserRole) == "selected"
+    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "selected"
 
     actions[4].trigger()
     assert copied_threads == ["target"]
-    assert pane.list_widget.currentItem().data(Qt.ItemDataRole.UserRole) == "selected"
+    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "selected"
 
 
 def test_thread_context_menu_disables_folder_action_without_valid_cwd(tmp_path) -> None:
@@ -196,10 +430,27 @@ def test_thread_context_menu_disables_folder_action_without_valid_cwd(tmp_path) 
     pane = ThreadListPane()
     pane.set_threads([{"id": "target", "name": "Target"}])
 
-    menu = pane._context_menu_for_item(pane.list_widget.item(0))
+    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
 
     assert menu.actions()[-1].text() == "作業フォルダを開く"
     assert not menu.actions()[-1].isEnabled()
+
+
+def test_thread_context_menu_opens_existing_absolute_cwd(tmp_path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "target", "cwd": str(tmp_path)}])
+    opened: list[QUrl] = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
+
+    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
+    menu.actions()[-1].trigger()
+
+    assert len(opened) == 1
+    assert os.path.normcase(os.path.normpath(opened[0].toLocalFile())) == os.path.normcase(
+        os.path.normpath(str(tmp_path))
+    )
 
 
 def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
@@ -211,7 +462,7 @@ def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
     missing_cwd = str(tmp_path / "not-created")
     pane.set_threads([{"id": "target", "name": "Target", "cwd": missing_cwd}])
 
-    menu = pane._context_menu_for_item(pane.list_widget.item(0))
+    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
     copied: list[str] = []
     monkeypatch.setattr(pane, "_copy_text", copied.append)
     menu.actions()[3].trigger()

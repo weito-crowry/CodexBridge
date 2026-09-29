@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
@@ -20,10 +21,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from .project_names import normalize_cwd
 from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
 
 
@@ -236,21 +240,31 @@ class ThreadListPane(QWidget):
     thread_rename_requested = Signal(str)
     thread_open_requested = Signal(str)
     thread_copy_requested = Signal(str)
+    _GROUP_KEY_ROLE = Qt.ItemDataRole.UserRole + 1
+    _OTHER_GROUP_KEY = "\x00other"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._threads: list[dict[str, object]] = []
         self._active_thread_ids: set[str] = set()
+        self._project_names: dict[str, str] = {}
+        self._collapsed_group_keys: set[str] = set()
+        self._selected_thread_id: str | None = None
+        self._rendering = False
         title = QLabel("Threads")
         self.refresh_button = QPushButton("Refresh")
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("Filter threads")
-        self.list_widget = QListWidget()
+        self.list_widget = QTreeWidget()
         self.list_widget.setObjectName("threadList")
+        self.list_widget.setHeaderHidden(True)
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.filter_edit.textChanged.connect(self._render)
         self.list_widget.itemActivated.connect(self._emit_selected)
         self.list_widget.itemClicked.connect(self._emit_selected)
+        self.list_widget.currentItemChanged.connect(self._remember_selected_thread)
+        self.list_widget.itemCollapsed.connect(self._group_collapsed)
+        self.list_widget.itemExpanded.connect(self._group_expanded)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
         header = QHBoxLayout()
@@ -267,8 +281,14 @@ class ThreadListPane(QWidget):
         threads: Sequence[Mapping[str, object]],
         *,
         active_thread_ids: Collection[str] | None = None,
+        project_names: Mapping[str, str] | None = None,
     ) -> None:
         self._threads = [dict(thread) for thread in threads]
+        self._project_names = dict(project_names or {})
+        if self._selected_thread_id is not None and not any(
+            thread.get("id") == self._selected_thread_id for thread in self._threads
+        ):
+            self._selected_thread_id = None
         if active_thread_ids is not None:
             self._active_thread_ids = set(active_thread_ids)
         self._render()
@@ -284,42 +304,125 @@ class ThreadListPane(QWidget):
     def _render(self) -> None:
         query = self.filter_edit.text().casefold()
         current_item = self.list_widget.currentItem()
-        selected_thread_id = (
-            current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
-        )
-        self.list_widget.clear()
+        if current_item is not None:
+            self._remember_selected_thread(current_item, None)
+        selected_thread_id = self._selected_thread_id
+        groups: dict[str | None, list[dict[str, object]]] = {}
+        group_cwds: dict[str | None, str | None] = {}
         for thread in self._threads:
             thread_id = thread.get("id")
             if not isinstance(thread_id, str):
                 continue
-            searchable = " ".join(
-                str(thread.get(key, "")) for key in ("id", "name", "preview", "cwd")
-            )
-            if query and query not in searchable.casefold():
-                continue
-            title = _safe_text(thread.get("name")) or "New スレッド"
-            is_active = thread_id in self._active_thread_ids
-            item = QListWidgetItem(f"\u25cf {title}" if is_active else title)
-            item.setData(Qt.ItemDataRole.UserRole, thread_id)
-            item.setToolTip(thread_id)
-            if is_active:
-                font = QFont(item.font())
-                font.setWeight(QFont.Weight.DemiBold)
-                item.setFont(font)
-                item.setForeground(
-                    QBrush(self.list_widget.palette().color(QPalette.ColorRole.Link))
-                )
-            self.list_widget.addItem(item)
-        if isinstance(selected_thread_id, str):
-            for index in range(self.list_widget.count()):
-                item = self.list_widget.item(index)
-                if item.data(Qt.ItemDataRole.UserRole) == selected_thread_id:
-                    self.list_widget.setCurrentRow(index)
-                    break
+            raw_cwd = thread.get("cwd")
+            cwd = raw_cwd if isinstance(raw_cwd, str) else None
+            group_key = normalize_cwd(raw_cwd)
+            if group_key not in groups:
+                groups[group_key] = []
+                group_cwds[group_key] = cwd
+            groups[group_key].append(thread)
 
-    def _emit_selected(self, item: QListWidgetItem) -> None:
-        thread_id = item.data(Qt.ItemDataRole.UserRole)
+        self._rendering = True
+        try:
+            self.list_widget.clear()
+            selected_item: QTreeWidgetItem | None = None
+            for group_key, group_threads in groups.items():
+                group_cwd = group_cwds[group_key]
+                friendly_name = (
+                    self._project_names.get(group_key) if group_key is not None else None
+                )
+                basename = (
+                    os.path.basename(os.path.normpath(group_cwd)) or group_cwd
+                    if group_cwd is not None
+                    else "Other"
+                )
+                label = basename
+                if isinstance(friendly_name, str) and friendly_name.strip():
+                    friendly_name = friendly_name.strip()
+                    if friendly_name.casefold() == basename.casefold():
+                        label = friendly_name
+                    else:
+                        label = f"{friendly_name} — {basename}"
+
+                matching_threads: list[dict[str, object]] = []
+                for thread in group_threads:
+                    searchable = " ".join(
+                        str(thread.get(key, "")) for key in ("id", "name", "preview", "cwd")
+                    )
+                    if query and query not in f"{searchable} {label}".casefold():
+                        continue
+                    matching_threads.append(thread)
+                if not matching_threads:
+                    continue
+
+                parent = QTreeWidgetItem([label])
+                parent.setData(0, Qt.ItemDataRole.UserRole, None)
+                state_key = group_key if group_key is not None else self._OTHER_GROUP_KEY
+                parent.setData(0, self._GROUP_KEY_ROLE, state_key)
+                if group_cwd is not None:
+                    parent.setToolTip(0, group_cwd)
+                self.list_widget.addTopLevelItem(parent)
+
+                for thread in matching_threads:
+                    thread_id = thread.get("id")
+                    if not isinstance(thread_id, str):
+                        continue
+                    title = _safe_text(thread.get("name")) or "New スレッド"
+                    is_active = thread_id in self._active_thread_ids
+                    item = QTreeWidgetItem([f"\u25cf {title}" if is_active else title])
+                    item.setData(0, Qt.ItemDataRole.UserRole, thread_id)
+                    item.setToolTip(0, thread_id)
+                    if is_active:
+                        font = QFont(item.font(0))
+                        font.setWeight(QFont.Weight.DemiBold)
+                        item.setFont(0, font)
+                        item.setForeground(
+                            0,
+                            QBrush(self.list_widget.palette().color(QPalette.ColorRole.Link)),
+                        )
+                    parent.addChild(item)
+                    if thread_id == selected_thread_id:
+                        selected_item = item
+
+                collapsed = state_key in self._collapsed_group_keys
+                parent.setExpanded(bool(query) or not collapsed)
+            if selected_item is not None:
+                self.list_widget.setCurrentItem(selected_item)
+        finally:
+            self._rendering = False
+
+    def _remember_selected_thread(
+        self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None
+    ) -> None:
+        if current is None:
+            return
+        thread_id = current.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(thread_id, str):
+            self._selected_thread_id = (
+                thread_id if self._thread_for_id(thread_id) is not None else None
+            )
+
+    def _group_collapsed(self, item: QTreeWidgetItem) -> None:
+        if self._rendering:
+            return
+        group_key = item.data(0, self._GROUP_KEY_ROLE)
+        if not isinstance(group_key, str):
+            return
+        if self.filter_edit.text():
+            item.setExpanded(True)
+            return
+        self._collapsed_group_keys.add(group_key)
+
+    def _group_expanded(self, item: QTreeWidgetItem) -> None:
+        if self._rendering or self.filter_edit.text():
+            return
+        group_key = item.data(0, self._GROUP_KEY_ROLE)
+        if isinstance(group_key, str):
+            self._collapsed_group_keys.discard(group_key)
+
+    def _emit_selected(self, item: QTreeWidgetItem, _column: int = 0) -> None:
+        thread_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(thread_id, str):
+            self._selected_thread_id = thread_id
             self.thread_selected.emit(thread_id)
 
     def _thread_for_id(self, thread_id: str) -> dict[str, object] | None:
@@ -382,11 +485,11 @@ class ThreadListPane(QWidget):
         except Exception:
             return
 
-    def _context_menu_for_item(self, item: QListWidgetItem) -> QMenu:
-        menu = QMenu(self)
-        thread_id = item.data(Qt.ItemDataRole.UserRole)
+    def _context_menu_for_item(self, item: QTreeWidgetItem) -> QMenu | None:
+        thread_id = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(thread_id, str):
-            return menu
+            return None
+        menu = QMenu(self)
 
         rename_action = menu.addAction("名前を変更...")
         rename_action.triggered.connect(
@@ -426,11 +529,16 @@ class ThreadListPane(QWidget):
         if item is None:
             return
         menu = self._context_menu_for_item(item)
+        if menu is None:
+            return
         menu.exec(self.list_widget.viewport().mapToGlobal(position))
 
     def set_empty_state(self, text: str) -> None:
+        self._selected_thread_id = None
         self.list_widget.clear()
-        self.list_widget.addItem(text)
+        item = QTreeWidgetItem([text])
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled)
+        self.list_widget.addTopLevelItem(item)
 
 
 class _HistoryContent(QWidget):

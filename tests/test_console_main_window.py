@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTextBrowser,
+    QTreeWidgetItem,
 )
 
+from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.codex_updates import CodexUpdateInfo
 from codex_bridge.console.config import ConsoleConfig
@@ -258,6 +261,17 @@ def _application() -> QApplication:
 
 def _config() -> ConsoleConfig:
     return ConsoleConfig(allowed_roots=(str(Path.cwd()),))
+
+
+def _thread_item(window: MainWindow, thread_id: str) -> QTreeWidgetItem:
+    tree = window.thread_pane.list_widget
+    return next(
+        tree.topLevelItem(group_index).child(child_index)
+        for group_index in range(tree.topLevelItemCount())
+        for child_index in range(tree.topLevelItem(group_index).childCount())
+        if tree.topLevelItem(group_index).child(child_index).data(0, Qt.ItemDataRole.UserRole)
+        == thread_id
+    )
 
 
 def _usage_window(client: FakeClient) -> MainWindow:
@@ -1220,7 +1234,7 @@ def test_main_window_tracks_selected_turn_activity_without_refresh_fanout() -> N
         "threads",
         {"threads": [{"id": "thread-a", "name": "A", "preview": "ignored"}]},
     )
-    window.thread_pane.list_widget.setCurrentRow(0)
+    window.thread_pane.list_widget.setCurrentItem(_thread_item(window, "thread-a"))
     window.select_thread("thread-a")
     status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
 
@@ -1249,7 +1263,7 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     window = MainWindow(_config(), api_client=client, tray_available=False)
 
     client.result("threads", {"threads": [{"id": "thread-a"}]})
-    window.thread_pane.list_widget.setCurrentRow(0)
+    window.thread_pane.list_widget.setCurrentItem(_thread_item(window, "thread-a"))
     window.select_thread("thread-a")
     status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
     client.result(
@@ -1257,17 +1271,44 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
         {"thread_id": "thread-a", "state": "in_progress", "recent_activities": []},
     )
 
-    active_item = window.thread_pane.list_widget.item(0)
-    assert active_item.text() == "\u25cf New \u30b9\u30ec\u30c3\u30c9"
-    active_weight = active_item.font().weight()
+    active_item = _thread_item(window, "thread-a")
+    assert active_item.text(0) == "\u25cf New \u30b9\u30ec\u30c3\u30c9"
+    active_weight = active_item.font(0).weight()
 
     client.result("threads", {"threads": [{"id": "thread-a", "name": "Renamed"}]})
 
     current = window.thread_pane.list_widget.currentItem()
     assert current is not None
-    assert current.data(Qt.ItemDataRole.UserRole) == "thread-a"
-    assert current.text() == "\u25cf Renamed"
-    assert current.font().weight() == active_weight
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "thread-a"
+    assert current.text(0) == "\u25cf Renamed"
+    assert current.font(0).weight() == active_weight
+    window.close()
+
+
+def test_main_window_reads_project_names_on_thread_refresh_only(monkeypatch, tmp_path) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    cwd = str(tmp_path / "codexbridge")
+    key = os.path.normcase(os.path.normpath(cwd))
+    calls: list[None] = []
+
+    def read_names() -> dict[str, str]:
+        calls.append(None)
+        return {key: "Friendly Project"}
+
+    monkeypatch.setattr(main_window_module, "read_local_project_names", read_names)
+    client.result("threads", {"threads": [{"id": "thread-a", "cwd": cwd}]})
+
+    assert calls == [None]
+    assert window.thread_pane.list_widget.topLevelItem(0).text(0) == (
+        "Friendly Project — codexbridge"
+    )
+    window.thread_pane.filter_edit.setText("thread-a")
+    assert calls == [None]
+
+    client.result("threads", {"threads": [{"id": "thread-a", "cwd": cwd}]})
+    assert calls == [None, None]
     window.close()
 
 
@@ -1298,7 +1339,7 @@ def test_rename_uses_right_clicked_thread_and_updates_after_success(monkeypatch)
     ]
     client.result("rename:thread-b", {})
 
-    assert window.thread_pane.list_widget.item(1).text() == "Renamed"
+    assert _thread_item(window, "thread-b").text(0) == "Renamed"
     window.close()
 
 
@@ -1339,9 +1380,9 @@ def test_open_in_codex_app_uses_right_clicked_thread_id_and_preserves_selection(
         },
     )
     window.select_thread("thread-a")
-    window.thread_pane.list_widget.setCurrentRow(0)
+    window.thread_pane.list_widget.setCurrentItem(_thread_item(window, "thread-a"))
 
-    menu = window.thread_pane._context_menu_for_item(window.thread_pane.list_widget.item(1))
+    menu = window.thread_pane._context_menu_for_item(_thread_item(window, "thread-b"))
     action = next(action for action in menu.actions() if action.text() == "Open in Codex App")
     action.trigger()
 
@@ -1349,7 +1390,7 @@ def test_open_in_codex_app_uses_right_clicked_thread_id_and_preserves_selection(
     assert window._selected_thread_id == "thread-a"
     current = window.thread_pane.list_widget.currentItem()
     assert current is not None
-    assert current.data(Qt.ItemDataRole.UserRole) == "thread-a"
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "thread-a"
     assert client.json_posts == []
     window.close()
 
@@ -1377,7 +1418,7 @@ def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selecti
     initial_selected = window._selected_thread_id
     initial_active = set(window._active_thread_ids)
 
-    menu = window.thread_pane._context_menu_for_item(window.thread_pane.list_widget.item(1))
+    menu = window.thread_pane._context_menu_for_item(_thread_item(window, "thread-b"))
     action = next(action for action in menu.actions() if action.text() == "Copy thread content")
     action.trigger()
 
@@ -1440,9 +1481,7 @@ def test_open_in_codex_app_default_helper_passes_exact_uri_to_qt_shell(monkeypat
     client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
     window.select_thread("thread-a")
 
-    actions = window.thread_pane._context_menu_for_item(
-        window.thread_pane.list_widget.item(0)
-    ).actions()
+    actions = window.thread_pane._context_menu_for_item(_thread_item(window, "thread-a")).actions()
     assert "Open in Codex App" in [action.text() for action in actions]
     opened: list[str] = []
     monkeypatch.setattr(
@@ -1478,7 +1517,7 @@ def test_open_in_codex_app_failure_is_visible_without_changing_thread_state(open
     initial_title = window.thread_pane.thread_name("thread-a")
     initial_generation = window._selection_generation
 
-    menu = window.thread_pane._context_menu_for_item(window.thread_pane.list_widget.item(0))
+    menu = window.thread_pane._context_menu_for_item(_thread_item(window, "thread-a"))
     action = next(action for action in menu.actions() if action.text() == "Open in Codex App")
     action.trigger()
 
