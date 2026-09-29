@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from math import ceil
 from typing import Any
 
 from PySide6.QtCore import QDir, QPoint, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette, QResizeEvent
+from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette, QResizeEvent, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -434,15 +436,41 @@ class _HistoryContent(QWidget):
         hint = super().minimumSizeHint()
         layout = self.layout()
         if layout is None or self.width() <= 0:
-            return hint
+            return QSize(0, hint.height())
         height = (
             layout.heightForWidth(self.width()) if layout.hasHeightForWidth() else hint.height()
         )
-        return QSize(hint.width(), height)
+        return QSize(0, height)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self.updateGeometry()
+
+
+class _HistoryBody(QTextBrowser):
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setReadOnly(True)
+        self.setPlainText(text)
+        self.document().setDocumentMargin(0)
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        available_width = max(1, width - self.frameWidth() * 2)
+        self.document().setTextWidth(available_width)
+        document_height = self.document().documentLayout().documentSize().height()
+        return max(1, ceil(document_height) + self.frameWidth() * 2)
 
 
 class HistoryPane(QWidget):
@@ -460,6 +488,7 @@ class HistoryPane(QWidget):
         self._content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setWidget(self._content)
         layout = QVBoxLayout(self)
         layout.addWidget(self.load_older_button)
@@ -508,7 +537,12 @@ class HistoryPane(QWidget):
         if entry.status is not None:
             header_parts.append(entry.status)
         header = QHBoxLayout()
-        header.addWidget(QLabel(" · ".join(header_parts)))
+        header_label = QLabel(" · ".join(header_parts))
+        header_label.setWordWrap(True)
+        header_policy = header_label.sizePolicy()
+        header_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        header_label.setSizePolicy(header_policy)
+        header.addWidget(header_label)
         if entry.kind in {"User", "Agent"}:
             header.addStretch(1)
             copy_button = QPushButton("Copy")
@@ -519,18 +553,9 @@ class HistoryPane(QWidget):
             header.addWidget(copy_button)
         layout.addLayout(header)
         if entry.body:
-            body = QLabel()
-            body.setTextFormat(Qt.TextFormat.PlainText)
-            body.setWordWrap(True)
-            body.setText(entry.body)
-            body.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-                | Qt.TextInteractionFlag.TextSelectableByKeyboard
-            )
-            body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-            layout.addWidget(body)
+            layout.addWidget(_HistoryBody(entry.body))
         if entry.details:
-            layout.addWidget(QLabel(" · ".join(entry.details)))
+            layout.addWidget(_HistoryBody(" · ".join(entry.details)))
         return card
 
     def set_empty_state(self, text: str) -> None:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QTextEdit
+from PySide6.QtGui import QPalette, QTextOption
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QTextBrowser
 
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
@@ -495,13 +495,82 @@ def test_history_pane_shows_each_message_in_full_without_inner_scroll() -> None:
 
     pane.set_timeline((TimelineEntry("turn", "item", "Agent", "Agent", message, None, ()),))
 
-    body_labels = [label for label in pane.findChildren(QLabel) if label.text() == message]
-    assert len(body_labels) == 1
-    body = body_labels[0]
-    assert body.wordWrap() is True
-    assert body.textFormat() == Qt.TextFormat.PlainText
+    body_widgets = [
+        widget for widget in pane.findChildren(QTextBrowser) if widget.toPlainText() == message
+    ]
+    assert len(body_widgets) == 1
+    body = body_widgets[0]
+    assert body.wordWrapMode() == QTextOption.WrapMode.WrapAnywhere
     assert body.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
-    assert not pane.findChildren(QTextEdit)
+    assert body.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert body.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_history_pane_disables_horizontal_scrolling() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+
+    assert pane._scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_history_pane_reflows_long_content_to_viewport_and_preserves_copy(monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    body_text = "https://" + "u" * 6_000
+    command = "powershell -NoProfile -Command " + "x" * 3_000
+    path = "C:\\" + ("nested\\" * 400) + "result.txt"
+    pane.resize(900, 500)
+    pane.set_timeline(
+        (
+            TimelineEntry("turn", "body", "Agent", "Agent", body_text, None, ()),
+            TimelineEntry("turn", "command", "Command", "Command", command, None, ()),
+            TimelineEntry("turn", "file", "Files", "Files", "Changed file", None, (path,)),
+        )
+    )
+    pane.show()
+    application.processEvents()
+
+    body = next(
+        widget for widget in pane.findChildren(QTextBrowser) if widget.toPlainText() == body_text
+    )
+    wide_body_height = body.height()
+    pane.resize(560, 500)
+    application.processEvents()
+
+    viewport = pane._scroll.viewport()
+    assert pane._scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert pane._content.width() == viewport.width()
+    assert pane._content.minimumSizeHint().width() <= viewport.width()
+    assert body.toPlainText() == body_text
+    assert body.height() > wide_body_height
+    text_widgets = pane._content.findChildren(QTextBrowser)
+    assert {widget.toPlainText() for widget in text_widgets} == {
+        body_text,
+        command,
+        "Changed file",
+        path,
+    }
+    assert all(
+        widget.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        and widget.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        and widget.verticalScrollBar().maximum() == 0
+        for widget in text_widgets
+    )
+    cards = pane._content.findChildren(QFrame, "historyCard")
+    assert len(cards) == 3
+    assert all(card.geometry().width() <= viewport.width() for card in cards)
+
+    copied: list[str] = []
+    monkeypatch.setattr("codex_bridge.console.widgets.copy_to_clipboard", copied.append)
+    next(
+        button
+        for button in pane.findChildren(QPushButton)
+        if button.objectName() == "copyMessageButton"
+    ).click()
+    application.processEvents()
+    assert copied == [body_text]
 
 
 def test_history_pane_adds_model_metadata_to_each_turn_header_only() -> None:

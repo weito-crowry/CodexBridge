@@ -6,7 +6,15 @@ from typing import Any
 import pytest
 from PySide6.QtCore import QCoreApplication, Qt, QTimer
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QPushButton, QSplitter
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QTextBrowser,
+)
 
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.codex_updates import CodexUpdateInfo
@@ -1379,7 +1387,7 @@ def test_main_window_keeps_history_when_turn_model_metadata_is_unavailable() -> 
         if card.objectName() == "historyCard"
     ]
     assert len(cards) == 1
-    assert any(body.text() == "answer" for body in cards[0].findChildren(QLabel))
+    assert any(body.toPlainText() == "answer" for body in cards[0].findChildren(QTextBrowser))
     assert "Turn · Model: unavailable" in {
         label.text() for label in window.history_pane._content.findChildren(QLabel)
     }
