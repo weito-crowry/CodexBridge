@@ -548,26 +548,38 @@ class HistoryPane(QWidget):
 class ActivityPane(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.state_label = QLabel("Current state\nnot loaded")
+        self.state_label = QLabel("not_loaded")
         self.state_label.setWordWrap(True)
+        state_header = QLabel("Current state")
         self.pending_label = QLabel("")
         self.pending_label.setWordWrap(True)
+        self._pending_header = QLabel("Pending request summary")
+        self._state_section = QWidget()
+        state_layout = QVBoxLayout(self._state_section)
+        state_layout.setContentsMargins(0, 0, 0, 0)
+        state_layout.addWidget(state_header)
+        state_layout.addWidget(self.state_label)
+        state_layout.addWidget(self._pending_header)
+        state_layout.addWidget(self.pending_label)
+        self._state_section.hide()
         self.activity_list = QListWidget()
         self.activity_list.setObjectName("activityList")
+        self._activity_header = QLabel("Recent activities")
+        self._activity_header.setObjectName("recentActivitiesHeader")
         self._activity_ids: set[str] = set()
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Current state"))
-        layout.addWidget(self.state_label)
-        layout.addWidget(QLabel("Pending request summary"))
-        layout.addWidget(self.pending_label)
-        layout.addWidget(QLabel("Recent activities"))
+        layout.addWidget(self._state_section)
+        layout.addWidget(self._activity_header)
         layout.addWidget(self.activity_list, 1)
 
     def set_snapshot(self, snapshot: Mapping[str, object], *, reset: bool = False) -> None:
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
         self.state_label.setText(state)
         pending = snapshot.get("pending_request")
-        if isinstance(pending, Mapping):
+        has_pending = isinstance(pending, Mapping)
+        self._pending_header.setVisible(has_pending)
+        self.pending_label.setVisible(has_pending)
+        if has_pending:
             label = "Approval required" if state == "needs_approval" else "Input required"
             summary = _safe_text(pending.get("summary"), 2_000) or _safe_text(
                 pending.get("reason"), 2_000
@@ -575,6 +587,8 @@ class ActivityPane(QWidget):
             self.pending_label.setText(f"{label}\n{summary}".strip())
         else:
             self.pending_label.setText("")
+        error = _safe_text(snapshot.get("error"), 2_000)
+        self._state_section.setVisible(state != "not_loaded" or has_pending or bool(error))
         if reset:
             self.activity_list.clear()
             self._activity_ids.clear()
@@ -605,5 +619,15 @@ class ActivityPane(QWidget):
     def set_empty_state(self, text: str) -> None:
         self.state_label.setText(text)
         self.pending_label.clear()
+        self._pending_header.hide()
+        self.pending_label.hide()
+        self._state_section.hide()
         self.activity_list.clear()
         self._activity_ids.clear()
+
+    def set_error(self, text: str) -> None:
+        self.state_label.setText(text)
+        self.pending_label.clear()
+        self._pending_header.hide()
+        self.pending_label.hide()
+        self._state_section.show()

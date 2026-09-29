@@ -807,7 +807,7 @@ class MainWindow(QMainWindow):
             self.history_pane.set_empty_state(
                 f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
             )
-            self.activity_pane.set_empty_state("Bridge unavailable")
+            self.activity_pane.set_error("Bridge unavailable")
             return
         if getattr(self.thread_pane, "thread_count", 0) == 0:
             self.history_pane.set_empty_state("No threads found.")
@@ -1945,7 +1945,7 @@ class MainWindow(QMainWindow):
         if suffix in {"items", "turns"} or suffix.startswith("older:"):
             self.history_pane.set_error(message)
         if suffix == "status":
-            self.activity_pane.set_empty_state(message)
+            self.activity_pane.set_error(message)
             if self._stream_sync_pending:
                 self._schedule_reconnect(self._selection_generation)
 

@@ -374,6 +374,79 @@ def test_activity_rows_distinguish_commentary_from_final_agent_message() -> None
     assert "Agent" in final
 
 
+def test_activity_pane_hides_empty_and_unloaded_state_but_keeps_recent_activities() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ActivityPane()
+
+    pane.set_empty_state("No thread selected.")
+    assert not pane.state_label.isVisibleTo(pane)
+
+    pane.set_snapshot(
+        {
+            "state": "not_loaded",
+            "pending_request": None,
+            "recent_activities": [
+                {"activity_id": "activity-1", "type": "turn_completed", "summary": "done"}
+            ],
+        }
+    )
+
+    assert not pane.state_label.isVisibleTo(pane)
+    recent_header = next(
+        label for label in pane.findChildren(QLabel) if label.text() == "Recent activities"
+    )
+    assert recent_header.isVisibleTo(pane)
+    assert pane.activity_list.count() == 1
+
+
+def test_activity_pane_shows_active_pending_and_failure_states() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ActivityPane()
+
+    pane.set_snapshot({"state": "in_progress", "pending_request": None})
+    assert pane.state_label.text() == "in_progress"
+    assert pane.state_label.isVisibleTo(pane)
+
+    for state in ("needs_approval", "needs_input"):
+        pane.set_snapshot(
+            {
+                "state": state,
+                "pending_request": {"summary": "Waiting for a decision"},
+            }
+        )
+        assert pane.state_label.isVisibleTo(pane)
+        assert "Waiting for a decision" in pane.pending_label.text()
+        assert pane.pending_label.isVisibleTo(pane)
+
+    for state in ("failed", "error"):
+        pane.set_snapshot({"state": state, "pending_request": None})
+        assert pane.state_label.text() == state
+        assert pane.state_label.isVisibleTo(pane)
+
+
+def test_activity_pane_shows_request_error_without_dropping_recent_activities() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ActivityPane()
+    pane.set_snapshot(
+        {
+            "state": "in_progress",
+            "pending_request": None,
+            "recent_activities": [
+                {"activity_id": "activity-1", "type": "turn_started", "summary": "started"}
+            ],
+        }
+    )
+
+    pane.set_error("Bridge request failed")
+
+    assert pane.state_label.text() == "Bridge request failed"
+    assert pane.state_label.isVisibleTo(pane)
+    assert pane.activity_list.count() == 1
+
+
 def test_activity_pane_caps_rows_and_deduplicates_current_rows() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
