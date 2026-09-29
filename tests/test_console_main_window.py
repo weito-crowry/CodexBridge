@@ -787,7 +787,7 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     )
 
     active_item = window.thread_pane.list_widget.item(0)
-    assert active_item.text() == "New スレッド"
+    assert active_item.text() == "\u25cf New \u30b9\u30ec\u30c3\u30c9"
     active_weight = active_item.font().weight()
 
     client.result("threads", {"threads": [{"id": "thread-a", "name": "Renamed"}]})
@@ -795,7 +795,7 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     current = window.thread_pane.list_widget.currentItem()
     assert current is not None
     assert current.data(Qt.ItemDataRole.UserRole) == "thread-a"
-    assert current.text() == "Renamed"
+    assert current.text() == "\u25cf Renamed"
     assert current.font().weight() == active_weight
     window.close()
 
