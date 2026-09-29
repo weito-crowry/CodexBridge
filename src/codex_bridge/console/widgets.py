@@ -294,10 +294,11 @@ class ThreadListPane(QWidget):
             if query and query not in searchable.casefold():
                 continue
             title = _safe_text(thread.get("name")) or "New スレッド"
-            item = QListWidgetItem(title)
+            is_active = thread_id in self._active_thread_ids
+            item = QListWidgetItem(f"\u25cf {title}" if is_active else title)
             item.setData(Qt.ItemDataRole.UserRole, thread_id)
             item.setToolTip(thread_id)
-            if thread_id in self._active_thread_ids:
+            if is_active:
                 font = QFont(item.font())
                 font.setWeight(QFont.Weight.DemiBold)
                 item.setFont(font)

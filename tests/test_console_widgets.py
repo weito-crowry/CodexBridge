@@ -62,6 +62,33 @@ def test_thread_list_marks_active_threads_with_palette_color_and_bold_font() -> 
     assert active.foreground().color() != idle.foreground().color()
 
 
+def test_thread_list_keeps_running_indicator_through_selection_and_state_changes() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    threads = [
+        {"id": "active", "name": "Active"},
+        {"id": "idle", "name": "Idle"},
+    ]
+
+    pane.set_threads(threads, active_thread_ids={"active"})
+
+    assert pane.list_widget.item(0).text() == "\u25cf Active"
+    assert pane.list_widget.item(1).text() == "Idle"
+    pane.list_widget.setCurrentRow(0)
+    selected = pane.list_widget.currentItem()
+    assert selected is not None
+    assert selected.text() == "\u25cf Active"
+    assert selected.data(Qt.ItemDataRole.UserRole) == "active"
+
+    pane.set_active_thread_ids(set())
+
+    selected = pane.list_widget.currentItem()
+    assert selected is not None
+    assert selected.text() == "Active"
+    assert selected.data(Qt.ItemDataRole.UserRole) == "active"
+
+
 def test_thread_list_refresh_preserves_selected_thread_id() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
