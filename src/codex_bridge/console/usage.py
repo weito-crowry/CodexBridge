@@ -20,6 +20,12 @@ class CodexUsage:
     weekly: UsageWindow | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CodexUsageSnapshot:
+    usage: CodexUsage
+    captured_at: datetime
+
+
 def _window_mappings(value: object, *, depth: int = 0) -> Iterator[Mapping[str, object]]:
     if depth > 8:
         return
@@ -120,6 +126,15 @@ def format_codex_usage_detail(usage: CodexUsage) -> str:
     if usage.five_hour is None and usage.weekly is None:
         return "Unavailable"
     return format_codex_usage_tooltip(usage)
+
+
+def format_codex_usage_snapshot(snapshot: CodexUsageSnapshot) -> str:
+    usage = snapshot.usage
+    captured_at = snapshot.captured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"Usage snapshot: 5h {_window_text(usage.five_hour)} · "
+        f"Week {_window_text(usage.weekly)} · captured {captured_at}"
+    )
 
 
 def usage_level(usage: CodexUsage) -> str:

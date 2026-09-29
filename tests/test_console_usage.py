@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+from codex_bridge.console import usage as usage_module
 from codex_bridge.console.usage import (
     format_codex_usage,
     format_codex_usage_tooltip,
@@ -85,3 +88,18 @@ def test_codex_usage_tooltip_includes_remaining_and_local_reset_values() -> None
     assert "Week: 61% left" in tooltip
     assert "2030-01-02 " in tooltip
     assert "2030-01-09 " in tooltip
+
+
+def test_codex_usage_snapshot_formats_partial_windows_and_local_timestamp() -> None:
+    usage = parse_codex_usage({"rateLimits": {"primary": _window(300, 28)}})
+    snapshot_type = getattr(usage_module, "CodexUsageSnapshot", None)
+    formatter = getattr(usage_module, "format_codex_usage_snapshot", None)
+    assert snapshot_type is not None
+    assert callable(formatter)
+    snapshot = snapshot_type(
+        usage=usage,
+        captured_at=datetime(2026, 9, 30, 4, 45, 12, tzinfo=UTC),
+    )
+
+    captured = snapshot.captured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    assert formatter(snapshot) == (f"Usage snapshot: 5h 72% · Week — · captured {captured}")

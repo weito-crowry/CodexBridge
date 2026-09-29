@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from inspect import signature
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette, QTextOption
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QTextBrowser
 
+from codex_bridge.console import usage as usage_module
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
+from codex_bridge.console.usage import parse_codex_usage
 from codex_bridge.console.widgets import (
     ActivityPane,
     HistoryPane,
@@ -22,6 +27,22 @@ from tests.test_console_main_window import (
     FakeLauncher,
     StableTunnel,
 )
+
+
+def _usage_snapshot() -> object:
+    snapshot_type = getattr(usage_module, "CodexUsageSnapshot", None)
+    assert snapshot_type is not None
+    return snapshot_type(
+        parse_codex_usage(
+            {
+                "rateLimits": {
+                    "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                    "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
+                }
+            }
+        ),
+        datetime(2026, 9, 30, 4, 45, 12, tzinfo=UTC),
+    )
 
 
 def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
@@ -491,6 +512,65 @@ def test_history_pane_shows_turn_status_in_separator() -> None:
 
     assert any("Turn · Model: unavailable" in label.text() for label in pane.findChildren(QLabel))
     assert any("Turn · completed" in label.text() for label in pane.findChildren(QLabel))
+
+
+def test_history_pane_shows_usage_snapshot_on_a_separate_wrapping_line() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    snapshot = _usage_snapshot()
+    assert "turn_usage_snapshots" in signature(pane.set_timeline).parameters
+    pane.resize(420, 300)
+    pane.set_timeline(
+        (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
+        turn_usage_snapshots={"turn": snapshot},
+    )
+    pane.show()
+    _process_layout(application)
+
+    snapshot_label = pane.findChild(QLabel, "turnUsageSnapshot")
+    assert snapshot_label is not None
+    assert snapshot_label.wordWrap()
+    assert snapshot_label.text().startswith("Usage snapshot: 5h 72% · Week 61% · captured ")
+    assert pane._scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert pane._content.width() == pane._scroll.viewport().width()
+    assert snapshot_label.width() <= pane._scroll.viewport().width()
+
+
+def test_history_pane_omits_usage_snapshot_when_turn_has_none() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+
+    pane.set_timeline((TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),))
+
+    assert pane.findChild(QLabel, "turnUsageSnapshot") is None
+
+
+def test_history_pane_preserves_manual_scroll_position_when_snapshot_is_added() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entries = tuple(
+        TimelineEntry(f"turn-{index}", f"item-{index}", "Agent", "Agent", "answer", None, ())
+        for index in range(30)
+    )
+    snapshot = _usage_snapshot()
+    assert "turn_usage_snapshots" in signature(pane.set_timeline).parameters
+    pane.resize(600, 300)
+    pane.set_timeline(entries)
+    pane.show()
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    old_value = scrollbar.value()
+
+    pane.set_timeline(entries, turn_usage_snapshots={"turn-0": snapshot})
+    _process_layout(application)
+
+    assert scrollbar.value() == old_value
+    assert scrollbar.value() < scrollbar.maximum()
 
 
 def test_history_pane_shows_each_message_in_full_without_inner_scroll() -> None:

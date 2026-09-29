@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from secrets import token_urlsafe
 from time import monotonic
 from typing import Any
@@ -46,6 +48,7 @@ from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
 from .tunnel_supervisor import TunnelSupervisor, tunnel_state_label
 from .usage import (
     CodexUsage,
+    CodexUsageSnapshot,
     format_codex_usage,
     format_codex_usage_detail,
     format_codex_usage_tooltip,
@@ -71,6 +74,9 @@ _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 5 * 60 * 1_000
 _USAGE_MAX_ATTEMPTS = 3
+_USAGE_SNAPSHOT_DELAY_MS = 1_000
+_USAGE_SNAPSHOT_DEFER_MS = 500
+_USAGE_SNAPSHOT_MAX_ENTRIES = 500
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
@@ -201,6 +207,12 @@ class MainWindow(QMainWindow):
         self._reconnect_scheduled = False
         self._runtime_state = "unavailable"
         self._usage = CodexUsage()
+        self._usage_refresh_error: str | None = None
+        self._usage_snapshots: OrderedDict[tuple[str, str], CodexUsageSnapshot | None] = (
+            OrderedDict()
+        )
+        self._pending_usage_snapshot_turns: set[tuple[str, str]] = set()
+        self._usage_snapshot_request_turns: set[tuple[str, str]] = set()
         self._usage_sequence_active = False
         self._usage_attempts = 0
         self._usage_request_in_flight = False
@@ -679,6 +691,10 @@ class MainWindow(QMainWindow):
         self.usage_poll_timer = QTimer(self)
         self.usage_poll_timer.setInterval(_USAGE_POLL_INTERVAL_MS)
         self.usage_poll_timer.timeout.connect(self._on_usage_poll_timeout)
+        self.turn_usage_snapshot_timer = QTimer(self)
+        self.turn_usage_snapshot_timer.setSingleShot(True)
+        self.turn_usage_snapshot_timer.setInterval(_USAGE_SNAPSHOT_DELAY_MS)
+        self.turn_usage_snapshot_timer.timeout.connect(self._on_turn_usage_snapshot_timeout)
         self.codex_update_auto_timer = QTimer(self)
         self.codex_update_auto_timer.setSingleShot(True)
         self.codex_update_auto_timer.setInterval(5_000)
@@ -995,10 +1011,13 @@ class MainWindow(QMainWindow):
     def _begin_usage_sequence(self) -> None:
         self._usage_sequence_active = True
         self._usage_attempts = 0
-        self._usage_request_mode = None
+        if not self._usage_request_in_flight:
+            self._usage_request_mode = None
         self.usage_initial_timer.start()
         self.usage_retry_timer.stop()
         self.usage_poll_timer.start()
+        if self._pending_usage_snapshot_turns and not self.turn_usage_snapshot_timer.isActive():
+            self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
 
     def _invalidate_usage_sequence(self) -> None:
         self._usage_sequence_active = False
@@ -1006,25 +1025,30 @@ class MainWindow(QMainWindow):
         self.usage_initial_timer.stop()
         self.usage_retry_timer.stop()
         self.usage_poll_timer.stop()
+        self.turn_usage_snapshot_timer.stop()
         if self._usage_request_in_flight:
             self._client.abort_json_group("usage")
+        if self._usage_request_mode == "turn_snapshot":
+            self._usage_snapshot_request_turns.clear()
         self._usage_request_in_flight = False
         self._usage_request_mode = None
 
-    def _start_usage_request(self, mode: str) -> None:
+    def _start_usage_request(self, mode: str) -> bool:
         if self._closing or self._usage_request_in_flight:
-            return
+            return False
         if mode != "manual" and not self._usage_ready:
-            return
+            return False
         if mode == "initial":
             if not self._usage_sequence_active or self._usage_attempts >= _USAGE_MAX_ATTEMPTS:
-                return
+                return False
             self._usage_attempts += 1
         if self._client.get_json("/ui-api/account/rate-limits", key="usage"):
             self._usage_request_in_flight = True
             self._usage_request_mode = mode
+            return True
         elif mode == "initial":
             self._usage_attempts -= 1
+        return False
 
     def _on_usage_initial_timeout(self) -> None:
         self.usage_initial_timer.stop()
@@ -1039,11 +1063,79 @@ class MainWindow(QMainWindow):
         if self._usage_ready:
             self._start_usage_request("periodic")
 
+    def _schedule_turn_usage_snapshot(self, thread_id: str, turn_id: str) -> None:
+        key = (thread_id, turn_id)
+        if key in self._usage_snapshots:
+            return
+        self._usage_snapshots[key] = None
+        self._pending_usage_snapshot_turns.add(key)
+        while len(self._usage_snapshots) > _USAGE_SNAPSHOT_MAX_ENTRIES:
+            oldest, _snapshot = self._usage_snapshots.popitem(last=False)
+            self._pending_usage_snapshot_turns.discard(oldest)
+            self._usage_snapshot_request_turns.discard(oldest)
+        if self._pending_usage_snapshot_turns and not self.turn_usage_snapshot_timer.isActive():
+            self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
+
+    def _on_turn_usage_snapshot_timeout(self) -> None:
+        if self._closing or not self._pending_usage_snapshot_turns:
+            return
+        if (
+            self._usage_request_in_flight
+            or self.usage_initial_timer.isActive()
+            or self.usage_retry_timer.isActive()
+        ):
+            self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DEFER_MS)
+            return
+        if not self._usage_ready:
+            return
+        candidates = set(self._pending_usage_snapshot_turns)
+        if not self._start_usage_request("turn_snapshot"):
+            return
+        self._usage_snapshot_request_turns = candidates
+
+    def _finish_turn_usage_snapshot(self, candidates: set[tuple[str, str]]) -> None:
+        has_usage = self._usage.five_hour is not None or self._usage.weekly is not None
+        snapshot = (
+            CodexUsageSnapshot(self._usage, datetime.now().astimezone()) if has_usage else None
+        )
+        for key in candidates:
+            if key in self._usage_snapshots and snapshot is not None:
+                self._usage_snapshots[key] = snapshot
+            self._pending_usage_snapshot_turns.discard(key)
+
+        selected_thread_id = self._selected_thread_id
+        snapshot_turn_ids = {
+            turn_id
+            for thread_id, turn_id in candidates
+            if thread_id == selected_thread_id and snapshot is not None
+        }
+        if snapshot_turn_ids and any(
+            entry.turn_id in snapshot_turn_ids for entry in self._timeline_entries
+        ):
+            self._render_timeline()
+
     def _apply_usage(self, payload: object) -> None:
         self._usage = parse_codex_usage(payload)
-        self.usage_status_label.setText(format_codex_usage(self._usage))
-        self.usage_status_label.setToolTip(format_codex_usage_tooltip(self._usage))
-        self.usage_detail_label.setText(format_codex_usage_detail(self._usage))
+        self._usage_refresh_error = None
+        self._render_usage_status()
+
+    def _apply_usage_failure(self, message: str) -> None:
+        bounded_message = " ".join(message.split())[:256]
+        self._usage_refresh_error = bounded_message or "request failed"
+        self._render_usage_status()
+
+    def _render_usage_status(self) -> None:
+        status_text = format_codex_usage(self._usage)
+        tooltip = format_codex_usage_tooltip(self._usage)
+        detail = format_codex_usage_detail(self._usage)
+        if self._usage_refresh_error is not None:
+            failure_detail = f"Refresh failed: {self._usage_refresh_error}"
+            status_text += " · refresh failed"
+            tooltip += f"\n{failure_detail}"
+            detail += f"\n{failure_detail}"
+        self.usage_status_label.setText(status_text)
+        self.usage_status_label.setToolTip(tooltip)
+        self.usage_detail_label.setText(detail)
         level = usage_level(self._usage)
         font = self.usage_status_label.font()
         font.setBold(level != "normal")
@@ -1753,14 +1845,22 @@ class MainWindow(QMainWindow):
             self._sync_empty_state()
             return
         if key == "usage":
+            mode = self._usage_request_mode
+            snapshot_candidates = (
+                set(self._usage_snapshot_request_turns) if mode == "turn_snapshot" else set()
+            )
             self._usage_request_in_flight = False
             self._usage_request_mode = None
-            self._usage_sequence_active = False
-            self.usage_initial_timer.stop()
-            self.usage_retry_timer.stop()
+            self._usage_snapshot_request_turns.clear()
+            if mode != "turn_snapshot":
+                self._usage_sequence_active = False
+                self.usage_initial_timer.stop()
+                self.usage_retry_timer.stop()
             if self._usage_ready:
                 self.usage_poll_timer.start()
             self._apply_usage(payload)
+            if mode == "turn_snapshot":
+                self._finish_turn_usage_snapshot(snapshot_candidates)
             return
         if key == "launch:health":
             self._apply_launch_health(payload)
@@ -1828,11 +1928,18 @@ class MainWindow(QMainWindow):
         self._render_timeline(prepend=prepend)
 
     def _render_timeline(self, *, prepend: bool = False) -> None:
+        selected_thread_id = self._selected_thread_id
+        turn_usage_snapshots = {
+            turn_id: snapshot
+            for (thread_id, turn_id), snapshot in self._usage_snapshots.items()
+            if thread_id == selected_thread_id and snapshot is not None
+        }
         self.history_pane.set_timeline(
             self._timeline_entries,
             has_older=self._next_cursor is not None,
             turn_statuses=self._turn_statuses,
             turn_model_metadata=self._turn_model_metadata,
+            turn_usage_snapshots=turn_usage_snapshots,
             prepend=prepend,
         )
 
@@ -1926,17 +2033,31 @@ class MainWindow(QMainWindow):
             if not self._usage_request_in_flight:
                 return
             mode = self._usage_request_mode
+            snapshot_candidates = (
+                set(self._usage_snapshot_request_turns) if mode == "turn_snapshot" else set()
+            )
             self._usage_request_in_flight = False
             self._usage_request_mode = None
-            if (
-                mode == "initial"
-                and self._usage_sequence_active
-                and self._usage_ready
-                and self._usage_attempts < _USAGE_MAX_ATTEMPTS
-            ):
-                self.usage_retry_timer.start()
-            else:
-                self._usage_sequence_active = False
+            self._usage_snapshot_request_turns.clear()
+            self._apply_usage_failure(message)
+            if mode == "turn_snapshot":
+                for candidate in snapshot_candidates:
+                    self._pending_usage_snapshot_turns.discard(candidate)
+                if (
+                    self._pending_usage_snapshot_turns
+                    and not self.turn_usage_snapshot_timer.isActive()
+                ):
+                    self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
+            if mode != "turn_snapshot":
+                if (
+                    mode == "initial"
+                    and self._usage_sequence_active
+                    and self._usage_ready
+                    and self._usage_attempts < _USAGE_MAX_ATTEMPTS
+                ):
+                    self.usage_retry_timer.start()
+                else:
+                    self._usage_sequence_active = False
             return
         selection = self._is_current_selection(key)
         if selection is None:
@@ -1962,6 +2083,7 @@ class MainWindow(QMainWindow):
         thread_id = payload.get("thread_id")
         activity_type = payload.get("type")
         activity_status = payload.get("status")
+        turn_id = payload.get("turn_id")
         if isinstance(thread_id, str) and isinstance(activity_type, str):
             if (
                 activity_type == "turn_started"
@@ -1981,6 +2103,12 @@ class MainWindow(QMainWindow):
                 and activity_status in _TERMINAL_TURN_STATES
             ):
                 self._set_thread_active(thread_id, False)
+            if (
+                activity_type == "turn_completed"
+                and activity_status == "completed"
+                and isinstance(turn_id, str)
+            ):
+                self._schedule_turn_usage_snapshot(thread_id, turn_id)
         self.activity_pane.append_activity(payload)
 
     def _apply_stream_state(self, generation: int, state: str) -> None:

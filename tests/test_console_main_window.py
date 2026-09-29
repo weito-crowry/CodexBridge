@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import QCoreApplication, Qt, QTimer
-from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import QDesktopServices, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -22,6 +22,7 @@ from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.runtime_launcher import DetachedLaunchResult
 from codex_bridge.console.tunnel_supervisor import TunnelActionState
+from codex_bridge.console.widgets import TimelineEntry
 
 
 class Signal:
@@ -259,6 +260,22 @@ def _config() -> ConsoleConfig:
     return ConsoleConfig(allowed_roots=(str(Path.cwd()),))
 
 
+def _usage_window(client: FakeClient) -> MainWindow:
+    return MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+    )
+
+
+def _set_usage_ready(window: MainWindow) -> None:
+    window._bridge_ready = True
+    window._app_server_ready = True
+
+
 def _item(item_id: str, item_type: str, **fields: object) -> dict[str, object]:
     return {"id": item_id, "type": item_type, **fields}
 
@@ -308,6 +325,10 @@ def test_status_button_opens_detail_dialog_and_refresh_reloads_usage() -> None:
     assert any(
         key == "usage" and path == "/ui-api/account/rate-limits" for key, path, _ in client.requests
     )
+    assert window._usage_request_mode == "manual"
+    client.failure("usage", "manual refresh unavailable")
+    assert "refresh failed" in window.usage_status_label.text()
+    assert "manual refresh unavailable" in window.usage_detail_label.text()
     window.status_dialog.close()
     window.close()
 
@@ -340,6 +361,20 @@ def test_force_usage_does_not_change_mode_of_in_flight_initial_request() -> None
     window.close()
 
 
+def test_manual_usage_mode_survives_bridge_readiness_transition() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window._request_usage(force=True)
+    assert window._usage_request_mode == "manual"
+
+    client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+
+    assert window._usage_request_mode == "manual"
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    window.close()
+
+
 def test_ready_usage_waits_before_first_request() -> None:
     _application()
     client = FakeClient()
@@ -364,9 +399,11 @@ def test_initial_usage_failure_retries_only_after_delay_and_stops_at_three_attem
 
     client.result("health", {"status": "ok"})
     client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
+    assert window.usage_poll_timer.interval() == 5 * 60 * 1_000
     window._on_usage_initial_timeout()
     client.failure("usage", "Bridge unavailable")
 
+    assert "refresh failed" in window.usage_status_label.text()
     assert sum(key == "usage" for key, _, _ in client.requests) == 1
     assert window.usage_retry_timer.isActive()
     assert window.usage_retry_timer.interval() == 3_000
@@ -436,13 +473,439 @@ def test_periodic_usage_failure_keeps_last_known_display() -> None:
         {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}},
     )
     known = window.usage_status_label.text()
+    known_font_weight = window.usage_status_label.font().weight()
+    known_color = window.usage_status_label.palette().color(QPalette.ColorRole.WindowText)
     window._bridge_ready = True
     window._app_server_ready = True
     window._on_usage_poll_timeout()
     client.failure("usage", "Bridge unavailable")
 
-    assert window.usage_status_label.text() == known
-    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week —"
+    assert window.usage_status_label.text() == f"{known} · refresh failed"
+    assert window.usage_status_label.text().startswith("Codex Usage  5h 72% · Week —")
+    assert "Bridge unavailable" in window.usage_status_label.toolTip()
+    assert "Bridge unavailable" in window.usage_detail_label.text()
+    assert window.usage_status_label.font().weight() == known_font_weight
+    assert window.usage_status_label.palette().color(QPalette.ColorRole.WindowText) == known_color
+    assert window._usage.five_hour is not None
+    assert window._usage.five_hour.remaining_percent == 72
+    window.close()
+
+
+def test_periodic_usage_success_updates_values_and_clears_failure_state() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window._apply_usage({"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}})
+    window._bridge_ready = True
+    window._app_server_ready = True
+    window._on_usage_poll_timeout()
+    client.failure("usage", "temporary failure")
+
+    window._on_usage_poll_timeout()
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 11}}},
+    )
+
+    assert window.usage_status_label.text() == "Codex Usage  5h 89% · Week —"
+    assert "refresh failed" not in window.usage_status_label.text()
+    assert "temporary failure" not in window.usage_detail_label.text()
+    window.close()
+
+
+def test_usage_failure_message_is_bounded() -> None:
+    _application()
+    window = _usage_window(FakeClient())
+
+    window._apply_usage_failure("x" * 500)
+
+    assert window._usage_refresh_error == "x" * 256
+    assert len(window.usage_detail_label.text()) < 300
+    window.close()
+
+
+def test_completed_activity_schedules_one_delayed_snapshot_for_unique_turn() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window.select_thread("thread-a")
+    client.requests.clear()
+    event = {
+        "activity_id": "completed",
+        "thread_id": "thread-a",
+        "turn_id": "turn-a",
+        "type": "turn_completed",
+        "status": "completed",
+        "summary": "Turn completed",
+    }
+
+    client.activity(window._selection_generation, event)
+    client.activity(window._selection_generation, event)
+
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    assert window.turn_usage_snapshot_timer.isActive()
+    assert window.turn_usage_snapshot_timer.isSingleShot()
+    assert window.turn_usage_snapshot_timer.interval() == 1_000
+    assert not any(key == "usage" for key, _, _ in client.requests)
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    assert window._usage_request_mode == "turn_snapshot"
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}},
+    )
+    client.activity(window._selection_generation, event)
+    assert not window.turn_usage_snapshot_timer.isActive()
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    window.close()
+
+
+@pytest.mark.parametrize(
+    ("activity_type", "status"),
+    [
+        ("turn_failed", "failed"),
+        ("turn_interrupted", "interrupted"),
+        ("error", "error"),
+        ("turn_completed", "failed"),
+        ("turn_completed", "interrupted"),
+    ],
+)
+def test_non_completed_activity_does_not_schedule_usage_snapshot(
+    activity_type: str, status: str
+) -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "terminal",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": activity_type,
+            "status": status,
+        },
+    )
+
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    assert not window.turn_usage_snapshot_timer.isActive()
+    window.close()
+
+
+def test_completed_status_snapshot_does_not_capture_historical_turn_usage() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-a",
+            "state": "completed",
+            "recent_activities": [
+                {
+                    "activity_id": "old-completion",
+                    "thread_id": "thread-a",
+                    "turn_id": "turn-a",
+                    "type": "turn_completed",
+                    "status": "completed",
+                }
+            ],
+        },
+    )
+
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    assert not window.turn_usage_snapshot_timer.isActive()
+    assert not window._usage_snapshots
+    window.close()
+
+
+def test_completion_with_non_string_turn_id_does_not_schedule_snapshot() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": 17,
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    assert not window.turn_usage_snapshot_timer.isActive()
+    window.close()
+
+
+def test_simultaneous_completed_turns_share_one_usage_snapshot_request() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window.select_thread("thread-a")
+    for turn_id in ("turn-a", "turn-b"):
+        client.activity(
+            window._selection_generation,
+            {
+                "activity_id": f"completed-{turn_id}",
+                "thread_id": "thread-a",
+                "turn_id": turn_id,
+                "type": "turn_completed",
+                "status": "completed",
+            },
+        )
+
+    assert len(window._pending_usage_snapshot_turns) == 2
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    assert window._usage_snapshot_request_turns == {
+        ("thread-a", "turn-a"),
+        ("thread-a", "turn-b"),
+    }
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}},
+    )
+    assert window._usage_snapshots[("thread-a", "turn-a")] is not None
+    assert window._usage_snapshots[("thread-a", "turn-b")] is not None
+    window.close()
+
+
+@pytest.mark.parametrize("waiting_timer_name", ["usage_initial_timer", "usage_retry_timer"])
+def test_turn_snapshot_wait_does_not_cancel_initial_usage_sequence(
+    waiting_timer_name: str,
+) -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window._begin_usage_sequence()
+    waiting_timer = getattr(window, waiting_timer_name)
+    if waiting_timer_name == "usage_retry_timer":
+        window.usage_initial_timer.stop()
+        window._usage_attempts = 1
+        waiting_timer.start()
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+
+    assert waiting_timer.isActive()
+    assert window._usage_sequence_active
+    assert window._usage_request_mode is None
+    assert not any(key == "usage" for key, _, _ in client.requests)
+    assert window.turn_usage_snapshot_timer.interval() == 500
+    window.close()
+
+
+def test_turn_snapshot_waits_for_existing_usage_request_without_overwriting_mode() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window._on_usage_poll_timeout()
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+
+    assert window._usage_request_mode == "periodic"
+    assert sum(key == "usage" for key, _, _ in client.requests) == 1
+    assert window.turn_usage_snapshot_timer.isActive()
+    assert window.turn_usage_snapshot_timer.interval() == 500
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 20}}},
+    )
+    assert window._usage_snapshots.get(("thread-a", "turn-a")) is None
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    assert window._usage_request_mode == "turn_snapshot"
+    assert sum(key == "usage" for key, _, _ in client.requests) == 2
+    window.close()
+
+
+def test_turn_snapshot_success_is_saved_with_timestamp_and_rendered_in_history() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window.select_thread("thread-a")
+    window._timeline_entries = [
+        TimelineEntry("turn-a", "item-a", "Agent", "Agent", "answer", None, ())
+    ]
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    client.result(
+        "usage",
+        {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
+            }
+        },
+    )
+
+    assert hasattr(window, "_usage_snapshots")
+    snapshot = window._usage_snapshots[("thread-a", "turn-a")]
+    assert snapshot is not None
+    assert snapshot.usage.five_hour is not None
+    assert snapshot.usage.five_hour.remaining_percent == 72
+    assert snapshot.captured_at.tzinfo is not None
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week 61%"
+    labels = {label.text() for label in window.history_pane.findChildren(QLabel)}
+    assert any(
+        label.startswith("Usage snapshot: 5h 72% · Week 61% · captured ") for label in labels
+    )
+    assert not window._pending_usage_snapshot_turns
+    window.close()
+
+
+def test_turn_snapshot_failure_preserves_current_usage_and_saves_no_snapshot() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window._apply_usage({"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}})
+    known = window._usage
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    client.failure("usage", "snapshot unavailable")
+
+    assert window._usage is known
+    assert "5h 72%" in window.usage_status_label.text()
+    assert "refresh failed" in window.usage_status_label.text()
+    assert window._usage_snapshots.get(("thread-a", "turn-a")) is None
+    assert not window._pending_usage_snapshot_turns
+    window.close()
+
+
+def test_unavailable_usage_does_not_create_turn_snapshot() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    client.result("usage", {"rateLimits": {}})
+
+    assert window._usage_snapshots.get(("thread-a", "turn-a")) is None
+    assert not window._pending_usage_snapshot_turns
+    window.close()
+
+
+def test_usage_snapshot_survives_thread_switch_and_store_is_bounded() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+    window.select_thread("thread-a")
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "completed",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "turn_completed",
+            "status": "completed",
+        },
+    )
+    assert hasattr(window, "turn_usage_snapshot_timer")
+    window.turn_usage_snapshot_timer.stop()
+    window._on_turn_usage_snapshot_timeout()
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}},
+    )
+    window.select_thread("thread-b")
+    window.select_thread("thread-a")
+    window._apply_items(
+        {
+            "items": [
+                {
+                    "turn_id": "turn-a",
+                    "item": {"id": "item-a", "type": "agentMessage", "text": "answer"},
+                }
+            ]
+        },
+        prepend=False,
+    )
+
+    assert any(
+        label.text().startswith("Usage snapshot: 5h 72% · Week — · captured ")
+        for label in window.history_pane.findChildren(QLabel)
+    )
+
+    assert hasattr(window, "_schedule_turn_usage_snapshot")
+    for index in range(501):
+        window._schedule_turn_usage_snapshot("thread-a", f"turn-{index}")
+    assert len(window._usage_snapshots) == 500
+    assert ("thread-a", "turn-a") not in window._usage_snapshots
     window.close()
 
 

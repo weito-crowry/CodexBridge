@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
+
 
 @dataclass(frozen=True, slots=True)
 class TimelineEntry:
@@ -524,6 +526,7 @@ class HistoryPane(QWidget):
         has_older: bool = False,
         turn_statuses: Mapping[str, str] | None = None,
         turn_model_metadata: Mapping[str, Mapping[str, object]] | None = None,
+        turn_usage_snapshots: Mapping[str, CodexUsageSnapshot] | None = None,
         prepend: bool = False,
     ) -> None:
         scrollbar = self._scroll.verticalScrollBar()
@@ -546,6 +549,15 @@ class HistoryPane(QWidget):
                 separator = QLabel(_turn_header(turn_status, metadata))
                 separator.setObjectName("turnSeparator")
                 self._content_layout.addWidget(separator)
+                snapshot = turn_usage_snapshots.get(entry.turn_id) if turn_usage_snapshots else None
+                if snapshot is not None:
+                    snapshot_label = QLabel(format_codex_usage_snapshot(snapshot))
+                    snapshot_label.setObjectName("turnUsageSnapshot")
+                    snapshot_label.setWordWrap(True)
+                    snapshot_policy = snapshot_label.sizePolicy()
+                    snapshot_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+                    snapshot_label.setSizePolicy(snapshot_policy)
+                    self._content_layout.addWidget(snapshot_label)
             self._content_layout.addWidget(self._card(entry))
             previous_turn = entry.turn_id
         self._empty_label.setVisible(not entries)
