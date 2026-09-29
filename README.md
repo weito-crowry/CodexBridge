@@ -79,6 +79,39 @@ API keys, control-plane keys, or runtime control tokens.
 The GitHub Remote MCP PAT is never accepted in TOML and must be supplied only through
 `CODEX_BRIDGE_GITHUB_PAT` when the mount is enabled.
 
+## Windows packaged desktop app
+
+Download and extract the Windows package, then start `CodexBridge.exe` from the extracted
+`CodexBridge` folder. The Console starts and supervises its Bridge runtime when no external
+Bridge is already ready. You do not need to open a separate command prompt or start
+`codex-bridge` manually.
+
+The package does not include Codex CLI. The target PC needs a locally authenticated Codex CLI
+installation and, when used, the existing Tunnel client and profile configured separately.
+The app reads `%APPDATA%\CodexBridge\config.toml`; configure at least one existing absolute
+`bridge.allowed_roots` path using the configuration shape above. The setup UI is not included.
+
+The GUI-first package uses PyInstaller `onedir` with `windowed` mode, so normal startup and the
+detached Bridge runtime do not open a command prompt. Runtime output is written to the existing
+`bridge-runtime-stdout.log` and `bridge-runtime-stderr.log` diagnostics files.
+
+To rebuild on Windows from this repository, run:
+
+```powershell
+uv sync --extra dev --extra console --extra package
+.\scripts\build_windows.ps1
+```
+
+The build creates `dist\CodexBridge\` and `dist\CodexBridge-windows.zip`. No Codex CLI, PAT,
+Tunnel credentials, user configuration, or repository working files are bundled.
+
+For development and troubleshooting, both source entry points remain available:
+
+```powershell
+uv run codex-bridge
+uv run codex-bridge-console
+```
+
 The MCP endpoint is:
 
 ```text
@@ -242,7 +275,7 @@ canonical comparison. The `--version` probe has a roughly three-second timeout a
 output, and the Console shows only the detected version and source, never raw subprocess output
 or environment values.
 
-When the existing UI API is ready, the Console reports `Runtime: external` and disables Start Bridge. The existing external Bridge is never replaced. A valid detected Codex enables Start Bridge only while the Bridge is unavailable. The button starts exactly one detached child using `sys.executable -m codex_bridge`; the child inherits the current environment, with only `CODEX_BRIDGE_CODEX_EXECUTABLE` and `CODEX_BRIDGE_UI_PORT` controlled by the launcher. The Console waits for `/healthz` and `/ui-api/status` readiness before showing `Runtime: started by Console`.
+When the existing UI API is ready, the Console reports `Runtime: external` and disables Start Bridge. The existing external Bridge is never replaced. A valid detected Codex enables Start Bridge only while the Bridge is unavailable. The button starts exactly one detached child. Source runs use `sys.executable -m codex_bridge`; a frozen Windows package starts its own executable with the internal `--codexbridge-runtime` mode. The child inherits the current environment, with the Codex executable, UI port, control token, and allowed roots set by the launcher. The Console waits for `/healthz` and `/ui-api/status` readiness before showing `Runtime: started by Console`.
 
 The detached Bridge and its App Server continue after a tray hide, while explicit Console Exit
 requests graceful shutdown for a Bridge owned by this Console. A launch timeout is safe and does

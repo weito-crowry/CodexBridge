@@ -10,6 +10,7 @@ from typing import Any
 from PySide6.QtCore import QIODevice, QProcess, QProcessEnvironment
 
 from ..observability import bridge_runtime_stderr_log_path, bridge_runtime_stdout_log_path
+from ..runtime_mode import INTERNAL_RUNTIME_FLAG
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +52,11 @@ class BridgeRuntimeLauncher:
         environment.insert("CODEX_BRIDGE_CONTROL_TOKEN", control_token)
         if allowed_roots:
             environment.insert("CODEX_BRIDGE_ALLOWED_ROOTS", os.pathsep.join(allowed_roots))
+        frozen = bool(getattr(sys, "frozen", False))
+        if frozen:
+            environment.insert("PYINSTALLER_RESET_ENVIRONMENT", "1")
         process.setProgram(sys.executable)
-        process.setArguments(["-m", "codex_bridge"])
+        process.setArguments([INTERNAL_RUNTIME_FLAG] if frozen else ["-m", "codex_bridge"])
         process.setProcessEnvironment(environment)
         self._configure_output_redirects(process)
         self._process = process

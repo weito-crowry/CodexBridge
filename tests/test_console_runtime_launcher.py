@@ -62,6 +62,7 @@ def _application() -> QApplication:
 
 def test_launcher_uses_python_module_and_only_authorized_environment_overrides(monkeypatch) -> None:
     _application()
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
     process = FakeProcess()
     environments: list[FakeEnvironment] = []
 
@@ -104,6 +105,47 @@ def test_launcher_uses_python_module_and_only_authorized_environment_overrides(m
     assert token not in process.arguments
     assert token not in str(process.stdout_file)
     assert token not in str(process.stderr_file)
+    assert "PYINSTALLER_RESET_ENVIRONMENT" not in process.environment.values
+
+
+def test_frozen_launcher_uses_internal_runtime_mode_and_reset_environment(monkeypatch) -> None:
+    _application()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    process = FakeProcess()
+    environments: list[FakeEnvironment] = []
+
+    def environment_factory() -> FakeEnvironment:
+        environment = FakeEnvironment(
+            {
+                "CODEX_BRIDGE_PORT": "8123",
+                "CODEX_BRIDGE_GITHUB_PAT": "inherited-but-not-logged",
+            }
+        )
+        environments.append(environment)
+        return environment
+
+    launcher = BridgeRuntimeLauncher(
+        process_factory=lambda: process,
+        environment_factory=environment_factory,
+    )
+    token = "B" * 32
+
+    result = launcher.launch(
+        codex_executable="C:/Codex/codex.exe",
+        ui_port=8456,
+        control_token=token,
+    )
+
+    assert result.started
+    assert process.program == sys.executable
+    assert process.arguments == ["--codexbridge-runtime"]
+    assert process.environment is environments[0]
+    assert process.environment.values["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert process.environment.values["CODEX_BRIDGE_PORT"] == "8123"
+    assert process.environment.values["CODEX_BRIDGE_GITHUB_PAT"] == "inherited-but-not-logged"
+    assert process.environment.values["CODEX_BRIDGE_CONTROL_TOKEN"] == token
+    assert token not in process.arguments
+    assert process.detached_calls == 1
 
 
 def test_launcher_accepts_qprocess_bool_detached_result_without_pid() -> None:
