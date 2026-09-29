@@ -334,23 +334,62 @@ def test_friendly_project_label_requires_exact_normalized_root_match(tmp_path) -
     assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "exact"
 
 
-def test_missing_cwd_threads_are_kept_in_other_group() -> None:
+@pytest.mark.parametrize(
+    "threads, expected_child_ids",
+    [
+        pytest.param(
+            [
+                {"id": "relative", "cwd": "relative/path"},
+                {"id": "missing"},
+            ],
+            ["relative", "missing"],
+            id="relative-first",
+        ),
+        pytest.param(
+            [
+                {"id": "missing"},
+                {"id": "relative", "cwd": "relative/path"},
+            ],
+            ["missing", "relative"],
+            id="missing-first",
+        ),
+    ],
+)
+def test_invalid_cwd_threads_are_kept_in_other_group(
+    threads: list[dict[str, str]], expected_child_ids: list[str]
+) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     pane = ThreadListPane()
-    pane.set_threads([{"id": "missing"}, {"id": "relative", "cwd": "relative/path"}])
+    pane.set_threads(threads)
 
     assert pane.list_widget.topLevelItemCount() == 1
     assert pane.list_widget.topLevelItem(0).text(0) == "Other"
     assert pane.list_widget.topLevelItem(0).data(0, Qt.ItemDataRole.UserRole) is None
-    assert [item.data(0, Qt.ItemDataRole.UserRole) for item in _thread_items(pane)] == [
-        "missing",
-        "relative",
-    ]
+    assert [item.data(0, Qt.ItemDataRole.UserRole) for item in _thread_items(pane)] == (
+        expected_child_ids
+    )
 
     pane.list_widget.topLevelItem(0).setExpanded(False)
-    pane.set_threads([{"id": "missing"}, {"id": "relative", "cwd": "relative/path"}])
+    pane.set_threads(threads)
     assert not pane.list_widget.topLevelItem(0).isExpanded()
+
+
+def test_single_relative_cwd_displays_other_without_friendly_name() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+    pane.set_threads(
+        [{"id": "relative", "cwd": "relative/path"}],
+        project_names={"relative/path": "Friendly Project"},
+    )
+
+    parent = pane.list_widget.topLevelItem(0)
+    assert pane.list_widget.topLevelItemCount() == 1
+    assert parent.text(0) == "Other"
+    assert parent.data(0, Qt.ItemDataRole.UserRole) is None
+    assert parent.childCount() == 1
+    assert parent.child(0).data(0, Qt.ItemDataRole.UserRole) == "relative"
 
 
 def test_parent_and_empty_placeholder_have_no_thread_context_menu(tmp_path) -> None:

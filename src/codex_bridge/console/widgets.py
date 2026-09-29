@@ -318,7 +318,7 @@ class ThreadListPane(QWidget):
             group_key = normalize_cwd(raw_cwd)
             if group_key not in groups:
                 groups[group_key] = []
-                group_cwds[group_key] = cwd
+                group_cwds[group_key] = cwd if group_key is not None else None
             groups[group_key].append(thread)
 
         self._rendering = True
