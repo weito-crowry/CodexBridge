@@ -90,7 +90,6 @@ class FakeRemoteProvider:
 class ProbeSession:
     def __init__(self, client_capabilities: types.ClientCapabilities | None = None) -> None:
         self.protocol_version = "2026-07-28"
-        self.client_info = types.Implementation(name="ChatGPT", version="1.2.3")
         self.client_capabilities = client_capabilities
         self.progress_attempts: list[tuple[float, float | None, str | None]] = []
 
@@ -271,6 +270,11 @@ async def test_mcp_progress_token_probe_omits_raw_request_metadata_values(tmp_pa
     capabilities = types.ClientCapabilities(extensions={"example-safe-capability": {}})
     context, _ = probe_context(
         meta={
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "openai-mcp",
+                "version": "1.0.0",
+                "secret": "DO_NOT_LEAK",
+            },
             "progress_token": "secret-progress-token",
             "openai/session": "secret-session",
             "openai/subject": "secret-subject",
@@ -308,6 +312,7 @@ async def test_mcp_progress_token_probe_omits_raw_request_metadata_values(tmp_pa
     assert result["progress_token_present"] is True
     assert result["progress_token_type"] == "str"
     assert result["request_meta_keys"] == [
+        "io.modelcontextprotocol/clientInfo",
         "locale",
         "openai/organization",
         "openai/session",
@@ -319,7 +324,7 @@ async def test_mcp_progress_token_probe_omits_raw_request_metadata_values(tmp_pa
         "user/custom",
     ]
     assert result["protocol_version"] == "2026-07-28"
-    assert result["client_info"] == {"name": "ChatGPT", "version": "1.2.3"}
+    assert result["client_info"] == {"name": "openai-mcp", "version": "1.0.0"}
     assert result["client_capabilities"]["extensions"] == {"example-safe-capability": {}}
     assert result["locale"] == "ja-JP"
     assert result["timezone"] == "Asia/Tokyo"
@@ -334,9 +339,37 @@ async def test_mcp_progress_token_probe_omits_raw_request_metadata_values(tmp_pa
         "Secret Country",
         "SECRET_COORDINATES",
         "secret-custom-value",
+        "DO_NOT_LEAK",
     ):
         assert sensitive_value not in serialized
     assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_progress_token_probe_omits_absent_or_malformed_client_info(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_progress_token_probe"
+    )
+    client_info_values = (
+        None,
+        "invalid",
+        {"name": 123, "version": ["x"]},
+        {"name": "openai-mcp", "version": 1},
+    )
+
+    for client_info in client_info_values:
+        meta = {} if client_info is None else {"io.modelcontextprotocol/clientInfo": client_info}
+        context, _ = probe_context(meta=meta)
+
+        result = await tool.fn(context)
+
+        assert result["client_info"] is None
 
 
 @pytest.mark.asyncio

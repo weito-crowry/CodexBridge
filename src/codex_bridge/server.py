@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from importlib.resources import files as package_files
@@ -368,7 +368,15 @@ def create_app(
         """Report safe request and client capability details without metadata values."""
         meta = ctx.request_context.meta
         progress_token = meta.get("progress_token") if isinstance(meta, dict) else None
-        client_info = ctx.session.client_info
+        raw_client_info = (
+            meta.get("io.modelcontextprotocol/clientInfo") if isinstance(meta, dict) else None
+        )
+        client_info = None
+        if isinstance(raw_client_info, Mapping):
+            client_name = raw_client_info.get("name")
+            client_version = raw_client_info.get("version")
+            if isinstance(client_name, str) and isinstance(client_version, str):
+                client_info = {"name": client_name, "version": client_version}
         capabilities = ctx.session.client_capabilities
         capabilities_json = (
             capabilities.model_dump(
@@ -395,11 +403,7 @@ def create_app(
             if isinstance(meta, dict)
             else [],
             "protocol_version": ctx.protocol_version,
-            "client_info": (
-                {"name": client_info.name, "version": client_info.version}
-                if client_info is not None
-                else None
-            ),
+            "client_info": client_info,
             "client_capabilities": capabilities_json,
             "locale": locale if isinstance(locale, str) else None,
             "timezone": timezone if isinstance(timezone, str) else None,
