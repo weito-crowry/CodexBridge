@@ -4,8 +4,9 @@ import os
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from pathlib import Path
 from secrets import token_urlsafe
-from time import monotonic
+from time import monotonic, time
 from typing import Any
 from urllib.parse import quote
 
@@ -58,11 +59,20 @@ from .usage import (
     parse_codex_usage,
     usage_level,
 )
+from .usage_history import (
+    UsageHistoryEvent,
+    UsageHistorySample,
+    default_usage_history_path,
+    get_recent_usage_events,
+    get_usage_samples,
+    record_usage_sample,
+)
 from .widgets import (
     ActivityPane,
     HistoryPane,
     ThreadListPane,
     TimelineEntry,
+    UsageHistoryWidget,
     copy_to_clipboard,
     format_thread_content,
     timeline_entries,
@@ -75,7 +85,7 @@ _BRIDGE_START_RETRY_DELAYS_MS = (2_000, 5_000, 10_000)
 _BRIDGE_LOSS_THRESHOLD = 2
 _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
-_USAGE_POLL_INTERVAL_MS = 5 * 60 * 1_000
+_USAGE_POLL_INTERVAL_MS = 60 * 1_000
 _USAGE_MAX_ATTEMPTS = 3
 _USAGE_SNAPSHOT_DELAY_MS = 1_000
 _USAGE_SNAPSHOT_DEFER_MS = 500
@@ -167,9 +177,13 @@ class MainWindow(QMainWindow):
         tray_available: bool | None = None,
         quit_application: Callable[[], None] | None = None,
         codex_uri_opener: Callable[[str], bool] | None = None,
+        usage_history_path: Path | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
+        self._usage_history_path = (
+            default_usage_history_path() if usage_history_path is None else usage_history_path
+        )
         self._client = api_client or ApiClient(config.base_url, self)
         self._codex_probe = codex_probe if codex_probe is not None else self._new_codex_probe()
         self._codex_update_probe = (
@@ -394,6 +408,7 @@ class MainWindow(QMainWindow):
 
         self.usage_detail_label = QLabel(format_codex_usage_detail(self._usage))
         self.usage_detail_label.setWordWrap(True)
+        self.usage_history_widget = UsageHistoryWidget()
         self.codex_latest_label = QLabel("Not checked")
         self.codex_update_status_label = QLabel("Not checked")
         self.codex_update_message_label = QLabel("")
@@ -442,7 +457,10 @@ class MainWindow(QMainWindow):
                 ("Runtime", self.runtime_status_label),
             ],
         )
-        add_section("Usage", [("Codex Usage", self.usage_detail_label)])
+        add_section(
+            "Usage",
+            [("Codex Usage", self.usage_detail_label), ("", self.usage_history_widget)],
+        )
         add_section(
             "Tunnel",
             [
@@ -617,6 +635,7 @@ class MainWindow(QMainWindow):
         self.advanced_toggle_button.toggled.connect(self.advanced_controls.setVisible)
 
     def _show_status(self) -> None:
+        self._refresh_usage_history()
         self.status_dialog.show()
         self.status_dialog.raise_()
         self.status_dialog.activateWindow()
@@ -1224,6 +1243,32 @@ class MainWindow(QMainWindow):
         }[level]
         palette.setColor(QPalette.ColorRole.WindowText, palette.color(role))
         self.usage_status_label.setPalette(palette)
+
+    def _refresh_usage_history(self, *, end_epoch: float | None = None) -> None:
+        end = time() if end_epoch is None else end_epoch
+        start = end - 7 * 24 * 60 * 60
+        samples: list[UsageHistorySample] = get_usage_samples(
+            start, end, database_path=self._usage_history_path
+        )
+        events: list[UsageHistoryEvent] = get_recent_usage_events(
+            limit=20, database_path=self._usage_history_path
+        )
+        self.usage_history_widget.set_history(
+            samples,
+            events,
+            start_epoch=start,
+            end_epoch=end,
+        )
+
+    def _record_usage_history(self) -> None:
+        captured_at_epoch = time()
+        sample = record_usage_sample(
+            self._usage,
+            captured_at_epoch=captured_at_epoch,
+            database_path=self._usage_history_path,
+        )
+        if sample is not None:
+            self._refresh_usage_history(end_epoch=captured_at_epoch)
 
     def _sync_overall_status(self) -> None:
         bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
@@ -1929,6 +1974,7 @@ class MainWindow(QMainWindow):
             if self._usage_ready:
                 self.usage_poll_timer.start()
             self._apply_usage(payload)
+            self._record_usage_history()
             if mode == "turn_snapshot":
                 self._finish_turn_usage_snapshot(snapshot_candidates)
             return

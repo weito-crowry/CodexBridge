@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.runtime_launcher import DetachedLaunchResult
 from codex_bridge.console.tunnel_supervisor import TunnelActionState
+from codex_bridge.console.usage_history import get_recent_usage_events, get_usage_samples
 from codex_bridge.console.widgets import TimelineEntry
 
 
@@ -464,10 +466,15 @@ def test_diagnostics_widget_is_bounded_and_follows_only_when_at_bottom() -> None
     window.close()
 
 
-def test_status_button_opens_detail_dialog_and_refresh_reloads_usage() -> None:
+def test_status_button_opens_detail_dialog_and_refresh_reloads_usage(tmp_path: Path) -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=tmp_path / "usage-history.sqlite3",
+    )
 
     window.status_button.click()
     assert window.status_dialog.isVisible()
@@ -552,7 +559,7 @@ def test_initial_usage_failure_retries_only_after_delay_and_stops_at_three_attem
 
     client.result("health", {"status": "ok"})
     client.result("bridge-status", {"bridge": "ready", "app_server": "ready"})
-    assert window.usage_poll_timer.interval() == 5 * 60 * 1_000
+    assert window.usage_poll_timer.interval() == 60 * 1_000
     window._on_usage_initial_timeout()
     client.failure("usage", "Bridge unavailable")
 
@@ -663,6 +670,111 @@ def test_periodic_usage_success_updates_values_and_clears_failure_state() -> Non
     assert window.usage_status_label.text() == "Codex Usage  5h 89% · Week —"
     assert "refresh failed" not in window.usage_status_label.text()
     assert "temporary failure" not in window.usage_detail_label.text()
+    window.close()
+
+
+def test_usage_failure_does_not_save_history(tmp_path: Path) -> None:
+    _application()
+    client = FakeClient()
+    database_path = tmp_path / "usage-history.sqlite3"
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=database_path,
+    )
+    window._usage_request_in_flight = True
+    window._usage_request_mode = "periodic"
+
+    client.failure("usage", "temporary failure")
+
+    assert not database_path.exists()
+    window.close()
+
+
+def test_success_with_unavailable_usage_does_not_save_history(tmp_path: Path) -> None:
+    _application()
+    client = FakeClient()
+    database_path = tmp_path / "usage-history.sqlite3"
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=database_path,
+    )
+
+    client.result("usage", {"rateLimits": {}})
+
+    assert not database_path.exists()
+    window.close()
+
+
+def test_success_saves_history_refreshes_ui_and_status_reopens_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _application()
+    client = FakeClient()
+    database_path = tmp_path / "usage-history.sqlite3"
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=database_path,
+    )
+    current_epoch = 1_790_000_000.0
+    monkeypatch.setattr(main_window_module, "time", lambda: current_epoch)
+
+    client.result(
+        "usage",
+        {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 70},
+            }
+        },
+    )
+    assert (
+        len(get_usage_samples(current_epoch - 1, current_epoch, database_path=database_path)) == 1
+    )
+    assert [
+        series.count() for series in window.usage_history_widget.chart_view.chart().series()
+    ] == [
+        1,
+        1,
+    ]
+
+    current_epoch += 60
+    client.result(
+        "usage",
+        {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 25},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 0},
+            }
+        },
+    )
+    assert get_recent_usage_events(database_path=database_path)[0].current_weekly_remaining == 100
+    local_time = datetime.fromtimestamp(current_epoch).strftime("%Y-%m-%d %H:%M")
+    assert window.usage_history_widget.weekly_increases_label.text() == (
+        f"{local_time}  30% -> 100%"
+    )
+    assert [
+        series.count() for series in window.usage_history_widget.chart_view.chart().series()
+    ] == [
+        2,
+        2,
+    ]
+
+    window.usage_history_widget.set_history([], [], start_epoch=0, end_epoch=60)
+    window._show_status()
+
+    assert [
+        series.count() for series in window.usage_history_widget.chart_view.chart().series()
+    ] == [
+        2,
+        2,
+    ]
+    assert "30% -> 100%" in window.usage_history_widget.weekly_increases_label.text()
     window.close()
 
 
