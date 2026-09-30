@@ -1450,6 +1450,25 @@ async def test_approval_response_is_scoped_to_request_id(allowed_dir) -> None:
 
 
 @pytest.mark.asyncio
+async def test_has_pending_request_is_read_only_and_matches_exact_id(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    request_id = "notebook::request::eyJyZXF1ZXN0X2lkIjoxfQ"
+    await bridge.handle_server_request(
+        {
+            "id": request_id,
+            "method": "item/fileChange/requestApproval",
+            "params": {"itemId": "item", "threadId": "thread", "turnId": "turn"},
+        }
+    )
+    pending = store.get_pending_request(request_id)
+
+    assert bridge.has_pending_request(request_id) is True
+    assert bridge.has_pending_request("notebook::request::other") is False
+    assert store.get_pending_request(request_id) is pending
+    assert app.responses == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "decision",
     ["accept", "acceptForSession", "decline", "cancel"],

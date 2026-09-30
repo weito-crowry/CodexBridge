@@ -568,6 +568,9 @@ class Bridge:
         self._state.ensure_turn(thread_id, turn_id)
         return self._public_snapshot(thread_id, turn_id)
 
+    def has_pending_request(self, request_id: RequestId) -> bool:
+        return self._state.get_pending_request(request_id) is not None
+
     async def approve(self, request_id: RequestId, decision: ApprovalDecision) -> dict[str, Any]:
         if decision not in _APPROVAL_DECISIONS:
             raise ValueError("unsupported approval decision")

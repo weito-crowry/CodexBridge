@@ -51,6 +51,8 @@ class ExecutionTargetError(ValueError):
 
 
 class BridgePort(Protocol):
+    def has_pending_request(self, request_id: RequestId) -> bool: ...
+
     async def start(self, cwd: str, prompt: str) -> dict[str, Any]: ...
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]: ...
@@ -569,25 +571,30 @@ class ExecutionTargetRouter:
     ) -> dict[str, Any]:
         if not isinstance(request_id, (int, str)) or isinstance(request_id, bool):
             raise ExecutionTargetError("request id is malformed")
-        handle = _parse_request_handle(request_id)
-        if handle is None:
+        bridge = self._bridge()
+        if bridge.has_pending_request(request_id):
             target = self._local
             native_request_id = request_id
         else:
-            target_id, native_request_id = handle
-            selected_target = self._by_id.get(target_id)
-            if selected_target is None or selected_target.kind != "remote":
-                raise ExecutionTargetError("request handle references an unknown target")
-            target = selected_target
+            handle = _parse_request_handle(request_id)
+            if handle is None:
+                target = self._local
+                native_request_id = request_id
+            else:
+                target_id, native_request_id = handle
+                selected_target = self._by_id.get(target_id)
+                if selected_target is None or selected_target.kind != "remote":
+                    raise ExecutionTargetError("request handle references an unknown target")
+                target = selected_target
         arguments = {"request_id": native_request_id, **values}
         if target.kind == "remote":
             result = await self._remote_clients[target.id].call_tool(name, arguments)
         elif name == "codex_approval":
-            result = await self._bridge().approve(
+            result = await bridge.approve(
                 native_request_id, cast(ApprovalDecision, values["decision"])
             )
         else:
-            result = await self._bridge().answer_user_input(
+            result = await bridge.answer_user_input(
                 native_request_id, cast(dict[str, list[str]], values["answers"])
             )
         return self._rewrite_result(target, result)

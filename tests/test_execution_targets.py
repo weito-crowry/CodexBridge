@@ -27,6 +27,10 @@ OTHER = ExecutionTargetConfig("other", "Other PC", "remote", "https://other.exam
 class FakeBridge:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self.pending_requests: set[int | str] = set()
+
+    def has_pending_request(self, request_id: int | str) -> bool:
+        return request_id in self.pending_requests
 
     async def _call(self, name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self.calls.append((name, args, kwargs))
@@ -274,6 +278,30 @@ async def test_approval_and_user_input_decode_target_request_handles() -> None:
         ("codex_approval", {"request_id": 1, "decision": "accept"}),
         ("codex_user_input", {"request_id": "1", "answers": {"q": ["answer"]}}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_pending_approval_id_takes_precedence_over_remote_handle() -> None:
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK)
+    collision_id = _request_handle("notebook", 1)
+    bridge.pending_requests.add(collision_id)
+
+    await router.codex_approval(collision_id, "accept")
+
+    assert bridge.calls == [("approve", (collision_id, "accept"), {})]
+    assert remotes["notebook"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_local_pending_user_input_id_takes_precedence_over_remote_handle() -> None:
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK)
+    collision_id = _request_handle("notebook", 1)
+    bridge.pending_requests.add(collision_id)
+
+    await router.codex_user_input(collision_id, {"q": ["answer"]})
+
+    assert bridge.calls == [("answer", (collision_id, {"q": ["answer"]}), {})]
+    assert remotes["notebook"].calls == []
 
 
 @pytest.mark.parametrize(
