@@ -155,6 +155,49 @@ def test_reset_events_without_confirmation_samples_are_not_displayed(tmp_path: P
     window.close()
 
 
+def test_legacy_transient_reset_event_is_hidden_without_deleting_database_row(
+    tmp_path: Path,
+) -> None:
+    _application()
+    database_path = tmp_path / "legacy-event.sqlite3"
+    reset_at = _epoch(2026, 9, 27, 6, 14)
+    record_usage_sample(
+        _usage(70, 18), captured_at_epoch=reset_at - 120, database_path=database_path
+    )
+    record_usage_sample(
+        _usage(70, 61), captured_at_epoch=reset_at - 60, database_path=database_path
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO usage_events (
+                occurred_at_epoch, event_type, previous_weekly_remaining,
+                current_weekly_remaining
+            ) VALUES (?, ?, ?, ?)""",
+            (reset_at - 60, "weekly_remaining_increase", 18, 61),
+        )
+    record_usage_sample(_usage(70, 19), captured_at_epoch=reset_at, database_path=database_path)
+    record_usage_sample(
+        _usage(70, 18), captured_at_epoch=reset_at + 60, database_path=database_path
+    )
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = UsageHistoryWindow(
+        database_path,
+        now=lambda: float(reset_at + 120),
+        settings=settings,
+    )
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at - 300))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at + 300))
+
+    assert window.refresh()
+    assert window.summary_labels["Reset candidates"].text() == "0"
+    assert window.reset_series.count() == 0
+    assert window.reset_history_list.count() == 1
+    assert window.reset_history_list.item(0).text() == "No reset candidates in this period."
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 1
+    window.close()
+
+
 def test_reset_view_ignores_unrecognized_event_types(tmp_path: Path) -> None:
     _application()
     database_path = tmp_path / "usage.sqlite3"
@@ -166,6 +209,9 @@ def test_reset_view_ignores_unrecognized_event_types(tmp_path: Path) -> None:
         _usage(70, 100), captured_at_epoch=reset_at - 60, database_path=database_path
     )
     record_usage_sample(_usage(70, 99), captured_at_epoch=reset_at, database_path=database_path)
+    record_usage_sample(
+        _usage(70, 98), captured_at_epoch=reset_at + 60, database_path=database_path
+    )
     with sqlite3.connect(database_path) as connection:
         connection.executemany(
             """INSERT INTO usage_events (
@@ -202,6 +248,9 @@ def test_summary_and_reset_marker_use_selected_period_events(tmp_path: Path) -> 
         _usage(None, 100), captured_at_epoch=reset_at - 60, database_path=database_path
     )
     record_usage_sample(_usage(None, 99), captured_at_epoch=reset_at, database_path=database_path)
+    record_usage_sample(
+        _usage(None, 98), captured_at_epoch=reset_at + 60, database_path=database_path
+    )
     window = UsageHistoryWindow(
         database_path,
         now=lambda: float(reset_at + 1),
@@ -212,7 +261,7 @@ def test_summary_and_reset_marker_use_selected_period_events(tmp_path: Path) -> 
     assert window.refresh()
 
     assert window.summary_labels["5h remaining"].text() == "71%"
-    assert window.summary_labels["Weekly remaining"].text() == "99%"
+    assert window.summary_labels["Weekly remaining"].text() == "98%"
     assert window.summary_labels["Reset candidates"].text() == "1"
     assert window.reset_series.count() == 1
     point = window.reset_series.at(0)
@@ -257,21 +306,52 @@ def test_legend_marker_click_can_toggle_each_series_off_and_on(
 
     series = getattr(window, series_name)
     marker = window.chart.legend().markers(series)[0]
+    original_pen = marker.pen()
+    original_brush = marker.brush()
+    original_label_brush = marker.labelBrush()
     legend_rect = window.chart.legend().sceneBoundingRect()
-    x_fraction = 0.24 if series_name == "five_hour_series" else 0.47
+    x_fraction = 0.35 if series_name == "five_hour_series" else 0.47
     click_position = window.chart_view.mapFromScene(
         QPointF(legend_rect.left() + legend_rect.width() * x_fraction, legend_rect.center().y())
     )
     QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
     _application().processEvents()
-    assert series.isVisible()
-    assert series.opacity() == 1.0
-    assert series.pen().color().alpha() == 0
+    assert not series.isVisible()
     assert marker.isVisible()
+    assert marker.pen().color().alpha() < original_pen.color().alpha()
+    assert marker.labelBrush().color().alpha() < original_label_brush.color().alpha()
 
     QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
     _application().processEvents()
-    assert series.pen().color().alpha() == 255
+    assert series.isVisible()
+    assert marker.isVisible()
+    assert marker.pen() == original_pen
+    assert marker.brush() == original_brush
+    assert marker.labelBrush() == original_label_brush
+    window.close()
+
+
+def test_reset_candidate_legend_marker_does_not_toggle_its_series(tmp_path: Path) -> None:
+    _application()
+    settings = QSettings(str(tmp_path / "reset-legend-settings.ini"), QSettings.Format.IniFormat)
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: 1_790_000_000.0,
+        settings=settings,
+    )
+    window.resize(900, 700)
+    window.show()
+    _application().processEvents()
+
+    marker = window.chart.legend().markers(window.reset_series)[0]
+    legend_rect = window.chart.legend().sceneBoundingRect()
+    click_position = window.chart_view.mapFromScene(
+        QPointF(legend_rect.left() + legend_rect.width() * 0.62, legend_rect.center().y())
+    )
+    QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
+    _application().processEvents()
+
+    assert window.reset_series.isVisible()
     assert marker.isVisible()
     window.close()
 
@@ -426,12 +506,18 @@ def test_usage_history_window_restores_saved_geometry_and_recovers_from_corrupti
     settings_path = tmp_path / "settings.ini"
     settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
     first = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
-    first.resize(1_100, 740)
+    screen = QApplication.primaryScreen()
+    assert screen is not None
+    available = screen.availableGeometry()
+    first.resize(
+        min(1_100, max(first.minimumWidth(), available.width() - 40)),
+        min(740, max(first.minimumHeight(), available.height() - 40)),
+    )
+    saved_size = first.size()
     first.close()
 
     restored = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
-    assert restored.size().width() == 1_100
-    assert restored.size().height() == 740
+    assert restored.size() == saved_size
     restored.close()
 
     settings.setValue("console/usageHistory/geometry", b"damaged")

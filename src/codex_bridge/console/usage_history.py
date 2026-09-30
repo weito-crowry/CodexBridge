@@ -127,16 +127,21 @@ def record_usage_sample(
             FROM usage_samples
             WHERE weekly_remaining IS NOT NULL
             ORDER BY minute_epoch DESC
-            LIMIT 3
+            LIMIT 4
             """
         ).fetchall()
-        if len(recent_weekly) == 3:
-            confirmation, candidate, baseline = recent_weekly
+        if len(recent_weekly) == 4:
+            confirmation_2, confirmation_1, candidate, baseline = recent_weekly
             previous_weekly = baseline["weekly_remaining"]
             candidate_weekly = candidate["weekly_remaining"]
-            confirmed_weekly = confirmation["weekly_remaining"]
+            confirmed_weekly_1 = confirmation_1["weekly_remaining"]
+            confirmed_weekly_2 = confirmation_2["weekly_remaining"]
             candidate_minute = candidate["minute_epoch"]
-            if candidate_weekly > previous_weekly and confirmed_weekly > previous_weekly:
+            if (
+                candidate_weekly > previous_weekly
+                and confirmed_weekly_1 > previous_weekly
+                and confirmed_weekly_2 > previous_weekly
+            ):
                 existing_event = connection.execute(
                     """
                     SELECT 1
@@ -370,17 +375,17 @@ def get_confirmed_usage_events(
                 """,
                 (candidate_minute,),
             ).fetchone()
-            confirmation = connection.execute(
+            confirmations = connection.execute(
                 """
                 SELECT weekly_remaining
                 FROM usage_samples
                 WHERE minute_epoch > ? AND weekly_remaining IS NOT NULL
                 ORDER BY minute_epoch ASC
-                LIMIT 1
+                LIMIT 2
                 """,
                 (candidate_minute,),
-            ).fetchone()
-            if baseline is None or candidate is None or confirmation is None:
+            ).fetchall()
+            if baseline is None or candidate is None or len(confirmations) < 2:
                 continue
             previous_weekly = baseline["weekly_remaining"]
             candidate_weekly = candidate["weekly_remaining"]
@@ -388,7 +393,8 @@ def get_confirmed_usage_events(
                 event.previous_weekly_remaining == previous_weekly
                 and event.current_weekly_remaining == candidate_weekly
                 and candidate_weekly > previous_weekly
-                and confirmation["weekly_remaining"] > previous_weekly
+                and confirmations[0]["weekly_remaining"] > previous_weekly
+                and confirmations[1]["weekly_remaining"] > previous_weekly
             ):
                 confirmed.append(event)
                 seen_candidate_minutes.add(candidate_minute)

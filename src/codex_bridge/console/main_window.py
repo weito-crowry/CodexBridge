@@ -814,7 +814,7 @@ class MainWindow(QMainWindow):
         scrollbar = self.diagnostics_text.verticalScrollBar()
         follow = scrollbar.maximum() - scrollbar.value() <= 1
         previous_value = scrollbar.value()
-        self.diagnostics_text.appendPlainText("\r\n".join(lines))
+        self.diagnostics_text.appendPlainText("\n".join(lines))
         if follow:
             scrollbar.setValue(scrollbar.maximum())
         else:
@@ -928,7 +928,7 @@ class MainWindow(QMainWindow):
         if not self._bridge_ready:
             location = f"{self._config.host}:{self._config.port}"
             self.history_pane.set_empty_state(
-                f"CodexBridge is not available on {location}\r\nStart codex-bridge and retry."
+                f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
             )
             self.activity_pane.set_error("Bridge unavailable")
             return
@@ -1240,8 +1240,8 @@ class MainWindow(QMainWindow):
         if self._usage_refresh_error is not None:
             failure_detail = f"Refresh failed: {self._usage_refresh_error}"
             status_text += " · refresh failed"
-            tooltip += f"\r\n{failure_detail}"
-            detail += f"\r\n{failure_detail}"
+            tooltip += f"\n{failure_detail}"
+            detail += f"\n{failure_detail}"
         self.usage_status_label.setText(status_text)
         self.usage_status_label.setToolTip(tooltip)
         self.usage_detail_label.setText(detail)

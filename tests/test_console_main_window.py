@@ -384,7 +384,7 @@ def test_diagnostics_clear_only_clears_widget_and_future_logs_return(tmp_path) -
 
     _application()
     path = tmp_path / "runtime.log"
-    path.write_text("first line\r\n", encoding="utf-8")
+    path.write_text("first line\n", encoding="utf-8")
     reader = DiagnosticsReader(
         sources=(DiagnosticSource("Bridge stdout", path, False),),
     )
@@ -404,7 +404,7 @@ def test_diagnostics_clear_only_clears_widget_and_future_logs_return(tmp_path) -
     assert window.diagnostics_text.toPlainText() == ""
     assert path.read_bytes() == original_contents
     with path.open("a", encoding="utf-8") as stream:
-        stream.write("after clear\r\n")
+        stream.write("after clear\n")
     window._on_diagnostics_timeout()
     assert "after clear" in window.diagnostics_text.toPlainText()
     window.close()
@@ -415,7 +415,7 @@ def test_diagnostics_reopen_rebuilds_recent_tail_without_duplicates(tmp_path) ->
 
     _application()
     path = tmp_path / "runtime.log"
-    path.write_text("first\r\n", encoding="utf-8")
+    path.write_text("first\n", encoding="utf-8")
     reader = DiagnosticsReader(
         sources=(DiagnosticSource("Bridge stdout", path, False),),
     )
@@ -436,7 +436,7 @@ def test_diagnostics_reopen_rebuilds_recent_tail_without_duplicates(tmp_path) ->
     assert window.diagnostics_pane.isHidden()
     assert not window.diagnostics_timer.isActive()
     with path.open("a", encoding="utf-8") as stream:
-        stream.write("second\r\n")
+        stream.write("second\n")
 
     window.diagnostics_toggle_button.click()
     text = window.diagnostics_text.toPlainText()
@@ -1940,8 +1940,8 @@ def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selecti
 
     application.processEvents()
     assert copied == [
-        "User:\r\nUser A\r\n\r\nAgent:\r\nAgent A\r\n\r\nUser:\r\nUser B"
-        "\r\n\r\nCommentary:\r\nProgress B\r\n\r\nAgent:\r\nAgent B"
+        "User:\nUser A\n\nAgent:\nAgent A\n\nUser:\nUser B"
+        "\n\nCommentary:\nProgress B\n\nAgent:\nAgent B"
     ]
     assert window._selected_thread_id == initial_selected
     assert window._selection_generation == initial_generation

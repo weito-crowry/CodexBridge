@@ -61,12 +61,12 @@ def format_sample_tooltip(sample: UsageHistorySample) -> str:
         lines.append(f"5h remaining: {sample.five_hour_remaining}%")
     if sample.weekly_remaining is not None:
         lines.append(f"Weekly remaining: {sample.weekly_remaining}%")
-    return "\r\n".join(lines)
+    return "\n".join(lines)
 
 
 def format_reset_tooltip(event: UsageHistoryEvent) -> str:
     increase = event.current_weekly_remaining - event.previous_weekly_remaining
-    return "\r\n".join(
+    return "\n".join(
         (
             "Weekly reset candidate",
             datetime.fromtimestamp(event.occurred_at_epoch).strftime("%Y/%m/%d %H:%M:%S"),
@@ -410,7 +410,6 @@ class UsageHistoryWindow(QMainWindow):
                         self.toggle_series_visibility,
                         series,
                         marker,
-                        QPen(series.pen()),
                         QPen(marker.pen()),
                         QBrush(marker.brush()),
                         QBrush(marker.labelBrush()),
@@ -421,19 +420,13 @@ class UsageHistoryWindow(QMainWindow):
         self,
         series: QLineSeries,
         marker: QLegendMarker,
-        original_series_pen: QPen,
         original_pen: QPen,
         original_brush: QBrush,
         original_label_brush: QBrush,
         *_args: object,
     ) -> None:
-        visible = series.pen().color().alpha() == 0
-        series_pen = QPen(original_series_pen)
-        if not visible:
-            series_color = series_pen.color()
-            series_color.setAlpha(0)
-            series_pen.setColor(series_color)
-        series.setPen(series_pen)
+        visible = not series.isVisible()
+        series.setVisible(visible)
         marker.setVisible(True)
         pen = QPen(original_pen)
         brush = QBrush(original_brush)
