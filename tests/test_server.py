@@ -24,11 +24,32 @@ class FakeBridge:
     error: Exception | None = None
     start_count: int = 0
 
-    async def start(self, _cwd: str, _prompt: str) -> dict[str, Any]:
+    async def start(
+        self,
+        _cwd: str,
+        _prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
         self.start_count += 1
         if self.error is not None:
             raise self.error
         return {"ok": True}
+
+    async def model_capabilities(self) -> dict[str, Any]:
+        return {
+            "models": [
+                {
+                    "model": "test-model",
+                    "display_name": "Test model",
+                    "description": None,
+                    "reasoning_efforts": [{"id": "effort-a", "description": None}],
+                    "default_reasoning_effort": "effort-a",
+                }
+            ],
+            "defaults": {"model": "test-model", "reasoning_effort": "effort-a"},
+        }
 
 
 class FakeRuntime:
@@ -96,13 +117,20 @@ def test_prepare_config_keeps_cli_codex_before_process_environment(tmp_path, mon
     assert prepared.codex_executable == str(cli_executable)
 
 
-def test_server_registers_exactly_ten_tools(tmp_path) -> None:
+def test_server_registers_thirteen_native_tools_plus_local_probe_tools(tmp_path) -> None:
     runtime = FakeRuntime()
     app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
 
     names = {tool.name for tool in app.state.mcp_server._tool_manager.list_tools()}
 
-    assert names == {
+    probe_names = names & {
+        "mcp_tasks_probe",
+        "mcp_long_wait_probe",
+        "mcp_long_wait_progress_probe",
+        "mcp_progress_token_probe",
+    }
+    assert len(names - probe_names) == 13
+    assert names - probe_names == {
         "codex_targets",
         "codex_start",
         "codex_continue",
@@ -113,6 +141,9 @@ def test_server_registers_exactly_ten_tools(tmp_path) -> None:
         "codex_interrupt",
         "codex_threads",
         "codex_status",
+        "codex_setup",
+        "codex_setup_capabilities",
+        "codex_setup_confirm",
     }
 
 
@@ -202,6 +233,8 @@ def test_server_publishes_codex_delegation_instructions(tmp_path) -> None:
         "Never infer a target",
         "thread_id carries routing affinity",
         "ユーザーに選択を求めて",
+        "codex_setup",
+        "confirmed target/model/reasoning",
     ):
         assert anchor in instructions
 
@@ -219,6 +252,151 @@ async def test_execution_target_tool_schemas_are_explicit_and_optional(tmp_path)
     assert "target_id" not in tools["codex_start"].input_schema.get("required", [])
     assert "target_id" in tools["codex_threads"].input_schema["properties"]
     assert "target_id" not in tools["codex_threads"].input_schema.get("required", [])
+
+
+def test_setup_tools_bind_the_app_resource_and_app_only_visibility(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+    tools = {tool.name: tool for tool in app.state.mcp_server._tool_manager.list_tools()}
+
+    assert tools["codex_setup"].meta["ui"]["resourceUri"] == "ui://codexbridge/setup/app.html"
+    assert tools["codex_setup"].meta["ui"].get("visibility") is None
+    for name in ("codex_setup_capabilities", "codex_setup_confirm"):
+        assert tools[name].meta["ui"]["visibility"] == ["app"]
+    assert all(
+        "ui" not in (tool.meta or {})
+        for name, tool in tools.items()
+        if name not in {"codex_setup", "codex_setup_capabilities", "codex_setup_confirm"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_wire_server_advertises_apps_and_reads_setup_html_resource(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+    lowlevel = app.state.mcp_lowlevel_server
+    initialization = lowlevel.create_initialization_options()
+    assert "io.modelcontextprotocol/ui" in initialization.capabilities.extensions
+
+    async with app.router.lifespan_context(app):
+        client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream(0)
+        server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream(0)
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                lowlevel.run,
+                client_to_server_receive,
+                server_to_client_send,
+                initialization,
+            )
+            async with ClientSession(server_to_client_receive, client_to_server_send) as client:
+                discover_result = await client.discover()
+                assert "io.modelcontextprotocol/ui" in discover_result.capabilities.extensions
+                result = await client.read_resource("ui://codexbridge/setup/app.html")
+                assert result.contents[0].mime_type == "text/html;profile=mcp-app"
+                assert "CodexBridge Setup" in result.contents[0].text
+                assert "cdn.jsdelivr.net" not in result.contents[0].text
+                assert "unpkg.com" not in result.contents[0].text
+                capabilities = await client.call_tool(
+                    "codex_setup_capabilities", {"target_id": "local"}
+                )
+                assert capabilities.structured_content["models"][0]["model"] == "test-model"
+                confirmed = await client.call_tool(
+                    "codex_setup_confirm",
+                    {
+                        "target_id": "local",
+                        "model": "test-model",
+                        "reasoning_effort": "effort-a",
+                    },
+                )
+                assert confirmed.structured_content["confirmed"] is True
+            task_group.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_text_only_codex_setup_returns_target_ids_and_selection_guidance(
+    tmp_path, monkeypatch
+) -> None:
+    settings = replace(
+        config(tmp_path),
+        targets=(
+            ExecutionTargetConfig("main-pc", "Main PC", "local"),
+            ExecutionTargetConfig(
+                "notebook", "Notebook", "remote", "https://notebook.example.test/mcp"
+            ),
+        ),
+    )
+
+    class FakeSetupRouter:
+        def __init__(self, *_args: Any) -> None:
+            pass
+
+        async def start(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def target_list(self) -> dict[str, Any]:
+            return {
+                "targets": [
+                    {"id": "main-pc", "name": "Main PC", "kind": "local", "available": True},
+                    {
+                        "id": "notebook",
+                        "name": "Notebook",
+                        "kind": "remote",
+                        "available": False,
+                    },
+                ],
+                "selection_required": True,
+            }
+
+    monkeypatch.setattr("codex_bridge.server.ExecutionTargetRouter", FakeSetupRouter)
+    app = create_app(settings, runtime_factory=lambda _: FakeRuntime())
+    lowlevel = app.state.mcp_lowlevel_server
+    initialization = lowlevel.create_initialization_options()
+
+    async with app.router.lifespan_context(app):
+        client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream(0)
+        server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream(0)
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                lowlevel.run,
+                client_to_server_receive,
+                server_to_client_send,
+                initialization,
+            )
+            async with ClientSession(server_to_client_receive, client_to_server_send) as client:
+                await client.initialize()
+                result = await client.call_tool("codex_setup", {})
+                content = result.structured_content
+                assert content["selection_required"] is True
+                assert "main-pc" in content["message"]
+                assert "notebook" in content["message"]
+                assert "selection" in content["message"].lower()
+                assert "MCP Apps support" in content["message"]
+                assert "notebook.example.test" not in str(content)
+            task_group.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_setup_confirm_tool_returns_explicit_validated_selection(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_setup_confirm"
+    )
+
+    async with app.router.lifespan_context(app):
+        result = await tool.fn("local", "test-model", "effort-a")
+
+    assert result == {
+        "confirmed": True,
+        "selection": {
+            "target_id": "local",
+            "target_name": "Local PC",
+            "model": "test-model",
+            "reasoning_effort": "effort-a",
+        },
+    }
 
 
 @pytest.mark.asyncio

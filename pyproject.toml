@@ -33,6 +33,7 @@ codex-bridge-console = "codex_bridge.console_entry:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_bridge"]
+include = ["src/codex_bridge/assets/*.html", "src/codex_bridge/assets/*.ico"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

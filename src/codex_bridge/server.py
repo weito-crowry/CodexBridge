@@ -3,10 +3,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from importlib.resources import files as package_files
 from typing import Any, Protocol
 
 from mcp.server import MCPServer
+from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
 from mcp.server.lowlevel import Server as LowLevelServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -154,10 +157,22 @@ def create_app(
     shutdown_callback: ShutdownCallback | None = None,
     observability: ObservabilityLogger | None = None,
 ) -> Starlette:
-    mcp = MCPServer(
-        "CodexBridge",
-        version="0.1.0",
-        instructions=MCP_SERVER_INSTRUCTIONS,
+    apps = Apps()
+    app_resource_uri = "ui://codexbridge/setup/app.html"
+    setup_html = (
+        package_files("codex_bridge")
+        .joinpath("assets", "codexbridge_setup_app.html")
+        .read_text(encoding="utf-8")
+    )
+    apps.add_html_resource(
+        app_resource_uri,
+        setup_html,
+        name="codexbridge-setup-app",
+        title="CodexBridge Setup",
+        description="Choose an execution target, model, and reasoning effort.",
+        csp=ResourceCsp(
+            connect_domains=[], resource_domains=[], frame_domains=[], base_uri_domains=[]
+        ),
     )
     observer = observability or ObservabilityLogger()
     runtime_holder: dict[str, RuntimeLike | None] = {"runtime": None}
@@ -170,15 +185,86 @@ def create_app(
 
     execution_router = ExecutionTargetRouter(config.targets, bridge)
 
+    @apps.tool(
+        resource_uri=app_resource_uri,
+        title="CodexBridge Setup",
+        description="Open the CodexBridge target, model, and reasoning setup form.",
+    )
+    async def codex_setup(ctx: Context) -> dict[str, Any]:
+        """Return fresh targets and the setup UI's initial selection data."""
+        target_result = await execution_router.target_list()
+        targets = target_result["targets"]
+        result: dict[str, Any] = {
+            "targets": targets,
+            "selection_required": target_result["selection_required"],
+        }
+        if len(targets) == 1:
+            result["capabilities"] = await execution_router.setup_capabilities(targets[0]["id"])
+        target_lines = [
+            f"- {target['name']} (id: {target['id']}; "
+            f"{'Connected' if target['available'] else 'Unavailable'})"
+            for target in targets
+        ]
+        message = "Available execution targets:\n" + "\n".join(target_lines)
+        if result["selection_required"]:
+            message += "\nChoose an execution target before starting Codex."
+        if client_supports_apps(ctx):
+            message += (
+                "\nUse the CodexBridge Setup UI to select a target, model, and reasoning effort."
+            )
+        else:
+            message += "\nA client with MCP Apps support can show the setup selection UI."
+        result["message"] = message
+        return result
+
+    @apps.tool(
+        resource_uri=app_resource_uri,
+        visibility=["app"],
+        title="Load target model capabilities",
+        description="Load current model and reasoning choices for the selected execution target.",
+    )
+    async def codex_setup_capabilities(target_id: str) -> dict[str, Any]:
+        """Load safe model and reasoning choices for one selected target."""
+        return await execution_router.setup_capabilities(target_id)
+
+    @apps.tool(
+        resource_uri=app_resource_uri,
+        visibility=["app"],
+        title="Confirm CodexBridge setup",
+        description="Revalidate and confirm the selected target, model, and reasoning effort.",
+    )
+    async def codex_setup_confirm(
+        target_id: str, model: str, reasoning_effort: str
+    ) -> dict[str, Any]:
+        """Revalidate a setup selection against current target capabilities."""
+        return await _run_tool(
+            lambda: execution_router.confirm_setup(target_id, model, reasoning_effort)
+        )
+
+    mcp = MCPServer(
+        "CodexBridge",
+        version="0.1.0",
+        instructions=MCP_SERVER_INSTRUCTIONS,
+        extensions=[apps],
+    )
+
     @mcp.tool()
     async def codex_targets() -> dict[str, Any]:
         """List configured execution machines and their current availability."""
         return await execution_router.target_list()
 
     @mcp.tool()
-    async def codex_start(cwd: str, prompt: str, target_id: str | None = None) -> dict[str, Any]:
+    async def codex_start(
+        cwd: str,
+        prompt: str,
+        target_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
         """Start a native Codex thread and its first turn without waiting for completion."""
-        return await _run_tool(lambda: execution_router.codex_start(cwd, prompt, target_id))
+        return await _run_tool(
+            lambda: execution_router.codex_start(cwd, prompt, target_id, model, reasoning_effort)
+        )
 
     @mcp.tool()
     async def codex_continue(thread_id: str, prompt: str) -> dict[str, Any]:
@@ -254,7 +340,10 @@ def create_app(
         instructions=MCP_SERVER_INSTRUCTIONS,
         on_list_tools=router.list_tools,
         on_call_tool=router.call_tool,
+        on_list_resources=mcp._handle_list_resources,
+        on_read_resource=mcp._handle_read_resource,
     )
+    wire_server.extensions.update(mcp._lowlevel_server.extensions)
 
     security = _transport_security(config)
     transport_app = wire_server.streamable_http_app(

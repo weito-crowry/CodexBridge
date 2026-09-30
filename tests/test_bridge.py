@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from codex_bridge.activity import ActivityStore
-from codex_bridge.bridge import Bridge
+from codex_bridge.bridge import Bridge, BridgeError
 from codex_bridge.history import HistoryValidationError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
@@ -34,6 +34,8 @@ class FakeAppServer:
                 "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
             }
         }
+        self.model_pages: dict[str | None, dict[str, Any]] = {}
+        self.config_response: dict[str, Any] = {"config": {}}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
@@ -48,6 +50,10 @@ class FakeAppServer:
                     "cliVersion": "0.1.2",
                 }
             }
+        if method == "model/list":
+            return self.model_pages.get(params.get("cursor"), {"data": []})
+        if method == "config/read":
+            return self.config_response
         if method == "thread/resume":
             return {
                 "thread": {
@@ -156,6 +162,104 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
     }
     assert app.methods == ["thread/start", "turn/start"]
     assert app.calls[1][1]["input"] == [{"type": "text", "text": "inspect this"}]
+
+
+@pytest.mark.asyncio
+async def test_start_passes_explicit_model_and_effort_only_to_expected_wire_fields(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    await bridge.start(
+        str(allowed_dir), "inspect this", model="model-value", reasoning_effort="high"
+    )
+
+    assert app.calls[0] == ("thread/start", {"cwd": str(allowed_dir), "model": "model-value"})
+    assert app.calls[1][0] == "turn/start"
+    assert app.calls[1][1]["model"] == "model-value"
+    assert app.calls[1][1]["effort"] == "high"
+    assert "reasoningEffort" not in app.calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_model_capabilities_reads_all_pages_and_only_projects_safe_fields(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.model_pages = {
+        None: {
+            "data": [
+                {
+                    "id": "private-id",
+                    "model": "model-a",
+                    "displayName": "Model A",
+                    "description": "Safe description",
+                    "hidden": False,
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+                    "defaultReasoningEffort": "low",
+                }
+            ],
+            "nextCursor": "page-two",
+        },
+        "page-two": {
+            "data": [
+                {
+                    "model": "hidden-model",
+                    "displayName": "Hidden",
+                    "description": "",
+                    "hidden": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+                    "defaultReasoningEffort": "low",
+                }
+            ]
+        },
+    }
+    app.config_response = {
+        "config": {"model": "model-a", "model_reasoning_effort": "low", "api_key": "secret"},
+        "layers": {"raw": "never return"},
+    }
+
+    result = await bridge.model_capabilities()
+
+    assert result["defaults"] == {"model": "model-a", "reasoning_effort": "low"}
+    assert [entry["model"] for entry in result["models"]] == ["model-a"]
+    assert all("id" not in entry for entry in result["models"])
+    assert "secret" not in str(result)
+    assert app.calls[-1] == (
+        "config/read",
+        {"includeLayers": False, "cwd": None},
+    )
+    assert [call for call in app.calls if call[0] == "model/list"] == [
+        ("model/list", {}),
+        ("model/list", {"cursor": "page-two"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_capabilities_pagination_cycle_and_empty_catalog_are_safe(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    with pytest.raises(BridgeError, match="model capabilities are unavailable") as exc_info:
+        await bridge.model_capabilities()
+    assert "api" not in str(exc_info.value)
+
+    entry = {
+        "id": "model-id",
+        "model": "model-value",
+        "displayName": "Model",
+        "description": "",
+        "hidden": False,
+        "supportedReasoningEfforts": [{"reasoningEffort": "effort"}],
+        "defaultReasoningEffort": "effort",
+    }
+    app.model_pages = {
+        None: {"data": [entry], "nextCursor": "loop"},
+        "loop": {"data": [entry], "nextCursor": "loop"},
+    }
+
+    with pytest.raises(BridgeError, match="model capabilities are unavailable"):
+        await bridge.model_capabilities()
 
 
 @pytest.mark.asyncio

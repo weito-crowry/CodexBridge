@@ -33,6 +33,7 @@ from .models import (
 )
 from .paths import AllowedPathPolicy
 from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unavailable_metadata
+from .setup_capabilities import normalize_capabilities
 from .state import StateStore
 
 
@@ -466,11 +467,23 @@ class Bridge:
         if isinstance(thread_id, str):
             self._state.update_thread_metadata(thread_id, thread)
 
-    async def _start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
-        response = await self._app_server.request(
-            "turn/start",
-            {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},
-        )
+    async def _start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if model is not None:
+            params["model"] = model
+        if reasoning_effort is not None:
+            params["effort"] = reasoning_effort
+        response = await self._app_server.request("turn/start", params)
         turn = response.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
             raise BridgeError("turn/start did not return a turn id")
@@ -507,16 +520,59 @@ class Bridge:
                 )
         return self._public_snapshot(thread_id, turn_id)
 
-    async def start(self, cwd: str, prompt: str) -> dict[str, Any]:
+    async def start(
+        self,
+        cwd: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        if reasoning_effort is not None and model is None:
+            raise BridgeError("reasoning_effort requires an explicit model")
         canonical_cwd = self._path_policy.validate_cwd(cwd)
-        response = await self._app_server.request("thread/start", {"cwd": canonical_cwd})
+        thread_params: dict[str, Any] = {"cwd": canonical_cwd}
+        if model is not None:
+            thread_params["model"] = model
+        response = await self._app_server.request("thread/start", thread_params)
         thread = response.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
         self._state.mark_loaded(thread_id, canonical_cwd, thread)
         log_event("thread.start", thread_id=thread_id)
-        return await self._start_turn(thread_id, prompt)
+        return await self._start_turn(
+            thread_id, prompt, model=model, reasoning_effort=reasoning_effort
+        )
+
+    async def model_capabilities(self) -> dict[str, Any]:
+        pages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        try:
+            for _ in range(100):
+                params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
+                page = await self._app_server.request("model/list", params)
+                if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                    raise ValueError("malformed model catalog")
+                pages.append(page)
+                next_cursor = page.get("nextCursor")
+                if next_cursor is None:
+                    break
+                if not isinstance(next_cursor, str) or not next_cursor.strip():
+                    raise ValueError("malformed model catalog cursor")
+                if next_cursor in seen_cursors:
+                    raise ValueError("model catalog pagination cycle")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise ValueError("model catalog exceeded its page bound")
+            config_response = await self._app_server.request(
+                "config/read", {"includeLayers": False, "cwd": None}
+            )
+            return normalize_capabilities(pages, config_response)
+        except Exception:
+            raise BridgeError("model capabilities are unavailable") from None
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
         if not self._state.is_loaded(thread_id):

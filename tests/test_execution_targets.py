@@ -39,9 +39,35 @@ class FakeBridge:
             "thread_id": args[0] if args and isinstance(args[0], str) else "native-local",
         }
 
-    async def start(self, cwd: str, prompt: str) -> dict[str, Any]:
-        self.calls.append(("start", (cwd, prompt), {}))
+    async def start(
+        self,
+        cwd: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        kwargs = {}
+        if model is not None:
+            kwargs["model"] = model
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        self.calls.append(("start", (cwd, prompt), kwargs))
         return {"ok": True, "thread_id": "native-local", "turn_id": "turn-local"}
+
+    async def model_capabilities(self) -> dict[str, Any]:
+        return {
+            "models": [
+                {
+                    "model": "model-a",
+                    "display_name": "Model A",
+                    "description": None,
+                    "reasoning_efforts": [{"id": "high", "description": None}],
+                    "default_reasoning_effort": "high",
+                }
+            ],
+            "defaults": {"model": "model-a", "reasoning_effort": "high"},
+        }
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
         return await self._call("continue", thread_id, prompt)
@@ -96,6 +122,9 @@ class FakeRemote:
             raise self.error
         return self.response
 
+    async def setup_capabilities(self) -> dict[str, Any]:
+        return await self.call_tool("codex_setup_capabilities", {"target_id": "local"})
+
 
 def make_router(*targets: ExecutionTargetConfig, response=None):
     local = FakeBridge()
@@ -136,6 +165,213 @@ async def test_remote_start_forwards_remote_cwd_and_routes_public_thread_id() ->
     assert result["thread_id"] == "notebook::019abc"
     assert result["native_thread_id"] == "019abc"
     assert result["target_id"] == "notebook"
+
+
+@pytest.mark.asyncio
+async def test_remote_start_forwards_confirmed_model_and_effort_with_metadata() -> None:
+    class ConfiguredRemote(FakeRemote):
+        async def setup_capabilities(self) -> dict[str, Any]:
+            self.calls.append(("codex_setup_capabilities", {"target_id": "leaf-main"}))
+            return {
+                "models": [
+                    {
+                        "model": "model-a",
+                        "display_name": "Model A",
+                        "description": None,
+                        "reasoning_efforts": [{"id": "high", "description": None}],
+                        "default_reasoning_effort": "high",
+                    }
+                ],
+                "defaults": {"model": "model-a", "reasoning_effort": "high"},
+            }
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            return {"ok": True, "thread_id": "native-remote", "turn_id": "turn-1"}
+
+    remote = ConfiguredRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    result = await router.codex_start(
+        "Z:/Notebook/repo", "prompt", "notebook", model="model-a", reasoning_effort="high"
+    )
+
+    assert remote.calls == [
+        ("codex_setup_capabilities", {"target_id": "leaf-main"}),
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "model": "model-a",
+                "reasoning_effort": "high",
+            },
+        ),
+    ]
+    assert result["thread_id"] == "notebook::native-remote"
+    assert result["execution_config"] == {
+        "target_id": "notebook",
+        "model": "model-a",
+        "reasoning_effort": "high",
+    }
+
+
+@pytest.mark.asyncio
+async def test_setup_capabilities_returns_local_catalog_with_target_metadata() -> None:
+    router, _, _ = make_router(LOCAL)
+
+    result = await router.setup_capabilities("main-pc")
+
+    assert result["target"] == {
+        "id": "main-pc",
+        "name": "Main PC",
+        "kind": "local",
+        "available": True,
+    }
+    assert result["models"][0]["model"] == "model-a"
+    assert "url" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_setup_capabilities_forwards_only_selected_remote_and_safely_degrades() -> None:
+    offline = FakeRemote()
+    online = FakeRemote(
+        {
+            "target": {"id": "remote-local", "available": True},
+            "models": [],
+            "defaults": {"model": None, "reasoning_effort": None},
+            "error": {"code": "capabilities_unavailable", "message": "safe"},
+        }
+    )
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK, OTHER),
+        lambda: FakeBridge(),
+        remote_clients={"notebook": online, "other": offline},
+    )
+
+    result = await router.setup_capabilities("notebook")
+
+    assert [call[0] for call in online.calls] == ["codex_setup_capabilities"]
+    assert offline.calls == []
+    assert result["target"]["id"] == "notebook"
+    assert result["target"]["available"] is True
+    assert result["models"] == []
+    assert result["error"]["code"] == "capabilities_unavailable"
+    assert "example.test" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_old_remote_without_setup_tool_stays_available_for_execution() -> None:
+    class OldRemote(FakeRemote):
+        async def setup_capabilities(self) -> dict[str, Any]:
+            self.calls.append(("codex_setup_capabilities", {"target_id": "local"}))
+            raise ExecutionTargetError("execution target returned an upstream tool error")
+
+    old = OldRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": old}
+    )
+
+    result = await router.setup_capabilities("notebook")
+    targets = await router.target_list()
+
+    assert result["target"]["available"] is True
+    assert result["error"]["code"] == "capabilities_unavailable"
+    assert targets["targets"][1]["available"] is True
+    assert old.calls[0][0] == "codex_setup_capabilities"
+
+
+@pytest.mark.asyncio
+async def test_remote_setup_call_uses_leaf_target_id_and_app_only_tool_call() -> None:
+    class SetupSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+            self.calls.append((name, arguments))
+            if name == "codex_targets":
+                return types.CallToolResult(
+                    content=[],
+                    structured_content={
+                        "targets": [{"id": "leaf-main", "available": True}],
+                        "selection_required": False,
+                    },
+                )
+            return types.CallToolResult(
+                content=[],
+                structured_content={
+                    "target": {"id": "leaf-main", "available": True},
+                    "models": [],
+                    "defaults": {"model": None, "reasoning_effort": None},
+                },
+            )
+
+    client = ExecutionTargetClient(NOTEBOOK)
+    client._connected = True
+    session = SetupSession()
+    client._session = session
+
+    result = await client.setup_capabilities()
+
+    assert result["target"]["id"] == "leaf-main"
+    assert session.calls == [
+        ("codex_targets", {}),
+        ("codex_setup_capabilities", {"target_id": "leaf-main"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_start_config_is_validated_and_added_to_result() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    result = await router.codex_start(
+        "D:/repo", "do work", "main-pc", model="model-a", reasoning_effort="high"
+    )
+
+    assert bridge.calls[0] == (
+        "start",
+        ("D:/repo", "do work"),
+        {"model": "model-a", "reasoning_effort": "high"},
+    )
+    assert result["execution_config"] == {
+        "target_id": "main-pc",
+        "model": "model-a",
+        "reasoning_effort": "high",
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_start_rejects_stale_model_or_effort_without_creating_thread() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    with pytest.raises(ExecutionTargetError, match="selected model is no longer available"):
+        await router.codex_start("D:/repo", "do work", "main-pc", model="stale")
+    with pytest.raises(ExecutionTargetError, match="reasoning effort is not supported"):
+        await router.codex_start(
+            "D:/repo", "do work", "main-pc", model="model-a", reasoning_effort="low"
+        )
+    with pytest.raises(ExecutionTargetError, match="requires an explicit model"):
+        await router.codex_start("D:/repo", "do work", "main-pc", reasoning_effort="high")
+
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_setup_revalidates_unknown_unavailable_and_stale_selections() -> None:
+    router, _, remotes = make_router(LOCAL, NOTEBOOK)
+    with pytest.raises(ExecutionTargetError, match="unknown execution target"):
+        await router.confirm_setup("missing", "model-a", "high")
+
+    remotes["notebook"].available = False
+    with pytest.raises(ExecutionTargetError, match="execution target is unavailable"):
+        await router.confirm_setup("notebook", "model-a", "high")
+
+    with pytest.raises(ExecutionTargetError, match="selected model is no longer available"):
+        await router.confirm_setup("main-pc", "stale-model", "high")
+    with pytest.raises(ExecutionTargetError, match="reasoning effort is not supported"):
+        await router.confirm_setup("main-pc", "model-a", "low")
 
 
 @pytest.mark.asyncio
@@ -431,6 +667,9 @@ async def test_remote_compatibility_requires_all_tools_and_a_leaf_gateway() -> N
         {"targets": [{"id": "local"}], "selection_required": False},
     )
     await compatible._validate_leaf()
+    assert not _REQUIRED_TARGET_TOOLS.intersection(
+        {"codex_setup", "codex_setup_capabilities", "codex_setup_confirm"}
+    )
 
     missing = ExecutionTargetClient(NOTEBOOK)
     missing._session = ToolListSession(

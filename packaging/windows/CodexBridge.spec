@@ -4,12 +4,13 @@ ROOT = Path(SPECPATH).resolve().parents[1]
 SOURCE = ROOT / "src"
 ENTRY = ROOT / "packaging" / "windows" / "codexbridge_entry.py"
 ICON = SOURCE / "codex_bridge" / "assets" / "codexbridge_icon_256.ico"
+SETUP_APP = SOURCE / "codex_bridge" / "assets" / "codexbridge_setup_app.html"
 
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(SOURCE)],
     binaries=[],
-    datas=[(str(ICON), "codex_bridge/assets")],
+    datas=[(str(ICON), "codex_bridge/assets"), (str(SETUP_APP), "codex_bridge/assets")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

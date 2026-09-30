@@ -18,6 +18,7 @@ from mcp.client.streamable_http import (  # type: ignore[attr-defined]
 from .config import ExecutionTargetConfig
 from .logging_utils import log_event
 from .models import ApprovalDecision, RequestId
+from .setup_capabilities import project_public_capabilities
 
 _REQUIRED_TARGET_TOOLS = frozenset(
     {
@@ -53,7 +54,16 @@ class ExecutionTargetError(ValueError):
 class BridgePort(Protocol):
     def has_pending_request(self, request_id: RequestId) -> bool: ...
 
-    async def start(self, cwd: str, prompt: str) -> dict[str, Any]: ...
+    async def start(
+        self,
+        cwd: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def model_capabilities(self) -> dict[str, Any]: ...
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]: ...
 
@@ -130,6 +140,7 @@ class ExecutionTargetClient:
         self._stack: AsyncExitStack | None = None
         self._session: Any | None = None
         self._connected = False
+        self._leaf_target_id: str | None = None
 
     @property
     def connected(self) -> bool:
@@ -200,8 +211,12 @@ class ExecutionTargetClient:
             not isinstance(rows, list)
             or len(rows) != 1
             or targets.get("selection_required") is not False
+            or not isinstance(rows[0], dict)
+            or not isinstance(rows[0].get("id"), str)
+            or not rows[0]["id"]
         ):
             raise ExecutionTargetError("execution target must be a single-target leaf")
+        self._leaf_target_id = rows[0]["id"]
 
     async def _close_stack(self) -> None:
         stack = self._stack
@@ -258,6 +273,23 @@ class ExecutionTargetClient:
                     "execution target call outcome unknown; request was not retried"
                 ) from None
             raise ExecutionTargetError("execution target call failed") from None
+
+    async def setup_capabilities(self) -> dict[str, Any]:
+        session = await self._session_for_call()
+        target_id = self._leaf_target_id
+        if target_id is None:
+            targets = _extract_dict_result(await session.call_tool("codex_targets", {}))
+            rows = targets.get("targets")
+            if (
+                not isinstance(rows, list)
+                or len(rows) != 1
+                or not isinstance(rows[0], dict)
+                or not isinstance(rows[0].get("id"), str)
+            ):
+                raise ExecutionTargetError("execution target is unavailable")
+            target_id = rows[0]["id"]
+            self._leaf_target_id = target_id
+        return await self.call_tool("codex_setup_capabilities", {"target_id": target_id})
 
     async def close(self) -> None:
         async with self._connect_lock:
@@ -363,6 +395,75 @@ class ExecutionTargetRouter:
             "selection_required": len(self.targets) > 1,
         }
 
+    @staticmethod
+    def _capability_error(target: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "target": target,
+            "models": [],
+            "defaults": {"model": None, "reasoning_effort": None},
+            "error": {
+                "code": "capabilities_unavailable",
+                "message": "Model capabilities are unavailable for this target.",
+            },
+        }
+
+    async def setup_capabilities(self, target_id: str) -> dict[str, Any]:
+        target = self._select_target(target_id)
+        public_target = {
+            "id": target.id,
+            "name": target.name,
+            "kind": target.kind,
+            "available": True,
+        }
+        try:
+            if target.kind == "local":
+                capabilities = await self._bridge().model_capabilities()
+            else:
+                client = self._remote_clients[target.id]
+                if not await client.probe():
+                    public_target["available"] = False
+                    return self._capability_error(public_target)
+                capabilities = await client.setup_capabilities()
+            if capabilities.get("error") is not None:
+                return self._capability_error(public_target)
+            return {"target": public_target, **project_public_capabilities(capabilities)}
+        except Exception:
+            return self._capability_error(public_target)
+
+    async def confirm_setup(
+        self, target_id: str, model: str, reasoning_effort: str
+    ) -> dict[str, Any]:
+        capabilities = await self.setup_capabilities(target_id)
+        target = capabilities["target"]
+        if not target["available"]:
+            raise ExecutionTargetError("execution target is unavailable")
+        if "error" in capabilities:
+            raise ExecutionTargetError("model capabilities are unavailable for this target")
+        selected = next(
+            (
+                entry
+                for entry in capabilities["models"]
+                if isinstance(entry, dict) and entry.get("model") == model
+            ),
+            None,
+        )
+        if selected is None:
+            raise ExecutionTargetError("selected model is no longer available on this target")
+        efforts = selected.get("reasoning_efforts")
+        if not isinstance(efforts, list) or not any(
+            isinstance(entry, dict) and entry.get("id") == reasoning_effort for entry in efforts
+        ):
+            raise ExecutionTargetError("selected reasoning effort is not supported by this model")
+        return {
+            "confirmed": True,
+            "selection": {
+                "target_id": target["id"],
+                "target_name": target["name"],
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            },
+        }
+
     def _select_target(self, target_id: str | None) -> ExecutionTargetConfig:
         if target_id is None:
             if len(self.targets) != 1:
@@ -456,16 +557,69 @@ class ExecutionTargetRouter:
         return result
 
     async def codex_start(
-        self, cwd: str, prompt: str, target_id: str | None = None
+        self,
+        cwd: str,
+        prompt: str,
+        target_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
+        if reasoning_effort is not None and model is None:
+            raise ExecutionTargetError("reasoning_effort requires an explicit model")
         target = self._select_target(target_id)
+        if model is not None:
+            capabilities = await self.setup_capabilities(target.id)
+            if not capabilities["target"]["available"]:
+                raise ExecutionTargetError("execution target is unavailable")
+            if "error" in capabilities:
+                raise ExecutionTargetError("model capabilities are unavailable for this target")
+            selected = next(
+                (
+                    entry
+                    for entry in capabilities["models"]
+                    if isinstance(entry, dict) and entry.get("model") == model
+                ),
+                None,
+            )
+            if selected is None:
+                raise ExecutionTargetError("selected model is no longer available on this target")
+            if reasoning_effort is not None:
+                efforts = selected.get("reasoning_efforts")
+                if not isinstance(efforts, list) or not any(
+                    isinstance(entry, dict) and entry.get("id") == reasoning_effort
+                    for entry in efforts
+                ):
+                    raise ExecutionTargetError(
+                        "selected reasoning effort is not supported by this model"
+                    )
+
+        arguments: dict[str, Any] = {"cwd": cwd, "prompt": prompt}
+        if model is not None:
+            arguments["model"] = model
+        if reasoning_effort is not None:
+            arguments["reasoning_effort"] = reasoning_effort
         bridge = self._bridge() if target.kind == "local" else None
-        return await self._call(
+
+        async def local_start() -> dict[str, Any] | None:
+            if bridge is None:
+                return None
+            if model is None and reasoning_effort is None:
+                return await bridge.start(cwd, prompt)
+            return await bridge.start(cwd, prompt, model=model, reasoning_effort=reasoning_effort)
+
+        result = await self._call(
             target,
             "codex_start",
-            {"cwd": cwd, "prompt": prompt},
-            lambda: bridge.start(cwd, prompt) if bridge is not None else None,
+            arguments,
+            local_start,
         )
+        if model is not None:
+            result["execution_config"] = {
+                "target_id": target.id,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            }
+        return result
 
     async def _thread_call(
         self,
