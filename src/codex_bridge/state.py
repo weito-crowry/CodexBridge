@@ -155,24 +155,26 @@ class StateStore:
         return pending
 
     async def wait_for_change(self, thread_id: str, turn_id: str, timeout: float) -> bool:
-        turn = self._turn(thread_id, turn_id)
+        thread = self._threads.get(thread_id)
+        turn = thread.turns.get(turn_id) if thread is not None else None
+        if turn is None:
+            return False
         condition = self._condition(thread_id, turn_id)
         generation = turn.generation
         try:
             async with condition:
                 await asyncio.wait_for(
-                    condition.wait_for(
-                        lambda: self._turn(thread_id, turn_id).generation != generation
-                    ),
-                    timeout=timeout,
+                    condition.wait_for(lambda: turn.generation != generation), timeout=timeout
                 )
         except TimeoutError:
             return False
         return True
 
     def snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
-        turn = self._turn(thread_id, turn_id)
-        return self._snapshot_turn(turn)
+        snapshot = self.snapshot_if_known(thread_id, turn_id)
+        if snapshot is None:
+            raise KeyError((thread_id, turn_id))
+        return snapshot
 
     def snapshot_if_known(self, thread_id: str, turn_id: str) -> dict[str, Any] | None:
         thread = self._threads.get(thread_id)

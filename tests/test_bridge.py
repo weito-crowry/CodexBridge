@@ -1537,6 +1537,25 @@ async def test_status_for_unknown_thread_returns_not_loaded_without_state_creati
 
 
 @pytest.mark.asyncio
+async def test_unknown_wait_does_not_create_ghost_or_override_latest_status(allowed_dir) -> None:
+    bridge, _, store, _ = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread-a", "known-turn")
+    store.set_terminal("thread-a", "known-turn", "completed")
+
+    wait_result = await bridge.wait("thread-a", "ghost-turn", 0)
+
+    assert wait_result["turn_id"] == "ghost-turn"
+    assert wait_result["state"] == "not_loaded"
+    assert store.has_turn("thread-a", "ghost-turn") is False
+    assert store.active_turn_for_thread("thread-a") is None
+    assert store.latest_known_turn("thread-a") == "known-turn"
+
+    status = await bridge.status("thread-a")
+    assert status["turn_id"] == "known-turn"
+    assert status["state"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_approval_response_is_scoped_to_request_id(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
     await bridge.handle_server_request(

@@ -21,6 +21,26 @@ async def test_wait_for_change_does_not_cross_talk() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_change_does_not_create_unknown_turn() -> None:
+    store = StateStore()
+
+    assert await store.wait_for_change("thread-a", "unknown-turn", 0) is False
+
+    assert store.has_thread("thread-a") is False
+    assert store.has_turn("thread-a", "unknown-turn") is False
+
+
+def test_snapshot_does_not_create_unknown_turn() -> None:
+    store = StateStore()
+
+    with pytest.raises(KeyError):
+        store.snapshot("thread-a", "unknown-turn")
+
+    assert store.has_thread("thread-a") is False
+    assert store.has_turn("thread-a", "unknown-turn") is False
+
+
+@pytest.mark.asyncio
 async def test_wait_for_change_wakes_for_matching_turn() -> None:
     store = StateStore()
     store.ensure_turn("thread-a", "turn-a")

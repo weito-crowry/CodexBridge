@@ -1179,7 +1179,9 @@ class Bridge:
                 )
 
     def _public_snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
-        snapshot = self._state.snapshot(thread_id, turn_id)
+        snapshot = self._state.snapshot_if_known(thread_id, turn_id)
+        if snapshot is None:
+            return self._not_loaded_status(thread_id, turn_id)
         pending = snapshot["pending_request"]
         if isinstance(pending, PendingRequest):
             public_pending: dict[str, Any] = {
