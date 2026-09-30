@@ -4,6 +4,7 @@ import csv
 import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import datetime
+from functools import partial
 from math import inf
 from pathlib import Path
 from time import time
@@ -12,12 +13,13 @@ from PySide6.QtCharts import (
     QChart,
     QChartView,
     QDateTimeAxis,
+    QLegendMarker,
     QLineSeries,
     QScatterSeries,
     QValueAxis,
 )
 from PySide6.QtCore import QByteArray, QDateTime, QMargins, QSettings, Qt
-from PySide6.QtGui import QCloseEvent, QCursor, QFont, QPainter, QPalette, QPen
+from PySide6.QtGui import QBrush, QCloseEvent, QCursor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -41,8 +43,8 @@ from PySide6.QtWidgets import (
 from .usage_history import (
     UsageHistoryEvent,
     UsageHistorySample,
+    get_confirmed_usage_events,
     get_latest_usage_remaining,
-    get_usage_events,
     get_usage_samples,
     get_usage_samples_for_display,
 )
@@ -59,12 +61,12 @@ def format_sample_tooltip(sample: UsageHistorySample) -> str:
         lines.append(f"5h remaining: {sample.five_hour_remaining}%")
     if sample.weekly_remaining is not None:
         lines.append(f"Weekly remaining: {sample.weekly_remaining}%")
-    return "\n".join(lines)
+    return "\r\n".join(lines)
 
 
 def format_reset_tooltip(event: UsageHistoryEvent) -> str:
     increase = event.current_weekly_remaining - event.previous_weekly_remaining
-    return "\n".join(
+    return "\r\n".join(
         (
             "Weekly reset candidate",
             datetime.fromtimestamp(event.occurred_at_epoch).strftime("%Y/%m/%d %H:%M:%S"),
@@ -404,11 +406,51 @@ class UsageHistoryWindow(QMainWindow):
         for series in (self.five_hour_series, self.weekly_series):
             for marker in self.chart.legend().markers(series):
                 marker.clicked.connect(
-                    lambda *_args, target=series: self.toggle_series_visibility(target)
+                    partial(
+                        self.toggle_series_visibility,
+                        series,
+                        marker,
+                        QPen(series.pen()),
+                        QPen(marker.pen()),
+                        QBrush(marker.brush()),
+                        QBrush(marker.labelBrush()),
+                    )
                 )
 
-    def toggle_series_visibility(self, series: QLineSeries) -> None:
-        series.setVisible(not series.isVisible())
+    def toggle_series_visibility(
+        self,
+        series: QLineSeries,
+        marker: QLegendMarker,
+        original_series_pen: QPen,
+        original_pen: QPen,
+        original_brush: QBrush,
+        original_label_brush: QBrush,
+        *_args: object,
+    ) -> None:
+        visible = series.pen().color().alpha() == 0
+        series_pen = QPen(original_series_pen)
+        if not visible:
+            series_color = series_pen.color()
+            series_color.setAlpha(0)
+            series_pen.setColor(series_color)
+        series.setPen(series_pen)
+        marker.setVisible(True)
+        pen = QPen(original_pen)
+        brush = QBrush(original_brush)
+        label_brush = QBrush(original_label_brush)
+        if not visible:
+            pen_color = pen.color()
+            pen_color.setAlphaF(0.45)
+            brush_color = brush.color()
+            brush_color.setAlphaF(0.45)
+            label_color = label_brush.color()
+            label_color.setAlphaF(0.45)
+            pen.setColor(pen_color)
+            brush.setColor(brush_color)
+            label_brush.setColor(label_color)
+        marker.setPen(pen)
+        marker.setBrush(brush)
+        marker.setLabelBrush(label_brush)
 
     def _on_sample_hover(self, point: object, entered: bool) -> None:
         if not entered or not self._display_samples:
@@ -505,7 +547,7 @@ class UsageHistoryWindow(QMainWindow):
                 max_points=_TARGET_POINTS,
                 database_path=self._database_path,
             )
-            events = get_usage_events(start, end, database_path=self._database_path)
+            events = get_confirmed_usage_events(start, end, database_path=self._database_path)
             five_hour, weekly = get_latest_usage_remaining(
                 start, end, database_path=self._database_path
             )

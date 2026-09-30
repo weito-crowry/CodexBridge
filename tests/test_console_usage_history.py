@@ -125,34 +125,90 @@ def test_weekly_event_is_not_saved_without_a_non_null_increase(
     assert get_recent_usage_events(database_path=database_path) == []
 
 
-def test_weekly_increase_is_saved_once_and_detected_after_database_reopen(
+def test_confirmed_weekly_increase_is_saved_once_and_detected_after_database_reopen(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "usage-history.sqlite3"
     record_usage_sample(_usage(50, 30), captured_at_epoch=60.0, database_path=database_path)
-
     event = record_usage_sample(
         _usage(55, 80), captured_at_epoch=120.0, database_path=database_path
     )
+    record_usage_sample(_usage(55, 80), captured_at_epoch=180.0, database_path=database_path)
     repeated = record_usage_sample(
-        _usage(55, 80), captured_at_epoch=180.0, database_path=database_path
+        _usage(55, 80), captured_at_epoch=181.0, database_path=database_path
     )
 
     events = get_recent_usage_events(database_path=database_path)
     assert event == UsageHistorySample(120, 120.0, 55, 80)
-    assert repeated == UsageHistorySample(180, 180.0, 55, 80)
+    assert repeated == UsageHistorySample(180, 181.0, 55, 80)
     assert events == [UsageHistoryEvent(120.0, "weekly_remaining_increase", 30, 80)]
 
 
-def test_weekly_increase_compares_against_last_non_null_sample(tmp_path: Path) -> None:
+@pytest.mark.parametrize("weekly_values", [(18, 61, 18), (18, 61, 18, 61, 18)])
+def test_transient_weekly_increases_are_not_saved(
+    tmp_path: Path, weekly_values: tuple[int, ...]
+) -> None:
     database_path = tmp_path / "usage-history.sqlite3"
-    record_usage_sample(_usage(50, 30), captured_at_epoch=60.0, database_path=database_path)
-    record_usage_sample(_usage(55, None), captured_at_epoch=120.0, database_path=database_path)
+    for index, weekly in enumerate(weekly_values, start=1):
+        record_usage_sample(
+            _usage(50, weekly),
+            captured_at_epoch=float(index * 60),
+            database_path=database_path,
+        )
 
-    record_usage_sample(_usage(60, 80), captured_at_epoch=180.0, database_path=database_path)
+    assert get_recent_usage_events(database_path=database_path) == []
+
+
+def test_same_minute_weekly_oscillation_is_not_confirmed(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for captured_at, weekly in ((600.0, 18), (601.0, 61), (602.0, 18), (603.0, 61)):
+        record_usage_sample(
+            _usage(50, weekly), captured_at_epoch=captured_at, database_path=database_path
+        )
+
+    assert len(get_usage_samples(600.0, 659.0, database_path=database_path)) == 1
+    assert get_recent_usage_events(database_path=database_path) == []
+
+
+def test_sustained_weekly_increase_records_first_candidate_once(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for index, weekly in enumerate((18, 100, 99, 98), start=1):
+        record_usage_sample(
+            _usage(50, weekly),
+            captured_at_epoch=float(index * 60),
+            database_path=database_path,
+        )
 
     assert get_recent_usage_events(database_path=database_path) == [
-        UsageHistoryEvent(180.0, "weekly_remaining_increase", 30, 80)
+        UsageHistoryEvent(120.0, "weekly_remaining_increase", 18, 100)
+    ]
+
+
+def test_stable_weekly_increase_is_confirmed(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for index, weekly in enumerate((18, 100, 100), start=1):
+        record_usage_sample(
+            _usage(50, weekly),
+            captured_at_epoch=float(index * 60),
+            database_path=database_path,
+        )
+
+    assert get_recent_usage_events(database_path=database_path) == [
+        UsageHistoryEvent(120.0, "weekly_remaining_increase", 18, 100)
+    ]
+
+
+def test_none_weekly_sample_is_skipped_when_confirming_increase(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for index, weekly in enumerate((18, None, 100, 99), start=1):
+        record_usage_sample(
+            _usage(50, weekly),
+            captured_at_epoch=float(index * 60),
+            database_path=database_path,
+        )
+
+    assert get_recent_usage_events(database_path=database_path) == [
+        UsageHistoryEvent(180.0, "weekly_remaining_increase", 18, 100)
     ]
 
 
@@ -274,8 +330,8 @@ def test_recent_weekly_events_are_limited_and_newest_first(tmp_path: Path) -> No
     events = get_recent_usage_events(limit=2, database_path=database_path)
 
     assert events == [
-        UsageHistoryEvent(240.0, "weekly_remaining_increase", 50, 60),
         UsageHistoryEvent(180.0, "weekly_remaining_increase", 40, 50),
+        UsageHistoryEvent(120.0, "weekly_remaining_increase", 30, 40),
     ]
     assert get_recent_usage_events(limit=0, database_path=database_path) == []
 

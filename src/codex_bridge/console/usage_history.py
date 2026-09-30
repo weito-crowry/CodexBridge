@@ -14,6 +14,7 @@ from .usage import CodexUsage
 
 _DATABASE_NAME = "usage-history.sqlite3"
 _EVENT_INDEX_NAME = "idx_usage_events_occurred_at_epoch"
+WEEKLY_REMAINING_INCREASE_EVENT = "weekly_remaining_increase"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,28 +106,6 @@ def record_usage_sample(
     minute_epoch = int(captured // 60 * 60)
     sample = UsageHistorySample(minute_epoch, captured, five_hour, weekly)
     with _open_database(database_path) as connection:
-        previous = connection.execute(
-            """
-            SELECT weekly_remaining
-            FROM usage_samples
-            WHERE weekly_remaining IS NOT NULL
-            ORDER BY minute_epoch DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        previous_weekly = previous["weekly_remaining"] if previous is not None else None
-        if previous_weekly is not None and weekly is not None and weekly > previous_weekly:
-            connection.execute(
-                """
-                INSERT INTO usage_events (
-                    occurred_at_epoch,
-                    event_type,
-                    previous_weekly_remaining,
-                    current_weekly_remaining
-                ) VALUES (?, 'weekly_remaining_increase', ?, ?)
-                """,
-                (captured, previous_weekly, weekly),
-            )
         connection.execute(
             """
             INSERT INTO usage_samples (
@@ -142,6 +121,54 @@ def record_usage_sample(
             """,
             (minute_epoch, captured, five_hour, weekly),
         )
+        recent_weekly = connection.execute(
+            """
+            SELECT minute_epoch, captured_at_epoch, weekly_remaining
+            FROM usage_samples
+            WHERE weekly_remaining IS NOT NULL
+            ORDER BY minute_epoch DESC
+            LIMIT 3
+            """
+        ).fetchall()
+        if len(recent_weekly) == 3:
+            confirmation, candidate, baseline = recent_weekly
+            previous_weekly = baseline["weekly_remaining"]
+            candidate_weekly = candidate["weekly_remaining"]
+            confirmed_weekly = confirmation["weekly_remaining"]
+            candidate_minute = candidate["minute_epoch"]
+            if candidate_weekly > previous_weekly and confirmed_weekly > previous_weekly:
+                existing_event = connection.execute(
+                    """
+                    SELECT 1
+                    FROM usage_events
+                    WHERE event_type = ?
+                      AND occurred_at_epoch >= ?
+                      AND occurred_at_epoch < ?
+                    LIMIT 1
+                    """,
+                    (
+                        WEEKLY_REMAINING_INCREASE_EVENT,
+                        candidate_minute,
+                        candidate_minute + 60,
+                    ),
+                ).fetchone()
+                if existing_event is None:
+                    connection.execute(
+                        """
+                        INSERT INTO usage_events (
+                            occurred_at_epoch,
+                            event_type,
+                            previous_weekly_remaining,
+                            current_weekly_remaining
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            candidate["captured_at_epoch"],
+                            WEEKLY_REMAINING_INCREASE_EVENT,
+                            previous_weekly,
+                            candidate_weekly,
+                        ),
+                    )
     return sample
 
 
@@ -306,3 +333,63 @@ def get_usage_events(
         )
         for row in rows
     ]
+
+
+def get_confirmed_usage_events(
+    start_epoch: float,
+    end_epoch: float,
+    *,
+    database_path: Path | None = None,
+) -> list[UsageHistoryEvent]:
+    events = get_usage_events(start_epoch, end_epoch, database_path=database_path)
+    confirmed: list[UsageHistoryEvent] = []
+    seen_candidate_minutes: set[int] = set()
+    with _open_database(database_path) as connection:
+        for event in events:
+            if event.event_type != WEEKLY_REMAINING_INCREASE_EVENT:
+                continue
+            candidate_minute = int(event.occurred_at_epoch // 60 * 60)
+            if candidate_minute in seen_candidate_minutes:
+                continue
+            baseline = connection.execute(
+                """
+                SELECT weekly_remaining
+                FROM usage_samples
+                WHERE minute_epoch < ? AND weekly_remaining IS NOT NULL
+                ORDER BY minute_epoch DESC
+                LIMIT 1
+                """,
+                (candidate_minute,),
+            ).fetchone()
+            candidate = connection.execute(
+                """
+                SELECT weekly_remaining
+                FROM usage_samples
+                WHERE minute_epoch = ? AND weekly_remaining IS NOT NULL
+                LIMIT 1
+                """,
+                (candidate_minute,),
+            ).fetchone()
+            confirmation = connection.execute(
+                """
+                SELECT weekly_remaining
+                FROM usage_samples
+                WHERE minute_epoch > ? AND weekly_remaining IS NOT NULL
+                ORDER BY minute_epoch ASC
+                LIMIT 1
+                """,
+                (candidate_minute,),
+            ).fetchone()
+            if baseline is None or candidate is None or confirmation is None:
+                continue
+            previous_weekly = baseline["weekly_remaining"]
+            candidate_weekly = candidate["weekly_remaining"]
+            if (
+                event.previous_weekly_remaining == previous_weekly
+                and event.current_weekly_remaining == candidate_weekly
+                and candidate_weekly > previous_weekly
+                and confirmation["weekly_remaining"] > previous_weekly
+            ):
+                confirmed.append(event)
+                seen_candidate_minutes.add(candidate_minute)
+    return confirmed

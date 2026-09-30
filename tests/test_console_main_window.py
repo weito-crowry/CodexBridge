@@ -28,7 +28,10 @@ from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.runtime_launcher import DetachedLaunchResult
 from codex_bridge.console.tunnel_supervisor import TunnelActionState
-from codex_bridge.console.usage_history import get_usage_samples
+from codex_bridge.console.usage_history import (
+    get_recent_usage_events,
+    get_usage_samples,
+)
 from codex_bridge.console.widgets import TimelineEntry
 
 
@@ -381,7 +384,7 @@ def test_diagnostics_clear_only_clears_widget_and_future_logs_return(tmp_path) -
 
     _application()
     path = tmp_path / "runtime.log"
-    path.write_text("first line\n", encoding="utf-8")
+    path.write_text("first line\r\n", encoding="utf-8")
     reader = DiagnosticsReader(
         sources=(DiagnosticSource("Bridge stdout", path, False),),
     )
@@ -401,7 +404,7 @@ def test_diagnostics_clear_only_clears_widget_and_future_logs_return(tmp_path) -
     assert window.diagnostics_text.toPlainText() == ""
     assert path.read_bytes() == original_contents
     with path.open("a", encoding="utf-8") as stream:
-        stream.write("after clear\n")
+        stream.write("after clear\r\n")
     window._on_diagnostics_timeout()
     assert "after clear" in window.diagnostics_text.toPlainText()
     window.close()
@@ -412,7 +415,7 @@ def test_diagnostics_reopen_rebuilds_recent_tail_without_duplicates(tmp_path) ->
 
     _application()
     path = tmp_path / "runtime.log"
-    path.write_text("first\n", encoding="utf-8")
+    path.write_text("first\r\n", encoding="utf-8")
     reader = DiagnosticsReader(
         sources=(DiagnosticSource("Bridge stdout", path, False),),
     )
@@ -433,7 +436,7 @@ def test_diagnostics_reopen_rebuilds_recent_tail_without_duplicates(tmp_path) ->
     assert window.diagnostics_pane.isHidden()
     assert not window.diagnostics_timer.isActive()
     with path.open("a", encoding="utf-8") as stream:
-        stream.write("second\n")
+        stream.write("second\r\n")
 
     window.diagnostics_toggle_button.click()
     text = window.diagnostics_text.toPlainText()
@@ -672,6 +675,45 @@ def test_periodic_usage_success_updates_values_and_clears_failure_state() -> Non
     assert window.usage_status_label.text() == "Codex Usage  5h 89% · Week —"
     assert "refresh failed" not in window.usage_status_label.text()
     assert "temporary failure" not in window.usage_detail_label.text()
+    window.close()
+
+
+@pytest.mark.parametrize("mode", ["initial", "periodic", "manual"])
+def test_canonical_usage_modes_update_status_and_save_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    _application()
+    client = FakeClient()
+    database_path = tmp_path / "usage-history.sqlite3"
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=database_path,
+    )
+    _set_usage_ready(window)
+    monkeypatch.setattr(main_window_module, "time", lambda: 120.0)
+    window._usage_request_in_flight = True
+    window._usage_request_mode = mode
+
+    client.result(
+        "usage",
+        {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                    "secondary": {"windowDurationMins": 10080, "usedPercent": 82},
+                }
+            }
+        },
+    )
+
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week 18%"
+    assert [
+        sample.weekly_remaining
+        for sample in get_usage_samples(0.0, 180.0, database_path=database_path)
+    ] == [18]
+    assert get_recent_usage_events(database_path=database_path) == []
     window.close()
 
 
@@ -1145,11 +1187,57 @@ def test_turn_snapshot_waits_for_existing_usage_request_without_overwriting_mode
     window.close()
 
 
-def test_turn_snapshot_success_is_saved_with_timestamp_and_rendered_in_history() -> None:
+def test_turn_snapshot_is_saved_per_turn_without_changing_global_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _application()
     client = FakeClient()
-    window = _usage_window(client)
+    database_path = tmp_path / "usage-history.sqlite3"
+    current_epoch = [1_790_000_000.0]
+    monkeypatch.setattr(main_window_module, "time", lambda: current_epoch[0])
+    monkeypatch.setattr(usage_history_window_module, "time", lambda: current_epoch[0])
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=database_path,
+    )
     _set_usage_ready(window)
+    window._usage_request_in_flight = True
+    window._usage_request_mode = "periodic"
+    periodic_payload = {
+        "rateLimitsByLimitId": {
+            "codex": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 82},
+            }
+        }
+    }
+    client.result("usage", periodic_payload)
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week 18%"
+    assert [
+        sample.weekly_remaining
+        for sample in get_usage_samples(
+            current_epoch[0] - 1, current_epoch[0] + 1, database_path=database_path
+        )
+    ] == [18]
+
+    window.usage_history_button.click()
+    history_window = window._usage_history_window
+    assert history_window is not None and history_window.isVisible()
+    refresh_calls: list[dict[str, bool]] = []
+    monkeypatch.setattr(
+        history_window,
+        "refresh",
+        lambda *, rolling=False: refresh_calls.append({"rolling": rolling}),
+    )
+    current_epoch[0] += 60
+    window._usage_request_in_flight = True
+    window._usage_request_mode = "periodic"
+    client.result("usage", periodic_payload)
+    assert refresh_calls == [{"rolling": True}]
+    global_usage = window._usage
+
     window.select_thread("thread-a")
     window._timeline_entries = [
         TimelineEntry("turn-a", "item-a", "Agent", "Agent", "answer", None, ())
@@ -1167,6 +1255,8 @@ def test_turn_snapshot_success_is_saved_with_timestamp_and_rendered_in_history()
     assert hasattr(window, "turn_usage_snapshot_timer")
     window.turn_usage_snapshot_timer.stop()
     window._on_turn_usage_snapshot_timeout()
+    assert window._usage_request_mode == "turn_snapshot"
+    current_epoch[0] += 60
     client.result(
         "usage",
         {
@@ -1182,12 +1272,21 @@ def test_turn_snapshot_success_is_saved_with_timestamp_and_rendered_in_history()
     assert snapshot is not None
     assert snapshot.usage.five_hour is not None
     assert snapshot.usage.five_hour.remaining_percent == 72
+    assert snapshot.usage.weekly is not None
+    assert snapshot.usage.weekly.remaining_percent == 61
     assert snapshot.captured_at.tzinfo is not None
-    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week 61%"
+    assert window._usage is global_usage
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week 18%"
     labels = {label.text() for label in window.history_pane.findChildren(QLabel)}
     assert any(
         label.startswith("Usage snapshot: 5h 72% · Week 61% · captured ") for label in labels
     )
+    history_samples = get_usage_samples(
+        current_epoch[0] - 180, current_epoch[0] + 1, database_path=database_path
+    )
+    assert [sample.weekly_remaining for sample in history_samples] == [18, 18]
+    assert get_recent_usage_events(database_path=database_path) == []
+    assert refresh_calls == [{"rolling": True}]
     assert not window._pending_usage_snapshot_turns
     window.close()
 
@@ -1841,8 +1940,8 @@ def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selecti
 
     application.processEvents()
     assert copied == [
-        "User:\nUser A\n\nAgent:\nAgent A\n\nUser:\nUser B"
-        "\n\nCommentary:\nProgress B\n\nAgent:\nAgent B"
+        "User:\r\nUser A\r\n\r\nAgent:\r\nAgent A\r\n\r\nUser:\r\nUser B"
+        "\r\n\r\nCommentary:\r\nProgress B\r\n\r\nAgent:\r\nAgent B"
     ]
     assert window._selected_thread_id == initial_selected
     assert window._selection_generation == initial_generation

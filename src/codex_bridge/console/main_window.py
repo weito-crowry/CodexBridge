@@ -814,7 +814,7 @@ class MainWindow(QMainWindow):
         scrollbar = self.diagnostics_text.verticalScrollBar()
         follow = scrollbar.maximum() - scrollbar.value() <= 1
         previous_value = scrollbar.value()
-        self.diagnostics_text.appendPlainText("\n".join(lines))
+        self.diagnostics_text.appendPlainText("\r\n".join(lines))
         if follow:
             scrollbar.setValue(scrollbar.maximum())
         else:
@@ -928,7 +928,7 @@ class MainWindow(QMainWindow):
         if not self._bridge_ready:
             location = f"{self._config.host}:{self._config.port}"
             self.history_pane.set_empty_state(
-                f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
+                f"CodexBridge is not available on {location}\r\nStart codex-bridge and retry."
             )
             self.activity_pane.set_error("Bridge unavailable")
             return
@@ -1200,11 +1200,13 @@ class MainWindow(QMainWindow):
             return
         self._usage_snapshot_request_turns = candidates
 
-    def _finish_turn_usage_snapshot(self, candidates: set[tuple[str, str]]) -> None:
-        has_usage = self._usage.five_hour is not None or self._usage.weekly is not None
-        snapshot = (
-            CodexUsageSnapshot(self._usage, datetime.now().astimezone()) if has_usage else None
-        )
+    def _finish_turn_usage_snapshot(
+        self,
+        candidates: set[tuple[str, str]],
+        usage: CodexUsage,
+    ) -> None:
+        has_usage = usage.five_hour is not None or usage.weekly is not None
+        snapshot = CodexUsageSnapshot(usage, datetime.now().astimezone()) if has_usage else None
         for key in candidates:
             if key in self._usage_snapshots and snapshot is not None:
                 self._usage_snapshots[key] = snapshot
@@ -1238,8 +1240,8 @@ class MainWindow(QMainWindow):
         if self._usage_refresh_error is not None:
             failure_detail = f"Refresh failed: {self._usage_refresh_error}"
             status_text += " · refresh failed"
-            tooltip += f"\n{failure_detail}"
-            detail += f"\n{failure_detail}"
+            tooltip += f"\r\n{failure_detail}"
+            detail += f"\r\n{failure_detail}"
         self.usage_status_label.setText(status_text)
         self.usage_status_label.setToolTip(tooltip)
         self.usage_detail_label.setText(detail)
@@ -1979,10 +1981,12 @@ class MainWindow(QMainWindow):
                 self.usage_retry_timer.stop()
             if self._usage_ready:
                 self.usage_poll_timer.start()
-            self._apply_usage(payload)
-            self._record_usage_history()
             if mode == "turn_snapshot":
-                self._finish_turn_usage_snapshot(snapshot_candidates)
+                snapshot_usage = parse_codex_usage(payload)
+                self._finish_turn_usage_snapshot(snapshot_candidates, snapshot_usage)
+            else:
+                self._apply_usage(payload)
+                self._record_usage_history()
             return
         if key == "launch:health":
             self._apply_launch_health(payload)

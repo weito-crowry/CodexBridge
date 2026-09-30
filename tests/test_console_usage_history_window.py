@@ -4,7 +4,9 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDateTime, QSettings, Qt
+import pytest
+from PySide6.QtCore import QDateTime, QPointF, QSettings, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolButton
 
 from codex_bridge.console.usage import CodexUsage, UsageWindow
@@ -121,7 +123,7 @@ def test_empty_and_database_error_states_are_visible(tmp_path: Path) -> None:
     failed.close()
 
 
-def test_reset_events_remain_visible_when_the_period_has_no_samples(tmp_path: Path) -> None:
+def test_reset_events_without_confirmation_samples_are_not_displayed(tmp_path: Path) -> None:
     _application()
     database_path = tmp_path / "events-only.sqlite3"
     reset_at = _epoch(2026, 9, 27, 6, 14)
@@ -146,8 +148,46 @@ def test_reset_events_remain_visible_when_the_period_has_no_samples(tmp_path: Pa
 
     assert window.chart_stack.currentWidget() is window.chart_content
     assert not window.empty_state_label.isHidden()
+    assert window.summary_labels["Reset candidates"].text() == "0"
+    assert window.reset_series.count() == 0
+    assert window.reset_history_list.count() == 1
+    assert window.reset_history_list.item(0).text() == "No reset candidates in this period."
+    window.close()
+
+
+def test_reset_view_ignores_unrecognized_event_types(tmp_path: Path) -> None:
+    _application()
+    database_path = tmp_path / "usage.sqlite3"
+    reset_at = _epoch(2026, 9, 27, 6, 14)
+    record_usage_sample(
+        _usage(70, 18), captured_at_epoch=reset_at - 120, database_path=database_path
+    )
+    record_usage_sample(
+        _usage(70, 100), captured_at_epoch=reset_at - 60, database_path=database_path
+    )
+    record_usage_sample(_usage(70, 99), captured_at_epoch=reset_at, database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.executemany(
+            """INSERT INTO usage_events (
+                occurred_at_epoch, event_type, previous_weekly_remaining,
+                current_weekly_remaining
+            ) VALUES (?, ?, ?, ?)""",
+            (
+                (reset_at + 30, "unrecognized_event", 40, 90),
+                (reset_at - 59, "weekly_remaining_increase", 18, 100),
+                (reset_at - 58, "weekly_remaining_increase", 40, 90),
+            ),
+        )
+    window = UsageHistoryWindow(database_path, now=lambda: float(reset_at + 60))
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at - 300))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at + 300))
+
+    assert window.refresh()
+
+    assert window.summary_labels["Reset candidates"].text() == "1"
     assert window.reset_series.count() == 1
     assert window.reset_history_list.count() == 1
+    assert "18% → 100%" in window.reset_history_list.item(0).text()
     window.close()
 
 
@@ -156,9 +196,12 @@ def test_summary_and_reset_marker_use_selected_period_events(tmp_path: Path) -> 
     database_path = tmp_path / "usage.sqlite3"
     reset_at = _epoch(2026, 9, 27, 6, 14)
     record_usage_sample(
-        _usage(71, 18), captured_at_epoch=reset_at - 60, database_path=database_path
+        _usage(71, 18), captured_at_epoch=reset_at - 120, database_path=database_path
     )
-    record_usage_sample(_usage(None, 100), captured_at_epoch=reset_at, database_path=database_path)
+    record_usage_sample(
+        _usage(None, 100), captured_at_epoch=reset_at - 60, database_path=database_path
+    )
+    record_usage_sample(_usage(None, 99), captured_at_epoch=reset_at, database_path=database_path)
     window = UsageHistoryWindow(
         database_path,
         now=lambda: float(reset_at + 1),
@@ -169,11 +212,11 @@ def test_summary_and_reset_marker_use_selected_period_events(tmp_path: Path) -> 
     assert window.refresh()
 
     assert window.summary_labels["5h remaining"].text() == "71%"
-    assert window.summary_labels["Weekly remaining"].text() == "100%"
+    assert window.summary_labels["Weekly remaining"].text() == "99%"
     assert window.summary_labels["Reset candidates"].text() == "1"
     assert window.reset_series.count() == 1
     point = window.reset_series.at(0)
-    assert point.x() == reset_at * 1_000
+    assert point.x() == (reset_at - 60) * 1_000
     assert point.y() == 100
     assert window.reset_history_list.count() == 1
     assert "18% → 100%" in window.reset_history_list.item(0).text()
@@ -193,18 +236,43 @@ def test_axis_modes_update_datetime_format(tmp_path: Path) -> None:
     window.close()
 
 
-def test_series_visibility_controls_toggle_each_chart_series(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "series_name",
+    ("five_hour_series", "weekly_series"),
+)
+def test_legend_marker_click_can_toggle_each_series_off_and_on(
+    tmp_path: Path, series_name: str
+) -> None:
     _application()
-    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: 1_790_000_000.0)
+    settings = QSettings(str(tmp_path / "legend-settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("test/isolated", True)
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: 1_790_000_000.0,
+        settings=settings,
+    )
+    window.resize(900, 700)
+    window.show()
+    _application().processEvents()
 
-    marker = window.chart.legend().markers(window.five_hour_series)[0]
-    marker.clicked.emit()
-    assert not window.five_hour_series.isVisible()
-    assert window.weekly_series.isVisible()
-    window.toggle_series_visibility(window.five_hour_series)
-    window.toggle_series_visibility(window.weekly_series)
-    assert window.five_hour_series.isVisible()
-    assert not window.weekly_series.isVisible()
+    series = getattr(window, series_name)
+    marker = window.chart.legend().markers(series)[0]
+    legend_rect = window.chart.legend().sceneBoundingRect()
+    x_fraction = 0.24 if series_name == "five_hour_series" else 0.47
+    click_position = window.chart_view.mapFromScene(
+        QPointF(legend_rect.left() + legend_rect.width() * x_fraction, legend_rect.center().y())
+    )
+    QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
+    _application().processEvents()
+    assert series.isVisible()
+    assert series.opacity() == 1.0
+    assert series.pen().color().alpha() == 0
+    assert marker.isVisible()
+
+    QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
+    _application().processEvents()
+    assert series.pen().color().alpha() == 255
+    assert marker.isVisible()
     window.close()
 
 
