@@ -17,6 +17,21 @@ _EVENT_INDEX_NAME = "idx_usage_events_occurred_at_epoch"
 WEEKLY_REMAINING_INCREASE_EVENT = "weekly_remaining_increase"
 
 
+def _is_confirmed_weekly_increase(
+    baseline: int,
+    candidate: int,
+    confirmation_1: int,
+    confirmation_2: int,
+) -> bool:
+    return (
+        candidate > baseline
+        and confirmation_1 > baseline
+        and confirmation_2 > baseline
+        and candidate >= confirmation_1
+        and candidate >= confirmation_2
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class UsageHistorySample:
     minute_epoch: int
@@ -137,10 +152,11 @@ def record_usage_sample(
             confirmed_weekly_1 = confirmation_1["weekly_remaining"]
             confirmed_weekly_2 = confirmation_2["weekly_remaining"]
             candidate_minute = candidate["minute_epoch"]
-            if (
-                candidate_weekly > previous_weekly
-                and confirmed_weekly_1 > previous_weekly
-                and confirmed_weekly_2 > previous_weekly
+            if _is_confirmed_weekly_increase(
+                previous_weekly,
+                candidate_weekly,
+                confirmed_weekly_1,
+                confirmed_weekly_2,
             ):
                 existing_event = connection.execute(
                     """
@@ -392,9 +408,12 @@ def get_confirmed_usage_events(
             if (
                 event.previous_weekly_remaining == previous_weekly
                 and event.current_weekly_remaining == candidate_weekly
-                and candidate_weekly > previous_weekly
-                and confirmations[0]["weekly_remaining"] > previous_weekly
-                and confirmations[1]["weekly_remaining"] > previous_weekly
+                and _is_confirmed_weekly_increase(
+                    previous_weekly,
+                    candidate_weekly,
+                    confirmations[0]["weekly_remaining"],
+                    confirmations[1]["weekly_remaining"],
+                )
             ):
                 confirmed.append(event)
                 seen_candidate_minutes.add(candidate_minute)

@@ -149,7 +149,13 @@ def test_confirmed_weekly_increase_is_saved_once_and_detected_after_database_reo
 
 @pytest.mark.parametrize(
     "weekly_values",
-    [(18, 61, 18), (18, 61, 19, 18), (18, 61, 18, 61, 18)],
+    [
+        (18, 61, 18),
+        (18, 61, 19, 18),
+        (18, 61, 18, 61, 18),
+        (18, 19, 20, 21),
+        (30, 40, 50, 60, 70),
+    ],
 )
 def test_transient_weekly_increases_are_not_saved(
     tmp_path: Path, weekly_values: tuple[int, ...]
@@ -193,6 +199,20 @@ def test_sustained_weekly_increase_records_first_candidate_once(tmp_path: Path) 
 def test_stable_weekly_increase_is_confirmed(tmp_path: Path) -> None:
     database_path = tmp_path / "usage-history.sqlite3"
     for index, weekly in enumerate((18, 100, 100, 100), start=1):
+        record_usage_sample(
+            _usage(50, weekly),
+            captured_at_epoch=float(index * 60),
+            database_path=database_path,
+        )
+
+    assert get_recent_usage_events(database_path=database_path) == [
+        UsageHistoryEvent(120.0, "weekly_remaining_increase", 18, 100)
+    ]
+
+
+def test_peak_weekly_increase_may_equal_a_later_confirmation(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for index, weekly in enumerate((18, 100, 99, 100), start=1):
         record_usage_sample(
             _usage(50, weekly),
             captured_at_epoch=float(index * 60),
@@ -265,9 +285,11 @@ def test_usage_history_event_range_is_ascending_and_inclusive(tmp_path: Path) ->
         (60, 10),
         (120, 30),
         (180, 20),
-        (240, 50),
-        (300, 40),
-        (360, 30),
+        (240, 25),
+        (300, 20),
+        (360, 50),
+        (420, 40),
+        (480, 30),
     ):
         record_usage_sample(
             _usage(70, weekly), captured_at_epoch=float(captured_at), database_path=database_path
@@ -275,7 +297,10 @@ def test_usage_history_event_range_is_ascending_and_inclusive(tmp_path: Path) ->
 
     assert get_usage_events(120.0, 240.0, database_path=database_path) == [
         UsageHistoryEvent(120.0, "weekly_remaining_increase", 10, 30),
-        UsageHistoryEvent(240.0, "weekly_remaining_increase", 20, 50),
+    ]
+    assert get_usage_events(120.0, 360.0, database_path=database_path) == [
+        UsageHistoryEvent(120.0, "weekly_remaining_increase", 10, 30),
+        UsageHistoryEvent(360.0, "weekly_remaining_increase", 20, 50),
     ]
 
 
@@ -364,16 +389,25 @@ def test_one_year_minute_samples_are_limited_by_display_query(tmp_path: Path) ->
 
 def test_recent_weekly_events_are_limited_and_newest_first(tmp_path: Path) -> None:
     database_path = tmp_path / "usage-history.sqlite3"
-    for index, weekly in enumerate((30, 40, 50, 60, 70), start=1):
-        record_usage_sample(
-            _usage(70, weekly), captured_at_epoch=index * 60.0, database_path=database_path
+    record_usage_sample(_usage(70, 30), captured_at_epoch=60.0, database_path=database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.executemany(
+            """INSERT INTO usage_events (
+                occurred_at_epoch, event_type, previous_weekly_remaining,
+                current_weekly_remaining
+            ) VALUES (?, ?, ?, ?)""",
+            (
+                (120.0, "weekly_remaining_increase", 10, 20),
+                (240.0, "weekly_remaining_increase", 20, 30),
+                (180.0, "weekly_remaining_increase", 15, 25),
+            ),
         )
 
     events = get_recent_usage_events(limit=2, database_path=database_path)
 
     assert events == [
-        UsageHistoryEvent(180.0, "weekly_remaining_increase", 40, 50),
-        UsageHistoryEvent(120.0, "weekly_remaining_increase", 30, 40),
+        UsageHistoryEvent(240.0, "weekly_remaining_increase", 20, 30),
+        UsageHistoryEvent(180.0, "weekly_remaining_increase", 15, 25),
     ]
     assert get_recent_usage_events(limit=0, database_path=database_path) == []
 

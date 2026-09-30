@@ -198,6 +198,48 @@ def test_legacy_transient_reset_event_is_hidden_without_deleting_database_row(
     window.close()
 
 
+def test_legacy_rising_candidate_is_hidden_without_deleting_database_row(
+    tmp_path: Path,
+) -> None:
+    _application()
+    database_path = tmp_path / "legacy-rising-event.sqlite3"
+    reset_at = _epoch(2026, 9, 27, 6, 14)
+    record_usage_sample(
+        _usage(70, 30), captured_at_epoch=reset_at - 120, database_path=database_path
+    )
+    record_usage_sample(
+        _usage(70, 40), captured_at_epoch=reset_at - 60, database_path=database_path
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """INSERT INTO usage_events (
+                occurred_at_epoch, event_type, previous_weekly_remaining,
+                current_weekly_remaining
+            ) VALUES (?, ?, ?, ?)""",
+            (reset_at - 60, "weekly_remaining_increase", 30, 40),
+        )
+    record_usage_sample(_usage(70, 50), captured_at_epoch=reset_at, database_path=database_path)
+    record_usage_sample(
+        _usage(70, 60), captured_at_epoch=reset_at + 60, database_path=database_path
+    )
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = UsageHistoryWindow(
+        database_path,
+        now=lambda: float(reset_at + 300),
+        settings=settings,
+    )
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at - 300))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at + 300))
+
+    assert window.refresh()
+    assert window.summary_labels["Reset candidates"].text() == "0"
+    assert window.reset_series.count() == 0
+    assert window.reset_history_list.item(0).text() == "No reset candidates in this period."
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 1
+    window.close()
+
+
 def test_reset_view_ignores_unrecognized_event_types(tmp_path: Path) -> None:
     _application()
     database_path = tmp_path / "usage.sqlite3"
