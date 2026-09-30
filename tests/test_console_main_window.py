@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +17,18 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTextBrowser,
     QTreeWidgetItem,
+    QWidget,
 )
 
 from codex_bridge.console import main_window as main_window_module
+from codex_bridge.console import usage_history_window as usage_history_window_module
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.codex_updates import CodexUpdateInfo
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.runtime_launcher import DetachedLaunchResult
 from codex_bridge.console.tunnel_supervisor import TunnelActionState
-from codex_bridge.console.usage_history import get_recent_usage_events, get_usage_samples
+from codex_bridge.console.usage_history import get_usage_samples
 from codex_bridge.console.widgets import TimelineEntry
 
 
@@ -710,7 +711,57 @@ def test_success_with_unavailable_usage_does_not_save_history(tmp_path: Path) ->
     window.close()
 
 
-def test_success_saves_history_refreshes_ui_and_status_reopens_history(
+def test_status_opens_one_independent_usage_history_window(tmp_path: Path) -> None:
+    _application()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        tray_available=False,
+        usage_history_path=tmp_path / "usage-history.sqlite3",
+    )
+    window._show_status()
+
+    assert window.status_dialog.isVisible()
+    assert window.status_dialog.findChild(QWidget, "usageHistoryChart") is None
+    assert window.usage_history_button.text() == "Show usage history"
+    assert not window.status_dialog.isModal()
+
+    window.usage_history_button.click()
+    first_window = window._usage_history_window
+    assert first_window is not None
+    assert first_window.isVisible()
+    window.status_dialog.close()
+    assert first_window.isVisible()
+
+    window.usage_history_button.click()
+    assert window._usage_history_window is first_window
+    window.close()
+
+
+def test_main_window_exit_closes_its_usage_history_window(tmp_path: Path) -> None:
+    _application()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+        quit_application=lambda: None,
+        usage_history_path=tmp_path / "usage-history.sqlite3",
+    )
+    window.usage_history_button.click()
+    history_window = window._usage_history_window
+    assert history_window is not None and history_window.isVisible()
+
+    window._begin_exit()
+
+    assert not history_window.isVisible()
+    window.close()
+
+
+def test_usage_sample_refreshes_only_a_visible_history_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _application()
@@ -722,61 +773,69 @@ def test_success_saves_history_refreshes_ui_and_status_reopens_history(
         tray_available=False,
         usage_history_path=database_path,
     )
-    current_epoch = 1_790_000_000.0
-    monkeypatch.setattr(main_window_module, "time", lambda: current_epoch)
-    window._show_status()
-
-    client.result(
-        "usage",
-        {
-            "rateLimits": {
-                "primary": {"windowDurationMins": 300, "usedPercent": 28},
-                "secondary": {"windowDurationMins": 10080, "usedPercent": 70},
-            }
-        },
+    current_epoch = [1_790_000_000.0]
+    monkeypatch.setattr(main_window_module, "time", lambda: current_epoch[0])
+    monkeypatch.setattr(usage_history_window_module, "time", lambda: current_epoch[0])
+    _set_usage_ready(window)
+    window.usage_history_button.click()
+    history_window = window._usage_history_window
+    assert history_window is not None
+    refresh_calls: list[dict[str, bool]] = []
+    monkeypatch.setattr(
+        history_window,
+        "refresh",
+        lambda *, rolling=False: refresh_calls.append({"rolling": rolling}),
     )
+
+    def deliver_sample(weekly_used: int) -> None:
+        window._usage_request_in_flight = True
+        window._usage_request_mode = "periodic"
+        client.result(
+            "usage",
+            {
+                "rateLimits": {
+                    "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                    "secondary": {
+                        "windowDurationMins": 10080,
+                        "usedPercent": weekly_used,
+                    },
+                }
+            },
+        )
+
+    deliver_sample(70)
+    assert refresh_calls == [{"rolling": True}]
     assert (
-        len(get_usage_samples(current_epoch - 1, current_epoch, database_path=database_path)) == 1
+        len(get_usage_samples(current_epoch[0] - 1, current_epoch[0], database_path=database_path))
+        == 1
     )
-    assert [
-        series.count() for series in window.usage_history_widget.chart_view.chart().series()
-    ] == [
-        1,
-        1,
-    ]
 
-    current_epoch += 60
-    client.result(
-        "usage",
-        {
-            "rateLimits": {
-                "primary": {"windowDurationMins": 300, "usedPercent": 25},
-                "secondary": {"windowDurationMins": 10080, "usedPercent": 0},
-            }
-        },
+    history_window.hide()
+    current_epoch[0] += 60
+    deliver_sample(65)
+    assert refresh_calls == [{"rolling": True}]
+    assert (
+        len(get_usage_samples(current_epoch[0] - 1, current_epoch[0], database_path=database_path))
+        == 1
     )
-    assert get_recent_usage_events(database_path=database_path)[0].current_weekly_remaining == 100
-    local_time = datetime.fromtimestamp(current_epoch).strftime("%Y-%m-%d %H:%M")
-    assert window.usage_history_widget.weekly_increases_label.text() == (
-        f"{local_time}  30% -> 100%"
-    )
-    assert [
-        series.count() for series in window.usage_history_widget.chart_view.chart().series()
-    ] == [
-        2,
-        2,
-    ]
 
-    window.usage_history_widget.set_history([], [], start_epoch=0, end_epoch=60)
     window._show_status()
+    current_epoch[0] += 60
+    deliver_sample(60)
+    assert refresh_calls == [{"rolling": True}]
+    assert (
+        len(get_usage_samples(current_epoch[0] - 1, current_epoch[0], database_path=database_path))
+        == 1
+    )
 
-    assert [
-        series.count() for series in window.usage_history_widget.chart_view.chart().series()
-    ] == [
-        2,
-        2,
-    ]
-    assert "30% -> 100%" in window.usage_history_widget.weekly_increases_label.text()
+    history_window.show()
+    current_epoch[0] += 60
+    deliver_sample(55)
+    assert refresh_calls == [{"rolling": True}, {"rolling": True}]
+    assert (
+        len(get_usage_samples(current_epoch[0] - 1, current_epoch[0], database_path=database_path))
+        == 1
+    )
     window.close()
 
 
@@ -814,7 +873,7 @@ def test_usage_history_write_failure_keeps_usage_and_polling(
 
 
 @pytest.mark.parametrize("history_error", [sqlite3.OperationalError, OSError])
-def test_status_dialog_opens_when_usage_history_read_fails(
+def test_status_opens_and_usage_history_reports_read_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     history_error: type[Exception],
@@ -830,67 +889,17 @@ def test_status_dialog_opens_when_usage_history_read_fails(
     def fail_read(*args: object, **kwargs: object) -> None:
         raise history_error("history unavailable")
 
-    monkeypatch.setattr(main_window_module, "get_usage_samples", fail_read)
+    monkeypatch.setattr(usage_history_window_module, "get_usage_samples_for_display", fail_read)
 
     window._show_status()
+    window.usage_history_button.click()
 
     assert window.status_dialog.isVisible()
-    assert window.usage_history_widget.weekly_increases_label.text() == (
-        "Usage history unavailable."
-    )
-    window.close()
-
-
-def test_hidden_status_dialog_saves_usage_without_refreshing_chart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _application()
-    client = FakeClient()
-    database_path = tmp_path / "usage-history.sqlite3"
-    window = MainWindow(
-        _config(),
-        api_client=client,
-        tray_available=False,
-        usage_history_path=database_path,
-    )
-    current_epoch = 1_790_000_000.0
-    monkeypatch.setattr(main_window_module, "time", lambda: current_epoch)
-    _set_usage_ready(window)
-    refresh_history = window._refresh_usage_history
-    refresh_calls: list[object] = []
-    monkeypatch.setattr(
-        window,
-        "_refresh_usage_history",
-        lambda **kwargs: refresh_calls.append(kwargs),
-    )
-    window._usage_request_in_flight = True
-    window._usage_request_mode = "periodic"
-
-    client.result(
-        "usage",
-        {
-            "rateLimits": {
-                "primary": {"windowDurationMins": 300, "usedPercent": 28},
-                "secondary": {"windowDurationMins": 10080, "usedPercent": 70},
-            }
-        },
-    )
-
-    assert not window.status_dialog.isVisible()
-    assert refresh_calls == []
+    assert window._usage_history_window is not None
     assert (
-        len(get_usage_samples(current_epoch - 1, current_epoch, database_path=database_path)) == 1
+        window._usage_history_window.chart_stack.currentWidget()
+        is window._usage_history_window.error_state_label
     )
-    assert [
-        series.count() for series in window.usage_history_widget.chart_view.chart().series()
-    ] == [0, 0]
-
-    monkeypatch.setattr(window, "_refresh_usage_history", refresh_history)
-    window._show_status()
-
-    assert [
-        series.count() for series in window.usage_history_widget.chart_view.chart().series()
-    ] == [1, 1]
     window.close()
 
 

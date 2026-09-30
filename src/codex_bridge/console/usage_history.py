@@ -6,6 +6,7 @@ import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from time import time
 
@@ -173,6 +174,81 @@ def get_usage_samples(
     ]
 
 
+def get_usage_samples_for_display(
+    start_epoch: float,
+    end_epoch: float,
+    *,
+    max_points: int = 4_000,
+    database_path: Path | None = None,
+) -> list[UsageHistorySample]:
+    if end_epoch < start_epoch:
+        return []
+    if max_points <= 0:
+        raise ValueError("max_points must be positive")
+
+    duration_seconds = max(0.0, end_epoch - start_epoch)
+    bucket_seconds = max(60, ceil(duration_seconds / max_points))
+    with _open_database(database_path) as connection:
+        rows = connection.execute(
+            """
+            WITH ranked_samples AS (
+                SELECT minute_epoch, captured_at_epoch, five_hour_remaining,
+                       weekly_remaining,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY MIN(
+                               CAST((captured_at_epoch - ?) / ? AS INTEGER), ?
+                           )
+                           ORDER BY captured_at_epoch DESC, minute_epoch DESC
+                       ) AS bucket_rank
+                FROM usage_samples
+                WHERE captured_at_epoch >= ? AND captured_at_epoch <= ?
+            )
+            SELECT minute_epoch, captured_at_epoch, five_hour_remaining, weekly_remaining
+            FROM ranked_samples
+            WHERE bucket_rank = 1
+            ORDER BY captured_at_epoch ASC, minute_epoch ASC
+            """,
+            (start_epoch, bucket_seconds, max_points - 1, start_epoch, end_epoch),
+        ).fetchall()
+    return [
+        UsageHistorySample(
+            row["minute_epoch"],
+            row["captured_at_epoch"],
+            row["five_hour_remaining"],
+            row["weekly_remaining"],
+        )
+        for row in rows
+    ]
+
+
+def get_latest_usage_remaining(
+    start_epoch: float,
+    end_epoch: float,
+    *,
+    database_path: Path | None = None,
+) -> tuple[int | None, int | None]:
+    if end_epoch < start_epoch:
+        return None, None
+    with _open_database(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                (SELECT five_hour_remaining FROM usage_samples
+                 WHERE captured_at_epoch >= ? AND captured_at_epoch <= ?
+                   AND five_hour_remaining IS NOT NULL
+                 ORDER BY captured_at_epoch DESC, minute_epoch DESC LIMIT 1)
+                    AS five_hour_remaining,
+                (SELECT weekly_remaining FROM usage_samples
+                 WHERE captured_at_epoch >= ? AND captured_at_epoch <= ?
+                   AND weekly_remaining IS NOT NULL
+                 ORDER BY captured_at_epoch DESC, minute_epoch DESC LIMIT 1)
+                    AS weekly_remaining
+            """,
+            (start_epoch, end_epoch, start_epoch, end_epoch),
+        ).fetchone()
+    return row["five_hour_remaining"], row["weekly_remaining"]
+
+
 def get_recent_usage_events(
     limit: int = 20,
     *,
@@ -190,6 +266,36 @@ def get_recent_usage_events(
             LIMIT ?
             """,
             (limit,),
+        ).fetchall()
+    return [
+        UsageHistoryEvent(
+            row["occurred_at_epoch"],
+            row["event_type"],
+            row["previous_weekly_remaining"],
+            row["current_weekly_remaining"],
+        )
+        for row in rows
+    ]
+
+
+def get_usage_events(
+    start_epoch: float,
+    end_epoch: float,
+    *,
+    database_path: Path | None = None,
+) -> list[UsageHistoryEvent]:
+    if end_epoch < start_epoch:
+        return []
+    with _open_database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT occurred_at_epoch, event_type, previous_weekly_remaining,
+                   current_weekly_remaining
+            FROM usage_events
+            WHERE occurred_at_epoch >= ? AND occurred_at_epoch <= ?
+            ORDER BY occurred_at_epoch ASC, id ASC
+            """,
+            (start_epoch, end_epoch),
         ).fetchall()
     return [
         UsageHistoryEvent(

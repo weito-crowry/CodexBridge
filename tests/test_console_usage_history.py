@@ -10,8 +10,11 @@ from codex_bridge.console.usage_history import (
     UsageHistoryEvent,
     UsageHistorySample,
     default_usage_history_path,
+    get_latest_usage_remaining,
     get_recent_usage_events,
+    get_usage_events,
     get_usage_samples,
+    get_usage_samples_for_display,
     record_usage_sample,
 )
 
@@ -163,6 +166,102 @@ def test_usage_history_sample_range_is_ascending_and_inclusive(tmp_path: Path) -
     samples = get_usage_samples(60, 120, database_path=database_path)
 
     assert [sample.minute_epoch for sample in samples] == [60, 120]
+
+
+def test_usage_history_event_range_is_ascending_and_inclusive(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for captured_at, weekly in ((60, 10), (120, 30), (180, 20), (240, 50), (300, 40)):
+        record_usage_sample(
+            _usage(70, weekly), captured_at_epoch=float(captured_at), database_path=database_path
+        )
+
+    assert get_usage_events(120.0, 240.0, database_path=database_path) == [
+        UsageHistoryEvent(120.0, "weekly_remaining_increase", 10, 30),
+        UsageHistoryEvent(240.0, "weekly_remaining_increase", 20, 50),
+    ]
+
+
+def test_display_samples_choose_last_sample_in_each_bucket(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for index in range(61):
+        record_usage_sample(
+            _usage(index % 100, index % 90),
+            captured_at_epoch=float(index * 60),
+            database_path=database_path,
+        )
+
+    samples = get_usage_samples_for_display(0.0, 3_600.0, max_points=6, database_path=database_path)
+
+    assert len(samples) <= 6
+    assert [sample.captured_at_epoch for sample in samples] == [
+        540.0,
+        1_140.0,
+        1_740.0,
+        2_340.0,
+        2_940.0,
+        3_600.0,
+    ]
+
+
+def test_display_samples_keep_sparse_rows_and_nullable_values(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    expected = [
+        record_usage_sample(_usage(None, 40), captured_at_epoch=60.0, database_path=database_path),
+        record_usage_sample(_usage(75, None), captured_at_epoch=600.0, database_path=database_path),
+    ]
+
+    samples = get_usage_samples_for_display(
+        0.0, 1_000.0, max_points=20, database_path=database_path
+    )
+
+    assert samples == expected
+
+
+def test_latest_non_null_summary_values_are_selected_independently(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    for captured_at, five_hour, weekly in (
+        (60.0, 70, 20),
+        (120.0, None, 90),
+        (180.0, 60, None),
+    ):
+        record_usage_sample(
+            _usage(five_hour, weekly),
+            captured_at_epoch=captured_at,
+            database_path=database_path,
+        )
+
+    assert get_latest_usage_remaining(60.0, 180.0, database_path=database_path) == (60, 90)
+
+
+def test_one_year_minute_samples_are_limited_by_display_query(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    start_epoch = 1_700_000_000
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """CREATE TABLE usage_samples (
+                minute_epoch INTEGER PRIMARY KEY,
+                captured_at_epoch REAL NOT NULL,
+                five_hour_remaining INTEGER,
+                weekly_remaining INTEGER
+            )"""
+        )
+        connection.executemany(
+            "INSERT INTO usage_samples VALUES (?, ?, ?, ?)",
+            (
+                (start_epoch + index * 60, start_epoch + index * 60, index % 101, index % 101)
+                for index in range(525_600)
+            ),
+        )
+
+    samples = get_usage_samples_for_display(
+        start_epoch,
+        start_epoch + 365 * 24 * 60 * 60,
+        max_points=4_000,
+        database_path=database_path,
+    )
+
+    assert len(samples) <= 4_000
+    assert samples[-1].captured_at_epoch == start_epoch + 525_599 * 60
 
 
 def test_recent_weekly_events_are_limited_and_newest_first(tmp_path: Path) -> None:

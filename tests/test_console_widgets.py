@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from inspect import signature
 
 import pytest
-from PySide6.QtCharts import QDateTimeAxis, QValueAxis
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QPalette, QTextOption
 from PySide6.QtWidgets import (
@@ -21,13 +20,11 @@ from codex_bridge.console import usage as usage_module
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.usage import parse_codex_usage
-from codex_bridge.console.usage_history import UsageHistoryEvent, UsageHistorySample
 from codex_bridge.console.widgets import (
     ActivityPane,
     HistoryPane,
     ThreadListPane,
     TimelineEntry,
-    UsageHistoryWidget,
     activity_row,
     format_thread_content,
     timeline_entries,
@@ -838,87 +835,6 @@ def test_history_pane_omits_usage_snapshot_when_turn_has_none() -> None:
     pane.set_timeline((TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),))
 
     assert pane.findChild(QLabel, "turnUsageSnapshot") is None
-
-
-def test_usage_history_widget_shows_two_percent_series_and_empty_event_state() -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    widget = UsageHistoryWidget()
-
-    widget.set_history(
-        [
-            UsageHistorySample(60, 65.0, 70, 26),
-            UsageHistorySample(120, 125.0, None, 100),
-        ],
-        [],
-        start_epoch=60.0,
-        end_epoch=604_800.0,
-    )
-
-    chart = widget.chart_view.chart()
-    assert chart.legend().isVisible()
-    assert [series.name() for series in chart.series()] == [
-        "5h remaining",
-        "Weekly remaining",
-    ]
-    assert [series.count() for series in chart.series()] == [1, 2]
-    vertical_axes = chart.axes(Qt.Orientation.Vertical)
-    horizontal_axes = chart.axes(Qt.Orientation.Horizontal)
-    assert len(vertical_axes) == 1 and isinstance(vertical_axes[0], QValueAxis)
-    assert vertical_axes[0].min() == 0
-    assert vertical_axes[0].max() == 100
-    assert len(horizontal_axes) == 1 and isinstance(horizontal_axes[0], QDateTimeAxis)
-    assert horizontal_axes[0].min().toMSecsSinceEpoch() == 60_000
-    assert horizontal_axes[0].max().toMSecsSinceEpoch() == 604_800_000
-    assert widget.weekly_increases_label.text() == "No weekly increases recorded."
-
-
-def test_usage_history_widget_formats_weekly_increase_in_local_time() -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    widget = UsageHistoryWidget()
-    occurred_at = 1_790_000_000.0
-    local_time = datetime.fromtimestamp(occurred_at).strftime("%Y-%m-%d %H:%M")
-
-    widget.set_history(
-        [],
-        [UsageHistoryEvent(occurred_at, "weekly_remaining_increase", 26, 100)],
-        start_epoch=occurred_at - 604_800,
-        end_epoch=occurred_at,
-    )
-
-    assert widget.weekly_increases_label.text() == f"{local_time}  26% -> 100%"
-    assert widget.chart_view.chart().series()[0].count() == 0
-    assert widget.chart_view.chart().series()[1].count() == 0
-
-
-def test_usage_history_widget_accepts_empty_history() -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    widget = UsageHistoryWidget()
-
-    widget.set_history([], [], start_epoch=0, end_epoch=604_800)
-
-    assert len(widget.chart_view.chart().series()) == 2
-    assert [series.count() for series in widget.chart_view.chart().series()] == [0, 0]
-    assert widget.weekly_increases_label.text() == "No weekly increases recorded."
-
-
-def test_usage_history_widget_can_show_unavailable_state() -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    widget = UsageHistoryWidget()
-    widget.set_history(
-        [UsageHistorySample(60, 60.0, 70, 30)],
-        [UsageHistoryEvent(60.0, "weekly_remaining_increase", 20, 30)],
-        start_epoch=0,
-        end_epoch=120,
-    )
-
-    widget.set_unavailable()
-
-    assert [series.count() for series in widget.chart_view.chart().series()] == [0, 0]
-    assert widget.weekly_increases_label.text() == "Usage history unavailable."
 
 
 def test_history_pane_preserves_manual_scroll_position_when_snapshot_is_added() -> None:

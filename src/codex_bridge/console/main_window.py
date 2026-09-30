@@ -61,19 +61,15 @@ from .usage import (
     usage_level,
 )
 from .usage_history import (
-    UsageHistoryEvent,
-    UsageHistorySample,
     default_usage_history_path,
-    get_recent_usage_events,
-    get_usage_samples,
     record_usage_sample,
 )
+from .usage_history_window import UsageHistoryWindow
 from .widgets import (
     ActivityPane,
     HistoryPane,
     ThreadListPane,
     TimelineEntry,
-    UsageHistoryWidget,
     copy_to_clipboard,
     format_thread_content,
     timeline_entries,
@@ -185,6 +181,7 @@ class MainWindow(QMainWindow):
         self._usage_history_path = (
             default_usage_history_path() if usage_history_path is None else usage_history_path
         )
+        self._usage_history_window: UsageHistoryWindow | None = None
         self._client = api_client or ApiClient(config.base_url, self)
         self._codex_probe = codex_probe if codex_probe is not None else self._new_codex_probe()
         self._codex_update_probe = (
@@ -409,7 +406,15 @@ class MainWindow(QMainWindow):
 
         self.usage_detail_label = QLabel(format_codex_usage_detail(self._usage))
         self.usage_detail_label.setWordWrap(True)
-        self.usage_history_widget = UsageHistoryWidget()
+        self.usage_history_button = QPushButton("Show usage history")
+        self.usage_history_button.setObjectName("showUsageHistory")
+        self.usage_history_button.setFlat(True)
+        self.usage_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.usage_history_button.setStyleSheet(
+            "QPushButton { color: palette(link); text-decoration: underline; "
+            "border: 0; padding: 2px 0; text-align: left; }"
+            "QPushButton:hover { color: palette(highlight); }"
+        )
         self.codex_latest_label = QLabel("Not checked")
         self.codex_update_status_label = QLabel("Not checked")
         self.codex_update_message_label = QLabel("")
@@ -460,7 +465,7 @@ class MainWindow(QMainWindow):
         )
         add_section(
             "Usage",
-            [("Codex Usage", self.usage_detail_label), ("", self.usage_history_widget)],
+            [("Codex Usage", self.usage_detail_label), ("", self.usage_history_button)],
         )
         add_section(
             "Tunnel",
@@ -627,6 +632,7 @@ class MainWindow(QMainWindow):
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
         self.status_button.clicked.connect(self._show_status)
+        self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
         self.status_refresh_button.clicked.connect(self._refresh_status)
         self.status_close_button.clicked.connect(self.status_dialog.close)
         self.codex_update_check_button.clicked.connect(self._check_codex_updates)
@@ -636,10 +642,21 @@ class MainWindow(QMainWindow):
         self.advanced_toggle_button.toggled.connect(self.advanced_controls.setVisible)
 
     def _show_status(self) -> None:
-        self._refresh_usage_history()
         self.status_dialog.show()
         self.status_dialog.raise_()
         self.status_dialog.activateWindow()
+
+    def _create_or_show_usage_history_window(self) -> None:
+        if self._usage_history_window is None:
+            self._usage_history_window = UsageHistoryWindow(
+                self._usage_history_path,
+                parent=self,
+            )
+        else:
+            self._usage_history_window.refresh(rolling=True)
+        self._usage_history_window.show()
+        self._usage_history_window.raise_()
+        self._usage_history_window.activateWindow()
 
     def _refresh_status(self) -> None:
         self._request_usage(force=True)
@@ -1245,26 +1262,6 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.WindowText, palette.color(role))
         self.usage_status_label.setPalette(palette)
 
-    def _refresh_usage_history(self, *, end_epoch: float | None = None) -> None:
-        end = time() if end_epoch is None else end_epoch
-        start = end - 7 * 24 * 60 * 60
-        try:
-            samples: list[UsageHistorySample] = get_usage_samples(
-                start, end, database_path=self._usage_history_path
-            )
-            events: list[UsageHistoryEvent] = get_recent_usage_events(
-                limit=20, database_path=self._usage_history_path
-            )
-        except (OSError, sqlite3.Error):
-            self.usage_history_widget.set_unavailable()
-            return
-        self.usage_history_widget.set_history(
-            samples,
-            events,
-            start_epoch=start,
-            end_epoch=end,
-        )
-
     def _record_usage_history(self) -> None:
         captured_at_epoch = time()
         try:
@@ -1275,8 +1272,9 @@ class MainWindow(QMainWindow):
             )
         except (OSError, sqlite3.Error):
             return
-        if sample is not None and self.status_dialog.isVisible():
-            self._refresh_usage_history(end_epoch=captured_at_epoch)
+        history_window = self._usage_history_window
+        if sample is not None and history_window is not None and history_window.isVisible():
+            history_window.refresh(rolling=True)
 
     def _sync_overall_status(self) -> None:
         bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
@@ -2332,6 +2330,8 @@ class MainWindow(QMainWindow):
             abort_update()
         self._client.abort_all()
         self._launcher.close()
+        if self._usage_history_window is not None:
+            self._usage_history_window.close()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.hide()

@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+import sqlite3
+from datetime import UTC, datetime
+from pathlib import Path
+
+from PySide6.QtCore import QDateTime, QSettings, Qt
+from PySide6.QtWidgets import QApplication, QToolButton
+
+from codex_bridge.console.usage import CodexUsage, UsageWindow
+from codex_bridge.console.usage_history import (
+    UsageHistoryEvent,
+    UsageHistorySample,
+    get_usage_samples_for_display,
+    record_usage_sample,
+)
+from codex_bridge.console.usage_history_window import (
+    UsageHistoryWindow,
+    export_usage_history_csv,
+    format_reset_tooltip,
+    format_sample_tooltip,
+    write_usage_history_csv,
+)
+
+
+def _application() -> QApplication:
+    application = QApplication.instance()
+    return application if isinstance(application, QApplication) else QApplication([])
+
+
+def _usage(five_hour: int | None, weekly: int | None) -> CodexUsage:
+    return CodexUsage(
+        five_hour=UsageWindow(300, five_hour, "reset") if five_hour is not None else None,
+        weekly=UsageWindow(10080, weekly, "reset") if weekly is not None else None,
+    )
+
+
+def _epoch(year: int, month: int, day: int, hour: int = 12, minute: int = 30) -> int:
+    return int(datetime(year, month, day, hour, minute, tzinfo=UTC).timestamp())
+
+
+def test_usage_history_window_starts_at_one_month_with_auto_axis(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: float(now))
+
+    assert window.selected_preset == "1 month"
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == now
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == now - 30 * 24 * 60 * 60
+    assert window.axis_mode_combo.currentText() == "Auto"
+    assert window.start_edit.calendarPopup()
+    assert window.end_edit.calendarPopup()
+    assert window.start_edit.dateTime().timeSpec() == Qt.TimeSpec.LocalTime
+    window.close()
+
+
+def test_usage_history_presets_replace_range_and_manual_edit_selects_custom(
+    tmp_path: Path,
+) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: float(now))
+
+    for label, days in (("7 days", 7), ("1 month", 30), ("1 year", 365)):
+        button = window.findChild(QToolButton, window.preset_object_names[label])
+        assert button is not None
+        button.click()
+        assert window.selected_preset == label
+        assert window.end_edit.dateTime().toSecsSinceEpoch() == now
+        assert window.start_edit.dateTime().toSecsSinceEpoch() == now - days * 24 * 60 * 60
+        expected_axis = "MM/dd HH:mm" if days == 7 else "MM/dd" if days == 30 else "yyyy/MM"
+        assert window.time_axis.format() == expected_axis
+
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(now - 10 * 24 * 60 * 60 + 60))
+
+    assert window.selected_preset == "Custom"
+    assert window.findChild(QToolButton, window.preset_object_names["Custom"]).isChecked()
+    window.close()
+
+
+def test_invalid_range_does_not_query_or_crash(tmp_path: Path, monkeypatch) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: float(now))
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(now))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(now - 60))
+    queried = False
+
+    def fail_if_queried(*args, **kwargs):
+        nonlocal queried
+        queried = True
+        raise AssertionError("invalid ranges must not query storage")
+
+    monkeypatch.setattr(
+        "codex_bridge.console.usage_history_window.get_usage_samples_for_display",
+        fail_if_queried,
+    )
+
+    assert not window.refresh()
+    assert not queried
+    assert window.range_error_label.text()
+    window.close()
+
+
+def test_empty_and_database_error_states_are_visible(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    empty = UsageHistoryWindow(tmp_path / "empty.sqlite3", now=lambda: float(now))
+    assert empty.refresh()
+    assert empty.chart_stack.currentWidget() is empty.chart_content
+    assert not empty.empty_state_label.isHidden()
+    assert "No usage data" in empty.empty_state_label.text()
+    empty.close()
+
+    database_directory = tmp_path / "directory.sqlite3"
+    database_directory.mkdir()
+    failed = UsageHistoryWindow(database_directory, now=lambda: float(now))
+    assert not failed.refresh()
+    assert failed.chart_stack.currentWidget() is failed.error_state_label
+    assert failed.error_state_label.text() == "Usage history unavailable."
+    failed.close()
+
+
+def test_reset_events_remain_visible_when_the_period_has_no_samples(tmp_path: Path) -> None:
+    _application()
+    database_path = tmp_path / "events-only.sqlite3"
+    reset_at = _epoch(2026, 9, 27, 6, 14)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_epoch REAL NOT NULL,
+                event_type TEXT NOT NULL,
+                previous_weekly_remaining INTEGER NOT NULL,
+                current_weekly_remaining INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO usage_events VALUES (NULL, ?, ?, ?, ?)",
+            (reset_at, "weekly_remaining_increase", 18, 100),
+        )
+    window = UsageHistoryWindow(
+        database_path,
+        now=lambda: float(_epoch(2026, 9, 30)),
+    )
+
+    assert window.chart_stack.currentWidget() is window.chart_content
+    assert not window.empty_state_label.isHidden()
+    assert window.reset_series.count() == 1
+    assert window.reset_history_list.count() == 1
+    window.close()
+
+
+def test_summary_and_reset_marker_use_selected_period_events(tmp_path: Path) -> None:
+    _application()
+    database_path = tmp_path / "usage.sqlite3"
+    reset_at = _epoch(2026, 9, 27, 6, 14)
+    record_usage_sample(
+        _usage(71, 18), captured_at_epoch=reset_at - 60, database_path=database_path
+    )
+    record_usage_sample(_usage(None, 100), captured_at_epoch=reset_at, database_path=database_path)
+    window = UsageHistoryWindow(
+        database_path,
+        now=lambda: float(reset_at + 1),
+    )
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at - 3_600))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(reset_at + 3_600))
+
+    assert window.refresh()
+
+    assert window.summary_labels["5h remaining"].text() == "71%"
+    assert window.summary_labels["Weekly remaining"].text() == "100%"
+    assert window.summary_labels["Reset candidates"].text() == "1"
+    assert window.reset_series.count() == 1
+    point = window.reset_series.at(0)
+    assert point.x() == reset_at * 1_000
+    assert point.y() == 100
+    assert window.reset_history_list.count() == 1
+    assert "18% → 100%" in window.reset_history_list.item(0).text()
+    window.close()
+
+
+def test_axis_modes_update_datetime_format(tmp_path: Path) -> None:
+    _application()
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: 1_790_000_000.0)
+
+    window.axis_mode_combo.setCurrentText("Date")
+    assert window.time_axis.format() == "MM/dd"
+    window.axis_mode_combo.setCurrentText("Time")
+    assert window.time_axis.format() == "HH:mm"
+    window.axis_mode_combo.setCurrentText("Auto")
+    assert window.time_axis.format() == "MM/dd"
+    window.close()
+
+
+def test_series_visibility_controls_toggle_each_chart_series(tmp_path: Path) -> None:
+    _application()
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: 1_790_000_000.0)
+
+    marker = window.chart.legend().markers(window.five_hour_series)[0]
+    marker.clicked.emit()
+    assert not window.five_hour_series.isVisible()
+    assert window.weekly_series.isVisible()
+    window.toggle_series_visibility(window.five_hour_series)
+    window.toggle_series_visibility(window.weekly_series)
+    assert window.five_hour_series.isVisible()
+    assert not window.weekly_series.isVisible()
+    window.close()
+
+
+def test_manual_refresh_keeps_custom_range(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    database_path = tmp_path / "usage.sqlite3"
+    record_usage_sample(
+        _usage(70, 40), captured_at_epoch=float(now - 600), database_path=database_path
+    )
+    window = UsageHistoryWindow(database_path, now=lambda: float(now))
+    start = now - 10 * 24 * 60 * 60
+    end = now - 300
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(start))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(end))
+
+    window.refresh_button.click()
+
+    assert window.selected_preset == "Custom"
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == start
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == end
+    assert window.five_hour_series.count() == 1
+    assert window.updated_label.text().startswith("Updated ")
+    window.close()
+
+
+def test_rolling_refresh_updates_presets_but_preserves_custom_dates(tmp_path: Path) -> None:
+    _application()
+    current_time = [_epoch(2026, 9, 30)]
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: float(current_time[0]),
+    )
+    window.preset_buttons["7 days"].click()
+    current_time[0] += 24 * 60 * 60
+
+    assert window.refresh(rolling=True)
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == current_time[0]
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == current_time[0] - 7 * 24 * 60 * 60
+
+    custom_start = current_time[0] - 3 * 24 * 60 * 60
+    custom_end = current_time[0] - 60
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(custom_start))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(custom_end))
+    current_time[0] += 24 * 60 * 60
+
+    assert window.refresh(rolling=True)
+    assert window.selected_preset == "Custom"
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == custom_start
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == custom_end
+    window.close()
+
+
+def test_sample_and_reset_tooltips_explain_observed_values() -> None:
+    sample = UsageHistorySample(
+        1,
+        float(_epoch(2026, 9, 29, 18, 42)),
+        71,
+        None,
+    )
+    event = UsageHistoryEvent(
+        float(_epoch(2026, 9, 27, 6, 14)),
+        "weekly_remaining_increase",
+        18,
+        100,
+    )
+
+    sample_text = format_sample_tooltip(sample)
+    complete_sample_text = format_sample_tooltip(
+        UsageHistorySample(sample.minute_epoch, sample.captured_at_epoch, 71, 32)
+    )
+    reset_text = format_reset_tooltip(event)
+
+    assert "5h remaining: 71%" in sample_text
+    assert "Weekly remaining" not in sample_text
+    assert "Weekly remaining: 32%" in complete_sample_text
+    assert "reset candidate" in reset_text.lower()
+    assert "quota increase" in reset_text.lower()
+    assert "18% → 100%" in reset_text
+    assert "+82 pt" in reset_text
+
+
+def test_csv_export_writes_raw_utf8_rows_and_blank_nulls(tmp_path: Path) -> None:
+    path = tmp_path / "usage.csv"
+    samples = [
+        UsageHistorySample(1, float(_epoch(2026, 9, 29, 18, 42)), 71, None),
+        UsageHistorySample(2, float(_epoch(2026, 9, 29, 18, 43)), None, 44),
+    ]
+
+    write_usage_history_csv(path, samples)
+
+    content = path.read_text(encoding="utf-8-sig")
+    rows = content.splitlines()
+    assert rows[0] == "timestamp,five_hour_remaining,weekly_remaining"
+    assert len(rows) == 3
+    assert rows[1].endswith(",71,")
+    assert rows[2].endswith(",,44")
+    expected_timestamp = (
+        datetime.fromtimestamp(samples[0].captured_at_epoch)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
+    assert rows[1].startswith(f"{expected_timestamp},")
+
+
+def test_csv_export_queries_raw_rows_instead_of_display_downsampling(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage.sqlite3"
+    start = _epoch(2026, 9, 1)
+    sample_count = 4_500
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """CREATE TABLE usage_samples (
+                minute_epoch INTEGER PRIMARY KEY,
+                captured_at_epoch REAL NOT NULL,
+                five_hour_remaining INTEGER,
+                weekly_remaining INTEGER
+            )"""
+        )
+        connection.executemany(
+            "INSERT INTO usage_samples VALUES (?, ?, ?, ?)",
+            (
+                (start + index * 60, start + index * 60, index % 101, None if index % 3 else 50)
+                for index in range(sample_count)
+            ),
+        )
+    end = start + (sample_count - 1) * 60
+    chart_samples = get_usage_samples_for_display(
+        start,
+        end,
+        max_points=1_000,
+        database_path=database_path,
+    )
+    export_path = tmp_path / "raw.csv"
+
+    written = export_usage_history_csv(
+        export_path,
+        start,
+        end,
+        database_path=database_path,
+    )
+
+    assert len(chart_samples) <= 1_000
+    assert written == sample_count
+    assert len(export_path.read_text(encoding="utf-8-sig").splitlines()) == sample_count + 1
+
+
+def test_usage_history_window_restores_saved_geometry_and_recovers_from_corruption(
+    tmp_path: Path,
+) -> None:
+    _application()
+    settings_path = tmp_path / "settings.ini"
+    settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
+    first = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
+    first.resize(1_100, 740)
+    first.close()
+
+    restored = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
+    assert restored.size().width() == 1_100
+    assert restored.size().height() == 740
+    restored.close()
+
+    settings.setValue("console/usageHistory/geometry", b"damaged")
+    fallback = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
+    assert fallback.size().width() == 1_040
+    assert fallback.size().height() == 700
+    fallback.close()

@@ -3,12 +3,10 @@ from __future__ import annotations
 import os
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from math import ceil
 from typing import Any
 
-from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
-from PySide6.QtCore import QDateTime, QDir, QPoint, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QDir, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette, QResizeEvent, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,7 +29,6 @@ from PySide6.QtWidgets import (
 
 from .project_names import normalize_cwd
 from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
-from .usage_history import UsageHistoryEvent, UsageHistorySample
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,81 +82,6 @@ def _turn_header(status: object, metadata: Mapping[str, object] | None) -> str:
         parts.append(safe_status)
     parts.append(_model_summary(metadata))
     return " · ".join(parts)
-
-
-class UsageHistoryWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        chart = QChart()
-        self.five_hour_series = QLineSeries()
-        self.five_hour_series.setName("5h remaining")
-        self.weekly_series = QLineSeries()
-        self.weekly_series.setName("Weekly remaining")
-        chart.addSeries(self.five_hour_series)
-        chart.addSeries(self.weekly_series)
-
-        self.time_axis = QDateTimeAxis()
-        self.time_axis.setFormat("yyyy-MM-dd HH:mm")
-        self.time_axis.setTickCount(6)
-        self.percent_axis = QValueAxis()
-        self.percent_axis.setRange(0, 100)
-        self.percent_axis.setLabelFormat("%d%%")
-        chart.addAxis(self.time_axis, Qt.AlignmentFlag.AlignBottom)
-        chart.addAxis(self.percent_axis, Qt.AlignmentFlag.AlignLeft)
-        for series in (self.five_hour_series, self.weekly_series):
-            series.attachAxis(self.time_axis)
-            series.attachAxis(self.percent_axis)
-        chart.legend().setVisible(True)
-
-        self.chart_view = QChartView(chart, self)
-        self.chart_view.setObjectName("usageHistoryChart")
-        self.chart_view.setMinimumHeight(220)
-        self.weekly_increases_heading = QLabel("Weekly increases")
-        self.weekly_increases_heading.setObjectName("weeklyIncreasesHeading")
-        self.weekly_increases_label = QLabel("No weekly increases recorded.")
-        self.weekly_increases_label.setObjectName("weeklyIncreases")
-        self.weekly_increases_label.setWordWrap(True)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.chart_view)
-        layout.addWidget(self.weekly_increases_heading)
-        layout.addWidget(self.weekly_increases_label)
-
-    def set_history(
-        self,
-        samples: Sequence[UsageHistorySample],
-        events: Sequence[UsageHistoryEvent],
-        *,
-        start_epoch: float,
-        end_epoch: float,
-    ) -> None:
-        self.five_hour_series.clear()
-        self.weekly_series.clear()
-        for sample in samples:
-            timestamp_ms = round(sample.captured_at_epoch * 1_000)
-            if sample.five_hour_remaining is not None:
-                self.five_hour_series.append(timestamp_ms, sample.five_hour_remaining)
-            if sample.weekly_remaining is not None:
-                self.weekly_series.append(timestamp_ms, sample.weekly_remaining)
-
-        self.time_axis.setRange(
-            QDateTime.fromMSecsSinceEpoch(round(start_epoch * 1_000)),
-            QDateTime.fromMSecsSinceEpoch(round(end_epoch * 1_000)),
-        )
-        event_lines = [
-            f"{datetime.fromtimestamp(event.occurred_at_epoch).strftime('%Y-%m-%d %H:%M')}  "
-            f"{event.previous_weekly_remaining}% -> {event.current_weekly_remaining}%"
-            for event in events
-        ]
-        self.weekly_increases_label.setText(
-            "\n".join(event_lines) if event_lines else "No weekly increases recorded."
-        )
-
-    def set_unavailable(self) -> None:
-        self.five_hour_series.clear()
-        self.weekly_series.clear()
-        self.weekly_increases_label.setText("Usage history unavailable.")
 
 
 def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
