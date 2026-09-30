@@ -141,6 +141,18 @@ def test_weekly_increase_is_saved_once_and_detected_after_database_reopen(
     assert events == [UsageHistoryEvent(120.0, "weekly_remaining_increase", 30, 80)]
 
 
+def test_weekly_increase_compares_against_last_non_null_sample(tmp_path: Path) -> None:
+    database_path = tmp_path / "usage-history.sqlite3"
+    record_usage_sample(_usage(50, 30), captured_at_epoch=60.0, database_path=database_path)
+    record_usage_sample(_usage(55, None), captured_at_epoch=120.0, database_path=database_path)
+
+    record_usage_sample(_usage(60, 80), captured_at_epoch=180.0, database_path=database_path)
+
+    assert get_recent_usage_events(database_path=database_path) == [
+        UsageHistoryEvent(180.0, "weekly_remaining_increase", 30, 80)
+    ]
+
+
 def test_usage_history_sample_range_is_ascending_and_inclusive(tmp_path: Path) -> None:
     database_path = tmp_path / "usage-history.sqlite3"
     for captured_at in (180.0, 60.0, 120.0):

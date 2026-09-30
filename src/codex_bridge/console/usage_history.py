@@ -105,7 +105,13 @@ def record_usage_sample(
     sample = UsageHistorySample(minute_epoch, captured, five_hour, weekly)
     with _open_database(database_path) as connection:
         previous = connection.execute(
-            "SELECT weekly_remaining FROM usage_samples ORDER BY minute_epoch DESC LIMIT 1"
+            """
+            SELECT weekly_remaining
+            FROM usage_samples
+            WHERE weekly_remaining IS NOT NULL
+            ORDER BY minute_epoch DESC
+            LIMIT 1
+            """
         ).fetchone()
         previous_weekly = previous["weekly_remaining"] if previous is not None else None
         if previous_weekly is not None and weekly is not None and weekly > previous_weekly:

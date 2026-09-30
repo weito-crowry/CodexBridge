@@ -904,6 +904,23 @@ def test_usage_history_widget_accepts_empty_history() -> None:
     assert widget.weekly_increases_label.text() == "No weekly increases recorded."
 
 
+def test_usage_history_widget_can_show_unavailable_state() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    widget = UsageHistoryWidget()
+    widget.set_history(
+        [UsageHistorySample(60, 60.0, 70, 30)],
+        [UsageHistoryEvent(60.0, "weekly_remaining_increase", 20, 30)],
+        start_epoch=0,
+        end_epoch=120,
+    )
+
+    widget.set_unavailable()
+
+    assert [series.count() for series in widget.chart_view.chart().series()] == [0, 0]
+    assert widget.weekly_increases_label.text() == "Usage history unavailable."
+
+
 def test_history_pane_preserves_manual_scroll_position_when_snapshot_is_added() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None

@@ -156,6 +156,11 @@ class UsageHistoryWidget(QWidget):
             "\n".join(event_lines) if event_lines else "No weekly increases recorded."
         )
 
+    def set_unavailable(self) -> None:
+        self.five_hour_series.clear()
+        self.weekly_series.clear()
+        self.weekly_increases_label.setText("Usage history unavailable.")
+
 
 def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
     item_id = item.get("id")

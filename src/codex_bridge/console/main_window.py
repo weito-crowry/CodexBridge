@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -1247,12 +1248,16 @@ class MainWindow(QMainWindow):
     def _refresh_usage_history(self, *, end_epoch: float | None = None) -> None:
         end = time() if end_epoch is None else end_epoch
         start = end - 7 * 24 * 60 * 60
-        samples: list[UsageHistorySample] = get_usage_samples(
-            start, end, database_path=self._usage_history_path
-        )
-        events: list[UsageHistoryEvent] = get_recent_usage_events(
-            limit=20, database_path=self._usage_history_path
-        )
+        try:
+            samples: list[UsageHistorySample] = get_usage_samples(
+                start, end, database_path=self._usage_history_path
+            )
+            events: list[UsageHistoryEvent] = get_recent_usage_events(
+                limit=20, database_path=self._usage_history_path
+            )
+        except (OSError, sqlite3.Error):
+            self.usage_history_widget.set_unavailable()
+            return
         self.usage_history_widget.set_history(
             samples,
             events,
@@ -1262,12 +1267,15 @@ class MainWindow(QMainWindow):
 
     def _record_usage_history(self) -> None:
         captured_at_epoch = time()
-        sample = record_usage_sample(
-            self._usage,
-            captured_at_epoch=captured_at_epoch,
-            database_path=self._usage_history_path,
-        )
-        if sample is not None:
+        try:
+            sample = record_usage_sample(
+                self._usage,
+                captured_at_epoch=captured_at_epoch,
+                database_path=self._usage_history_path,
+            )
+        except (OSError, sqlite3.Error):
+            return
+        if sample is not None and self.status_dialog.isVisible():
             self._refresh_usage_history(end_epoch=captured_at_epoch)
 
     def _sync_overall_status(self) -> None:

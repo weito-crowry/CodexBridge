@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -723,6 +724,7 @@ def test_success_saves_history_refreshes_ui_and_status_reopens_history(
     )
     current_epoch = 1_790_000_000.0
     monkeypatch.setattr(main_window_module, "time", lambda: current_epoch)
+    window._show_status()
 
     client.result(
         "usage",
@@ -775,6 +777,120 @@ def test_success_saves_history_refreshes_ui_and_status_reopens_history(
         2,
     ]
     assert "30% -> 100%" in window.usage_history_widget.weekly_increases_label.text()
+    window.close()
+
+
+@pytest.mark.parametrize("history_error", [sqlite3.OperationalError, OSError])
+def test_usage_history_write_failure_keeps_usage_and_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    history_error: type[Exception],
+) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=tmp_path / "usage-history.sqlite3",
+    )
+
+    def fail_record(*args: object, **kwargs: object) -> None:
+        raise history_error("history unavailable")
+
+    monkeypatch.setattr(main_window_module, "record_usage_sample", fail_record)
+    window._usage_request_in_flight = True
+    window._usage_request_mode = "periodic"
+    _set_usage_ready(window)
+
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 28}}},
+    )
+
+    assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week —"
+    assert window.usage_poll_timer.isActive()
+    window.close()
+
+
+@pytest.mark.parametrize("history_error", [sqlite3.OperationalError, OSError])
+def test_status_dialog_opens_when_usage_history_read_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    history_error: type[Exception],
+) -> None:
+    _application()
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        tray_available=False,
+        usage_history_path=tmp_path / "usage-history.sqlite3",
+    )
+
+    def fail_read(*args: object, **kwargs: object) -> None:
+        raise history_error("history unavailable")
+
+    monkeypatch.setattr(main_window_module, "get_usage_samples", fail_read)
+
+    window._show_status()
+
+    assert window.status_dialog.isVisible()
+    assert window.usage_history_widget.weekly_increases_label.text() == (
+        "Usage history unavailable."
+    )
+    window.close()
+
+
+def test_hidden_status_dialog_saves_usage_without_refreshing_chart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _application()
+    client = FakeClient()
+    database_path = tmp_path / "usage-history.sqlite3"
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        tray_available=False,
+        usage_history_path=database_path,
+    )
+    current_epoch = 1_790_000_000.0
+    monkeypatch.setattr(main_window_module, "time", lambda: current_epoch)
+    _set_usage_ready(window)
+    refresh_history = window._refresh_usage_history
+    refresh_calls: list[object] = []
+    monkeypatch.setattr(
+        window,
+        "_refresh_usage_history",
+        lambda **kwargs: refresh_calls.append(kwargs),
+    )
+    window._usage_request_in_flight = True
+    window._usage_request_mode = "periodic"
+
+    client.result(
+        "usage",
+        {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 70},
+            }
+        },
+    )
+
+    assert not window.status_dialog.isVisible()
+    assert refresh_calls == []
+    assert (
+        len(get_usage_samples(current_epoch - 1, current_epoch, database_path=database_path)) == 1
+    )
+    assert [
+        series.count() for series in window.usage_history_widget.chart_view.chart().series()
+    ] == [0, 0]
+
+    monkeypatch.setattr(window, "_refresh_usage_history", refresh_history)
+    window._show_status()
+
+    assert [
+        series.count() for series in window.usage_history_widget.chart_view.chart().series()
+    ] == [1, 1]
     window.close()
 
 
