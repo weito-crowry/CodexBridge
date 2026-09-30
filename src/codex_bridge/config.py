@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from .config_file import ConfigFileError, load_user_config
@@ -16,6 +18,7 @@ class ConfigurationError(ValueError):
 
 
 WAIT_HARD_MAX_SECONDS = 55.0
+_TARGET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", re.ASCII)
 
 
 def validate_allowed_roots(allowed_roots: tuple[str, ...]) -> tuple[str, ...]:
@@ -177,6 +180,112 @@ def _github_prefix(value: object, source: str) -> str:
     return value
 
 
+def _target_url(value: object) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ConfigurationError("remote target url must be an HTTP(S) URL")
+    if any(character.isspace() or unicodedata.category(character) == "Cc" for character in value):
+        raise ConfigurationError("remote target url must be an HTTP(S) URL")
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigurationError("remote target url must be an HTTP(S) URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in value
+        or "#" in value
+        or (port is not None and not 1 <= port <= 65_535)
+    ):
+        raise ConfigurationError("remote target url must be an HTTP(S) URL")
+    loopback = hostname.casefold() == "localhost"
+    try:
+        loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        pass
+    if parsed.scheme == "http" and not loopback:
+        raise ConfigurationError("plain HTTP is allowed only for loopback execution targets")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionTargetConfig:
+    id: str
+    name: str
+    kind: Literal["local", "remote"]
+    url: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or _TARGET_ID_PATTERN.fullmatch(self.id) is None:
+            raise ConfigurationError("execution target id is invalid")
+        if not isinstance(self.name, str):
+            raise ConfigurationError("execution target name must be a string")
+        if any(unicodedata.category(character) == "Cc" for character in self.name):
+            raise ConfigurationError("execution target name must not contain control characters")
+        normalized_name = self.name.strip()
+        if not 1 <= len(normalized_name) <= 100:
+            raise ConfigurationError("execution target name must contain 1 to 100 characters")
+        object.__setattr__(self, "name", normalized_name)
+        if not isinstance(self.kind, str) or self.kind not in {"local", "remote"}:
+            raise ConfigurationError("execution target kind must be local or remote")
+        if self.kind == "local":
+            if self.url is not None:
+                raise ConfigurationError("local execution targets must not have a url")
+        else:
+            object.__setattr__(self, "url", _target_url(self.url))
+
+
+def _execution_targets(value: object) -> tuple[ExecutionTargetConfig, ...]:
+    if value is None:
+        return (ExecutionTargetConfig("local", "Local PC", "local"),)
+    if not isinstance(value, Mapping) or not value:
+        raise ConfigurationError("targets must contain at least one execution target")
+    targets: list[ExecutionTargetConfig] = []
+    for target_id, definition in value.items():
+        if not isinstance(definition, Mapping):
+            raise ConfigurationError("execution target definitions must be tables")
+        if set(definition) - {"name", "kind", "url"}:
+            raise ConfigurationError("execution target contains an unsupported setting")
+        name = definition.get("name")
+        kind = definition.get("kind")
+        if (
+            not isinstance(name, str)
+            or not isinstance(kind, str)
+            or kind not in {"local", "remote"}
+        ):
+            raise ConfigurationError("execution target name or kind is invalid")
+        target = ExecutionTargetConfig(
+            id=target_id if isinstance(target_id, str) else "",
+            name=name,
+            kind=cast(Literal["local", "remote"], kind),
+            url=definition.get("url"),
+        )
+        targets.append(target)
+    return _validate_execution_targets(tuple(targets))
+
+
+def _validate_execution_targets(
+    targets: tuple[ExecutionTargetConfig, ...],
+) -> tuple[ExecutionTargetConfig, ...]:
+    if not isinstance(targets, tuple):
+        raise ConfigurationError("targets must be an immutable tuple")
+    if not targets:
+        raise ConfigurationError("targets must contain at least one execution target")
+    if len(targets) > 16:
+        raise ConfigurationError("a maximum of 16 execution targets may be configured")
+    if not all(isinstance(target, ExecutionTargetConfig) for target in targets):
+        raise ConfigurationError("targets must contain execution target configurations")
+    if sum(target.kind == "local" for target in targets) != 1:
+        raise ConfigurationError("explicit targets must contain exactly one local target")
+    if len({target.id for target in targets}) != len(targets):
+        raise ConfigurationError("execution target ids must be unique")
+    return targets
+
+
 @dataclass(frozen=True, slots=True)
 class GitHubMcpConfig:
     enabled: bool = False
@@ -285,6 +394,12 @@ class BridgeConfig:
     control_token: str | None = None
     codex_executable_source: str = "default"
     github_mcp: GitHubMcpConfig = field(default_factory=GitHubMcpConfig)
+    targets: tuple[ExecutionTargetConfig, ...] = field(
+        default_factory=lambda: (ExecutionTargetConfig("local", "Local PC", "local"),)
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "targets", _validate_execution_targets(self.targets))
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -305,6 +420,7 @@ class BridgeConfig:
         bridge_config = file_config.get("bridge", {})
         console_config = file_config.get("console", {})
         github_mcp_config = file_config.get("github_mcp", {})
+        target_config = file_config.get("targets")
         if (
             not isinstance(bridge_config, Mapping)
             or not isinstance(console_config, Mapping)
@@ -390,4 +506,5 @@ class BridgeConfig:
                 environ=values,
                 config_data=github_mcp_config,
             ),
+            targets=_execution_targets(target_config),
         )

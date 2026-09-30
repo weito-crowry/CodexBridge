@@ -26,7 +26,7 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "max_tools": int,
     },
 }
-_SECRET_TERMS = ("key", "token", "secret", "password", "credential")
+_SECRET_TERMS = ("key", "token", "secret", "password", "credential", "pat")
 
 
 def default_config_path(
@@ -60,7 +60,7 @@ def load_user_config(
     *,
     platform: str | None = None,
     path: str | os.PathLike[str] | None = None,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, Any]:
     config_path = (
         Path(path).expanduser()
         if path is not None
@@ -79,8 +79,34 @@ def load_user_config(
     if not isinstance(document, dict):
         raise ConfigFileError("CodexBridge configuration must be a TOML table")
 
-    result: dict[str, dict[str, Any]] = {}
+    result: dict[str, Any] = {}
     for section, values in document.items():
+        if section == "targets":
+            if not isinstance(values, dict):
+                raise ConfigFileError("targets must be a TOML table")
+            targets: dict[str, dict[str, Any]] = {}
+            target_fields = {"name": str, "kind": str, "url": str}
+            for target_id, definition in values.items():
+                if not isinstance(target_id, str) or not isinstance(definition, dict):
+                    raise ConfigFileError("each targets entry must be a table")
+                normalized_target: dict[str, Any] = {}
+                for key, value in definition.items():
+                    if _secret_setting("targets", key):
+                        raise ConfigFileError(
+                            "secret setting "
+                            f"targets.{target_id}.{key} must not be stored in the config file"
+                        )
+                    target_expected = target_fields.get(key)
+                    if target_expected is None:
+                        raise ConfigFileError(
+                            f"unsupported CodexBridge configuration key: targets.{target_id}.{key}"
+                        )
+                    if not isinstance(value, target_expected):
+                        raise ConfigFileError(f"targets.{target_id}.{key} must be a string")
+                    normalized_target[key] = value
+                targets[target_id] = normalized_target
+            result[section] = targets
+            continue
         if section not in _SCHEMA or not isinstance(values, dict):
             raise ConfigFileError(f"unsupported CodexBridge configuration section: {section}")
         allowed = _SCHEMA[section]

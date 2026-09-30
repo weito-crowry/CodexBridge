@@ -9,7 +9,12 @@ from mcp import ClientSession, MCPError, types
 from mcp.server.lowlevel import Server as LowLevelServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from codex_bridge.config import BridgeConfig, ConfigurationError, GitHubMcpConfig
+from codex_bridge.config import (
+    BridgeConfig,
+    ConfigurationError,
+    ExecutionTargetConfig,
+    GitHubMcpConfig,
+)
 from codex_bridge.paths import PathPolicyError
 from codex_bridge.server import build_runtime, create_app, prepare_config
 
@@ -17,8 +22,10 @@ from codex_bridge.server import build_runtime, create_app, prepare_config
 @dataclass
 class FakeBridge:
     error: Exception | None = None
+    start_count: int = 0
 
     async def start(self, _cwd: str, _prompt: str) -> dict[str, Any]:
+        self.start_count += 1
         if self.error is not None:
             raise self.error
         return {"ok": True}
@@ -89,13 +96,14 @@ def test_prepare_config_keeps_cli_codex_before_process_environment(tmp_path, mon
     assert prepared.codex_executable == str(cli_executable)
 
 
-def test_server_registers_exactly_nine_tools(tmp_path) -> None:
+def test_server_registers_exactly_ten_tools(tmp_path) -> None:
     runtime = FakeRuntime()
     app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
 
     names = {tool.name for tool in app.state.mcp_server._tool_manager.list_tools()}
 
     assert names == {
+        "codex_targets",
         "codex_start",
         "codex_continue",
         "codex_wait",
@@ -190,11 +198,84 @@ def test_server_publishes_codex_delegation_instructions(tmp_path) -> None:
         "codex_steer",
         "approved specification",
         "final review",
+        "codex_targets",
+        "Never infer a target",
+        "thread_id carries routing affinity",
+        "ユーザーに選択を求めて",
     ):
         assert anchor in instructions
 
     initialization_options = app.state.mcp_server._lowlevel_server.create_initialization_options()
     assert initialization_options.instructions == instructions
+
+
+@pytest.mark.asyncio
+async def test_execution_target_tool_schemas_are_explicit_and_optional(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+    tools = {tool.name: tool for tool in await app.state.mcp_server.list_tools()}
+
+    assert "codex_targets" in tools
+    assert "target_id" in tools["codex_start"].input_schema["properties"]
+    assert "target_id" not in tools["codex_start"].input_schema.get("required", [])
+    assert "target_id" in tools["codex_threads"].input_schema["properties"]
+    assert "target_id" not in tools["codex_threads"].input_schema.get("required", [])
+
+
+@pytest.mark.asyncio
+async def test_legacy_start_without_target_uses_existing_local_bridge(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    start = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_start"
+    )
+
+    async with app.router.lifespan_context(app):
+        result = await start.fn(str(tmp_path), "legacy prompt")
+
+    assert result["target_id"] == "local"
+    assert runtime.bridge.start_count == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_targets_returns_local_identity_without_connection_details(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+    targets_tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_targets"
+    )
+
+    result = await targets_tool.fn()
+
+    assert result == {
+        "targets": [{"id": "local", "name": "Local PC", "kind": "local", "available": True}],
+        "selection_required": False,
+    }
+    assert "url" not in result["targets"][0]
+
+
+@pytest.mark.asyncio
+async def test_multiple_target_start_selection_error_is_a_tool_error(tmp_path) -> None:
+    settings = replace(
+        config(tmp_path),
+        targets=(
+            ExecutionTargetConfig("main-pc", "Main PC", "local"),
+            ExecutionTargetConfig(
+                "notebook", "Notebook", "remote", "https://notebook.example.test/mcp"
+            ),
+        ),
+    )
+    app = create_app(settings, runtime_factory=lambda _: FakeRuntime())
+    start = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_start"
+    )
+
+    with pytest.raises(ToolError, match="target_id is required.*codex_targets"):
+        await start.fn("Z:/notebook/repo", "prompt")
 
 
 def test_codex_wait_description_explains_bounded_long_poll(tmp_path) -> None:

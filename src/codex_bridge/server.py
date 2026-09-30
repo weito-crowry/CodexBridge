@@ -18,6 +18,7 @@ from .app_server import AppServerClient
 from .bridge import Bridge
 from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
+from .execution_targets import ExecutionTargetRouter
 from .logging_utils import log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
@@ -167,15 +168,22 @@ def create_app(
             raise RuntimeError("CodexBridge runtime is not started")
         return runtime.bridge
 
+    execution_router = ExecutionTargetRouter(config.targets, bridge)
+
     @mcp.tool()
-    async def codex_start(cwd: str, prompt: str) -> dict[str, Any]:
+    async def codex_targets() -> dict[str, Any]:
+        """List configured execution machines and their current availability."""
+        return await execution_router.target_list()
+
+    @mcp.tool()
+    async def codex_start(cwd: str, prompt: str, target_id: str | None = None) -> dict[str, Any]:
         """Start a native Codex thread and its first turn without waiting for completion."""
-        return await _run_tool(lambda: bridge().start(cwd, prompt))
+        return await _run_tool(lambda: execution_router.codex_start(cwd, prompt, target_id))
 
     @mcp.tool()
     async def codex_continue(thread_id: str, prompt: str) -> dict[str, Any]:
         """Start a new turn on an existing Codex thread, resuming the thread when needed."""
-        return await _run_tool(lambda: bridge().continue_thread(thread_id, prompt))
+        return await _run_tool(lambda: execution_router.codex_continue(thread_id, prompt))
 
     @mcp.tool()
     async def codex_wait(
@@ -184,41 +192,45 @@ def create_app(
         """Long-poll a Codex turn for a bounded duration; return immediately on terminal
         or intervention state, otherwise return the current in_progress snapshot on
         timeout."""
-        return await _run_tool(lambda: bridge().wait(thread_id, turn_id, timeout_seconds))
+        return await _run_tool(
+            lambda: execution_router.codex_wait(thread_id, turn_id, timeout_seconds)
+        )
 
     @mcp.tool()
     async def codex_steer(thread_id: str, turn_id: str, prompt: str) -> dict[str, Any]:
         """Send additional input to the expected active Codex turn."""
-        return await _run_tool(lambda: bridge().steer(thread_id, turn_id, prompt))
+        return await _run_tool(lambda: execution_router.codex_steer(thread_id, turn_id, prompt))
 
     @mcp.tool()
     async def codex_approval(request_id: int | str, decision: ApprovalDecision) -> dict[str, Any]:
         """Resolve one pending Codex command, file, or permission approval request."""
-        return await _run_tool(lambda: bridge().approve(request_id, decision))
+        return await _run_tool(lambda: execution_router.codex_approval(request_id, decision))
 
     @mcp.tool()
     async def codex_user_input(
         request_id: int | str, answers: dict[str, list[str]]
     ) -> dict[str, Any]:
         """Resolve one pending Codex user-input request by exact question IDs."""
-        return await _run_tool(lambda: bridge().answer_user_input(request_id, answers))
+        return await _run_tool(lambda: execution_router.codex_user_input(request_id, answers))
 
     @mcp.tool()
     async def codex_interrupt(thread_id: str, turn_id: str) -> dict[str, Any]:
         """Request interruption of a running Codex turn."""
-        return await _run_tool(lambda: bridge().interrupt(thread_id, turn_id))
+        return await _run_tool(lambda: execution_router.codex_interrupt(thread_id, turn_id))
 
     @mcp.tool()
     async def codex_threads(
         thread_id: str | None = None,
+        target_id: str | None = None,
         include_history: bool = False,
         limit: int = 20,
         cursor: str | None = None,
     ) -> dict[str, Any]:
         """List native Codex threads or read one native thread's bounded history."""
         return await _run_tool(
-            lambda: bridge().threads(
+            lambda: execution_router.codex_threads(
                 thread_id,
+                target_id=target_id,
                 include_history=include_history,
                 limit=limit,
                 cursor=cursor,
@@ -230,7 +242,9 @@ def create_app(
         thread_id: str, turn_id: str | None = None, activity_limit: int = 20
     ) -> dict[str, Any]:
         """Return the current safe state and recent activities for a native Codex turn."""
-        return await _run_tool(lambda: bridge().status(thread_id, turn_id, activity_limit))
+        return await _run_tool(
+            lambda: execution_router.codex_status(thread_id, turn_id, activity_limit)
+        )
 
     remote_provider = RemoteMcpProvider(config.github_mcp)
     router = ToolRouter(mcp, remote_provider)
@@ -267,8 +281,10 @@ def create_app(
                     await router.start()
                     await runtime.start()
                     runtime_started = True
+                    await execution_router.start()
                     yield
                 finally:
+                    await execution_router.close()
                     if runtime_started:
                         await runtime.shutdown()
                     await router.shutdown()
@@ -286,6 +302,7 @@ def create_app(
     app.state.mcp_server = mcp
     app.state.mcp_lowlevel_server = wire_server
     app.state.mcp_router = router
+    app.state.execution_target_router = execution_router
     app.state.transport_security = security
     app.state.observability = observer
     app.state.runtime = None

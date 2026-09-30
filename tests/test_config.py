@@ -365,3 +365,129 @@ def test_github_mcp_rejects_malformed_url(monkeypatch: pytest.MonkeyPatch, url: 
 
     with pytest.raises(ConfigurationError, match=r"HTTP\(S\) URL"):
         BridgeConfig.from_env()
+
+
+def test_implicit_local_execution_target_is_created_by_default() -> None:
+    config = BridgeConfig.from_sources(environ={}, config_data={})
+
+    assert [(target.id, target.name, target.kind, target.url) for target in config.targets] == [
+        ("local", "Local PC", "local", None)
+    ]
+
+
+def test_execution_targets_parse_dynamic_toml_tables(tmp_path) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[targets.main-pc]\nname = "Main PC"\nkind = "local"\n\n'
+        '[targets.notebook]\nname = "Notebook PC"\nkind = "remote"\n'
+        'url = "https://example.test/mcp"\n',
+        encoding="utf-8",
+    )
+
+    config = BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+    assert [(target.id, target.name, target.kind, target.url) for target in config.targets] == [
+        ("main-pc", "Main PC", "local", None),
+        ("notebook", "Notebook PC", "remote", "https://example.test/mcp"),
+    ]
+
+
+def test_execution_target_id_secret_like_substring_is_not_a_secret_setting(tmp_path) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[targets.monkey]\nname="Local"\nkind="local"\n', encoding="utf-8")
+
+    config = BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+    assert config.targets[0].id == "monkey"
+
+
+@pytest.mark.parametrize(
+    "target_block",
+    [
+        '[targets."bad:id"]\nname="Machine"\nkind="local"\n',
+        '[targets.local]\nname="  "\nkind="local"\n',
+        '[targets.one]\nname="One"\nkind="local"\n[targets.two]\nname="Two"\nkind="local"\n',
+        '[targets.local]\nname="Local"\nkind="local"\nurl="https://host.test/mcp"\n',
+        '[targets.remote]\nname="Remote"\nkind="remote"\n',
+    ],
+)
+def test_execution_targets_reject_invalid_definitions(tmp_path, target_block: str) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(target_block, encoding="utf-8")
+
+    with pytest.raises(ConfigurationError):
+        BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:pass@example.test/mcp",
+        "https://example.test/mcp?token=secret",
+        "https://example.test/mcp#fragment",
+        "http://example.test/mcp",
+        "ftp://127.0.0.1/mcp",
+    ],
+)
+def test_execution_targets_reject_unsafe_urls(tmp_path, url: str) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[targets.local]\nname="Local"\nkind="local"\n'
+        f'[targets.remote]\nname="Remote"\nkind="remote"\nurl="{url}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError):
+        BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+
+def test_execution_targets_allow_http_only_for_loopback(tmp_path) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[targets.local]\nname="Local"\nkind="local"\n'
+        '[targets.remote]\nname="Remote"\nkind="remote"\nurl="http://127.0.0.1:9000/mcp"\n',
+        encoding="utf-8",
+    )
+
+    config = BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+    assert config.targets[1].url == "http://127.0.0.1:9000/mcp"
+
+
+def test_execution_targets_reject_unknown_and_secret_keys(tmp_path) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[targets.local]\nname="Local"\nkind="local"\npat="secret"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigFileError, match="secret"):
+        load_user_config(path=config_path)
+
+
+def test_execution_targets_reject_more_than_sixteen_targets(tmp_path) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    targets = ['[targets.local]\nname="Local"\nkind="local"\n']
+    targets.extend(
+        f'[targets.remote-{index}]\nname="Remote {index}"\nkind="remote"\n'
+        f'url="https://remote{index}.example.test/mcp"\n'
+        for index in range(16)
+    )
+    config_path.write_text("\n".join(targets), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="16"):
+        BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))

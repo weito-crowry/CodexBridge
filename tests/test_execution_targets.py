@@ -1,0 +1,492 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+from mcp import types
+
+from codex_bridge.config import ExecutionTargetConfig
+from codex_bridge.execution_targets import (
+    _REQUIRED_TARGET_TOOLS,
+    ExecutionTargetClient,
+    ExecutionTargetError,
+    ExecutionTargetRouter,
+    _extract_dict_result,
+    _parse_request_handle,
+    _request_handle,
+)
+
+LOCAL = ExecutionTargetConfig("main-pc", "Main PC", "local")
+NOTEBOOK = ExecutionTargetConfig(
+    "notebook", "Notebook PC", "remote", "https://notebook.example.test/mcp"
+)
+OTHER = ExecutionTargetConfig("other", "Other PC", "remote", "https://other.example.test/mcp")
+
+
+class FakeBridge:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def _call(self, name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append((name, args, kwargs))
+        return {
+            "ok": True,
+            "thread_id": args[0] if args and isinstance(args[0], str) else "native-local",
+        }
+
+    async def start(self, cwd: str, prompt: str) -> dict[str, Any]:
+        self.calls.append(("start", (cwd, prompt), {}))
+        return {"ok": True, "thread_id": "native-local", "turn_id": "turn-local"}
+
+    async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
+        return await self._call("continue", thread_id, prompt)
+
+    async def wait(self, thread_id: str, turn_id: str, timeout_seconds=None) -> dict[str, Any]:
+        return await self._call("wait", thread_id, turn_id, timeout_seconds=timeout_seconds)
+
+    async def steer(self, thread_id: str, turn_id: str, prompt: str) -> dict[str, Any]:
+        return await self._call("steer", thread_id, turn_id, prompt)
+
+    async def approve(self, request_id: int | str, decision: str) -> dict[str, Any]:
+        return await self._call("approve", request_id, decision)
+
+    async def answer_user_input(
+        self, request_id: int | str, answers: dict[str, list[str]]
+    ) -> dict[str, Any]:
+        return await self._call("answer", request_id, answers)
+
+    async def interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        return await self._call("interrupt", thread_id, turn_id)
+
+    async def threads(self, thread_id=None, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("threads", (thread_id,), kwargs))
+        if thread_id:
+            return {"thread": {"id": thread_id}}
+        return {"threads": [{"id": "native-local"}], "next_cursor": "local-cursor"}
+
+    async def status(self, thread_id: str, turn_id=None, activity_limit=20) -> dict[str, Any]:
+        return await self._call("status", thread_id, turn_id, activity_limit=activity_limit)
+
+
+class FakeRemote:
+    def __init__(self, response: dict[str, Any] | None = None) -> None:
+        self.response = response or {"ok": True, "thread_id": "native-remote"}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.available = True
+        self.error: Exception | None = None
+
+    async def start(self) -> None:
+        if self.error:
+            raise self.error
+
+    async def close(self) -> None:
+        return None
+
+    async def probe(self) -> bool:
+        return self.available and self.error is None
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((name, arguments))
+        if self.error:
+            raise self.error
+        return self.response
+
+
+def make_router(*targets: ExecutionTargetConfig, response=None):
+    local = FakeBridge()
+    remotes = {target.id: FakeRemote(response) for target in targets if target.kind == "remote"}
+    return ExecutionTargetRouter(targets, lambda: local, remote_clients=remotes), local, remotes
+
+
+@pytest.mark.asyncio
+async def test_single_local_target_start_keeps_native_thread_id() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    result = await router.codex_start("D:/repo", "do work")
+
+    assert bridge.calls == [("start", ("D:/repo", "do work"), {})]
+    assert result["thread_id"] == "native-local"
+    assert result["native_thread_id"] == "native-local"
+    assert result["target_id"] == "main-pc"
+
+
+@pytest.mark.asyncio
+async def test_multiple_targets_require_explicit_target_selection() -> None:
+    router, _, _ = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError, match="target_id is required"):
+        await router.codex_start("Z:/remote-path", "prompt")
+
+
+@pytest.mark.asyncio
+async def test_remote_start_forwards_remote_cwd_and_routes_public_thread_id() -> None:
+    remote = FakeRemote({"ok": True, "thread_id": "019abc", "turn_id": "turn-1"})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    result = await router.codex_start("Z:/Notebook/repo", "prompt", "notebook")
+
+    assert remote.calls == [("codex_start", {"cwd": "Z:/Notebook/repo", "prompt": "prompt"})]
+    assert result["thread_id"] == "notebook::019abc"
+    assert result["native_thread_id"] == "019abc"
+    assert result["target_id"] == "notebook"
+
+
+@pytest.mark.asyncio
+async def test_routed_thread_operations_keep_target_affinity() -> None:
+    remote = FakeRemote({"ok": True, "thread_id": "native-remote"})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK, OTHER), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_continue("notebook::native-remote", "continue")
+    await router.codex_wait("notebook::native-remote", "turn-1", 8)
+    await router.codex_steer("notebook::native-remote", "turn-1", "steer")
+    await router.codex_interrupt("notebook::native-remote", "turn-1")
+    await router.codex_status("notebook::native-remote", "turn-1", 9)
+
+    assert [call[0] for call in remote.calls] == [
+        "codex_continue",
+        "codex_wait",
+        "codex_steer",
+        "codex_interrupt",
+        "codex_status",
+    ]
+    assert all(call[1]["thread_id"] == "native-remote" for call in remote.calls)
+    assert remote.calls[1][1]["timeout_seconds"] == 8
+
+
+@pytest.mark.asyncio
+async def test_remote_failure_does_not_fallback_to_another_target() -> None:
+    first = FakeRemote()
+    second = FakeRemote()
+    first.error = ExecutionTargetError("execution target is unavailable")
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK, OTHER),
+        lambda: FakeBridge(),
+        remote_clients={"notebook": first, "other": second},
+    )
+
+    with pytest.raises(ExecutionTargetError, match="unavailable"):
+        await router.codex_status("notebook::native-id")
+
+    assert not second.calls
+
+
+@pytest.mark.asyncio
+async def test_unknown_or_mismatched_routed_thread_target_is_rejected() -> None:
+    router, _, _ = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError, match="unknown execution target"):
+        await router.codex_status("unknown::native")
+    with pytest.raises(ExecutionTargetError, match="does not match"):
+        await router.codex_threads("notebook::native", target_id="main-pc")
+
+
+@pytest.mark.asyncio
+async def test_remote_thread_list_is_scoped_and_native_id_can_be_adopted() -> None:
+    remote = FakeRemote({"threads": [{"id": "native-remote"}], "next_cursor": "remote-cursor"})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    listing = await router.codex_threads(target_id="notebook", cursor="remote-only")
+    adopted = await router.codex_threads("native-existing", target_id="notebook")
+
+    assert remote.calls[0][1]["cursor"] == "remote-only"
+    assert listing["next_cursor"] == "remote-cursor"
+    assert listing["threads"][0] == {
+        "id": "notebook::native-remote",
+        "native_thread_id": "native-remote",
+        "target_id": "notebook",
+    }
+    assert remote.calls[1][1]["thread_id"] == "native-existing"
+    assert adopted["threads"][0]["id"] == "notebook::native-remote"
+
+
+@pytest.mark.asyncio
+async def test_thread_list_requires_selection_when_multiple_targets_are_configured() -> None:
+    router, _, _ = make_router(LOCAL, NOTEBOOK, OTHER)
+
+    with pytest.raises(ExecutionTargetError, match="target_id is required"):
+        await router.codex_threads()
+
+
+@pytest.mark.parametrize("native_id", [1, "1"])
+def test_request_handles_preserve_original_request_id_type_and_scope(native_id: int | str) -> None:
+    handle = _request_handle("notebook", native_id)
+
+    assert handle.startswith("notebook::request::")
+    assert _parse_request_handle(handle) == ("notebook", native_id)
+    assert _request_handle("other", native_id) != handle
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "e30",  # Empty object has no original request ID.
+        "eyJyZXF1ZXN0X2lkIjp0cnVlfQ",  # Boolean is not a valid integer request ID.
+        "eyJyZXF1ZXN0X2lkIjoxLCJleHRyYSI6Mn0",  # Payload contains more than the original ID.
+    ],
+)
+def test_malformed_request_handle_payload_is_rejected(payload: str) -> None:
+    with pytest.raises(ExecutionTargetError, match="malformed"):
+        _parse_request_handle(f"notebook::request::{payload}")
+
+
+@pytest.mark.asyncio
+async def test_remote_pending_request_uses_target_handle_and_is_rewritten() -> None:
+    remote = FakeRemote(
+        {
+            "thread_id": "native-remote",
+            "pending_request": {"thread_id": "native-remote", "request_id": 1},
+            "latest_activity": {"thread_id": "native-remote"},
+            "recent_activities": [{"thread_id": "native-remote"}],
+        }
+    )
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    result = await router.codex_status("notebook::native-remote")
+
+    handle = result["pending_request"]["request_id"]
+    assert _parse_request_handle(handle) == ("notebook", 1)
+    assert result["thread_id"] == "notebook::native-remote"
+    assert result["pending_request"]["thread_id"] == "notebook::native-remote"
+    assert result["latest_activity"]["thread_id"] == "notebook::native-remote"
+    assert result["recent_activities"][0]["thread_id"] == "notebook::native-remote"
+
+
+@pytest.mark.asyncio
+async def test_approval_and_user_input_decode_target_request_handles() -> None:
+    remote = FakeRemote({"thread_id": "native-remote"})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_approval(_request_handle("notebook", 1), "accept")
+    await router.codex_user_input(_request_handle("notebook", "1"), {"q": ["answer"]})
+
+    assert remote.calls == [
+        ("codex_approval", {"request_id": 1, "decision": "accept"}),
+        ("codex_user_input", {"request_id": "1", "answers": {"q": ["answer"]}}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "handle", ["bad::request::e30", "unknown::request::e30", "notebook::request::@@"]
+)
+@pytest.mark.asyncio
+async def test_malformed_or_unknown_request_handles_are_rejected(handle: str) -> None:
+    router, _, _ = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError):
+        await router.codex_approval(handle, "accept")
+
+
+@pytest.mark.asyncio
+async def test_raw_local_request_id_remains_unchanged() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    await router.codex_approval("local::native-request", "accept")
+
+    assert bridge.calls[0][0:2] == ("approve", ("local::native-request", "accept"))
+
+
+@pytest.mark.asyncio
+async def test_remote_target_availability_is_independent() -> None:
+    offline = FakeRemote()
+    offline.available = False
+    online = FakeRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK, OTHER),
+        lambda: FakeBridge(),
+        remote_clients={"notebook": offline, "other": online},
+    )
+
+    result = await router.target_list()
+
+    assert result["selection_required"] is True
+    assert result["targets"] == [
+        {"id": "main-pc", "name": "Main PC", "kind": "local", "available": True},
+        {
+            "id": "notebook",
+            "name": "Notebook PC",
+            "kind": "remote",
+            "available": False,
+        },
+        {"id": "other", "name": "Other PC", "kind": "remote", "available": True},
+    ]
+    assert all("url" not in target for target in result["targets"])
+
+
+class ConcurrentSession:
+    def __init__(self) -> None:
+        self.entered = 0
+        self.one_entered = asyncio.Event()
+        self.both_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+        self.entered += 1
+        self.one_entered.set()
+        if self.entered == 2:
+            self.both_entered.set()
+        await self.release.wait()
+        from mcp import types
+
+        return types.CallToolResult(content=[], structuredContent={"ok": True})
+
+
+@pytest.mark.asyncio
+async def test_remote_tool_calls_on_one_target_are_not_serialized() -> None:
+    client = ExecutionTargetClient(NOTEBOOK)
+    client._connected = True
+    session = ConcurrentSession()
+    client._session = session
+
+    calls = [
+        asyncio.create_task(client.call_tool("codex_status", {"thread_id": str(index)}))
+        for index in range(2)
+    ]
+    await asyncio.wait_for(session.both_entered.wait(), timeout=1)
+    session.release.set()
+    await asyncio.gather(*calls)
+
+
+@pytest.mark.asyncio
+async def test_remote_tool_calls_on_different_targets_are_not_serialized() -> None:
+    first_client = ExecutionTargetClient(NOTEBOOK)
+    second_client = ExecutionTargetClient(OTHER)
+    first_client._connected = True
+    second_client._connected = True
+    first_session = ConcurrentSession()
+    second_session = ConcurrentSession()
+    first_client._session = first_session
+    second_client._session = second_session
+
+    calls = [
+        asyncio.create_task(first_client.call_tool("codex_status", {"thread_id": "one"})),
+        asyncio.create_task(second_client.call_tool("codex_status", {"thread_id": "two"})),
+    ]
+    await asyncio.wait_for(
+        asyncio.gather(first_session.one_entered.wait(), second_session.one_entered.wait()),
+        timeout=1,
+    )
+    first_session.release.set()
+    second_session.release.set()
+    await asyncio.gather(*calls)
+
+
+class ToolListSession:
+    def __init__(self, tools: set[str], targets: dict[str, Any]) -> None:
+        self.tools = tools
+        self.targets = targets
+
+    async def list_tools(self, *, params=None):
+        return types.ListToolsResult(
+            tools=[types.Tool(name=name, inputSchema={"type": "object"}) for name in self.tools]
+        )
+
+    async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> types.CallToolResult:
+        return types.CallToolResult(content=[], structured_content=self.targets)
+
+
+@pytest.mark.asyncio
+async def test_remote_compatibility_requires_all_tools_and_a_leaf_gateway() -> None:
+    compatible = ExecutionTargetClient(NOTEBOOK)
+    compatible._session = ToolListSession(
+        set(_REQUIRED_TARGET_TOOLS),
+        {"targets": [{"id": "local"}], "selection_required": False},
+    )
+    await compatible._validate_leaf()
+
+    missing = ExecutionTargetClient(NOTEBOOK)
+    missing._session = ToolListSession(
+        set(_REQUIRED_TARGET_TOOLS) - {"codex_steer"},
+        {"targets": [{"id": "local"}], "selection_required": False},
+    )
+    with pytest.raises(ExecutionTargetError, match="protocol-incompatible"):
+        await missing._validate_leaf()
+
+    nested = ExecutionTargetClient(NOTEBOOK)
+    nested._session = ToolListSession(
+        set(_REQUIRED_TARGET_TOOLS),
+        {"targets": [{"id": "local"}, {"id": "other"}], "selection_required": True},
+    )
+    with pytest.raises(ExecutionTargetError, match="single-target leaf"):
+        await nested._validate_leaf()
+
+
+def test_remote_result_extraction_prefers_structured_content() -> None:
+    result = types.CallToolResult(
+        content=[types.TextContent(type="text", text='{"source":"text"}')],
+        structured_content={"source": "structured"},
+    )
+
+    assert _extract_dict_result(result) == {"source": "structured"}
+
+
+def test_remote_result_extraction_accepts_one_json_text_content() -> None:
+    result = types.CallToolResult(content=[types.TextContent(type="text", text='{"ok":true}')])
+
+    assert _extract_dict_result(result) == {"ok": True}
+
+
+def test_remote_input_required_and_error_results_are_not_success() -> None:
+    with pytest.raises(ExecutionTargetError, match="input-required"):
+        _extract_dict_result(types.InputRequiredResult(inputRequests={}, requestState="state"))
+
+    with pytest.raises(ExecutionTargetError, match="upstream tool error"):
+        _extract_dict_result(
+            types.CallToolResult(
+                content=[types.TextContent(type="text", text="unsafe detail")],
+                isError=True,
+            )
+        )
+
+
+class RaisingSession:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> None:
+        self.calls += 1
+        raise TimeoutError("private url and prompt must not leak")
+
+
+@pytest.mark.asyncio
+async def test_remote_write_timeout_is_not_retried_or_echoed() -> None:
+    client = ExecutionTargetClient(NOTEBOOK)
+    client._connected = True
+    session = RaisingSession()
+    client._session = session
+
+    with pytest.raises(
+        ExecutionTargetError, match="outcome unknown; request was not retried"
+    ) as exc:
+        await client.call_tool("codex_start", {"cwd": "private", "prompt": "private"})
+
+    assert session.calls == 1
+    assert "private" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_remote_startup_failure_is_isolated_from_other_targets() -> None:
+    offline = FakeRemote()
+    offline.error = ExecutionTargetError("private endpoint URL")
+    online = FakeRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK, OTHER),
+        lambda: FakeBridge(),
+        remote_clients={"notebook": offline, "other": online},
+    )
+
+    await router.start()
+    result = await router.target_list()
+
+    assert [item["available"] for item in result["targets"]] == [True, False, True]
+    assert "private endpoint URL" not in str(result)

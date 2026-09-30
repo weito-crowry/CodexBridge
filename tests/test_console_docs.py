@@ -79,10 +79,11 @@ def test_phase4c_docs_describe_authenticated_graceful_bridge_control() -> None:
         "POST /ui-api/control/shutdown",
         "external Bridge is never taken over",
         "Stopping or restarting Bridge may interrupt active Codex turns.",
-        "exactly nine tools",
     ):
         assert text in readme
         assert text in spec
+    assert "ten tools before optional mounts" in readme
+    assert "exactly nine tools" in spec
     assert "Console Exit uses the same order" in readme
 
 

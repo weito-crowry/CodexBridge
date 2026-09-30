@@ -21,6 +21,7 @@ _SAFE_FIELDS = {
     "request_id",
     "serialized_schema_bytes",
     "state",
+    "target_id",
     "thread_id",
     "tool_name",
     "total_tool_count",

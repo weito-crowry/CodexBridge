@@ -1,9 +1,9 @@
 # CodexBridge
 
-CodexBridge is a thin single-user bridge for this path:
+CodexBridge is a thin MCP bridge for this path:
 
 ```text
-ChatGPT -> CodexBridge MCP -> native Codex tools / GitHub Remote MCP
+ChatGPT -> User-facing CodexBridge -> local or remote CodexBridge -> Codex App Server
 ```
 
 By default it exposes only thread/turn control and approval or user-input forwarding. When enabled,
@@ -14,7 +14,7 @@ sandbox policy, authentication, reasoning, commit, and push remain owned by Code
 
 The Streamable HTTP MCP server owns one ASGI lifespan. Startup creates exactly one `codex app-server --stdio` child and performs the JSON-RPC `initialize` / `initialized` handshake. A dedicated JSONL reader correlates response IDs and routes notifications and server-initiated requests to the in-memory state store. MCP tools call a transport-neutral bridge over that client. Phase 2 also starts a separate read-only Starlette/Uvicorn listener for the local UI API; it is not mounted in the MCP app.
 
-The bridge does not create a session ID or database. Codex's native `thread.id` is returned unchanged as `thread_id`; persistence and resume are delegated to Codex rollout/history data.
+The bridge does not create a session ID or routing database. Local Codex native `thread.id` values stay unchanged; remote thread IDs include their target ID so later calls and Bridge restarts retain routing affinity.
 
 ## MCP Server Instructions
 
@@ -70,7 +70,26 @@ include = ["*"]
 exclude = []
 toolsets = []
 max_tools = 0
+
+[targets.main-pc]
+name = "Main PC"
+kind = "local"
+
+[targets.notebook]
+name = "Notebook PC"
+kind = "remote"
+url = "https://notebook.example.test/mcp"
 ```
+
+`targets` is optional. With no target tables, CodexBridge creates the legacy local target named
+`Local PC` with ID `local`. An explicit target configuration must contain exactly one `local`
+target. Register a remote PC by running the usual CodexBridge there and pointing this machine's
+remote target at that PC's `/mcp` endpoint. A remote target node must itself be a single-target
+leaf (its own implicit local target); nested routing gateways are not supported. With more than
+one configured target, `codex_start` requires an explicit `target_id`, and `codex_threads` requires
+one when listing threads. Remote `cwd` values are paths on the selected remote PC and are checked
+against that PC's allowed roots. CodexBridge does not synchronize files or store target credentials
+in its config file.
 
 Configuration precedence is explicit CLI option, environment variable, user config file,
 then the existing default. `CODEX_BRIDGE_ALLOWED_ROOTS` remains an `os.pathsep`-separated
@@ -194,18 +213,19 @@ Only use the actual host and origin values supplied by the tunnel/client deploym
 
 The server publishes the native CodexBridge tool set. When the GitHub Remote MCP mount is enabled,
 its filtered tools are added to the same MCP namespace with the `github_` prefix:
-The tracked native baseline remains exactly nine tools before optional mounts.
+The native tool set contains ten tools before optional mounts.
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
-| `codex_start` | `cwd`, `prompt` | Native `thread_id`, `turn_id`, `in_progress` state, and safe `thread_metadata`; does not wait for completion. |
+| `codex_targets` | none | Configured target IDs, names, kinds, and best-effort availability. Does not return target URLs or connection errors. |
+| `codex_start` | `cwd`, `prompt`, optional `target_id` | Native or target-routed `thread_id`, `turn_id`, `in_progress` state, and safe `thread_metadata`; does not wait for completion. |
 | `codex_continue` | `thread_id`, `prompt` | Starts a new turn, calling `thread/resume` first when the thread is not loaded in this process. |
 | `codex_wait` | `thread_id`, `turn_id`, optional `timeout_seconds` | Waits up to the configured bound, then returns the normalized state, latest agent message, latest diff, pending request, error, and retained `thread_metadata`. Terminal states and pending approval/user-input requests return immediately; an active turn returns `in_progress` on timeout. Repeating the same IDs is supported and does not start or change a Codex turn. |
 | `codex_steer` | `thread_id`, `turn_id`, `prompt` | Uses `turn/steer` with `expectedTurnId` equal to the supplied turn ID. |
 | `codex_approval` | `request_id`, `decision` | Resolves one pending approval. Decisions are `accept`, `acceptForSession`, `decline`, or `cancel`. |
 | `codex_user_input` | `request_id`, `answers` | Resolves one pending user-input request keyed by exact question IDs. |
 | `codex_interrupt` | `thread_id`, `turn_id` | Requests interruption; the later terminal event determines the final state. |
-| `codex_threads` | optional `thread_id`, history flag, limit, cursor | Lists native threads or reads one sanitized native thread/history response. |
+| `codex_threads` | optional `thread_id`, `target_id`, history flag, limit, cursor | Lists one target's threads or reads one sanitized thread/history response; lists are never merged across targets. |
 | `codex_status` | `thread_id`, optional `turn_id`, `activity_limit` (1-100, default 20) | Returns the current safe turn snapshot plus bounded recent Activity records. |
 
 Normalized states are `in_progress`, `needs_approval`, `needs_input`, `completed`, `interrupted`, and `failed`.
