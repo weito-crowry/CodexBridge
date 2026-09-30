@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -252,6 +253,161 @@ def create_app(
     async def codex_targets() -> dict[str, Any]:
         """List configured execution machines and their current availability."""
         return await execution_router.target_list()
+
+    @mcp.tool()
+    async def mcp_tasks_probe(ctx: Context) -> dict[str, Any]:
+        """Report the MCP client protocol and advertised Tasks capabilities."""
+        capabilities = ctx.session.client_capabilities
+        capabilities_json = (
+            capabilities.model_dump(
+                by_alias=True,
+                mode="json",
+                exclude_none=True,
+            )
+            if capabilities is not None
+            else None
+        )
+
+        extensions = (
+            capabilities_json.get("extensions", {}) if capabilities_json is not None else {}
+        )
+
+        return {
+            "protocol_version": ctx.session.protocol_version,
+            "tasks_extension_id": "io.modelcontextprotocol/tasks",
+            "tasks_extension_advertised": ("io.modelcontextprotocol/tasks" in extensions),
+            "legacy_tasks_capability_advertised": (
+                capabilities_json is not None and capabilities_json.get("tasks") is not None
+            ),
+            "client_capabilities": capabilities_json,
+        }
+
+    @mcp.tool()
+    async def mcp_long_wait_probe(seconds: int = 30) -> dict[str, Any]:
+        """Wait inside one MCP tool call without invoking Codex, then return completion."""
+        if seconds < 1 or seconds > 600:
+            raise ValueError("seconds must be between 1 and 600")
+
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+
+        await asyncio.sleep(seconds)
+
+        elapsed_seconds = loop.time() - started_at
+
+        return {
+            "status": "completed",
+            "requested_seconds": seconds,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "codex_invoked": False,
+            "probe": "mcp_long_wait_probe",
+        }
+
+    @mcp.tool()
+    async def mcp_long_wait_progress_probe(
+        seconds: int = 120,
+        interval_seconds: int = 20,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Wait while periodically reporting MCP progress, without invoking Codex."""
+        if seconds < 1 or seconds > 600:
+            raise ValueError("seconds must be between 1 and 600")
+        if interval_seconds < 1 or interval_seconds > 60:
+            raise ValueError("interval_seconds must be between 1 and 60")
+        if ctx is None:
+            raise RuntimeError("MCP Context was not injected")
+
+        meta = ctx.request_context.meta
+        progress_token = meta.get("progress_token") if isinstance(meta, dict) else None
+        progress_token_present = progress_token is not None
+
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        notifications_attempted = 0
+
+        # 最初の通知も試す。progress token がない場合、SDK側では no-op。
+        await ctx.report_progress(
+            0.0,
+            float(seconds),
+            "Long-wait progress probe started",
+        )
+        notifications_attempted += 1
+
+        elapsed_target = 0
+
+        while elapsed_target < seconds:
+            sleep_seconds = min(interval_seconds, seconds - elapsed_target)
+            await asyncio.sleep(sleep_seconds)
+            elapsed_target += sleep_seconds
+
+            await ctx.report_progress(
+                float(elapsed_target),
+                float(seconds),
+                f"Long-wait progress probe: {elapsed_target}/{seconds}s",
+            )
+            notifications_attempted += 1
+
+        elapsed_seconds = loop.time() - started_at
+
+        return {
+            "status": "completed",
+            "probe": "mcp_long_wait_progress_probe",
+            "requested_seconds": seconds,
+            "interval_seconds": interval_seconds,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "progress_token_present": progress_token_present,
+            "progress_token_type": (
+                type(progress_token).__name__ if progress_token_present else None
+            ),
+            "notifications_attempted": notifications_attempted,
+            "codex_invoked": False,
+        }
+
+    @mcp.tool()
+    async def mcp_progress_token_probe(ctx: Context) -> dict[str, Any]:
+        """Report safe request and client capability details without metadata values."""
+        meta = ctx.request_context.meta
+        progress_token = meta.get("progress_token") if isinstance(meta, dict) else None
+        client_info = ctx.session.client_info
+        capabilities = ctx.session.client_capabilities
+        capabilities_json = (
+            capabilities.model_dump(
+                by_alias=True,
+                mode="json",
+                exclude_none=True,
+            )
+            if capabilities is not None
+            else None
+        )
+        locale = meta.get("locale") if isinstance(meta, dict) else None
+        timezone = meta.get("timezone") if isinstance(meta, dict) else None
+        timezone_offset_minutes = (
+            meta.get("timezone_offset_minutes") if isinstance(meta, dict) else None
+        )
+
+        return {
+            "probe": "mcp_progress_token_probe",
+            "progress_token_present": progress_token is not None,
+            "progress_token_type": (
+                type(progress_token).__name__ if progress_token is not None else None
+            ),
+            "request_meta_keys": sorted(str(key) for key in meta.keys())
+            if isinstance(meta, dict)
+            else [],
+            "protocol_version": ctx.protocol_version,
+            "client_info": (
+                {"name": client_info.name, "version": client_info.version}
+                if client_info is not None
+                else None
+            ),
+            "client_capabilities": capabilities_json,
+            "locale": locale if isinstance(locale, str) else None,
+            "timezone": timezone if isinstance(timezone, str) else None,
+            "timezone_offset_minutes": (
+                timezone_offset_minutes if type(timezone_offset_minutes) is int else None
+            ),
+            "codex_invoked": False,
+        }
 
     @mcp.tool()
     async def codex_start(

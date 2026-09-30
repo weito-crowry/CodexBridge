@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import pytest
 from mcp import ClientSession, MCPError, types
 from mcp.server.lowlevel import Server as LowLevelServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 
 from codex_bridge.config import (
@@ -84,6 +87,32 @@ class FakeRemoteProvider:
         return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
 
 
+class ProbeSession:
+    def __init__(self, client_capabilities: types.ClientCapabilities | None = None) -> None:
+        self.protocol_version = "2026-07-28"
+        self.client_info = types.Implementation(name="ChatGPT", version="1.2.3")
+        self.client_capabilities = client_capabilities
+        self.progress_attempts: list[tuple[float, float | None, str | None]] = []
+
+    async def report_progress(
+        self, progress: float, total: float | None, message: str | None
+    ) -> None:
+        self.progress_attempts.append((progress, total, message))
+
+
+def probe_context(
+    meta: dict[str, Any] | None = None,
+    client_capabilities: types.ClientCapabilities | None = None,
+) -> tuple[Context, ProbeSession]:
+    session = ProbeSession(client_capabilities)
+    request_context = SimpleNamespace(
+        meta=meta,
+        protocol_version="2026-07-28",
+        session=session,
+    )
+    return Context(request_context=request_context), session
+
+
 def config(tmp_path) -> BridgeConfig:
     return BridgeConfig(
         host="127.0.0.1",
@@ -145,6 +174,169 @@ def test_server_registers_thirteen_native_tools_plus_local_probe_tools(tmp_path)
         "codex_setup_capabilities",
         "codex_setup_confirm",
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_tasks_probe_reports_capability_advertisements_without_starting_codex(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_tasks_probe"
+    )
+    absent_context, _ = probe_context()
+
+    absent = await tool.fn(absent_context)
+
+    assert absent["protocol_version"] == "2026-07-28"
+    assert absent["tasks_extension_id"] == "io.modelcontextprotocol/tasks"
+    assert absent["tasks_extension_advertised"] is False
+    assert type(absent["tasks_extension_advertised"]) is bool
+    assert absent["legacy_tasks_capability_advertised"] is False
+    assert type(absent["legacy_tasks_capability_advertised"]) is bool
+    assert absent["client_capabilities"] is None
+
+    capabilities = types.ClientCapabilities(
+        extensions={"io.modelcontextprotocol/tasks": {}},
+        tasks=types.ClientTasksCapability(),
+    )
+    advertised_context, _ = probe_context(client_capabilities=capabilities)
+    advertised = await tool.fn(advertised_context)
+
+    assert advertised["tasks_extension_advertised"] is True
+    assert advertised["legacy_tasks_capability_advertised"] is True
+    assert advertised["client_capabilities"]["extensions"] == {"io.modelcontextprotocol/tasks": {}}
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_long_wait_probe_completes_without_starting_codex(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_long_wait_probe"
+    )
+
+    result = await tool.fn(seconds=1)
+
+    assert result["probe"] == "mcp_long_wait_probe"
+    assert result["status"] == "completed"
+    assert result["requested_seconds"] == 1
+    assert result["elapsed_seconds"] >= 1
+    assert result["codex_invoked"] is False
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_long_wait_progress_probe_completes_without_progress_token_or_codex(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_long_wait_progress_probe"
+    )
+    context, session = probe_context(meta={})
+
+    result = await tool.fn(seconds=1, interval_seconds=1, ctx=context)
+
+    assert result["status"] == "completed"
+    assert result["requested_seconds"] == 1
+    assert result["interval_seconds"] == 1
+    assert result["elapsed_seconds"] >= 1
+    assert result["progress_token_present"] is False
+    assert result["progress_token_type"] is None
+    assert result["notifications_attempted"] == 2
+    assert len(session.progress_attempts) == 2
+    assert result["codex_invoked"] is False
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_progress_token_probe_omits_raw_request_metadata_values(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_progress_token_probe"
+    )
+    capabilities = types.ClientCapabilities(extensions={"example-safe-capability": {}})
+    context, _ = probe_context(
+        meta={
+            "progress_token": "secret-progress-token",
+            "openai/session": "secret-session",
+            "openai/subject": "secret-subject",
+            "openai/organization": "secret-org",
+            "openai/userLocation": {
+                "city": "Secret City",
+                "country": "Secret Country",
+                "coordinates": "SECRET_COORDINATES",
+            },
+            "user/custom": "secret-custom-value",
+            "locale": "ja-JP",
+            "timezone": "Asia/Tokyo",
+            "timezone_offset_minutes": 540,
+        },
+        client_capabilities=capabilities,
+    )
+
+    result = await tool.fn(context)
+    serialized = json.dumps(result, sort_keys=True)
+
+    assert set(result) == {
+        "probe",
+        "progress_token_present",
+        "progress_token_type",
+        "request_meta_keys",
+        "protocol_version",
+        "client_info",
+        "client_capabilities",
+        "locale",
+        "timezone",
+        "timezone_offset_minutes",
+        "codex_invoked",
+    }
+    assert result["probe"] == "mcp_progress_token_probe"
+    assert result["progress_token_present"] is True
+    assert result["progress_token_type"] == "str"
+    assert result["request_meta_keys"] == [
+        "locale",
+        "openai/organization",
+        "openai/session",
+        "openai/subject",
+        "openai/userLocation",
+        "progress_token",
+        "timezone",
+        "timezone_offset_minutes",
+        "user/custom",
+    ]
+    assert result["protocol_version"] == "2026-07-28"
+    assert result["client_info"] == {"name": "ChatGPT", "version": "1.2.3"}
+    assert result["client_capabilities"]["extensions"] == {"example-safe-capability": {}}
+    assert result["locale"] == "ja-JP"
+    assert result["timezone"] == "Asia/Tokyo"
+    assert result["timezone_offset_minutes"] == 540
+    assert result["codex_invoked"] is False
+    for sensitive_value in (
+        "secret-progress-token",
+        "secret-session",
+        "secret-subject",
+        "secret-org",
+        "Secret City",
+        "Secret Country",
+        "SECRET_COORDINATES",
+        "secret-custom-value",
+    ):
+        assert sensitive_value not in serialized
+    assert runtime.bridge.start_count == 0
 
 
 @pytest.mark.asyncio
