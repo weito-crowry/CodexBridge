@@ -143,6 +143,75 @@ def test_explicit_override_is_fail_closed_without_fallback(tmp_path: Path) -> No
         )
 
 
+def test_shared_codex_resolver_prefers_config_before_codex_app_and_path(tmp_path: Path) -> None:
+    from codex_bridge.codex_resolver import enumerate_candidates as enumerate_shared
+
+    configured = tmp_path / "configured" / "codex.exe"
+    configured.parent.mkdir()
+    configured.write_bytes(b"")
+    native = tmp_path / "local" / "OpenAI" / "Codex" / "bin" / "v1" / "codex.exe"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"")
+    path_candidate = tmp_path / "path" / "codex.exe"
+    path_candidate.parent.mkdir()
+    path_candidate.write_bytes(b"")
+
+    candidates = enumerate_shared(
+        {
+            "LOCALAPPDATA": str(tmp_path / "local"),
+        },
+        config_executable=str(configured),
+        platform="win32",
+        which=lambda _name: str(path_candidate),
+    )
+
+    assert candidates[0].source == "config"
+    assert candidates[0].path == str(configured)
+
+
+def test_shared_codex_resolver_prefers_explicit_then_environment_then_config(
+    tmp_path: Path,
+) -> None:
+    from codex_bridge.codex_resolver import enumerate_candidates as enumerate_shared
+
+    explicit = tmp_path / "explicit.exe"
+    environment = tmp_path / "environment.exe"
+    configured = tmp_path / "configured.exe"
+    for executable in (explicit, environment, configured):
+        executable.write_bytes(b"")
+
+    candidates = enumerate_shared(
+        {"CODEX_BRIDGE_CODEX_EXECUTABLE": str(environment)},
+        config_executable=str(configured),
+        explicit_executable=str(explicit),
+        platform="win32",
+        which=lambda _name: None,
+    )
+
+    assert candidates == (CodexCandidate(str(explicit), "explicit"),)
+
+    candidates = enumerate_shared(
+        {"CODEX_BRIDGE_CODEX_EXECUTABLE": str(environment)},
+        config_executable=str(configured),
+        platform="win32",
+        which=lambda _name: None,
+    )
+
+    assert candidates == (CodexCandidate(str(environment), "explicit"),)
+
+
+def test_shared_codex_resolver_not_found_has_actionable_message() -> None:
+    from codex_bridge.codex_resolver import CodexResolutionError, resolve_codex_executable
+
+    with pytest.raises(CodexResolutionError, match="Set CODEX_BRIDGE_CODEX_EXECUTABLE"):
+        resolve_codex_executable(
+            config_executable=None,
+            environ={},
+            platform="win32",
+            which=lambda _name: None,
+        )
+
+
 def test_windows_candidates_are_deduplicated_case_insensitively(tmp_path: Path) -> None:
     native = tmp_path / "OpenAI" / "Codex" / "bin" / "a" / "codex.exe"
     native.parent.mkdir(parents=True)

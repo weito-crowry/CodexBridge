@@ -35,6 +35,16 @@ def test_cli_port_has_priority_over_environment() -> None:
     assert config.port == 8124
 
 
+def test_cli_codex_executable_has_priority_over_environment() -> None:
+    config = ConsoleConfig.from_sources(
+        explicit_codex_executable="cli-codex",
+        environ={"CODEX_BRIDGE_CODEX_EXECUTABLE": "env-codex"},
+    )
+
+    assert config.codex_executable == "cli-codex"
+    assert config.codex_executable_source == "explicit"
+
+
 @pytest.mark.parametrize("value", [0, -1, 65536, "not-a-port", True, None])
 def test_invalid_console_ports_are_rejected(value) -> None:
     with pytest.raises(ConsoleConfigurationError):
@@ -64,6 +74,53 @@ def test_tunnel_environment_overrides_are_read_without_secret_fields() -> None:
 
     assert config.tunnel_executable == "C:/tools/tunnel-client.exe"
     assert config.tunnel_profile == "work.profile-1"
+
+
+def test_console_reads_user_config_and_reports_effective_roots(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[bridge]\n"
+        f'allowed_roots = ["{root.as_posix()}"]\n'
+        'codex_executable = "configured-codex"\n'
+        "[console]\nui_port = 8125\n"
+        '[tunnel]\nexecutable = "configured-tunnel"\nprofile = "configured"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_BRIDGE_CONFIG", str(config_path))
+
+    config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+
+    assert config.port == 8125
+    assert config.allowed_roots == (root.as_posix(),)
+    assert config.codex_executable == "configured-codex"
+    assert config.tunnel_executable == "configured-tunnel"
+    assert config.tunnel_profile == "configured"
+    assert config.roots_ready
+    assert config.roots_count == 1
+
+
+def test_console_environment_overrides_config_and_cli_overrides_environment(tmp_path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[bridge]\nallowed_roots = ["{root.as_posix()}"]\n[console]\nui_port = 8125\n',
+        encoding="utf-8",
+    )
+    values = {
+        "CODEX_BRIDGE_CONFIG": str(config_path),
+        "CODEX_BRIDGE_UI_PORT": "8126",
+        "CODEX_BRIDGE_ALLOWED_ROOTS": "env-root",
+        "CODEX_BRIDGE_TUNNEL_PROFILE": "env-profile",
+    }
+
+    config = ConsoleConfig.from_sources(explicit_port=8127, environ=values)
+
+    assert config.port == 8127
+    assert config.allowed_roots == ("env-root",)
+    assert config.tunnel_profile == "env-profile"
 
 
 @pytest.mark.parametrize("value", ["", "bad profile", "a/b", "x" * 65, None, True])

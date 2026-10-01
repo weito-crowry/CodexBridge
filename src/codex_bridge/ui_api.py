@@ -23,6 +23,8 @@ from .paths import PathPolicyError
 
 
 class UiBridge(Protocol):
+    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]: ...
+
     async def threads(
         self,
         thread_id: str | None = None,
@@ -55,6 +57,8 @@ class UiBridge(Protocol):
         turn_id: str | None = None,
         activity_limit: int = 20,
     ) -> dict[str, Any]: ...
+
+    async def rate_limits(self) -> dict[str, Any]: ...
 
 
 ShutdownCallback = Callable[[], Awaitable[None] | None]
@@ -187,6 +191,20 @@ def create_ui_app(
         except Exception as exc:
             return _error_response(exc)
 
+    async def rename_thread(request: Request) -> Response:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid name")
+            name = payload.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("invalid name")
+            thread_id = request.path_params["thread_id"]
+            await bridge.rename_thread(thread_id, name)
+            return JSONResponse({"thread_id": thread_id, "name": name})
+        except Exception as exc:
+            return _error_response(exc)
+
     async def thread_detail(request: Request) -> Response:
         try:
             result = await bridge.threads(request.path_params["thread_id"])
@@ -230,6 +248,12 @@ def create_ui_app(
                 activity_limit=_parse_activity_limit(request),
             )
             return JSONResponse(result)
+        except Exception as exc:
+            return _error_response(exc)
+
+    async def rate_limits(request: Request) -> Response:
+        try:
+            return JSONResponse(await bridge.rate_limits())
         except Exception as exc:
             return _error_response(exc)
 
@@ -293,10 +317,12 @@ def create_ui_app(
         Route("/healthz", healthz),
         Route("/ui-api/status", status),
         Route("/ui-api/threads", threads),
+        Route("/ui-api/threads/{thread_id}/name", rename_thread, methods=["POST"]),
         Route("/ui-api/threads/{thread_id}", thread_detail),
         Route("/ui-api/threads/{thread_id}/turns", turns),
         Route("/ui-api/threads/{thread_id}/items", items),
         Route("/ui-api/threads/{thread_id}/status", thread_status),
+        Route("/ui-api/account/rate-limits", rate_limits),
         Route("/ui-api/events", events),
     ]
     if config.control_token is not None and shutdown_callback is not None:

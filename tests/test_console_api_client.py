@@ -219,6 +219,26 @@ def test_api_client_posts_authenticated_control_without_token_in_url_or_body() -
     assert reply.deleted
 
 
+def test_api_client_posts_json_payload() -> None:
+    _application()
+    reply = FakeReply(b"{}", status=200)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    successes: list[tuple[str, object]] = []
+    client.json_succeeded.connect(lambda key, payload: successes.append((key, payload)))
+
+    assert client.post_json(
+        "/ui-api/threads/thread-b/name", {"name": "Renamed"}, key="rename:thread-b"
+    )
+    request = manager.requests[0]
+    assert request.url().toString() == "http://127.0.0.1:8001/ui-api/threads/thread-b/name"
+    assert bytes(request.rawHeader("Content-Type")) == b"application/json"
+    assert manager.post_bodies == [b'{"name":"Renamed"}']
+    reply.finished.emit()
+
+    assert successes == [("rename:thread-b", {})]
+
+
 def test_api_client_maps_control_network_and_http_failures_to_fixed_message() -> None:
     _application()
     network_reply = FakeReply(error=1)

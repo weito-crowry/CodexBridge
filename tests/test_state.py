@@ -21,6 +21,26 @@ async def test_wait_for_change_does_not_cross_talk() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_change_does_not_create_unknown_turn() -> None:
+    store = StateStore()
+
+    assert await store.wait_for_change("thread-a", "unknown-turn", 0) is False
+
+    assert store.has_thread("thread-a") is False
+    assert store.has_turn("thread-a", "unknown-turn") is False
+
+
+def test_snapshot_does_not_create_unknown_turn() -> None:
+    store = StateStore()
+
+    with pytest.raises(KeyError):
+        store.snapshot("thread-a", "unknown-turn")
+
+    assert store.has_thread("thread-a") is False
+    assert store.has_turn("thread-a", "unknown-turn") is False
+
+
+@pytest.mark.asyncio
 async def test_wait_for_change_wakes_for_matching_turn() -> None:
     store = StateStore()
     store.ensure_turn("thread-a", "turn-a")
@@ -63,3 +83,25 @@ def test_zero_pending_request_id_is_exposed_in_snapshot() -> None:
     store.put_pending_request(pending)
 
     assert store.snapshot("thread", "turn")["pending_request"] == pending
+
+
+def test_thread_metadata_is_bounded_to_safe_known_fields() -> None:
+    store = StateStore()
+    store.ensure_turn("thread", "turn")
+    store.update_thread_metadata(
+        "thread",
+        {
+            "modelProvider": "openai",
+            "model": "gpt-5",
+            "reasoningEffort": "high",
+            "cliVersion": "0.1.2",
+            "apiKey": "must not appear",
+        },
+    )
+
+    assert store.snapshot("thread", "turn")["thread_metadata"] == {
+        "model_provider": "openai",
+        "model": "gpt-5",
+        "reasoning_effort": "high",
+        "cli_version": "0.1.2",
+    }

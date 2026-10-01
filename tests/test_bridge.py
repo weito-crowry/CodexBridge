@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from codex_bridge.activity import ActivityStore
-from codex_bridge.bridge import Bridge
+from codex_bridge.bridge import Bridge, BridgeError
 from codex_bridge.history import HistoryValidationError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
@@ -21,18 +24,45 @@ class FakeAppServer:
         self.thread_cwds: dict[str, str] = {}
         self.thread_histories: dict[str, list[dict[str, Any]]] = {}
         self.thread_history_modes: dict[str, str] = {}
+        self.thread_paths: dict[str, str] = {}
         self.thread_list: list[dict[str, Any]] = []
         self.turns_response: dict[str, Any] = {"data": []}
         self.items_response: dict[str, Any] = {"data": []}
+        self.rate_limits_response: dict[str, Any] = {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 28},
+                "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
+            }
+        }
+        self.model_pages: dict[str | None, dict[str, Any]] = {}
+        self.config_response: dict[str, Any] = {"config": {}}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
         self.calls.append((method, params))
         if method == "thread/start":
-            return {"thread": {"id": "native-thread"}}
+            return {
+                "thread": {
+                    "id": "native-thread",
+                    "modelProvider": "openai",
+                    "model": "gpt-5",
+                    "reasoningEffort": "high",
+                    "cliVersion": "0.1.2",
+                }
+            }
+        if method == "model/list":
+            return self.model_pages.get(params.get("cursor"), {"data": []})
+        if method == "config/read":
+            return self.config_response
         if method == "thread/resume":
             return {
-                "thread": {"id": params["threadId"]},
+                "thread": {
+                    "id": params["threadId"],
+                    "modelProvider": "openai",
+                    "model": "gpt-5",
+                    "reasoningEffort": "medium",
+                    "cliVersion": "0.1.2",
+                },
                 "cwd": self.thread_cwds[params["threadId"]],
             }
         if method == "turn/start":
@@ -41,6 +71,8 @@ class FakeAppServer:
             return {"turnId": params["expectedTurnId"]}
         if method == "turn/interrupt":
             return {}
+        if method == "thread/name/set":
+            return {"thread": {"id": params["threadId"], "name": params["name"]}}
         if method == "thread/list":
             return {"data": self.thread_list}
         if method == "thread/read":
@@ -56,11 +88,15 @@ class FakeAppServer:
                 thread["turns"] = self.thread_histories[params["threadId"]]
             if params["threadId"] in self.thread_history_modes:
                 thread["historyMode"] = self.thread_history_modes[params["threadId"]]
+            if params["threadId"] in self.thread_paths:
+                thread["path"] = self.thread_paths[params["threadId"]]
             return {"thread": thread}
         if method == "thread/turns/list":
             return self.turns_response
         if method == "thread/items/list":
             return self.items_response
+        if method == "account/rateLimits/read":
+            return self.rate_limits_response
         raise AssertionError(f"unexpected method {method}")
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
@@ -95,6 +131,20 @@ def make_activity_bridge(allowed_dir) -> tuple[Bridge, FakeAppServer, StateStore
     return bridge, app, store, activities
 
 
+def write_rollout(path: Path, *records: dict[str, Any]) -> None:
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_rate_limits_uses_the_formal_app_server_request(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    result = await bridge.rate_limits()
+
+    assert result["rateLimits"]["primary"]["windowDurationMins"] == 300
+    assert app.calls == [("account/rateLimits/read", {})]
+
+
 @pytest.mark.asyncio
 async def test_start_returns_native_ids_without_waiting_for_completion(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
@@ -104,8 +154,112 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
     assert result["thread_id"] == "native-thread"
     assert result["turn_id"] == "native-turn"
     assert result["state"] == "in_progress"
+    assert result["thread_metadata"] == {
+        "model_provider": "openai",
+        "model": "gpt-5",
+        "reasoning_effort": "high",
+        "cli_version": "0.1.2",
+    }
     assert app.methods == ["thread/start", "turn/start"]
     assert app.calls[1][1]["input"] == [{"type": "text", "text": "inspect this"}]
+
+
+@pytest.mark.asyncio
+async def test_start_passes_explicit_model_and_effort_only_to_expected_wire_fields(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    await bridge.start(
+        str(allowed_dir), "inspect this", model="model-value", reasoning_effort="high"
+    )
+
+    assert app.calls[0] == ("thread/start", {"cwd": str(allowed_dir), "model": "model-value"})
+    assert app.calls[1][0] == "turn/start"
+    assert app.calls[1][1]["model"] == "model-value"
+    assert app.calls[1][1]["effort"] == "high"
+    assert "reasoningEffort" not in app.calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_model_capabilities_reads_all_pages_and_only_projects_safe_fields(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.model_pages = {
+        None: {
+            "data": [
+                {
+                    "id": "private-id",
+                    "model": "model-a",
+                    "displayName": "Model A",
+                    "description": "Safe description",
+                    "hidden": False,
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+                    "defaultReasoningEffort": "low",
+                }
+            ],
+            "nextCursor": "page-two",
+        },
+        "page-two": {
+            "data": [
+                {
+                    "model": "hidden-model",
+                    "displayName": "Hidden",
+                    "description": "",
+                    "hidden": True,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+                    "defaultReasoningEffort": "low",
+                }
+            ]
+        },
+    }
+    app.config_response = {
+        "config": {"model": "model-a", "model_reasoning_effort": "low", "api_key": "secret"},
+        "layers": {"raw": "never return"},
+    }
+
+    result = await bridge.model_capabilities()
+
+    assert result["defaults"] == {"model": "model-a", "reasoning_effort": "low"}
+    assert [entry["model"] for entry in result["models"]] == ["model-a"]
+    assert all("id" not in entry for entry in result["models"])
+    assert "secret" not in str(result)
+    assert app.calls[-1] == (
+        "config/read",
+        {"includeLayers": False, "cwd": None},
+    )
+    assert [call for call in app.calls if call[0] == "model/list"] == [
+        ("model/list", {}),
+        ("model/list", {"cursor": "page-two"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_capabilities_pagination_cycle_and_empty_catalog_are_safe(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    with pytest.raises(BridgeError, match="model capabilities are unavailable") as exc_info:
+        await bridge.model_capabilities()
+    assert "api" not in str(exc_info.value)
+
+    entry = {
+        "id": "model-id",
+        "model": "model-value",
+        "displayName": "Model",
+        "description": "",
+        "hidden": False,
+        "supportedReasoningEfforts": [{"reasoningEffort": "effort"}],
+        "defaultReasoningEffort": "effort",
+    }
+    app.model_pages = {
+        None: {"data": [entry], "nextCursor": "loop"},
+        "loop": {"data": [entry], "nextCursor": "loop"},
+    }
+
+    with pytest.raises(BridgeError, match="model capabilities are unavailable"):
+        await bridge.model_capabilities()
 
 
 @pytest.mark.asyncio
@@ -233,6 +387,129 @@ async def test_threads_list_and_read_are_bounded_and_sanitized(allowed_dir) -> N
     }
 
 
+def _write_local_thread_catalog(path: Path, rows: list[tuple[str, str, str]]) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE local_thread_catalog ("
+            "host_id TEXT NOT NULL, thread_id TEXT NOT NULL, display_title TEXT NOT NULL, "
+            "PRIMARY KEY (host_id, thread_id))"
+        )
+        connection.executemany(
+            "INSERT INTO local_thread_catalog (host_id, thread_id, display_title) VALUES (?, ?, ?)",
+            rows,
+        )
+
+
+@pytest.mark.asyncio
+async def test_threads_prefer_app_server_name_over_local_catalog_and_ignore_prompt_prefix(
+    allowed_dir, tmp_path, monkeypatch
+) -> None:
+    import codex_bridge.bridge as bridge_module
+
+    catalog = tmp_path / "codex-dev.db"
+    _write_local_thread_catalog(
+        catalog,
+        [
+            ("local", "existing", "Stale local title"),
+            ("local", "generated", "Generated title"),
+            ("local", "prompt", "Please diagnose this"),
+            ("remote", "remote-only", "Remote title"),
+        ],
+    )
+    monkeypatch.setattr(bridge_module, "_LOCAL_THREAD_CATALOG_PATH", catalog, raising=False)
+    bridge, app, _ = make_bridge(allowed_dir)
+    cwd = str(allowed_dir)
+    app.thread_list = [
+        {"id": "existing", "name": "Existing title", "cwd": cwd, "preview": "User request"},
+        {
+            "id": "generated",
+            "cwd": cwd,
+            "preview": "Please review the changes and summarize the findings.",
+        },
+        {"id": "prompt", "cwd": cwd, "preview": "Please diagnose this failure carefully."},
+        {"id": "remote-only", "cwd": cwd, "preview": "A local thread title is unavailable."},
+        {"id": "untitled", "cwd": cwd, "preview": "A request without a local title."},
+    ]
+
+    result = await bridge.threads(limit=5)
+
+    threads = {thread["id"]: thread for thread in result["threads"]}
+    assert threads["existing"]["name"] == "Existing title"
+    assert threads["generated"]["name"] == "Generated title"
+    assert "name" not in threads["prompt"]
+    assert "name" not in threads["remote-only"]
+    assert "name" not in threads["untitled"]
+    assert app.calls == [("thread/list", {"limit": 5})]
+
+
+@pytest.mark.asyncio
+async def test_threads_ignore_unavailable_local_catalog(allowed_dir, tmp_path, monkeypatch) -> None:
+    import codex_bridge.bridge as bridge_module
+
+    missing_catalog = tmp_path / "missing" / "codex-dev.db"
+    monkeypatch.setattr(bridge_module, "_LOCAL_THREAD_CATALOG_PATH", missing_catalog, raising=False)
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_list = [
+        {
+            "id": "no-catalog",
+            "cwd": str(allowed_dir),
+            "preview": "Do not use this request as a title.",
+        }
+    ]
+
+    result = await bridge.threads(limit=1)
+
+    assert "name" not in result["threads"][0]
+    assert app.calls == [("thread/list", {"limit": 1})]
+
+
+@pytest.mark.asyncio
+async def test_threads_pick_up_local_title_added_after_an_earlier_empty_refresh(
+    allowed_dir, tmp_path, monkeypatch
+) -> None:
+    import codex_bridge.bridge as bridge_module
+
+    catalog = tmp_path / "codex-dev.db"
+    _write_local_thread_catalog(catalog, [])
+    monkeypatch.setattr(bridge_module, "_LOCAL_THREAD_CATALOG_PATH", catalog, raising=False)
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_list = [
+        {
+            "id": "late-title",
+            "cwd": str(allowed_dir),
+            "preview": "This request is not a generated title.",
+        }
+    ]
+
+    first = await bridge.threads(limit=1)
+    with sqlite3.connect(catalog) as connection:
+        connection.execute(
+            "INSERT INTO local_thread_catalog (host_id, thread_id, display_title) VALUES (?, ?, ?)",
+            ("local", "late-title", "Generated title"),
+        )
+    second = await bridge.threads(limit=1)
+
+    assert "name" not in first["threads"][0]
+    assert second["threads"][0]["name"] == "Generated title"
+    assert app.calls == [
+        ("thread/list", {"limit": 1}),
+        ("thread/list", {"limit": 1}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_calls_native_name_set_for_supplied_thread(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    result = await bridge.rename_thread("right-clicked", "Renamed")
+
+    assert result == {"thread": {"id": "right-clicked", "name": "Renamed"}}
+    assert app.calls[-1] == (
+        "thread/name/set",
+        {"threadId": "right-clicked", "name": "Renamed"},
+    )
+
+
 @pytest.mark.asyncio
 async def test_threads_history_omits_reasoning_thread_items(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
@@ -347,6 +624,121 @@ async def test_read_thread_items_preflights_metadata_and_preserves_entry_turn_id
     assert result["items"][0]["turn_id"] == "turn-1"
     assert result["next_cursor"] == "next"
     assert result["backwards_cursor"] == "back"
+
+
+@pytest.mark.asyncio
+async def test_read_thread_items_adds_turn_model_metadata_from_thread_read_path(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["paginated-thread"] = str(allowed_dir)
+    app.thread_history_modes["paginated-thread"] = "paginated"
+    rollout_path = allowed_dir / "rollout.jsonl"
+    write_rollout(
+        rollout_path,
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna", "effort": "xhigh"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna", "effort": "xhigh"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-sol", "effort": "high"},
+        },
+        {
+            "type": "turn_context",
+            "payload": {"turn_id": "orphan", "model": "gpt-5.5", "effort": "medium"},
+        },
+    )
+    app.thread_paths["paginated-thread"] = str(rollout_path)
+    app.items_response = {
+        "data": [
+            {
+                "turnId": "turn-1",
+                "item": {"id": "agent-1", "type": "agentMessage", "text": "hello"},
+            },
+            {
+                "turnId": "turn-2",
+                "item": {"id": "user-1", "type": "userMessage", "content": []},
+            },
+        ],
+        "nextCursor": None,
+        "backwardsCursor": None,
+    }
+
+    result = await bridge.read_thread_items("paginated-thread")
+
+    assert app.methods == ["thread/read", "thread/items/list"]
+    assert result["turn_model_metadata"] == {
+        "turn-1": {
+            "model_candidates": [
+                {"model": "gpt-5.6-luna", "reasoning_effort": "xhigh"},
+                {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+            ],
+            "model_resolution_status": "multiple",
+        },
+        "turn-2": {
+            "model_candidates": [],
+            "model_resolution_status": "unavailable",
+        },
+    }
+    assert "orphan" not in result["turn_model_metadata"]
+    assert str(rollout_path) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_read_thread_items_does_not_use_thread_list_path_for_metadata(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["paginated-thread"] = str(allowed_dir)
+    app.thread_history_modes["paginated-thread"] = "paginated"
+    listed_rollout = allowed_dir / "listed-rollout.jsonl"
+    write_rollout(
+        listed_rollout,
+        {"type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna"}},
+    )
+    app.thread_list = [{"id": "paginated-thread", "path": str(listed_rollout)}]
+    app.items_response = {
+        "data": [
+            {
+                "turnId": "turn-1",
+                "item": {"id": "item-1", "type": "agentMessage", "text": "safe"},
+            }
+        ]
+    }
+
+    result = await bridge.read_thread_items("paginated-thread")
+
+    assert result["turn_model_metadata"]["turn-1"]["model_resolution_status"] == "unavailable"
+    assert app.methods == ["thread/read", "thread/items/list"]
+
+
+@pytest.mark.asyncio
+async def test_read_legacy_items_adds_turn_model_metadata_and_fails_soft(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["legacy-thread"] = str(allowed_dir)
+    app.thread_histories["legacy-thread"] = [
+        {
+            "id": "turn-1",
+            "items": [{"id": "item-1", "type": "agentMessage", "text": "safe"}],
+        },
+        {
+            "id": "turn-2",
+            "items": [{"id": "item-2", "type": "agentMessage", "text": "older"}],
+        },
+    ]
+    app.thread_paths["legacy-thread"] = str(allowed_dir / "missing-rollout.jsonl")
+
+    result = await bridge.read_thread_items("legacy-thread")
+
+    assert [entry["turn_id"] for entry in result["items"]] == ["turn-2", "turn-1"]
+    assert result["turn_model_metadata"] == {
+        "turn-2": {"model_candidates": [], "model_resolution_status": "unavailable"},
+        "turn-1": {"model_candidates": [], "model_resolution_status": "unavailable"},
+    }
+    assert app.methods == ["thread/read", "thread/read"]
 
 
 @pytest.mark.asyncio
@@ -512,6 +904,106 @@ async def test_wait_wakes_when_matching_turn_completes(allowed_dir) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_uses_fifty_second_default(allowed_dir, monkeypatch) -> None:
+    bridge, _, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+    observed_timeouts: list[float] = []
+
+    async def wait_for_change(_thread_id: str, _turn_id: str, timeout: float) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(store, "wait_for_change", wait_for_change)
+
+    result = await bridge.wait("thread", "turn")
+
+    assert observed_timeouts == pytest.approx([50.0], abs=0.01)
+    assert result["state"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_wait_request_is_capped_at_fifty_five_seconds(allowed_dir, monkeypatch) -> None:
+    bridge, _, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+    observed_timeouts: list[float] = []
+
+    async def wait_for_change(_thread_id: str, _turn_id: str, timeout: float) -> bool:
+        observed_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(store, "wait_for_change", wait_for_change)
+
+    result = await bridge.wait("thread", "turn", 60.0)
+
+    assert observed_timeouts == pytest.approx([55.0], abs=0.01)
+    assert result["state"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_active_wait_timeout_returns_in_progress_without_rpc(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    result = await bridge.wait("thread", "turn", 0.01)
+
+    assert result["state"] == "in_progress"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_same_active_turn_can_be_waited_on_repeatedly(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    store.ensure_turn("thread", "turn")
+
+    first = await bridge.wait("thread", "turn", 0)
+    second = await bridge.wait("thread", "turn", 0)
+
+    assert first["state"] == "in_progress"
+    assert second["state"] == "in_progress"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_for_pending_approval(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    await bridge.handle_server_request(
+        {
+            "id": "approval-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "thread", "turnId": "turn"},
+        }
+    )
+
+    result = await asyncio.wait_for(bridge.wait("thread", "turn", 50.0), timeout=0.5)
+
+    assert result["state"] == "needs_approval"
+    assert result["pending_request"]["request_id"] == "approval-1"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_for_pending_user_input(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    await bridge.handle_server_request(
+        {
+            "id": "input-1",
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "questions": [{"header": "Choice", "id": "choice", "question": "Pick one"}],
+            },
+        }
+    )
+
+    result = await asyncio.wait_for(bridge.wait("thread", "turn", 50.0), timeout=0.5)
+
+    assert result["state"] == "needs_input"
+    assert result["pending_request"]["request_id"] == "input-1"
+    assert app.methods == []
+
+
+@pytest.mark.asyncio
 async def test_terminal_statuses_are_normalized(allowed_dir) -> None:
     bridge, _, store = make_bridge(allowed_dir)
     for native, expected in (
@@ -549,6 +1041,20 @@ async def test_agent_delta_and_diff_are_retained(allowed_dir) -> None:
     snapshot = store.snapshot("thread", "turn")
     assert snapshot["latest_agent_message"] == "hello"
     assert snapshot["current_diff"] == "diff"
+
+    public_snapshot = await bridge.wait("thread", "turn", 0)
+    assert {
+        "state",
+        "latest_agent_message",
+        "current_diff",
+        "pending_request",
+        "error",
+    }.issubset(public_snapshot)
+    assert public_snapshot["state"] == "in_progress"
+    assert public_snapshot["latest_agent_message"] == "hello"
+    assert public_snapshot["current_diff"] == "diff"
+    assert public_snapshot["pending_request"] is None
+    assert public_snapshot["error"] is None
 
 
 @pytest.mark.asyncio
@@ -824,15 +1330,35 @@ async def test_agent_deltas_update_state_but_create_one_completed_activity(allow
                 "threadId": "thread",
                 "turnId": "turn",
                 "completedAtMs": 1,
-                "item": {"id": "agent", "type": "agentMessage", "text": "final message"},
+                "item": {
+                    "id": "commentary",
+                    "type": "agentMessage",
+                    "text": "progress update",
+                    "phase": "commentary",
+                },
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 2,
+                "item": {
+                    "id": "agent",
+                    "type": "agentMessage",
+                    "text": "final message",
+                    "phase": "final_answer",
+                },
             },
         }
     )
 
     recent = activities.get_recent("thread", "turn")
-    assert len(recent) == 1
-    assert recent[0].type == "agent_message"
-    assert recent[0].summary == "final message"
+    assert [activity.type for activity in recent] == ["agent_commentary", "agent_message"]
+    assert [activity.summary for activity in recent] == ["progress update", "final message"]
 
 
 @pytest.mark.asyncio
@@ -993,6 +1519,12 @@ async def test_status_for_unknown_thread_returns_not_loaded_without_state_creati
     assert result == {
         "thread_id": "unknown-thread",
         "turn_id": None,
+        "thread_metadata": {
+            "model_provider": None,
+            "model": None,
+            "reasoning_effort": None,
+            "cli_version": None,
+        },
         "state": "not_loaded",
         "latest_agent_message": "",
         "current_diff": "",
@@ -1002,6 +1534,25 @@ async def test_status_for_unknown_thread_returns_not_loaded_without_state_creati
         "recent_activities": [],
     }
     assert store.has_thread("unknown-thread") is False
+
+
+@pytest.mark.asyncio
+async def test_unknown_wait_does_not_create_ghost_or_override_latest_status(allowed_dir) -> None:
+    bridge, _, store, _ = make_activity_bridge(allowed_dir)
+    store.ensure_turn("thread-a", "known-turn")
+    store.set_terminal("thread-a", "known-turn", "completed")
+
+    wait_result = await bridge.wait("thread-a", "ghost-turn", 0)
+
+    assert wait_result["turn_id"] == "ghost-turn"
+    assert wait_result["state"] == "not_loaded"
+    assert store.has_turn("thread-a", "ghost-turn") is False
+    assert store.active_turn_for_thread("thread-a") is None
+    assert store.latest_known_turn("thread-a") == "known-turn"
+
+    status = await bridge.status("thread-a")
+    assert status["turn_id"] == "known-turn"
+    assert status["state"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -1019,6 +1570,25 @@ async def test_approval_response_is_scoped_to_request_id(allowed_dir) -> None:
 
     assert result["state"] == "in_progress"
     assert app.responses == [("approval-1", {"decision": "accept"})]
+
+
+@pytest.mark.asyncio
+async def test_has_pending_request_is_read_only_and_matches_exact_id(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    request_id = "notebook::request::eyJyZXF1ZXN0X2lkIjoxfQ"
+    await bridge.handle_server_request(
+        {
+            "id": request_id,
+            "method": "item/fileChange/requestApproval",
+            "params": {"itemId": "item", "threadId": "thread", "turnId": "turn"},
+        }
+    )
+    pending = store.get_pending_request(request_id)
+
+    assert bridge.has_pending_request(request_id) is True
+    assert bridge.has_pending_request("notebook::request::other") is False
+    assert store.get_pending_request(request_id) is pending
+    assert app.responses == []
 
 
 @pytest.mark.asyncio

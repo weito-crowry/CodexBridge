@@ -1,0 +1,45 @@
+:root {
+  color-scheme: light dark;
+  font: 14px/1.45 system-ui, sans-serif;
+  background: Canvas;
+  color: CanvasText;
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+
+body { margin: 0; padding: 14px; }
+
+main { width: min(100%, 34rem); margin: 0 auto; }
+
+h1 { margin: 0 0 8px; font-size: 1.15rem; }
+
+#status { min-height: 1.45em; margin: 0 0 12px; }
+
+form { display: grid; gap: 7px; }
+
+label { font-weight: 600; margin-top: 4px; }
+
+select, button {
+  min-height: 38px;
+  border: 1px solid color-mix(in srgb, CanvasText 24%, Canvas);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: Canvas;
+  color: CanvasText;
+  font: inherit;
+}
+
+select:focus-visible, button:focus-visible {
+  outline: 2px solid Highlight;
+  outline-offset: 2px;
+}
+
+button { cursor: pointer; }
+button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
+
+.hint { min-height: 1em; margin: -3px 0 2px; color: color-mix(in srgb, CanvasText 70%, Canvas); }
+
+.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }

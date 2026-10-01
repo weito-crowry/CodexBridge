@@ -1,18 +1,24 @@
 # CodexBridge
 
-CodexBridge is a thin single-user bridge for this path:
+CodexBridge is a thin MCP bridge for this path:
 
 ```text
-ChatGPT -> Remote MCP -> CodexBridge -> codex app-server -> Codex
+ChatGPT -> User-facing CodexBridge -> local or remote CodexBridge -> Codex App Server
 ```
 
-It exposes only thread/turn control and approval or user-input forwarding. Shell execution, file changes, Git, sandbox policy, authentication, reasoning, commit, and push remain owned by Codex.
+By default it exposes only thread/turn control and approval or user-input forwarding. When enabled,
+it also transparently mounts the GitHub Remote MCP tool catalog. Shell execution, file changes, Git,
+sandbox policy, authentication, reasoning, commit, and push remain owned by Codex or the upstream MCP.
 
 ## Architecture
 
 The Streamable HTTP MCP server owns one ASGI lifespan. Startup creates exactly one `codex app-server --stdio` child and performs the JSON-RPC `initialize` / `initialized` handshake. A dedicated JSONL reader correlates response IDs and routes notifications and server-initiated requests to the in-memory state store. MCP tools call a transport-neutral bridge over that client. Phase 2 also starts a separate read-only Starlette/Uvicorn listener for the local UI API; it is not mounted in the MCP app.
 
-The bridge does not create a session ID or database. Codex's native `thread.id` is returned unchanged as `thread_id`; persistence and resume are delegated to Codex rollout/history data.
+The bridge does not create a session ID or routing database. Local Codex native `thread.id` values stay unchanged; remote thread IDs include their target ID so later calls and Bridge restarts retain routing affinity.
+
+## MCP Server Instructions
+
+CodexBridge publishes MCP Server Instructions for ChatGPT. The recommended flow is one complete `codex_start`, repeated `codex_wait` calls as needed, and ChatGPT review after completion. When `codex_wait` returns `state=in_progress`, call `codex_wait` again instead of creating an additional Codex turn; use `codex_continue` or `codex_steer` only when review or active-turn correction requires it.
 
 ## Requirements
 
@@ -34,9 +40,95 @@ The observed protocol includes `initialize`, `thread/start`, `thread/resume`, `t
 ## Setup
 
 ```powershell
-uv sync --extra dev
-$env:CODEX_BRIDGE_ALLOWED_ROOTS = 'C:\Users\you\Documents\src\MyRepo'
+uv sync --extra dev --extra console
+uv run codex-bridge-console
+```
+
+The recommended daily entry point is `uv run codex-bridge-console`. Configure at least one
+existing absolute allowed root before starting Bridge. The user-local TOML file is
+`%APPDATA%\CodexBridge\config.toml` on Windows, `$XDG_CONFIG_HOME/codexbridge/config.toml`
+when `XDG_CONFIG_HOME` is set, and `~/.config/codexbridge/config.toml` otherwise. Set
+`CODEX_BRIDGE_CONFIG` to use a different file. The supported shape is:
+
+```toml
+[bridge]
+allowed_roots = ["C:\\Users\\you\\Documents\\src"]
+# codex_executable = "C:\\Users\\you\\AppData\\Local\\Programs\\Codex\\codex.exe"
+
+[console]
+ui_port = 8001
+
+[tunnel]
+# executable = "C:\\Users\\you\\Documents\\src\\CodexBridge\\.tools\\tunnel-client\\tunnel-client.exe"
+profile = "codex-bridge"
+
+[github_mcp]
+enabled = false
+url = "https://api.githubcopilot.com/mcp/x/all"
+prefix = "github_"
+include = ["*"]
+exclude = []
+toolsets = []
+max_tools = 0
+
+[targets.main-pc]
+name = "Main PC"
+kind = "local"
+
+[targets.notebook]
+name = "Notebook PC"
+kind = "remote"
+url = "https://notebook.example.test/mcp"
+```
+
+`targets` is optional. With no target tables, CodexBridge creates the legacy local target named
+`Local PC` with ID `local`. An explicit target configuration must contain exactly one `local`
+target. Register a remote PC by running the usual CodexBridge there and pointing this machine's
+remote target at that PC's `/mcp` endpoint. A remote target node must itself be a single-target
+leaf (its own implicit local target); nested routing gateways are not supported. With more than
+one configured target, `codex_start` requires an explicit `target_id`, and `codex_threads` requires
+one when listing threads. Remote `cwd` values are paths on the selected remote PC and are checked
+against that PC's allowed roots. CodexBridge does not synchronize files or store target credentials
+in its config file.
+
+Configuration precedence is explicit CLI option, environment variable, user config file,
+then the existing default. `CODEX_BRIDGE_ALLOWED_ROOTS` remains an `os.pathsep`-separated
+environment value; the TOML form is an array of strings. The config file does not accept
+API keys, control-plane keys, or runtime control tokens.
+The GitHub Remote MCP PAT is never accepted in TOML and must be supplied only through
+`CODEX_BRIDGE_GITHUB_PAT` when the mount is enabled.
+
+## Windows packaged desktop app
+
+Download and extract the Windows package, then start `CodexBridge.exe` from the extracted
+`CodexBridge` folder. The Console starts and supervises its Bridge runtime when no external
+Bridge is already ready. You do not need to open a separate command prompt or start
+`codex-bridge` manually.
+
+The package does not include Codex CLI. The target PC needs a locally authenticated Codex CLI
+installation and, when used, the existing Tunnel client and profile configured separately.
+The app reads `%APPDATA%\CodexBridge\config.toml`; configure at least one existing absolute
+`bridge.allowed_roots` path using the configuration shape above. The setup UI is not included.
+
+The GUI-first package uses PyInstaller `onedir` with `windowed` mode, so normal startup and the
+detached Bridge runtime do not open a command prompt. Runtime output is written to the existing
+`bridge-runtime-stdout.log` and `bridge-runtime-stderr.log` diagnostics files.
+
+To rebuild on Windows from this repository, run:
+
+```powershell
+uv sync --extra dev --extra console --extra package
+.\scripts\build_windows.ps1
+```
+
+The build creates `dist\CodexBridge\` and `dist\CodexBridge-windows.zip`. No Codex CLI, PAT,
+Tunnel credentials, user configuration, or repository working files are bundled.
+
+For development and troubleshooting, both source entry points remain available:
+
+```powershell
 uv run codex-bridge
+uv run codex-bridge-console
 ```
 
 The MCP endpoint is:
@@ -55,6 +147,11 @@ It is fixed to `127.0.0.1`, is not a Tunnel target, and exposes only read-only h
 
 The default bind is loopback only. Tunnel profiles are not created or configured by CodexBridge; Phase 4B only supervises a profile that was configured externally. No tunnel identifier or token belongs in this repository.
 
+The direct `codex-bridge` entry point uses the same Codex executable resolver as the Console.
+If no executable is found it fails with a bounded configuration message instead of a raw
+`FileNotFoundError` traceback. `allowed_roots` is required at Bridge startup and is checked
+for absolute, existing, directory, and canonicalizable paths.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -65,13 +162,39 @@ The default bind is loopback only. Tunnel profiles are not created or configured
 | `CODEX_BRIDGE_ALLOWED_ROOTS` | empty | Required path-separated canonical roots. Empty means every `cwd` is rejected. |
 | `CODEX_BRIDGE_ALLOWED_HOSTS` | SDK loopback defaults | Exact Host allowlist, comma-separated. `example.com:*` allows any port. |
 | `CODEX_BRIDGE_ALLOWED_ORIGINS` | SDK loopback defaults | Exact browser Origin allowlist, comma-separated. This is separate from Host validation. |
-| `CODEX_BRIDGE_CODEX_EXECUTABLE` | `codex` | Codex executable name or path. The fixed subcommand remains `app-server --stdio`. |
+| `CODEX_BRIDGE_CODEX_EXECUTABLE` | resolver | Explicit Codex executable name or path. The fixed subcommand remains `app-server --stdio`. |
 | `CODEX_BRIDGE_CONTROL_TOKEN` | unset | Optional per-launch ASCII URL-safe control token; Console-launched values are process-local and never persisted. |
-| `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | unset | Optional explicit `tunnel-client` executable override; an invalid explicit value fails closed. |
+| `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | resolver | Optional explicit `tunnel-client` executable override; an invalid explicit value fails closed. |
 | `CODEX_BRIDGE_TUNNEL_PROFILE` | `codex-bridge` | Existing Secure MCP Tunnel profile name; valid values are 1–64 ASCII letters, digits, `.`, `_`, or `-`. |
-| `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `18` | Default long-poll duration. |
-| `CODEX_BRIDGE_WAIT_MAX_SECONDS` | `30` | Hard maximum long-poll duration. |
+| `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `50` | Default long-poll duration. |
+| `CODEX_BRIDGE_WAIT_MAX_SECONDS` | `55` | Configured maximum long-poll duration; values above 55 are rejected. |
 | `CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS` | `3` | Shutdown grace period for the App Server child. |
+| `CODEX_BRIDGE_GITHUB_MCP_ENABLED` | `false` | Enable the GitHub Remote MCP tools mount. Enabled startup fails closed. |
+| `CODEX_BRIDGE_GITHUB_MCP_URL` | `https://api.githubcopilot.com/mcp/x/all` | GitHub Remote MCP Streamable HTTP endpoint. |
+| `CODEX_BRIDGE_GITHUB_MCP_PREFIX` | `github_` | Prefix applied to exposed remote tool names. |
+| `CODEX_BRIDGE_GITHUB_MCP_INCLUDE` | `*` | Comma-separated upstream tool-name globs included before exclusion. |
+| `CODEX_BRIDGE_GITHUB_MCP_EXCLUDE` | empty | Comma-separated upstream tool-name globs excluded after inclusion. |
+| `CODEX_BRIDGE_GITHUB_MCP_TOOLSETS` | empty | Optional comma-separated GitHub upstream toolsets sent as `X-MCP-Toolsets`; empty preserves all upstream toolsets. |
+| `CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS` | `0` | Maximum exposed remote tools after stable sorting; `0` means unlimited. |
+| `CODEX_BRIDGE_GITHUB_PAT` | unset | Dedicated GitHub Remote MCP bearer token; environment-only and never logged or returned. |
+
+### GitHub Remote MCP mount
+
+When enabled, startup connects to the configured endpoint through the SDK v2 auto-negotiating
+`Client` (modern discovery with legacy `initialize` fallback), optionally sends the configured
+`X-MCP-Toolsets` header, fetches every `tools/list` page,
+applies include → exclude → name sort → `max_tools`, and exposes the resulting tools with the
+configured prefix in the same MCP namespace as the native tools. The snapshot stays fixed for the
+process lifetime. The startup catalog records native/upstream/exposed/total counts, serialized
+catalog bytes, and a deterministic SHA-256 fingerprint. A later upstream disconnect does not remove
+the catalog; calls fail explicitly, and only a call begun while disconnected may reconnect before its
+one request. Multi-round-trip fields and `InputRequiredResult` are passed through unchanged. Remote
+execution failures are returned as `isError` tool results. A communication error after sending a call
+is returned as outcome unknown and is never retried.
+
+For schema-reduction dogfood, an example value is
+`CODEX_BRIDGE_GITHUB_MCP_TOOLSETS=context,repos,issues,pull_requests,actions`. This is optional
+and is not the default; leaving it unset preserves the `/mcp/x/all` all-toolsets behavior.
 
 ### Tunnel Host configuration
 
@@ -88,21 +211,29 @@ Only use the actual host and origin values supplied by the tunnel/client deploym
 
 ## MCP tools
 
-The server publishes exactly nine tools:
+The server publishes the native CodexBridge tool set. When the GitHub Remote MCP mount is enabled,
+its filtered tools are added to the same MCP namespace with the `github_` prefix:
+The native tool set contains ten tools before optional mounts.
 
 | Tool | Inputs | Result |
 | --- | --- | --- |
-| `codex_start` | `cwd`, `prompt` | Native `thread_id`, `turn_id`, and `in_progress` state; does not wait for completion. |
+| `codex_targets` | none | Configured target IDs, names, kinds, and best-effort availability. Does not return target URLs or connection errors. |
+| `codex_start` | `cwd`, `prompt`, optional `target_id` | Native or target-routed `thread_id`, `turn_id`, `in_progress` state, and safe `thread_metadata`; does not wait for completion. |
 | `codex_continue` | `thread_id`, `prompt` | Starts a new turn, calling `thread/resume` first when the thread is not loaded in this process. |
-| `codex_wait` | `thread_id`, `turn_id`, optional `timeout_seconds` | Bounded normalized state, latest agent message, latest diff, pending request, and error. |
+| `codex_wait` | `thread_id`, `turn_id`, optional `timeout_seconds` | Waits up to the configured bound, then returns the normalized state, latest agent message, latest diff, pending request, error, and retained `thread_metadata`. Terminal states and pending approval/user-input requests return immediately; an active turn returns `in_progress` on timeout. Repeating the same IDs is supported and does not start or change a Codex turn. |
 | `codex_steer` | `thread_id`, `turn_id`, `prompt` | Uses `turn/steer` with `expectedTurnId` equal to the supplied turn ID. |
 | `codex_approval` | `request_id`, `decision` | Resolves one pending approval. Decisions are `accept`, `acceptForSession`, `decline`, or `cancel`. |
 | `codex_user_input` | `request_id`, `answers` | Resolves one pending user-input request keyed by exact question IDs. |
 | `codex_interrupt` | `thread_id`, `turn_id` | Requests interruption; the later terminal event determines the final state. |
-| `codex_threads` | optional `thread_id`, history flag, limit, cursor | Lists native threads or reads one sanitized native thread/history response. |
+| `codex_threads` | optional `thread_id`, `target_id`, history flag, limit, cursor | Lists one target's threads or reads one sanitized thread/history response; lists are never merged across targets. |
 | `codex_status` | `thread_id`, optional `turn_id`, `activity_limit` (1-100, default 20) | Returns the current safe turn snapshot plus bounded recent Activity records. |
 
 Normalized states are `in_progress`, `needs_approval`, `needs_input`, `completed`, `interrupted`, and `failed`.
+
+`thread_metadata` contains `model_provider`, `model`, `reasoning_effort`, and `cli_version` when
+the native Thread response provides them, otherwise `null`. `thread_metadata.model` means the
+current configured or latest persisted Thread model; it is not guaranteed per-turn execution
+telemetry.
 
 ## Example workflow
 
@@ -148,23 +279,37 @@ uv run codex-bridge-console
 
 The Console uses `CODEX_BRIDGE_UI_PORT` (default `8001`) or an explicit `--ui-port`, always connects to `http://127.0.0.1:<port>`, and uses Qt Network for asynchronous JSON GET and SSE reads. It shows the thread list, selected thread history, current status, pending approval/input summaries, recent Activity, and live Activity stream. It has no approval, input, steer, interrupt, new-thread, or other mutation controls. The UI API is loopback-only and is not a Tunnel target.
 
-Console close stops its timers and aborts only its own HTTP/SSE replies. It does not stop CodexBridge, the Codex App Server, the Tunnel, or an active Codex turn.
+Window close hides to the tray only when the tray is actually usable; otherwise it follows the
+normal graceful exit. Tray Exit, non-tray close, and Ctrl+C share one bounded shutdown path.
+That path stops the Console-owned Tunnel first, requests shutdown only for a Bridge started by
+this Console, confirms disappearance with a bounded wait, then closes Console requests and
+probes. An external Bridge is never stopped by Console exit.
 
 ## Phase 4A Codex detection and detached Bridge launch
 
-Phase 4A adds a small runtime area to the Console. It asynchronously discovers and verifies a Codex executable with the priority `CODEX_BRIDGE_CODEX_EXECUTABLE`, the Windows Codex App native installation, PATH (`codex.exe`, `codex.cmd`, `codex`), and `%APPDATA%\npm\codex.cmd`. Candidate paths are deduplicated with Windows case-insensitive canonical comparison. The `--version` probe has a roughly three-second timeout and bounded output, and the Console shows only the detected version and source, never raw subprocess output or environment values.
+Phase 4A adds a small runtime area to the Console. A shared resolver asynchronously discovers and
+verifies a Codex executable with the priority `CODEX_BRIDGE_CODEX_EXECUTABLE`, config-file
+`bridge.codex_executable`, the Windows Codex App native installation, PATH, and
+`%APPDATA%\npm\codex.cmd`. Candidate paths are deduplicated with Windows case-insensitive
+canonical comparison. The `--version` probe has a roughly three-second timeout and bounded
+output, and the Console shows only the detected version and source, never raw subprocess output
+or environment values.
 
-When the existing UI API is ready, the Console reports `Runtime: external` and disables Start Bridge. The existing external Bridge is never replaced. A valid detected Codex enables Start Bridge only while the Bridge is unavailable. The button starts exactly one detached child using `sys.executable -m codex_bridge`; the child inherits the current environment, with only `CODEX_BRIDGE_CODEX_EXECUTABLE` and `CODEX_BRIDGE_UI_PORT` controlled by the launcher. The Console waits for `/healthz` and `/ui-api/status` readiness before showing `Runtime: started by Console`.
+When the existing UI API is ready, the Console reports `Runtime: external` and disables Start Bridge. The existing external Bridge is never replaced. A valid detected Codex enables Start Bridge only while the Bridge is unavailable. The button starts exactly one detached child. Source runs use `sys.executable -m codex_bridge`; a frozen Windows package starts its own executable with the internal `--codexbridge-runtime` mode. The child inherits the current environment, with the Codex executable, UI port, control token, and allowed roots set by the launcher. The Console waits for `/healthz` and `/ui-api/status` readiness before showing `Runtime: started by Console`.
 
-The detached Bridge and its App Server continue after the Console closes. A launch timeout is safe and does not trigger a retry; there is no automatic restart. Phase 4A has no Stop or Restart UI and does not kill, terminate, or interrupt a Bridge, App Server, or turn. Tunnel/tray remain out of scope for Phase 4A.
+The detached Bridge and its App Server continue after a tray hide, while explicit Console Exit
+requests graceful shutdown for a Bridge owned by this Console. A launch timeout is safe and does
+not trigger a retry; there is no automatic restart. Phase 4A has no Stop or Restart UI and does
+not kill, terminate, or interrupt a Bridge, App Server, or turn. Tunnel/tray remain out of scope
+for Phase 4A.
 
 ## Phase 4B Secure MCP Tunnel supervision and system tray
 
-Phase 4B lets the Console supervise a configured Secure MCP Tunnel profile. Tunnel profile creation remains external: CodexBridge does not run `tunnel-client init`, edit profiles, configure connectors, or accept Tunnel IDs, API keys, OAuth data, or other identity input. The Console resolves the executable in this order: explicit `CODEX_BRIDGE_TUNNEL_EXECUTABLE`, PATH `tunnel-client.exe`, then PATH `tunnel-client`; invalid explicit values fail closed and `.ps1` files are excluded. The profile defaults to `codex-bridge` and is bounded to 1–64 ASCII letters, digits, `.`, `_`, or `-`.
+Phase 4B lets the Console supervise a configured Secure MCP Tunnel profile. Tunnel profile creation remains external: CodexBridge does not run `tunnel-client init`, edit profiles, configure connectors, or accept Tunnel IDs, API keys, OAuth data, or other identity input. The Console resolves the executable in this order: explicit `CODEX_BRIDGE_TUNNEL_EXECUTABLE`, config-file `tunnel.executable`, the CodexBridge checkout-local `.tools/tunnel-client/tunnel-client.exe` (or platform equivalent when checkout markers are present), then PATH. Invalid explicit/config values fail closed and `.ps1` files are excluded. The profile defaults to `codex-bridge` and is bounded to 1–64 ASCII letters, digits, `.`, `_`, or `-`.
 
-After Bridge and App Server readiness, one asynchronous `tunnel-client doctor --profile <profile> --explain --health.listen-addr 127.0.0.1:0` preflight runs with inherited process environment, a ten-second timeout, and an 8 KiB combined output bound. Output is discarded and never shown. A managed Tunnel uses a Console-owned `QProcess`, a fresh OS-assigned `127.0.0.1` ephemeral health port, and direct program/argument configuration; the Console does not shell out, dump the environment, or construct private Tunnel targets. `/healthz` and `/readyz` are polled asynchronously, response bodies are discarded, automatic Tunnel restart is disabled, and unexpected exit is reported as `Tunnel: failed`.
+Before that doctor preflight, `tunnel-client --version` must parse as semantic version `>= 0.0.14`; old or malformed clients are rejected and doctor is not started. After Bridge and App Server readiness, one asynchronous `tunnel-client doctor --profile <profile> --explain --health.listen-addr 127.0.0.1:0` preflight runs with inherited process environment, a ten-second timeout, and an 8 KiB combined output bound. Output is discarded and never shown. The top status shows the client version/source and uses a tooltip for the executable path. A managed Tunnel uses a Console-owned `QProcess`, a fresh OS-assigned `127.0.0.1` ephemeral health port, and direct program/argument configuration; the Console does not shell out, dump the environment, or construct private Tunnel targets. `/healthz` and `/readyz` are polled asynchronously, response bodies are discarded, automatic Tunnel restart is disabled, and unexpected exit is reported as `Tunnel: failed`.
 
-The Console exposes `Start Tunnel`, `Stop Tunnel`, and `Restart Tunnel` only for its own Tunnel process. Stop uses bounded `terminate` then `kill`; external Tunnel is never discovered/taken over, scanned, killed, or restarted. `QSystemTrayIcon`, `QMenu`, and `QAction` provide `Show Console`, `Hide Console`, Tunnel controls, and `Exit`. When available, window close minimizes/hides to tray when available and keeps Bridge and the Console-owned Tunnel running. explicit Exit stops Console-owned Tunnel and then quits; Bridge remains running on Console Exit. Tunnel secrets/identity are not stored by CodexBridge. Bridge Stop/Restart is Phase 4C.
+The Console exposes `Start Tunnel`, `Stop Tunnel`, and `Restart Tunnel` only for its own Tunnel process. Stop uses bounded `terminate` then `kill`; external Tunnel is never discovered/taken over, scanned, killed, or restarted. `QSystemTrayIcon`, `QMenu`, and `QAction` provide `Show Console`, `Hide Console`, Tunnel controls, and `Exit`, using the same non-null Qt standard icon for the window and tray. Tunnel secrets/identity are not stored by CodexBridge. Bridge Stop/Restart is Phase 4C.
 
 ## Phase 4C authenticated graceful Bridge control
 
@@ -172,11 +317,11 @@ Phase 4C adds `Start Bridge`, `Stop Bridge`, and `Restart Bridge` to the Console
 
 The authenticated control surface is only the fixed-loopback UI route `POST /ui-api/control/shutdown`. It is not present on the MCP port or Tunnel target. `Authorization: Bearer <token>` is checked with constant-time comparison; missing, malformed, and wrong credentials return a fixed `403`, while a valid request returns fixed `202` JSON and schedules the outer Uvicorn graceful-exit request after the response. The outer lifecycle then runs the existing Starlette lifespan cleanup and `BridgeRuntime.shutdown()` ordering. Stopping or restarting Bridge may interrupt active Codex turns.
 
-Stop first stops the Console-owned Tunnel when it is running, then posts the Bridge control request and waits asynchronously until both UI health/status endpoints become unreachable. Only confirmed disappearance changes the state to `Runtime: stopped`, clears the old token/PID/launch guard, and permits a new Start Bridge. A control failure or roughly ten-second stop timeout is fail closed: no retry, duplicate launch, PID kill, taskkill, OS signal, or force-kill fallback is used. Restart remembers whether the Console-owned Tunnel was running, performs the same graceful Bridge stop, launches with a fresh token, waits for readiness, and starts that Tunnel once only after the new Bridge is ready. Console Exit still does not stop Bridge; it only performs the existing Console/Tunnel cleanup. The MCP surface remains exactly nine tools and no dependency is added.
+Stop first stops the Console-owned Tunnel when it is running, then posts the Bridge control request and waits asynchronously until both UI health/status endpoints become unreachable. Only confirmed disappearance changes the state to `Runtime: stopped`, clears the old token/PID/launch guard, and permits a new Start Bridge. A control failure or roughly ten-second stop timeout is fail closed: no retry, duplicate launch, PID kill, taskkill, OS signal, or force-kill fallback is used. Restart remembers whether the Console-owned Tunnel was running, performs the same graceful Bridge stop, launches with a fresh token, waits for readiness, and starts that Tunnel once only after the new Bridge is ready. Console Exit uses the same order and a separate bounded twelve-second watchdog; an external Bridge is left running. The MCP surface retains the native tool set and may include the fixed GitHub Remote MCP catalog described above.
 
 ## Shutdown behavior
 
-SIGINT, SIGTERM, and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. It then stops the UI listener, closes protocol pipes, and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. If UI startup fails, already-started App Server resources are cleaned up. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
+Console SIGINT is delivered through a lightweight Qt timer into the same close/Exit path, so normal Ctrl+C does not raise a `KeyboardInterrupt` traceback. SIGTERM and ASGI lifespan shutdown best-effort interrupt active turns and allow a short terminal-notification grace. The Console then stops its owned Tunnel, requests owned Bridge shutdown, closes the UI listener and protocol pipes, and performs bounded `terminate -> wait -> kill -> final wait` process cleanup. If UI startup fails, already-started App Server resources are cleaned up. Infinite waits, rollback, and crash repair are out of scope; if even the OS-level final wait times out, the process reference is retained rather than silently orphaned.
 
 ## Security assumptions and limitations
 
@@ -215,4 +360,4 @@ It attempts App Server startup, a temporary file task, completion, continuation,
 
 ## Out of scope for the initial version
 
-SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, and complete hard-crash recovery are deliberately excluded. Automatic crash recovery and remote/MCP Bridge lifecycle control remain out of scope.
+SQLite, bridge session IDs, multi-user support, authentication storage, browser control UI, scheduler, job queue, automatic rollback, worktree generation, PR-specific automation, automatic approval, arbitrary shell/filesystem/Git MCP tools, execution-engine abstraction, telemetry SaaS, optional Codex tunnel plugin installation, and complete hard-crash recovery are deliberately excluded. Automatic crash recovery and remote/MCP Bridge lifecycle control remain out of scope.

@@ -18,6 +18,7 @@ ActivityType = Literal[
     "command_completed",
     "file_change_started",
     "file_change_completed",
+    "agent_commentary",
     "agent_message",
     "approval_requested",
     "approval_resolved",

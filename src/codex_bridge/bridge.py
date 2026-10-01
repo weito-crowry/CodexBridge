@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Mapping
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Protocol
 
 from .activity import ActivityStatus, ActivityStore, ActivityType
+from .config import WAIT_HARD_MAX_SECONDS
 from .history import (
     HistoryValidationError,
     project_items_response,
@@ -29,6 +32,8 @@ from .models import (
     UserInputQuestion,
 )
 from .paths import AllowedPathPolicy
+from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unavailable_metadata
+from .setup_capabilities import normalize_capabilities
 from .state import StateStore
 
 
@@ -44,6 +49,30 @@ class BridgeError(RuntimeError):
     """Raised when a native App Server response cannot be used safely."""
 
 
+def _with_turn_model_metadata(
+    result: dict[str, object], thread_response: Mapping[str, Any]
+) -> dict[str, object]:
+    thread = thread_response.get("thread")
+    rollout_path = thread.get("path") if isinstance(thread, Mapping) else None
+    try:
+        resolved = read_turn_model_metadata(rollout_path)
+    except Exception:
+        resolved = {}
+
+    metadata: dict[str, TurnModelMetadata] = {}
+    items = result.get("items")
+    if isinstance(items, list):
+        for entry in items:
+            if not isinstance(entry, Mapping):
+                continue
+            turn_id = entry.get("turn_id")
+            if not isinstance(turn_id, str) or turn_id in metadata:
+                continue
+            metadata[turn_id] = resolved.get(turn_id, unavailable_metadata())
+    result["turn_model_metadata"] = metadata
+    return result
+
+
 _APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -56,6 +85,46 @@ _PERMISSION_METHOD = "item/permissions/requestApproval"
 _PERMISSION_TEXT_LIMIT = 16_000
 _ACTIVITY_LIMIT_MIN = 1
 _ACTIVITY_LIMIT_MAX = 100
+_LOCAL_THREAD_CATALOG_PATH = Path.home() / ".codex" / "sqlite" / "codex-dev.db"
+_LOCAL_THREAD_TITLE_MAX_CHARS = 200
+
+
+def _read_local_thread_titles(thread_ids: list[str]) -> dict[str, str]:
+    if not thread_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in thread_ids)
+    query = (
+        "SELECT thread_id, display_title FROM local_thread_catalog "
+        f"WHERE host_id = ? AND thread_id IN ({placeholders})"
+    )
+    try:
+        connection = sqlite3.connect(
+            f"{_LOCAL_THREAD_CATALOG_PATH.as_uri()}?mode=ro", uri=True, timeout=0.05
+        )
+        try:
+            rows = connection.execute(query, ("local", *thread_ids)).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        return {}
+    return {
+        thread_id: title
+        for thread_id, title in rows
+        if isinstance(thread_id, str) and isinstance(title, str) and title.strip()
+    }
+
+
+def _usable_local_display_title(value: object, preview: object) -> str | None:
+    if not isinstance(value, str) or not isinstance(preview, str) or not preview.strip():
+        return None
+    title = value.strip()
+    if not title or len(title) > _LOCAL_THREAD_TITLE_MAX_CHARS or "\n" in title or "\r" in title:
+        return None
+    normalized_title = " ".join(title.rstrip("…").split()).casefold()
+    normalized_preview = " ".join(preview.split()).casefold()
+    if not normalized_title or normalized_preview.startswith(normalized_title):
+        return None
+    return title
 
 
 def _native_state(value: object) -> NormalizedState:
@@ -249,15 +318,15 @@ class Bridge:
         path_policy: AllowedPathPolicy,
         *,
         activity_store: ActivityStore | None = None,
-        wait_default_seconds: float = 18.0,
-        wait_max_seconds: float = 30.0,
+        wait_default_seconds: float = 50.0,
+        wait_max_seconds: float = WAIT_HARD_MAX_SECONDS,
     ) -> None:
         self._app_server = app_server
         self._state = state
         self._path_policy = path_policy
         self._activities = activity_store if activity_store is not None else ActivityStore()
         self._wait_default_seconds = wait_default_seconds
-        self._wait_max_seconds = min(wait_max_seconds, 30.0)
+        self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:
@@ -366,11 +435,14 @@ class Bridge:
             text = item.get("text")
             if isinstance(text, str):
                 self._state.update_latest_message(thread_id, turn_id, text)
+                agent_activity_type: ActivityType = "agent_message"
+                if item.get("phase") == "commentary":
+                    agent_activity_type = "agent_commentary"
                 self._record_activity(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     item_id=item_id,
-                    type="agent_message",
+                    type=agent_activity_type,
                     status="completed",
                     summary=_bounded_text(text),
                 )
@@ -390,11 +462,28 @@ class Bridge:
             raise BridgeError("thread response did not return a cwd")
         return self._path_policy.validate_cwd(cwd)
 
-    async def _start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
-        response = await self._app_server.request(
-            "turn/start",
-            {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},
-        )
+    def _remember_thread_metadata(self, thread: Mapping[str, Any]) -> None:
+        thread_id = thread.get("id")
+        if isinstance(thread_id, str):
+            self._state.update_thread_metadata(thread_id, thread)
+
+    async def _start_turn(
+        self,
+        thread_id: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if model is not None:
+            params["model"] = model
+        if reasoning_effort is not None:
+            params["effort"] = reasoning_effort
+        response = await self._app_server.request("turn/start", params)
         turn = response.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
             raise BridgeError("turn/start did not return a turn id")
@@ -431,16 +520,59 @@ class Bridge:
                 )
         return self._public_snapshot(thread_id, turn_id)
 
-    async def start(self, cwd: str, prompt: str) -> dict[str, Any]:
+    async def start(
+        self,
+        cwd: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        if reasoning_effort is not None and model is None:
+            raise BridgeError("reasoning_effort requires an explicit model")
         canonical_cwd = self._path_policy.validate_cwd(cwd)
-        response = await self._app_server.request("thread/start", {"cwd": canonical_cwd})
+        thread_params: dict[str, Any] = {"cwd": canonical_cwd}
+        if model is not None:
+            thread_params["model"] = model
+        response = await self._app_server.request("thread/start", thread_params)
         thread = response.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
-        self._state.mark_loaded(thread_id, canonical_cwd)
+        self._state.mark_loaded(thread_id, canonical_cwd, thread)
         log_event("thread.start", thread_id=thread_id)
-        return await self._start_turn(thread_id, prompt)
+        return await self._start_turn(
+            thread_id, prompt, model=model, reasoning_effort=reasoning_effort
+        )
+
+    async def model_capabilities(self) -> dict[str, Any]:
+        pages: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        try:
+            for _ in range(100):
+                params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
+                page = await self._app_server.request("model/list", params)
+                if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                    raise ValueError("malformed model catalog")
+                pages.append(page)
+                next_cursor = page.get("nextCursor")
+                if next_cursor is None:
+                    break
+                if not isinstance(next_cursor, str) or not next_cursor.strip():
+                    raise ValueError("malformed model catalog cursor")
+                if next_cursor in seen_cursors:
+                    raise ValueError("model catalog pagination cycle")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise ValueError("model catalog exceeded its page bound")
+            config_response = await self._app_server.request(
+                "config/read", {"includeLayers": False, "cwd": None}
+            )
+            return normalize_capabilities(pages, config_response)
+        except Exception:
+            raise BridgeError("model capabilities are unavailable") from None
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
         if not self._state.is_loaded(thread_id):
@@ -458,7 +590,7 @@ class Bridge:
                 raise BridgeError("thread/resume returned a malformed cwd")
             if self._path_policy.validate_cwd(resumed_cwd) != validated_cwd:
                 raise BridgeError("thread/resume returned a mismatched cwd")
-            self._state.mark_loaded(thread_id, validated_cwd)
+            self._state.mark_loaded(thread_id, validated_cwd, resumed_thread)
             log_event("thread.resume", thread_id=thread_id)
         return await self._start_turn(thread_id, prompt)
 
@@ -491,6 +623,9 @@ class Bridge:
         )
         self._state.ensure_turn(thread_id, turn_id)
         return self._public_snapshot(thread_id, turn_id)
+
+    def has_pending_request(self, request_id: RequestId) -> bool:
+        return self._state.get_pending_request(request_id) is not None
 
     async def approve(self, request_id: RequestId, decision: ApprovalDecision) -> dict[str, Any]:
         if decision not in _APPROVAL_DECISIONS:
@@ -631,6 +766,7 @@ class Bridge:
             )
             thread = self._thread_from_response(metadata)
             validated_cwd = self._validate_thread_metadata(thread, thread_id)
+            self._remember_thread_metadata(thread)
             response = metadata
             if include_history:
                 response = await self._app_server.request(
@@ -639,6 +775,7 @@ class Bridge:
                 history_thread = self._thread_from_response(response)
                 if self._validate_thread_metadata(history_thread, thread_id) != validated_cwd:
                     raise BridgeError("thread history returned a mismatched cwd")
+                self._remember_thread_metadata(history_thread)
             return {"thread": _sanitize_thread_history(response.get("thread", {}))}
         params: dict[str, Any] = {"limit": limit}
         if cursor:
@@ -646,6 +783,7 @@ class Bridge:
         response = await self._app_server.request("thread/list", params)
         rows = response.get("data")
         visible: list[object] = []
+        missing_title_rows: list[dict[str, object]] = []
         if isinstance(rows, list):
             for row in rows:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str):
@@ -654,12 +792,39 @@ class Bridge:
                     self._validate_thread_metadata(row, row["id"])
                 except (BridgeError, ValueError):
                     continue
-                visible.append(_sanitize(row))
+                self._remember_thread_metadata(row)
+                public_row = _sanitize(row)
+                visible.append(public_row)
+                if isinstance(public_row, dict) and not (
+                    isinstance(row.get("name"), str) and row["name"].strip()
+                ):
+                    missing_title_rows.append(public_row)
+        missing_title_ids = [
+            row_id for row in missing_title_rows if isinstance((row_id := row.get("id")), str)
+        ]
+        local_titles = _read_local_thread_titles(missing_title_ids)
+        for row in missing_title_rows:
+            row_id = row.get("id")
+            if not isinstance(row_id, str):
+                continue
+            title = _usable_local_display_title(local_titles.get(row_id), row.get("preview"))
+            if title is not None:
+                row["name"] = title
         return {
             "threads": visible,
             "next_cursor": response.get("nextCursor"),
             "backwards_cursor": response.get("backwardsCursor"),
         }
+
+    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("name must not be blank")
+        return await self._app_server.request(
+            "thread/name/set", {"threadId": thread_id, "name": name}
+        )
+
+    async def rate_limits(self) -> dict[str, Any]:
+        return await self._app_server.request("account/rateLimits/read", {})
 
     async def _history_metadata(self, thread_id: str) -> tuple[dict[str, Any], str, str]:
         response = await self._app_server.request(
@@ -667,6 +832,7 @@ class Bridge:
         )
         thread = self._thread_from_response(response)
         validated_cwd = self._validate_thread_metadata(thread, thread_id)
+        self._remember_thread_metadata(thread)
         mode = thread.get("historyMode")
         history_mode = mode if mode == "paginated" else "legacy"
         return response, history_mode, validated_cwd
@@ -733,7 +899,7 @@ class Bridge:
     ) -> dict[str, Any]:
         limit, sort_direction = validate_history_query(limit, sort_direction)
         validate_cursor(cursor)
-        _, history_mode, validated_cwd = await self._history_metadata(thread_id)
+        metadata_response, history_mode, validated_cwd = await self._history_metadata(thread_id)
         if history_mode == "paginated":
             params: dict[str, Any] = {
                 "threadId": thread_id,
@@ -746,20 +912,21 @@ class Bridge:
                 params["cursor"] = cursor
             response = await self._app_server.request("thread/items/list", params)
             try:
-                return project_items_response(
+                result = project_items_response(
                     thread_id,
                     turn_id,
                     response,
                     policy=self._path_policy,
                     limit=limit,
                 )
+                return _with_turn_model_metadata(result, metadata_response)
             except HistoryValidationError as exc:
                 raise BridgeError("malformed thread items response") from exc
 
         validate_legacy_cursor(cursor)
         response = await self._legacy_history_response(thread_id, validated_cwd)
         try:
-            return project_legacy_items_response(
+            result = project_legacy_items_response(
                 thread_id,
                 turn_id,
                 response,
@@ -768,6 +935,7 @@ class Bridge:
                 sort_direction=sort_direction,
                 cursor=cursor,
             )
+            return _with_turn_model_metadata(result, metadata_response)
         except HistoryValidationError as exc:
             raise BridgeError("malformed legacy thread history response") from exc
 
@@ -1011,7 +1179,9 @@ class Bridge:
                 )
 
     def _public_snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
-        snapshot = self._state.snapshot(thread_id, turn_id)
+        snapshot = self._state.snapshot_if_known(thread_id, turn_id)
+        if snapshot is None:
+            return self._not_loaded_status(thread_id, turn_id)
         pending = snapshot["pending_request"]
         if isinstance(pending, PendingRequest):
             public_pending: dict[str, Any] = {
@@ -1042,6 +1212,12 @@ class Bridge:
         return {
             "thread_id": thread_id,
             "turn_id": turn_id,
+            "thread_metadata": {
+                "model_provider": None,
+                "model": None,
+                "reasoning_effort": None,
+                "cli_version": None,
+            },
             "state": "not_loaded",
             "latest_agent_message": "",
             "current_diff": "",

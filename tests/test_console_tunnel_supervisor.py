@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtNetwork import QNetworkRequest
 from PySide6.QtWidgets import QApplication
 
-from codex_bridge.console.tunnel_supervisor import TunnelSupervisor
+from codex_bridge.console.tunnel_supervisor import TunnelSupervisor, parse_tunnel_version
 
 
 class Signal:
@@ -128,6 +129,72 @@ def _doctor(
     return supervisor
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [(b"0.0.14\n", "0.0.14"), (b"tunnel-client 0.0.15\n", "0.0.15")],
+)
+def test_tunnel_version_parser_uses_leading_semantic_version(output, expected) -> None:
+    assert parse_tunnel_version(output) == expected
+
+
+@pytest.mark.parametrize("output", [b"", b"version unknown", b"0.0", b"0.0.13\n"])
+def test_tunnel_version_parser_rejects_malformed_or_old_versions(output) -> None:
+    with pytest.raises(ValueError):
+        parse_tunnel_version(output, minimum="0.0.14")
+
+
+def test_version_preflight_runs_before_doctor_and_rejects_old_client() -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    processes = [version, doctor]
+    supervisor = TunnelSupervisor(
+        executable="C:/tools/tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+
+    supervisor.set_bridge_ready(True)
+
+    assert version.arguments == ["--version"]
+    assert doctor.start_calls == 0
+    version.stdout = b"tunnel-client 0.0.9\n"
+    version.readyReadStandardOutput.emit()
+    version.finished.emit(0, 0)
+
+    assert supervisor.state == "failed"
+    assert supervisor.client_version is None
+    assert doctor.start_calls == 0
+    supervisor.close()
+
+
+def test_version_preflight_allows_supported_future_client_then_runs_doctor() -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    processes = [version, doctor]
+    supervisor = TunnelSupervisor(
+        executable="C:/tools/tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+
+    supervisor.set_bridge_ready(True)
+    version.stdout = b"tunnel-client 0.0.99\n"
+    version.readyReadStandardOutput.emit()
+    version.finished.emit(0, 0)
+
+    assert supervisor.client_version == "0.0.99"
+    assert doctor.arguments[:2] == ["doctor", "--profile"]
+    supervisor.close()
+
+
 def test_doctor_uses_direct_process_with_profile_and_ephemeral_health_option() -> None:
     _application()
     process = FakeProcess()
@@ -147,7 +214,7 @@ def test_doctor_uses_direct_process_with_profile_and_ephemeral_health_option() -
     supervisor.close()
 
 
-def test_successful_doctor_is_ready_to_start_and_discards_raw_output() -> None:
+def test_successful_doctor_autostarts_and_discards_raw_output() -> None:
     _application()
     process = FakeProcess()
     messages: list[str] = []
@@ -159,8 +226,8 @@ def test_successful_doctor_is_ready_to_start_and_discards_raw_output() -> None:
     process.readyReadStandardError.emit()
     process.finished.emit(0, 0)
 
-    assert supervisor.state == "ready_to_start"
-    assert messages[-1] == "Tunnel: ready to start"
+    assert supervisor.state == "starting"
+    assert messages[-1] == "Tunnel: starting"
     assert all("private" not in message.casefold() for message in messages)
     supervisor.close()
 
@@ -221,7 +288,7 @@ def test_tunnel_start_uses_one_managed_process_and_ephemeral_health_port() -> No
     supervisor.set_bridge_ready(True)
     doctor.finished.emit(0, 0)
 
-    assert supervisor.start()
+    assert not supervisor.start()
     assert not supervisor.start()
     assert tunnel.start_calls == 1
     assert supervisor.state == "starting"
@@ -258,6 +325,208 @@ def test_unexpected_exit_fails_without_automatic_restart() -> None:
 
     assert supervisor.state == "failed"
     assert processes == []
+    supervisor.close()
+
+
+def test_tunnel_lifecycle_and_recovery_are_observed(monkeypatch) -> None:
+    from codex_bridge.console import tunnel_supervisor as tunnel_module
+
+    class RecordingObserver:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def tunnel_start(self) -> None:
+            self.events.append("tunnel.start")
+
+        def tunnel_exit(self, exit_code: int | None = None) -> None:
+            del exit_code
+            self.events.append("tunnel.exit")
+
+        def tunnel_recovery(self) -> None:
+            self.events.append("tunnel.recovery")
+
+    _application()
+    observer = RecordingObserver()
+    monkeypatch.setattr(tunnel_module, "get_observer", lambda: observer, raising=False)
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+
+    doctor.finished.emit(0, 0)
+    tunnel.finished.emit(1, 0)
+
+    assert observer.events == [
+        "tunnel.start",
+        "tunnel.exit",
+        "tunnel.recovery",
+    ]
+    supervisor.close()
+
+
+def _managed_supervisor(processes: list[FakeProcess]) -> TunnelSupervisor:
+    supervisor = TunnelSupervisor(
+        executable="tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        network_manager=FakeNetworkManager(),
+        health_port_provider=iter(range(41001, 41020)).__next__,
+    )
+    supervisor.set_bridge_ready(True)
+    return supervisor
+
+
+def test_doctor_pass_and_bridge_ready_auto_starts_tunnel() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+
+    doctor.finished.emit(0, 0)
+
+    assert tunnel.start_calls == 1
+    assert supervisor.state == "starting"
+    supervisor.close()
+
+
+def test_bridge_not_ready_never_auto_starts_tunnel() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = TunnelSupervisor(
+        executable="tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: [doctor, tunnel].pop(0),
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+    supervisor._start_doctor_once()
+
+    doctor.finished.emit(0, 0)
+
+    assert tunnel.start_calls == 0
+    assert supervisor.state == "unavailable"
+    supervisor.close()
+
+
+def test_unexpected_exit_uses_bounded_then_fallback_recovery_delays() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnels = [FakeProcess() for _ in range(6)]
+    supervisor = _managed_supervisor([doctor, *tunnels])
+    doctor.finished.emit(0, 0)
+
+    expected_delays = [1_000, 3_000, 10_000, 30_000, 60_000, 60_000]
+    for tunnel, expected_delay in zip(tunnels, expected_delays, strict=True):
+        tunnel.finished.emit(1, 0)
+        assert supervisor.recovery_timer.isActive()
+        assert supervisor.recovery_timer.interval() == expected_delay
+        if tunnel is not tunnels[-1]:
+            supervisor._on_recovery_timeout()
+    supervisor.close()
+
+
+def test_successful_running_state_resets_recovery_sequence() -> None:
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    third = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second, third])
+    doctor.finished.emit(0, 0)
+
+    first.started.emit()
+    first.finished.emit(1, 0)
+    assert supervisor.recovery_timer.interval() == 1_000
+    supervisor._on_recovery_timeout()
+    second.started.emit()
+    assert supervisor._recovery_index == 1
+    health_reply = supervisor._network_manager.replies[-1]
+    health_reply.status = 200
+    health_reply.finished.emit()
+    ready_reply = supervisor._network_manager.replies[-1]
+    ready_reply.status = 200
+    ready_reply.finished.emit()
+    assert supervisor.state == "ready"
+    assert supervisor._recovery_index == 0
+    second.finished.emit(1, 0)
+
+    assert supervisor.recovery_timer.interval() == 1_000
+    supervisor.close()
+
+
+def test_explicit_stop_does_not_schedule_recovery() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+    doctor.finished.emit(0, 0)
+    tunnel.started.emit()
+
+    assert supervisor.stop()
+    tunnel.finished.emit(0, 0)
+
+    assert not supervisor.recovery_timer.isActive()
+    supervisor.close()
+
+
+def test_close_does_not_schedule_recovery() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+    doctor.finished.emit(0, 0)
+    tunnel.started.emit()
+
+    supervisor.close()
+    tunnel.finished.emit(1, 0)
+
+    assert not supervisor.recovery_timer.isActive()
+
+
+def test_retry_now_attempts_immediately_when_bridge_and_preflight_are_ready() -> None:
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second])
+    doctor.finished.emit(0, 0)
+    first.started.emit()
+    first.finished.emit(1, 0)
+    assert supervisor.recovery_timer.isActive()
+
+    assert supervisor.retry_now()
+
+    assert second.start_calls == 1
+    assert supervisor.state == "starting"
+    supervisor.close()
+
+
+def test_retry_now_restarts_failed_validate_version_preflight() -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    retry_version = FakeProcess()
+    retry_doctor = FakeProcess()
+    processes = [version, doctor, retry_version, retry_doctor]
+    supervisor = TunnelSupervisor(
+        executable="tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+    supervisor.set_bridge_ready(True)
+    version.stdout = b"tunnel-client 0.0.99\n"
+    version.readyReadStandardOutput.emit()
+    version.finished.emit(0, 0)
+    doctor.exit_code = 1
+    doctor.finished.emit(1, 0)
+
+    assert supervisor.state == "failed"
+    assert supervisor.retry_now()
+    assert retry_version.start_calls == 1
+    assert retry_doctor.start_calls == 0
     supervisor.close()
 
 

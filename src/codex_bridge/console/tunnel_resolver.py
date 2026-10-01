@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sys
+import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,7 @@ def _append_candidate(
 def _explicit_candidate(
     value: str,
     *,
+    source: str,
     windows: bool,
     which: Callable[[str], str | None],
 ) -> TunnelCandidate:
@@ -67,12 +69,33 @@ def _explicit_candidate(
     path = raw if os.path.isabs(raw) or (windows and ntpath.isabs(raw)) else which(raw)
     if path is None or not _is_usable_path(path):
         raise TunnelResolutionError("Configured Tunnel executable was not found")
-    return TunnelCandidate(path, "explicit")
+    return TunnelCandidate(path, source)
+
+
+def _checkout_root(repository_root: str | os.PathLike[str] | None) -> Path | None:
+    root = (
+        Path(repository_root).resolve()
+        if repository_root is not None
+        else Path(__file__).resolve().parents[3]
+    )
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file() or not (root / "src" / "codex_bridge").is_dir():
+        return None
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    project = document.get("project")
+    if not isinstance(project, dict) or project.get("name") != "codexbridge":
+        return None
+    return root
 
 
 def enumerate_candidates(
     environ: Mapping[str, str] | None = None,
     *,
+    config_executable: str | None = None,
+    repository_root: str | os.PathLike[str] | None = None,
     platform: str | None = None,
     which: Callable[[str], str | None] = shutil.which,
 ) -> tuple[TunnelCandidate, ...]:
@@ -81,11 +104,28 @@ def enumerate_candidates(
     values = os.environ if environ is None else environ
     windows = _is_windows(platform)
     if _TUNNEL_OVERRIDE in values:
-        return (_explicit_candidate(values[_TUNNEL_OVERRIDE], windows=windows, which=which),)
+        return (
+            _explicit_candidate(
+                values[_TUNNEL_OVERRIDE], source="explicit", windows=windows, which=which
+            ),
+        )
+    if config_executable is not None:
+        return (
+            _explicit_candidate(config_executable, source="config", windows=windows, which=which),
+        )
 
     candidates: list[TunnelCandidate] = []
     seen: set[str] = set()
     path_names = ("tunnel-client.exe", "tunnel-client") if windows else ("tunnel-client",)
+    root = _checkout_root(repository_root)
+    if root is not None:
+        for name in path_names:
+            _append_candidate(
+                candidates,
+                seen,
+                TunnelCandidate(str(root / ".tools" / "tunnel-client" / name), "local"),
+                windows=windows,
+            )
     for name in path_names:
         found = which(name)
         if found is not None:
