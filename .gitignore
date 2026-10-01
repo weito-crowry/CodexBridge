@@ -15,4 +15,6 @@ coverage.xml
 .coverage
 htmlcov/
 integration-artifacts/
+ui/setup/node_modules/
+ui/setup/dist/
 
