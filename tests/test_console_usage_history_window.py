@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QDateTime, QPointF, QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolButton
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QToolButton
 
 from codex_bridge.console.usage import CodexUsage, UsageWindow
 from codex_bridge.console.usage_history import (
@@ -53,6 +54,47 @@ def test_usage_history_window_starts_at_one_month_with_auto_axis(tmp_path: Path)
     assert window.start_edit.calendarPopup()
     assert window.end_edit.calendarPopup()
     assert window.start_edit.dateTime().timeSpec() == Qt.TimeSpec.LocalTime
+    window.close()
+
+
+def test_usage_history_summary_cards_use_console_dark_theme_styles(tmp_path: Path) -> None:
+    _application()
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3")
+
+    cards = window.findChildren(QFrame, "usageHistoryMetricCard")
+    captions = window.findChildren(QLabel, "usageHistoryMetricCaption")
+    values = window.findChildren(QLabel, "usageHistoryMetricValue")
+
+    assert len(cards) == 3
+    assert len(captions) == 3
+    assert len(values) == 3
+
+    for card in cards:
+        style = card.styleSheet()
+        assert "palette(alternate-base)" not in style
+        assert "palette(text)" not in style
+        assert "palette(mid)" not in style
+        assert re.search(
+            r"QFrame#usageHistoryMetricCard\s*\{[^}]*background\s*:\s*#292a2d",
+            style,
+            re.IGNORECASE,
+        )
+        assert re.search(
+            r"QFrame#usageHistoryMetricCard\s+QLabel\s*\{[^}]*background\s*:\s*transparent",
+            style,
+            re.IGNORECASE,
+        )
+        assert re.search(
+            r"QLabel#usageHistoryMetricCaption\s*\{[^}]*color\s*:\s*#aeb4bd",
+            style,
+            re.IGNORECASE,
+        )
+        assert re.search(
+            r"QLabel#usageHistoryMetricValue\s*\{[^}]*color\s*:\s*#f1f3f4",
+            style,
+            re.IGNORECASE,
+        )
+
     window.close()
 
 

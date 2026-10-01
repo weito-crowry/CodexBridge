@@ -250,9 +250,12 @@ class UsageHistoryWindow(QMainWindow):
             card = QFrame(self)
             card.setObjectName("usageHistoryMetricCard")
             card.setStyleSheet(
-                "QFrame#usageHistoryMetricCard { background: palette(alternate-base); "
-                "border: 1px solid palette(mid); border-radius: 6px; }"
-                "QFrame#usageHistoryMetricCard QLabel { color: palette(text); }"
+                "QFrame#usageHistoryMetricCard { background: #292a2d; "
+                "border: 1px solid #42464a; border-radius: 6px; }"
+                "QFrame#usageHistoryMetricCard QLabel { background: transparent; "
+                "border: none; }"
+                "QLabel#usageHistoryMetricCaption { color: #aeb4bd; }"
+                "QLabel#usageHistoryMetricValue { color: #f1f3f4; }"
             )
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(12, 8, 12, 8)
