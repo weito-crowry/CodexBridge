@@ -19,16 +19,23 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-# Keep unrelated ICU DLLs found on the build machine's PATH out of the package.
-# QtCore imports the Windows ICU API; a bundled third-party ICU can shadow it
-# with an incompatible ABI (for example, Poppler's versioned ICU exports).
+def is_icu_runtime(name: str) -> bool:
+    normalized = Path(name).name.casefold()
+    return normalized.endswith(".dll") and normalized.startswith(("icuuc", "icudt", "icuin"))
+
+
+def is_pyside6_source(path: str) -> bool:
+    return "pyside6" in {part.casefold() for part in Path(path).parts}
+
+
+# Keep ICU runtime DLLs from the build machine out of the package. QtCore
+# imports the Windows ICU API, so a third-party ICU can shadow Qt's compatible
+# runtime (for example, Poppler's versioned ICU exports). Preserve any ICU
+# runtime that PyInstaller sourced from PySide6 itself.
 a.binaries = [
     binary
     for binary in a.binaries
-    if not (
-        Path(binary[0]).name.casefold() == "icuuc.dll"
-        and "pyside6" not in {part.casefold() for part in Path(binary[1]).parts}
-    )
+    if not (is_icu_runtime(binary[0]) and not is_pyside6_source(binary[1]))
 ]
 pyz = PYZ(a.pure)
 exe = EXE(
