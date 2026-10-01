@@ -542,7 +542,7 @@ class Bridge:
         canonical_cwd = self._path_policy.validate_cwd(cwd)
         thread_params: dict[str, Any] = {"cwd": canonical_cwd}
         if sandbox_mode == "danger-full-access":
-            thread_params["sandbox"] = sandbox_mode
+            thread_params["config"] = {"default_permissions": ":danger-full-access"}
         if model is not None:
             thread_params["model"] = model
         response = await self._app_server.request("thread/start", thread_params)

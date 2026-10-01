@@ -24,7 +24,7 @@ _SANDBOX_TYPES = {
     "workspaceWrite": "workspace-write",
     "externalSandbox": "external-sandbox",
 }
-_APPROVAL_POLICIES = {"untrusted", "on-request", "on-failure", "never"}
+_APPROVAL_POLICIES = {"untrusted", "on-request", "never"}
 _APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
 
 

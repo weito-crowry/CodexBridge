@@ -37,6 +37,7 @@ class FakeAppServer:
         self.model_pages: dict[str | None, dict[str, Any]] = {}
         self.config_response: dict[str, Any] = {"config": {}}
         self.thread_start_settings: dict[str, Any] = {}
+        self.thread_resume_settings: dict[str, Any] = {}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
@@ -66,6 +67,7 @@ class FakeAppServer:
                     "cliVersion": "0.1.2",
                 },
                 "cwd": self.thread_cwds[params["threadId"]],
+                **self.thread_resume_settings,
             }
         if method == "turn/start":
             return {"turn": {"id": "native-turn", "status": "inProgress"}}
@@ -197,15 +199,16 @@ async def test_start_inherit_does_not_send_sandbox(allowed_dir, sandbox_mode) ->
 
 
 @pytest.mark.asyncio
-async def test_start_full_access_sends_only_sandbox_override(allowed_dir) -> None:
+async def test_start_full_access_sends_durable_permission_profile_override(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
 
     await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="danger-full-access")
 
     assert app.calls[0] == (
         "thread/start",
-        {"cwd": str(allowed_dir), "sandbox": "danger-full-access"},
+        {"cwd": str(allowed_dir), "config": {"default_permissions": ":danger-full-access"}},
     )
+    assert "approvalPolicy" not in app.calls[0][1]
 
 
 @pytest.mark.asyncio
@@ -237,6 +240,7 @@ async def test_start_projects_effective_execution_settings_from_app_server(allow
         "approvalPolicy": "on-request",
         "approvalsReviewer": "user",
         "sandbox": {"type": "dangerFullAccess"},
+        "activePermissionProfile": {"id": ":danger-full-access"},
     }
 
     result = await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="danger-full-access")
@@ -244,7 +248,9 @@ async def test_start_projects_effective_execution_settings_from_app_server(allow
     assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
     assert result["thread_metadata"]["approval_policy"] == "on-request"
     assert result["thread_metadata"]["approvals_reviewer"] == "user"
+    assert "active_permission_profile" not in result["thread_metadata"]
     assert "approvalPolicy" not in app.calls[0][1]
+    assert app.calls[0][1]["config"]["default_permissions"] == ":danger-full-access"
 
 
 @pytest.mark.asyncio
@@ -336,6 +342,30 @@ async def test_continue_resumes_a_thread_not_loaded_in_this_process(allowed_dir)
     await bridge.continue_thread("persisted-thread", "continue")
 
     assert app.methods == ["thread/read", "thread/resume", "turn/start"]
+
+
+@pytest.mark.asyncio
+async def test_cold_resume_uses_effective_metadata_without_sandbox_overrides(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    await bridge.start(str(allowed_dir), "materialize", sandbox_mode="danger-full-access")
+    app.thread_cwds["native-thread"] = str(allowed_dir)
+    app.thread_resume_settings = {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": {"type": "dangerFullAccess"},
+        "activePermissionProfile": {"id": ":danger-full-access"},
+    }
+    cold_bridge = Bridge(app, StateStore(), AllowedPathPolicy((str(allowed_dir),)))
+
+    result = await cold_bridge.continue_thread("native-thread", "continue")
+
+    assert app.calls[0] == (
+        "thread/start",
+        {"cwd": str(allowed_dir), "config": {"default_permissions": ":danger-full-access"}},
+    )
+    assert app.calls[3] == ("thread/resume", {"threadId": "native-thread"})
+    assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
+    assert result["thread_metadata"]["approval_policy"] == "on-request"
 
 
 @pytest.mark.asyncio

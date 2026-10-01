@@ -108,3 +108,35 @@ def test_thread_metadata_is_bounded_to_safe_known_fields() -> None:
         "approval_policy": None,
         "approvals_reviewer": None,
     }
+
+
+@pytest.mark.parametrize("policy", ["untrusted", "on-request", "never"])
+def test_current_scalar_approval_policies_are_projected(policy: str) -> None:
+    store = StateStore()
+    store.ensure_turn("thread", "turn")
+
+    store.update_thread_metadata("thread", {"approvalPolicy": policy})
+
+    assert store.snapshot("thread", "turn")["thread_metadata"]["approval_policy"] == policy
+
+
+def test_obsolete_and_structured_approval_policies_are_not_passed_through() -> None:
+    store = StateStore()
+    store.ensure_turn("thread", "turn")
+
+    store.update_thread_metadata("thread", {"approvalPolicy": "on-failure"})
+    assert store.snapshot("thread", "turn")["thread_metadata"]["approval_policy"] is None
+
+    granular_policy = {
+        "granular": {
+            "sandbox_approval": True,
+            "rules": True,
+            "skill_approval": False,
+            "request_permissions": False,
+            "mcp_elicitations": False,
+        }
+    }
+    store.update_thread_metadata("thread", {"approvalPolicy": granular_policy})
+    metadata = store.snapshot("thread", "turn")["thread_metadata"]
+    assert metadata["approval_policy"] is None
+    assert metadata["approval_policy"] != granular_policy
