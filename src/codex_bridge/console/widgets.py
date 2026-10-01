@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -827,6 +828,8 @@ class HistoryPane(QWidget):
 
 
 class ActivityPane(QWidget):
+    approval_decision_requested = Signal(object, str)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.state_label = QLabel("not_loaded")
@@ -834,7 +837,42 @@ class ActivityPane(QWidget):
         state_header = QLabel("Current state")
         self.pending_label = QLabel("")
         self.pending_label.setWordWrap(True)
-        self._pending_header = QLabel("Pending request summary")
+        self._pending_header = QLabel("Pending request")
+        self.approval_details_label = QLabel("")
+        self.approval_details_label.setObjectName("approvalDetails")
+        self.approval_details_label.setWordWrap(True)
+        self.approval_control_message = QLabel("")
+        self.approval_control_message.setObjectName("approvalControlMessage")
+        self.approval_control_message.setWordWrap(True)
+        self._approval_feedback = QLabel("")
+        self._approval_feedback.setObjectName("approvalFeedback")
+        self._approval_feedback.setWordWrap(True)
+        self.approval_buttons: dict[str, QPushButton] = {}
+        button_layout = QHBoxLayout()
+        for label, decision, name in (
+            ("Allow once", "accept", "allowOnce"),
+            ("Allow for session", "acceptForSession", "allowForSession"),
+            ("Decline", "decline", "decline"),
+            ("Cancel", "cancel", "cancel"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(
+                lambda _checked=False, decision=decision: self._request_approval_decision(decision)
+            )
+            self.approval_buttons[decision] = button
+            button_layout.addWidget(button)
+        self.approval_buttons_widget = QWidget()
+        self.approval_buttons_widget.setLayout(button_layout)
+        self.allow_once_button = self.approval_buttons["accept"]
+        self.allow_for_session_button = self.approval_buttons["acceptForSession"]
+        self.decline_button = self.approval_buttons["decline"]
+        self.cancel_button = self.approval_buttons["cancel"]
+        self._pending_approval_id: int | str | None = None
+        self._has_approval = False
+        self._control_available = False
+        self._approval_busy = False
+        self._approval_resolved = False
         self._state_section = QWidget()
         state_layout = QVBoxLayout(self._state_section)
         state_layout.setContentsMargins(0, 0, 0, 0)
@@ -842,6 +880,14 @@ class ActivityPane(QWidget):
         state_layout.addWidget(self.state_label)
         state_layout.addWidget(self._pending_header)
         state_layout.addWidget(self.pending_label)
+        state_layout.addWidget(self.approval_details_label)
+        state_layout.addWidget(self.approval_buttons_widget)
+        state_layout.addWidget(self.approval_control_message)
+        state_layout.addWidget(self._approval_feedback)
+        self.approval_details_label.hide()
+        self.approval_buttons_widget.hide()
+        self.approval_control_message.hide()
+        self._approval_feedback.hide()
         self._state_section.hide()
         self.activity_list = QListWidget()
         self.activity_list.setObjectName("activityList")
@@ -866,17 +912,149 @@ class ActivityPane(QWidget):
                 pending.get("reason"), 2_000
             )
             self.pending_label.setText(f"{label}\n{summary}".strip())
+            method = pending.get("method")
+            request_id = pending.get("request_id")
+            self._has_approval = (
+                state == "needs_approval"
+                and method
+                in {
+                    "item/commandExecution/requestApproval",
+                    "item/fileChange/requestApproval",
+                    "item/permissions/requestApproval",
+                }
+                and not isinstance(request_id, bool)
+                and isinstance(request_id, (int, str))
+            )
+            self._pending_approval_id = request_id if self._has_approval else None
+            self._approval_busy = False
+            self._approval_resolved = False
+            self._approval_feedback.clear()
+            if self._has_approval:
+                self.approval_details_label.setText(self._approval_details(pending, snapshot))
+                self.approval_details_label.show()
+                self._approval_feedback.hide()
+            else:
+                self.approval_details_label.clear()
+                self.approval_details_label.hide()
+            self._sync_approval_controls()
         else:
             has_pending = False
             self._pending_header.hide()
             self.pending_label.hide()
             self.pending_label.setText("")
+            self._has_approval = False
+            self._pending_approval_id = None
+            self._approval_busy = False
+            self._approval_resolved = False
+            self.approval_details_label.clear()
+            self.approval_details_label.hide()
+            self._approval_feedback.clear()
+            self._approval_feedback.hide()
+            self._sync_approval_controls()
         error = _safe_text(snapshot.get("error"), 2_000)
         self._state_section.setVisible(state != "not_loaded" or has_pending or bool(error))
         if reset:
             self.activity_list.clear()
             self._activity_ids.clear()
         self.merge_activities(snapshot.get("recent_activities"))
+
+    @property
+    def approval_request_id(self) -> int | str | None:
+        return self._pending_approval_id
+
+    def set_control_available(self, available: bool) -> None:
+        self._control_available = available
+        self._sync_approval_controls()
+
+    def set_approval_busy(self, busy: bool) -> None:
+        self._approval_busy = busy
+        if busy:
+            self._approval_feedback.setText("Resolving approval…")
+            self._approval_feedback.show()
+        self._sync_approval_controls()
+
+    def set_approval_feedback(self, message: str) -> None:
+        self._approval_feedback.setText(message)
+        self._approval_feedback.setVisible(bool(message) and self._has_approval)
+
+    def mark_approval_resolved(self) -> None:
+        self._approval_resolved = True
+        self._approval_busy = False
+        self._approval_feedback.setText("Approval resolved. Refreshing status…")
+        self._approval_feedback.show()
+        self._sync_approval_controls()
+
+    def _sync_approval_controls(self) -> None:
+        active = self._has_approval
+        self.approval_buttons_widget.setVisible(active)
+        for button in self.approval_buttons.values():
+            button.setEnabled(
+                active
+                and self._control_available
+                and not self._approval_busy
+                and not self._approval_resolved
+            )
+        self.approval_control_message.setText(
+            "Resolve from MCP client; Console control is unavailable for this Bridge."
+        )
+        self.approval_control_message.setVisible(active and not self._control_available)
+
+    def _request_approval_decision(self, decision: str) -> None:
+        if (
+            self._pending_approval_id is not None
+            and self._control_available
+            and not self._approval_busy
+            and not self._approval_resolved
+        ):
+            self.approval_decision_requested.emit(self._pending_approval_id, decision)
+
+    @staticmethod
+    def _approval_details(pending: Mapping[str, object], snapshot: Mapping[str, object]) -> str:
+        method = pending.get("method")
+        titles = {
+            "item/commandExecution/requestApproval": "Command approval",
+            "item/fileChange/requestApproval": "File change approval",
+            "item/permissions/requestApproval": "Permission approval",
+        }
+        parts = [titles.get(method if isinstance(method, str) else "", "Approval request")]
+        for key, label in (("thread_id", "Thread"), ("turn_id", "Turn")):
+            value = _safe_text(pending.get(key), 512)
+            if value:
+                parts.append(f"{label}: {value}")
+        summary = _safe_text(pending.get("summary"), 2_000)
+        if summary:
+            parts.append(f"Summary / command: {summary}")
+
+        if method == "item/fileChange/requestApproval":
+            diff = _safe_text(snapshot.get("current_diff"), 16_000)
+            if diff:
+                parts.append(f"Current diff:\n{diff}")
+        elif method == "item/permissions/requestApproval":
+            permission = pending.get("permission")
+            if isinstance(permission, Mapping):
+                reason = _safe_text(permission.get("reason"), 2_000)
+                cwd = _safe_text(permission.get("cwd"), 2_000)
+                if reason:
+                    parts.append(f"Reason: {reason}")
+                if cwd:
+                    parts.append(f"Working directory: {cwd}")
+                requested = permission.get("requested_permissions")
+                if isinstance(requested, Mapping):
+                    for key, label in (
+                        ("fileSystem", "Requested filesystem permissions"),
+                        ("network", "Requested network permissions"),
+                    ):
+                        if key in requested:
+                            rendered = json.dumps(
+                                requested[key], ensure_ascii=False, sort_keys=True
+                            )[:2_000]
+                            parts.append(f"{label}: {rendered}")
+                scopes = permission.get("allowed_scopes")
+                if isinstance(scopes, list):
+                    safe_scopes = [scope for scope in scopes if scope in {"turn", "session"}]
+                    if safe_scopes:
+                        parts.append(f"Allowed scopes: {', '.join(safe_scopes)}")
+        return "\n".join(parts)[:8_000]
 
     def merge_activities(self, recent: object) -> None:
         if not isinstance(recent, list):
@@ -903,6 +1081,15 @@ class ActivityPane(QWidget):
     def set_empty_state(self, text: str) -> None:
         self.state_label.setText(text)
         self.pending_label.clear()
+        self._has_approval = False
+        self._pending_approval_id = None
+        self._approval_busy = False
+        self._approval_resolved = False
+        self.approval_details_label.clear()
+        self.approval_details_label.hide()
+        self._approval_feedback.clear()
+        self._approval_feedback.hide()
+        self._sync_approval_controls()
         self._pending_header.hide()
         self.pending_label.hide()
         self._state_section.hide()

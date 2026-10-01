@@ -27,6 +27,7 @@ from codex_bridge.server import build_runtime, create_app, prepare_config
 class FakeBridge:
     error: Exception | None = None
     start_count: int = 0
+    start_options: dict[str, Any] | None = None
 
     async def start(
         self,
@@ -35,8 +36,14 @@ class FakeBridge:
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        sandbox_mode: str | None = None,
     ) -> dict[str, Any]:
         self.start_count += 1
+        self.start_options = {
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "sandbox_mode": sandbox_mode,
+        }
         if self.error is not None:
             raise self.error
         return {"ok": True}
@@ -53,6 +60,10 @@ class FakeBridge:
                 }
             ],
             "defaults": {"model": "test-model", "reasoning_effort": "effort-a"},
+            "execution_modes": [
+                {"id": "inherit", "display_name": "Default"},
+                {"id": "danger-full-access", "display_name": "Full access"},
+            ],
         }
 
 
@@ -833,6 +844,7 @@ async def test_setup_confirm_tool_returns_explicit_validated_selection(tmp_path)
             "target_name": "Local PC",
             "model": "test-model",
             "reasoning_effort": "effort-a",
+            "sandbox_mode": "inherit",
         },
     }
 
@@ -852,6 +864,32 @@ async def test_legacy_start_without_target_uses_existing_local_bridge(tmp_path) 
 
     assert result["target_id"] == "local"
     assert runtime.bridge.start_count == 1
+
+
+@pytest.mark.asyncio
+async def test_start_tool_passes_full_access_without_model(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    start = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_start"
+    )
+
+    async with app.router.lifespan_context(app):
+        result = await start.fn(str(tmp_path), "prompt", sandbox_mode="danger-full-access")
+
+    assert runtime.bridge.start_options == {
+        "model": None,
+        "reasoning_effort": None,
+        "sandbox_mode": "danger-full-access",
+    }
+    assert result["execution_config"] == {
+        "target_id": "local",
+        "model": None,
+        "reasoning_effort": None,
+        "sandbox_mode": "danger-full-access",
+    }
 
 
 @pytest.mark.asyncio

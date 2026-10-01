@@ -31,6 +31,16 @@
         </select>
         <p id="reasoning-description" class="hint"></p>
 
+        <label for="access">Access</label>
+        <select id="access" name="access" disabled>
+          <option value="inherit">Default — Use Codex settings</option>
+          <option value="danger-full-access">Full access — No filesystem sandbox restrictions</option>
+        </select>
+        <p id="access-warning" class="warning" role="alert" hidden>
+          Codex may read and modify files outside the selected working directory.
+          Approval handling remains enabled according to the Codex approval policy.
+        </p>
+
         <div class="actions">
           <button id="refresh" type="button" disabled>Refresh</button>
           <button id="confirm" type="submit" disabled>Confirm</button>

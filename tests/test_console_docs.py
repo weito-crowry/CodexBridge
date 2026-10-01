@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
-def test_readme_documents_phase3_console_launch_and_boundaries() -> None:
+def test_readme_documents_console_launch_and_boundaries() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     for text in (
@@ -15,76 +15,38 @@ def test_readme_documents_phase3_console_launch_and_boundaries() -> None:
         "uv run codex-bridge-console",
         "read-only",
         "127.0.0.1",
-        "not a Tunnel target",
+        "is not a tunnel target.",
     ):
         assert text in readme
 
 
-def test_phase4a_docs_describe_detection_detached_launch_and_boundaries() -> None:
+def test_readme_documents_full_access_and_keeps_cwd_boundary() -> None:
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    for text in (
+        'sandbox_mode="inherit"',
+        'sandbox_mode="danger-full-access"',
+        "The default is `inherit`",
+        "does not disable or change the Codex approval policy",
+        "configured `allowed_roots` check remains in force",
+    ):
+        assert text in readme
+
+
+def test_readme_documents_console_approval_and_external_bridge_limits() -> None:
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    for text in (
+        "Review and resolve pending approvals",
+        "same approval handling as the `codex_approval` MCP tool",
+        "without the Console-owned control token",
+        "resolve those requests through an MCP client instead",
+    ):
+        assert text in readme
+
+
+def test_readme_does_not_restore_historical_phase_labels() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    spec = (ROOT / "docs" / "superpowers" / "specs" / "2026-08-28-codexbridge-design.md").read_text(
-        encoding="utf-8"
-    )
-
-    for text in (
-        "Phase 4A",
-        "detached",
-        "sys.executable -m codex_bridge",
-        "existing external Bridge is never replaced",
-        "no automatic restart",
-        "Tunnel/tray remain out of scope",
-    ):
-        assert text in readme
-        assert text in spec
-
-
-def test_phase4b_docs_describe_tunnel_supervision_tray_and_boundaries() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    spec = (ROOT / "docs" / "superpowers" / "specs" / "2026-08-28-codexbridge-design.md").read_text(
-        encoding="utf-8"
-    )
-
-    for text in (
-        "Phase 4B",
-        "CODEX_BRIDGE_TUNNEL_EXECUTABLE",
-        "CODEX_BRIDGE_TUNNEL_PROFILE",
-        "Tunnel profile creation remains external",
-        "Tunnel secrets/identity are not stored by CodexBridge",
-        "automatic Tunnel restart is disabled",
-        "Bridge Stop/Restart is Phase 4C",
-    ):
-        assert text in readme
-        assert text in spec
-    for text in (
-        "same non-null Qt standard icon",
-        "external Tunnel is never discovered/taken over",
-        "Console Exit uses the same order",
-        ">= 0.0.14",
-    ):
-        assert text in readme
-
-
-def test_phase4c_docs_describe_authenticated_graceful_bridge_control() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    spec = (ROOT / "docs" / "superpowers" / "specs" / "2026-08-28-codexbridge-design.md").read_text(
-        encoding="utf-8"
-    )
-
-    for text in (
-        "Phase 4C",
-        "Stop Bridge",
-        "Restart Bridge",
-        "CODEX_BRIDGE_CONTROL_TOKEN",
-        "process-local",
-        "POST /ui-api/control/shutdown",
-        "external Bridge is never taken over",
-        "Stopping or restarting Bridge may interrupt active Codex turns.",
-    ):
-        assert text in readme
-        assert text in spec
-    assert "ten tools before optional mounts" in readme
-    assert "exactly nine tools" in spec
-    assert "Console Exit uses the same order" in readme
+    for phase_label in ("Phase 3", "Phase 4A", "Phase 4B", "Phase 4C"):
+        assert phase_label not in readme
 
 
 def test_console_source_contains_no_mutation_or_process_ownership_operations() -> None:

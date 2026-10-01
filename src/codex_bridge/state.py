@@ -15,7 +15,17 @@ _THREAD_METADATA_KEYS = {
     "model": "model",
     "reasoning_effort": "reasoningEffort",
     "cli_version": "cliVersion",
+    "approval_policy": "approvalPolicy",
+    "approvals_reviewer": "approvalsReviewer",
 }
+_SANDBOX_TYPES = {
+    "dangerFullAccess": "danger-full-access",
+    "readOnly": "read-only",
+    "workspaceWrite": "workspace-write",
+    "externalSandbox": "external-sandbox",
+}
+_APPROVAL_POLICIES = {"untrusted", "on-request", "on-failure", "never"}
+_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
 
 
 class StateStore:
@@ -83,6 +93,18 @@ class StateStore:
                 thread.thread_metadata[target] = (
                     value[:_MAX_THREAD_METADATA_CHARS] if isinstance(value, str) else None
                 )
+        if "sandbox" in metadata:
+            sandbox = metadata["sandbox"]
+            sandbox_type = sandbox.get("type") if isinstance(sandbox, Mapping) else None
+            thread.thread_metadata["sandbox_mode"] = (
+                _SANDBOX_TYPES.get(sandbox_type) if isinstance(sandbox_type, str) else None
+            )
+        policy = thread.thread_metadata.get("approval_policy")
+        if policy not in _APPROVAL_POLICIES:
+            thread.thread_metadata["approval_policy"] = None
+        reviewer = thread.thread_metadata.get("approvals_reviewer")
+        if reviewer not in _APPROVAL_REVIEWERS:
+            thread.thread_metadata["approvals_reviewer"] = None
 
     def active_turns(self) -> tuple[tuple[str, str], ...]:
         active: list[tuple[str, str]] = []

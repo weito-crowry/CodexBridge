@@ -15,14 +15,19 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .activity import ActivityStore
-from .bridge import Bridge, BridgeError
+from .bridge import ApprovalConflictError, Bridge, BridgeError
 from .config import BridgeConfig
 from .history import HistoryValidationError, project_thread_metadata, validate_cursor
 from .jsonrpc import JsonRpcClosedError
+from .models import ApprovalDecision, RequestId
 from .paths import PathPolicyError
 
 
 class UiBridge(Protocol):
+    async def approve(
+        self, request_id: RequestId, decision: ApprovalDecision
+    ) -> dict[str, Any]: ...
+
     async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]: ...
 
     async def threads(
@@ -62,6 +67,7 @@ class UiBridge(Protocol):
 
 
 ShutdownCallback = Callable[[], Awaitable[None] | None]
+_APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
 
 
 def _parse_limit(request: Request, default: int) -> int:
@@ -114,6 +120,19 @@ def _app_server_ready(bridge: UiBridge) -> bool:
         return explicit
     app_server = getattr(bridge, "_app_server", None)
     return not bool(getattr(app_server, "failed", False))
+
+
+def _authorized_control_request(request: Request, token: str | None) -> bool:
+    authorization = request.headers.get("authorization")
+    if token is None or authorization is None:
+        return False
+    prefix = "Bearer "
+    if not authorization.startswith(prefix) or not authorization[len(prefix) :]:
+        return False
+    try:
+        return hmac.compare_digest(authorization[len(prefix) :], token)
+    except TypeError:
+        return False
 
 
 def _error_response(exc: Exception) -> JSONResponse:
@@ -287,17 +306,7 @@ def create_ui_app(
         )
 
     async def shutdown(request: Request) -> Response:
-        token = config.control_token
-        authorization = request.headers.get("authorization")
-        authorized = False
-        if token is not None and authorization is not None:
-            prefix = "Bearer "
-            if authorization.startswith(prefix) and authorization[len(prefix) :]:
-                try:
-                    authorized = hmac.compare_digest(authorization[len(prefix) :], token)
-                except TypeError:
-                    authorized = False
-        if not authorized:
+        if not _authorized_control_request(request, config.control_token):
             return JSONResponse({"error": "forbidden"}, status_code=403)
 
         assert shutdown_callback is not None
@@ -313,6 +322,29 @@ def create_ui_app(
             background=BackgroundTask(run_shutdown),
         )
 
+    async def approval(request: Request) -> Response:
+        if not _authorized_control_request(request, config.control_token):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("invalid approval request")
+            request_id = payload.get("request_id")
+            decision = payload.get("decision")
+            if (
+                isinstance(request_id, bool)
+                or not isinstance(request_id, (int, str))
+                or not isinstance(decision, str)
+                or decision not in _APPROVAL_DECISIONS
+            ):
+                raise ValueError("invalid approval request")
+            await bridge.approve(request_id, decision)  # type: ignore[arg-type]
+            return JSONResponse({"status": "approval_resolved"})
+        except ApprovalConflictError:
+            return JSONResponse({"error": "already_resolved"}, status_code=409)
+        except Exception as exc:
+            return _error_response(exc)
+
     routes = [
         Route("/healthz", healthz),
         Route("/ui-api/status", status),
@@ -327,6 +359,8 @@ def create_ui_app(
     ]
     if config.control_token is not None and shutdown_callback is not None:
         routes.append(Route("/ui-api/control/shutdown", shutdown, methods=["POST"]))
+    if config.control_token is not None:
+        routes.append(Route("/ui-api/control/approval", approval, methods=["POST"]))
     app = Starlette(routes=routes)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     app.state.bridge = bridge

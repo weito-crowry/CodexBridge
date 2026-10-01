@@ -6,6 +6,11 @@ from typing import Any
 _MAX_MODELS = 500
 _MAX_REASONING_EFFORTS = 32
 _MAX_DESCRIPTION_LENGTH = 2_000
+_DEFAULT_EXECUTION_MODES = [{"id": "inherit", "display_name": "Default"}]
+_LOCAL_EXECUTION_MODES = [
+    {"id": "inherit", "display_name": "Default"},
+    {"id": "danger-full-access", "display_name": "Full access"},
+]
 
 
 def _non_empty_string(value: object) -> str | None:
@@ -125,6 +130,7 @@ def normalize_capabilities(
     return {
         "models": public_models,
         "defaults": {"model": selected_model, "reasoning_effort": default_effort},
+        "execution_modes": [dict(mode) for mode in _LOCAL_EXECUTION_MODES],
     }
 
 
@@ -207,10 +213,22 @@ def project_public_capabilities(value: Mapping[str, Any]) -> dict[str, Any]:
     supported = (
         {entry["id"] for entry in selected["reasoning_efforts"]} if selected is not None else set()
     )
+    raw_modes = value.get("execution_modes")
+    execution_modes = [dict(mode) for mode in _DEFAULT_EXECUTION_MODES]
+    if (
+        isinstance(raw_modes, list)
+        and len(raw_modes) <= 2
+        and any(
+            isinstance(raw_mode, Mapping) and raw_mode.get("id") == "danger-full-access"
+            for raw_mode in raw_modes
+        )
+    ):
+        execution_modes.append(dict(_LOCAL_EXECUTION_MODES[1]))
     return {
         "models": models,
         "defaults": {
             "model": selected["model"] if selected is not None else None,
             "reasoning_effort": default_effort if default_effort in supported else None,
         },
+        "execution_modes": execution_modes,
     }

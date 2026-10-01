@@ -17,7 +17,7 @@ from mcp.client.streamable_http import (  # type: ignore[attr-defined]
 
 from .config import ExecutionTargetConfig
 from .logging_utils import log_event
-from .models import ApprovalDecision, RequestId
+from .models import ApprovalDecision, RequestId, SandboxMode, validate_sandbox_mode
 from .setup_capabilities import project_public_capabilities
 
 _REQUIRED_TARGET_TOOLS = frozenset(
@@ -61,6 +61,7 @@ class BridgePort(Protocol):
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        sandbox_mode: SandboxMode | None = None,
     ) -> dict[str, Any]: ...
 
     async def model_capabilities(self) -> dict[str, Any]: ...
@@ -401,6 +402,7 @@ class ExecutionTargetRouter:
             "target": target,
             "models": [],
             "defaults": {"model": None, "reasoning_effort": None},
+            "execution_modes": [{"id": "inherit", "display_name": "Default"}],
             "error": {
                 "code": "capabilities_unavailable",
                 "message": "Model capabilities are unavailable for this target.",
@@ -431,8 +433,16 @@ class ExecutionTargetRouter:
             return self._capability_error(public_target)
 
     async def confirm_setup(
-        self, target_id: str, model: str, reasoning_effort: str
+        self,
+        target_id: str,
+        model: str,
+        reasoning_effort: str,
+        sandbox_mode: SandboxMode = "inherit",
     ) -> dict[str, Any]:
+        try:
+            sandbox_mode = validate_sandbox_mode(sandbox_mode) or "inherit"
+        except ValueError as exc:
+            raise ExecutionTargetError(str(exc)) from None
         capabilities = await self.setup_capabilities(target_id)
         target = capabilities["target"]
         if not target["available"]:
@@ -454,6 +464,11 @@ class ExecutionTargetRouter:
             isinstance(entry, dict) and entry.get("id") == reasoning_effort for entry in efforts
         ):
             raise ExecutionTargetError("selected reasoning effort is not supported by this model")
+        if not any(
+            isinstance(entry, dict) and entry.get("id") == sandbox_mode
+            for entry in capabilities.get("execution_modes", [])
+        ):
+            raise ExecutionTargetError("selected sandbox_mode is not supported by this target")
         return {
             "confirmed": True,
             "selection": {
@@ -461,6 +476,7 @@ class ExecutionTargetRouter:
                 "target_name": target["name"],
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "sandbox_mode": sandbox_mode,
             },
         }
 
@@ -563,10 +579,16 @@ class ExecutionTargetRouter:
         target_id: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        sandbox_mode: SandboxMode | None = None,
     ) -> dict[str, Any]:
+        try:
+            sandbox_mode = validate_sandbox_mode(sandbox_mode)
+        except ValueError as exc:
+            raise ExecutionTargetError(str(exc)) from None
         if reasoning_effort is not None and model is None:
             raise ExecutionTargetError("reasoning_effort requires an explicit model")
         target = self._select_target(target_id)
+        capabilities: dict[str, Any] | None = None
         if model is not None:
             capabilities = await self.setup_capabilities(target.id)
             if not capabilities["target"]["available"]:
@@ -593,19 +615,38 @@ class ExecutionTargetRouter:
                         "selected reasoning effort is not supported by this model"
                     )
 
+        if target.kind == "remote" and sandbox_mode == "danger-full-access":
+            if capabilities is None:
+                capabilities = await self.setup_capabilities(target.id)
+            if not any(
+                isinstance(entry, dict) and entry.get("id") == sandbox_mode
+                for entry in capabilities.get("execution_modes", [])
+            ):
+                raise ExecutionTargetError("selected sandbox_mode is not supported by this target")
+
         arguments: dict[str, Any] = {"cwd": cwd, "prompt": prompt}
         if model is not None:
             arguments["model"] = model
         if reasoning_effort is not None:
             arguments["reasoning_effort"] = reasoning_effort
+        if sandbox_mode == "danger-full-access":
+            arguments["sandbox_mode"] = sandbox_mode
         bridge = self._bridge() if target.kind == "local" else None
 
         async def local_start() -> dict[str, Any] | None:
             if bridge is None:
                 return None
             if model is None and reasoning_effort is None:
-                return await bridge.start(cwd, prompt)
-            return await bridge.start(cwd, prompt, model=model, reasoning_effort=reasoning_effort)
+                if sandbox_mode is None:
+                    return await bridge.start(cwd, prompt)
+                return await bridge.start(cwd, prompt, sandbox_mode=sandbox_mode)
+            return await bridge.start(
+                cwd,
+                prompt,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                **({"sandbox_mode": sandbox_mode} if sandbox_mode is not None else {}),
+            )
 
         result = await self._call(
             target,
@@ -613,12 +654,15 @@ class ExecutionTargetRouter:
             arguments,
             local_start,
         )
-        if model is not None:
-            result["execution_config"] = {
+        if model is not None or sandbox_mode is not None:
+            execution_config: dict[str, Any] = {
                 "target_id": target.id,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
             }
+            if sandbox_mode is not None:
+                execution_config["sandbox_mode"] = sandbox_mode
+            result["execution_config"] = execution_config
         return result
 
     async def _thread_call(

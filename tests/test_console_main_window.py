@@ -61,6 +61,7 @@ class FakeClient:
         self.stopped_streams = 0
         self.aborted_all = False
         self.control_requests: list[tuple[str, str]] = []
+        self.approval_requests: list[tuple[str, object, str, str]] = []
         self.json_posts: list[tuple[str, str, dict[str, object]]] = []
 
     def get_json(self, path: str, *, key: str, query: dict[str, object] | None = None) -> bool:
@@ -85,6 +86,12 @@ class FakeClient:
 
     def post_control_shutdown(self, token: str, *, key: str) -> bool:
         self.control_requests.append((token, key))
+        return True
+
+    def post_control_approval(
+        self, token: str, *, request_id: object, decision: str, key: str
+    ) -> bool:
+        self.approval_requests.append((token, request_id, decision, key))
         return True
 
     def result(self, key: str, payload: object) -> None:
@@ -2090,6 +2097,99 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     assert "connected" in window.bridge_status_label.text().casefold()
     assert "ready" in window.app_server_status_label.text().casefold()
     assert client.streams == [("thread-a", 1)]
+    window.close()
+
+
+def test_main_window_resolves_pending_approval_and_refreshes_on_sse() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-a",
+            "state": "needs_approval",
+            "current_diff": "",
+            "pending_request": {
+                "request_id": "approval-1",
+                "method": "item/commandExecution/requestApproval",
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+                "summary": "run checks",
+            },
+            "recent_activities": [],
+        },
+    )
+    window._runtime_state = "console_started"
+    window._control_token = "owned-bridge-token"
+    window._sync_approval_controls()
+
+    assert window.activity_pane.allow_once_button.isEnabled()
+    window.activity_pane.allow_once_button.click()
+
+    assert client.approval_requests == [
+        ("owned-bridge-token", "approval-1", "accept", "control:approval")
+    ]
+    assert not window.activity_pane.allow_once_button.isEnabled()
+    client.control_success("control:approval")
+    assert window.activity_pane._approval_feedback.text() == "Approval sent. Refreshing status…"
+
+    before_refresh = len(client.requests)
+    client.activity(
+        window._selection_generation,
+        {
+            "activity_id": "approval-resolved",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "type": "approval_resolved",
+            "status": "resolved",
+            "summary": "run checks",
+            "details": {},
+        },
+    )
+    assert len(client.requests) > before_refresh
+    assert not window.activity_pane.allow_once_button.isEnabled()
+    window.close()
+
+
+def test_external_bridge_approval_is_read_only_and_conflict_is_nonfatal() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    pending_snapshot = {
+        "thread_id": "thread-a",
+        "state": "needs_approval",
+        "pending_request": {
+            "request_id": 9,
+            "method": "item/fileChange/requestApproval",
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "summary": "change files",
+        },
+        "recent_activities": [],
+    }
+    client.result(status_key, pending_snapshot)
+    assert not window.activity_pane.allow_once_button.isEnabled()
+    assert window.activity_pane.approval_control_message.text().startswith(
+        "Resolve from MCP client"
+    )
+    window.activity_pane.allow_once_button.click()
+    assert client.approval_requests == []
+
+    window._runtime_state = "console_started"
+    window._control_token = "owned-token"
+    window._sync_approval_controls()
+    window.activity_pane.allow_once_button.click()
+    assert client.approval_requests == [("owned-token", 9, "accept", "control:approval")]
+    client.control_failure("control:approval", "Approval already resolved")
+
+    assert window.runtime_state == "console_started"
+    assert "already resolved" in window.activity_pane._approval_feedback.text().lower()
+    assert any(key.endswith(":status") for key, _, _ in client.requests)
     window.close()
 
 

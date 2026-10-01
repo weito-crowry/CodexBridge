@@ -9,6 +9,7 @@ import {
   selectModel,
   selectionIsValid,
   type Capabilities,
+  type SandboxMode,
   type Selection,
   type SetupModel,
   type Target,
@@ -27,6 +28,7 @@ type ConfirmResult = {
     target_name: string;
     model: string;
     reasoning_effort: string;
+    sandbox_mode: SandboxMode;
   };
 };
 
@@ -35,8 +37,10 @@ const status = document.querySelector<HTMLElement>("#status")!;
 const targetSelect = document.querySelector<HTMLSelectElement>("#target")!;
 const modelSelect = document.querySelector<HTMLSelectElement>("#model")!;
 const reasoningSelect = document.querySelector<HTMLSelectElement>("#reasoning")!;
+const accessSelect = document.querySelector<HTMLSelectElement>("#access")!;
 const modelDescription = document.querySelector<HTMLElement>("#model-description")!;
 const reasoningDescription = document.querySelector<HTMLElement>("#reasoning-description")!;
+const accessWarning = document.querySelector<HTMLElement>("#access-warning")!;
 const refreshButton = document.querySelector<HTMLButtonElement>("#refresh")!;
 const confirmButton = document.querySelector<HTMLButtonElement>("#confirm")!;
 const form = document.querySelector<HTMLFormElement>("#setup-form")!;
@@ -44,7 +48,7 @@ const form = document.querySelector<HTMLFormElement>("#setup-form")!;
 let targets: Target[] = [];
 let selectionRequired = false;
 let capabilities: Capabilities | null = null;
-let selection: Selection = { model: null, reasoningEffort: null };
+let selection: Selection = changeTarget();
 let generation = 0;
 let hostReady = false;
 let selectionConfirmed = false;
@@ -63,6 +67,8 @@ function updateControls(): void {
   modelSelect.disabled = !hostReady || selectionConfirmed || !capabilities || Boolean(capabilities.error)
     || !capabilities.target.available;
   reasoningSelect.disabled = modelSelect.disabled || !selection.model;
+  accessSelect.disabled = !hostReady || selectionConfirmed || !capabilities
+    || Boolean(capabilities.error) || !capabilities.target.available;
   refreshButton.disabled = !hostReady || selectionConfirmed;
   confirmButton.disabled = !hostReady || selectionConfirmed || !capabilities
     || !selectionIsValid(capabilities, selection);
@@ -101,6 +107,15 @@ function renderModels(): void {
     (effort) => effort.id === selection.reasoningEffort,
   );
   reasoningDescription.textContent = currentEffort?.description ?? "";
+  accessSelect.replaceChildren();
+  for (const mode of capabilities?.execution_modes ?? []) {
+    const label = mode.id === "danger-full-access"
+      ? "Full access — No filesystem sandbox restrictions"
+      : "Default — Use Codex settings";
+    accessSelect.add(new Option(label, mode.id));
+  }
+  accessSelect.value = selection.sandboxMode;
+  accessWarning.hidden = selection.sandboxMode !== "danger-full-access";
   updateControls();
 }
 
@@ -113,7 +128,7 @@ function applySetupResult(result: SetupResult): void {
   const selectedId = keptTarget?.id ?? (!selectionRequired && targets.length === 1 ? targets[0].id : "");
   renderTargets(selectedId);
   capabilities = null;
-  selection = { model: null, reasoningEffort: null };
+  selection = changeTarget();
 
   const initialCapabilities = result.capabilities;
   if (initialCapabilities && initialCapabilities.target.id === selectedId) {
@@ -153,7 +168,7 @@ async function loadCapabilities(
 ): Promise<void> {
   const requestGeneration = ++generation;
   capabilities = null;
-  selection = { model: null, reasoningEffort: null };
+  selection = changeTarget();
   renderModels();
   setStatus("Loading models…");
   try {
@@ -182,7 +197,7 @@ async function loadCapabilities(
   } catch {
     if (!isCurrentGeneration(requestGeneration, generation)) return;
     capabilities = null;
-    selection = { model: null, reasoningEffort: null };
+    selection = changeTarget();
     renderModels();
     setStatus("Model capabilities are unavailable. Refresh to try again.");
   }
@@ -209,7 +224,15 @@ targetSelect.addEventListener("change", () => {
 modelSelect.addEventListener("change", () => {
   if (!capabilities) return;
   selectionConfirmed = false;
-  selection = selectModel(capabilities, modelSelect.value, selection.reasoningEffort);
+  selection = selectModel(
+    capabilities, modelSelect.value, selection.reasoningEffort, selection.sandboxMode,
+  );
+  renderModels();
+});
+
+accessSelect.addEventListener("change", () => {
+  selectionConfirmed = false;
+  selection = { ...selection, sandboxMode: accessSelect.value as SandboxMode };
   renderModels();
 });
 
@@ -246,15 +269,13 @@ form.addEventListener("submit", (event) => {
 async function confirmSelection(): Promise<void> {
   if (!capabilities || !selectionIsValid(capabilities, selection)) return;
   const targetId = capabilities.target.id;
-  const model = selection.model;
-  const reasoningEffort = selection.reasoningEffort;
   const requestGeneration = ++generation;
   confirmButton.disabled = true;
   setStatus("Confirming…");
   try {
     const result = await app.callServerTool({
       name: "codex_setup_confirm",
-      arguments: confirmPayload(targetId, { model, reasoningEffort }),
+      arguments: confirmPayload(targetId, selection),
     });
     if (!isCurrentGeneration(requestGeneration, generation)) return;
     const confirmed = readStructured<ConfirmResult>(result);
@@ -266,6 +287,7 @@ async function confirmSelection(): Promise<void> {
       `target_id=${confirmed.selection.target_id}`,
       `model=${confirmed.selection.model}`,
       `reasoning_effort=${confirmed.selection.reasoning_effort}`,
+      `sandbox_mode=${confirmed.selection.sandbox_mode}`,
     ].join("\n");
     if (!app.getHostCapabilities()?.updateModelContext) {
       setStatus("This client cannot save the confirmed selection to the conversation.");
@@ -290,7 +312,7 @@ async function confirmSelection(): Promise<void> {
           content: [
             {
               type: "text",
-              text: "CodexBridge setup confirmed. Continue the pending task using the confirmed target, model, and reasoning effort.",
+              text: "CodexBridge setup confirmed. Continue the pending task using the confirmed target, model, reasoning effort, and access mode.",
             },
           ],
         });

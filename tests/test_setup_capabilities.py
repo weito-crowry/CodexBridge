@@ -36,6 +36,10 @@ def test_normalize_capabilities_uses_effective_config_when_supported() -> None:
     )
 
     assert result["defaults"] == {"model": "model-b", "reasoning_effort": "high"}
+    assert result["execution_modes"] == [
+        {"id": "inherit", "display_name": "Default"},
+        {"id": "danger-full-access", "display_name": "Full access"},
+    ]
     assert result["models"][1] == {
         "model": "model-b",
         "display_name": "Display model-b",
@@ -114,4 +118,24 @@ def test_project_public_capabilities_revalidates_remote_catalog_and_drops_extra_
             }
         ],
         "defaults": {"model": "model-a", "reasoning_effort": "high"},
+        "execution_modes": [{"id": "inherit", "display_name": "Default"}],
     }
+
+
+def test_old_remote_capabilities_only_allow_inherit() -> None:
+    projected = project_public_capabilities(
+        {
+            "models": [
+                {
+                    "model": "model-a",
+                    "display_name": "Model A",
+                    "description": None,
+                    "reasoning_efforts": [{"id": "high", "description": None}],
+                    "default_reasoning_effort": "high",
+                }
+            ],
+            "defaults": {"model": "model-a", "reasoning_effort": "high"},
+        }
+    )
+
+    assert projected["execution_modes"] == [{"id": "inherit", "display_name": "Default"}]

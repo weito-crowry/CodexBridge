@@ -764,6 +764,123 @@ def test_activity_pane_shows_request_error_without_dropping_recent_activities() 
     assert pane.activity_list.count() == 1
 
 
+def test_activity_pane_reviews_command_file_and_permission_approvals() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ActivityPane()
+    requested: list[tuple[object, str]] = []
+    pane.approval_decision_requested.connect(
+        lambda request_id, decision: requested.append((request_id, decision))
+    )
+    pane.set_control_available(True)
+
+    pane.set_snapshot(
+        {
+            "state": "needs_approval",
+            "current_diff": "diff --git a/a.txt b/a.txt",
+            "pending_request": {
+                "request_id": "command-1",
+                "method": "item/commandExecution/requestApproval",
+                "thread_id": "thread-1",
+                "turn_id": "turn-1",
+                "summary": "pytest tests/test_example.py",
+            },
+        }
+    )
+    command_details = pane.approval_details_label.text()
+    assert "Command approval" in command_details
+    assert "pytest tests/test_example.py" in command_details
+    assert "Thread: thread-1" in command_details
+    assert "Turn: turn-1" in command_details
+
+    pane.allow_once_button.click()
+    pane.allow_for_session_button.click()
+    pane.decline_button.click()
+    pane.cancel_button.click()
+    assert requested == [
+        ("command-1", "accept"),
+        ("command-1", "acceptForSession"),
+        ("command-1", "decline"),
+        ("command-1", "cancel"),
+    ]
+
+    pane.set_snapshot(
+        {
+            "state": "needs_approval",
+            "current_diff": "diff --git a/a.txt b/a.txt",
+            "pending_request": {
+                "request_id": 2,
+                "method": "item/fileChange/requestApproval",
+                "thread_id": "thread-1",
+                "turn_id": "turn-2",
+                "summary": "Update a.txt",
+            },
+        }
+    )
+    assert "File change approval" in pane.approval_details_label.text()
+    assert "diff --git a/a.txt b/a.txt" in pane.approval_details_label.text()
+
+    pane.set_snapshot(
+        {
+            "state": "needs_approval",
+            "pending_request": {
+                "request_id": 3,
+                "method": "item/permissions/requestApproval",
+                "thread_id": "thread-1",
+                "turn_id": "turn-3",
+                "summary": "Need local access",
+                "permission": {
+                    "reason": "Need local access",
+                    "cwd": "C:/repo",
+                    "requested_permissions": {
+                        "fileSystem": {"entries": [{"access": "read", "path": "C:/repo"}]},
+                        "network": {"enabled": True},
+                    },
+                    "allowed_scopes": ["turn", "session"],
+                },
+            },
+        }
+    )
+    permission_details = pane.approval_details_label.text()
+    assert "Permission approval" in permission_details
+    assert "Reason: Need local access" in permission_details
+    assert "C:/repo" in permission_details
+    assert "Requested filesystem permissions" in permission_details
+    assert "Requested network permissions" in permission_details
+    assert "Allowed scopes: turn, session" in permission_details
+
+
+def test_activity_pane_disables_console_approval_without_control_and_clears_resolved() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ActivityPane()
+    pane.set_snapshot(
+        {
+            "state": "needs_approval",
+            "pending_request": {
+                "request_id": 1,
+                "method": "item/fileChange/requestApproval",
+                "thread_id": "thread-1",
+                "turn_id": "turn-1",
+                "summary": "Change files",
+            },
+        }
+    )
+
+    assert pane.approval_control_message.text() == (
+        "Resolve from MCP client; Console control is unavailable for this Bridge."
+    )
+    assert not pane.allow_once_button.isEnabled()
+    assert not pane.allow_for_session_button.isEnabled()
+    assert not pane.decline_button.isEnabled()
+    assert not pane.cancel_button.isEnabled()
+
+    pane.set_snapshot({"state": "in_progress", "pending_request": None})
+
+    assert pane.approval_details_label.isHidden()
+    assert pane.approval_buttons_widget.isHidden()
+
+
 def test_activity_pane_caps_rows_and_deduplicates_current_rows() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None

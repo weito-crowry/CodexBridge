@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QTimer
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..models import ApprovalDecision
 from .api_client import ApiClient
 from .codex_links import codex_thread_uri, open_codex_uri
 from .codex_resolver import (
@@ -255,6 +256,7 @@ class MainWindow(QMainWindow):
         self._detached_launch_started = False
         self._detached_pid: int | None = None
         self._control_token: str | None = None
+        self._approval_control_pending = False
         self._launch_generation = 0
         self._bridge_transition = False
         self._pending_bridge_action: str | None = None
@@ -607,6 +609,7 @@ class MainWindow(QMainWindow):
         self._client.stream_state_changed.connect(self._apply_stream_state)
         self._client.control_succeeded.connect(self._apply_control_success)
         self._client.control_failed.connect(self._apply_control_failure)
+        self.activity_pane.approval_decision_requested.connect(self._resolve_approval)
         self.thread_pane.refresh_requested.connect(self.refresh)
         self.thread_pane.thread_selected.connect(self.select_thread)
         self.thread_pane.thread_rename_requested.connect(self._rename_thread)
@@ -1092,6 +1095,7 @@ class MainWindow(QMainWindow):
     def _set_runtime_state(self, state: str, *, label: str | None = None) -> None:
         self._runtime_state = state
         self.runtime_status_label.setText(label or _RUNTIME_LABELS.get(state, f"Runtime: {state}"))
+        self._sync_approval_controls()
         self._update_start_button()
         self._update_bridge_controls()
         self._sync_overall_status()
@@ -1585,6 +1589,12 @@ class MainWindow(QMainWindow):
             return
 
     def _apply_control_success(self, key: str) -> None:
+        if key == "control:approval" and self._approval_control_pending:
+            self._approval_control_pending = False
+            self.activity_pane.set_approval_busy(False)
+            self.activity_pane.set_approval_feedback("Approval sent. Refreshing status…")
+            self._request_selected_status()
+            return
         if key != "control:shutdown" or not self._control_request_pending:
             return
         self._control_request_pending = False
@@ -1596,7 +1606,19 @@ class MainWindow(QMainWindow):
         self.bottom_status_label.setText("Bridge shutdown requested")
         self._request_health()
 
-    def _apply_control_failure(self, key: str, _message: str) -> None:
+    def _apply_control_failure(self, key: str, message: str) -> None:
+        if key == "control:approval" and self._approval_control_pending:
+            self._approval_control_pending = False
+            self.activity_pane.set_approval_busy(False)
+            if "already resolved" in message.casefold():
+                self.activity_pane.mark_approval_resolved()
+                self.activity_pane.set_approval_feedback(
+                    "Approval already resolved. Refreshing status…"
+                )
+                self._request_selected_status()
+            else:
+                self.activity_pane.set_approval_feedback("Approval request failed")
+            return
         if key != "control:shutdown":
             return
         self._control_request_pending = False
@@ -2083,6 +2105,7 @@ class MainWindow(QMainWindow):
         if isinstance(thread_id, str) and isinstance(state, str):
             self._update_thread_activity(thread_id, state)
         self.activity_pane.set_snapshot(payload)
+        self._sync_approval_controls()
         self.bottom_status_label.setText("Thread snapshot updated")
         if self._stream_sync_pending and self._selected_thread_id is not None:
             self._stream_sync_pending = False
@@ -2239,7 +2262,42 @@ class MainWindow(QMainWindow):
                 and isinstance(turn_id, str)
             ):
                 self._schedule_turn_usage_snapshot(thread_id, turn_id)
+            if activity_type == "approval_requested" and activity_status == "requested":
+                self._request_selected_status()
+            elif activity_type == "approval_resolved" and activity_status == "resolved":
+                self.activity_pane.mark_approval_resolved()
+                self._request_selected_status()
         self.activity_pane.append_activity(payload)
+
+    def _sync_approval_controls(self) -> None:
+        self.activity_pane.set_control_available(
+            self._runtime_state == "console_started"
+            and self._control_token is not None
+            and not self._closing
+        )
+
+    def _resolve_approval(self, request_id: object, decision: str) -> None:
+        if (
+            self._closing
+            or self._approval_control_pending
+            or self._runtime_state != "console_started"
+            or self._control_token is None
+            or request_id != self.activity_pane.approval_request_id
+            or isinstance(request_id, bool)
+            or not isinstance(request_id, (int, str))
+            or decision not in {"accept", "acceptForSession", "decline", "cancel"}
+        ):
+            return
+        self._approval_control_pending = True
+        self.activity_pane.set_approval_busy(True)
+        accepted = self._client.post_control_approval(
+            self._control_token,
+            request_id=request_id,
+            decision=cast(ApprovalDecision, decision),
+            key="control:approval",
+        )
+        if not accepted and self._approval_control_pending:
+            self._apply_control_failure("control:approval", "Bridge control request failed")
 
     def _apply_stream_state(self, generation: int, state: str) -> None:
         if self._closing or generation != self._selection_generation:

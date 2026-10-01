@@ -28,8 +28,10 @@ from .models import (
     PermissionGrantScope,
     PermissionRequestDetails,
     RequestId,
+    SandboxMode,
     UserInputAnswer,
     UserInputQuestion,
+    validate_sandbox_mode,
 )
 from .paths import AllowedPathPolicy
 from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unavailable_metadata
@@ -47,6 +49,10 @@ class AppServerPort(Protocol):
 
 class BridgeError(RuntimeError):
     """Raised when a native App Server response cannot be used safely."""
+
+
+class ApprovalConflictError(ValueError):
+    """Raised when an approval request is no longer pending."""
 
 
 def _with_turn_model_metadata(
@@ -327,6 +333,7 @@ class Bridge:
         self._activities = activity_store if activity_store is not None else ActivityStore()
         self._wait_default_seconds = wait_default_seconds
         self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
+        self._approval_lock = asyncio.Lock()
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:
@@ -527,11 +534,15 @@ class Bridge:
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        sandbox_mode: SandboxMode | None = None,
     ) -> dict[str, Any]:
+        sandbox_mode = validate_sandbox_mode(sandbox_mode)
         if reasoning_effort is not None and model is None:
             raise BridgeError("reasoning_effort requires an explicit model")
         canonical_cwd = self._path_policy.validate_cwd(cwd)
         thread_params: dict[str, Any] = {"cwd": canonical_cwd}
+        if sandbox_mode == "danger-full-access":
+            thread_params["sandbox"] = sandbox_mode
         if model is not None:
             thread_params["model"] = model
         response = await self._app_server.request("thread/start", thread_params)
@@ -540,6 +551,7 @@ class Bridge:
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
         self._state.mark_loaded(thread_id, canonical_cwd, thread)
+        self._state.update_thread_metadata(thread_id, response)
         log_event("thread.start", thread_id=thread_id)
         return await self._start_turn(
             thread_id, prompt, model=model, reasoning_effort=reasoning_effort
@@ -591,6 +603,7 @@ class Bridge:
             if self._path_policy.validate_cwd(resumed_cwd) != validated_cwd:
                 raise BridgeError("thread/resume returned a mismatched cwd")
             self._state.mark_loaded(thread_id, validated_cwd, resumed_thread)
+            self._state.update_thread_metadata(thread_id, response)
             log_event("thread.resume", thread_id=thread_id)
         return await self._start_turn(thread_id, prompt)
 
@@ -628,38 +641,41 @@ class Bridge:
         return self._state.get_pending_request(request_id) is not None
 
     async def approve(self, request_id: RequestId, decision: ApprovalDecision) -> dict[str, Any]:
-        if decision not in _APPROVAL_DECISIONS:
+        if not isinstance(decision, str) or decision not in _APPROVAL_DECISIONS:
             raise ValueError("unsupported approval decision")
-        pending = self._state.get_pending_request(request_id)
-        if pending is None or pending.method not in _APPROVAL_METHODS:
-            raise ValueError("unknown approval request")
-        payload: dict[str, Any]
-        if pending.permission is None:
-            payload = {"decision": decision}
-        elif decision in {"accept", "acceptForSession"}:
-            scope: PermissionGrantScope = "session" if decision == "acceptForSession" else "turn"
-            payload = {
-                "permissions": deepcopy(pending.permission.requested_permissions),
-                "scope": scope,
-            }
-        else:
-            payload = {
-                "permissions": {"fileSystem": None, "network": None},
-                "scope": "turn",
-            }
-        await self._app_server.respond(request_id, payload)
-        self._state.pop_pending_request(request_id)
-        self._record_activity(
-            thread_id=pending.thread_id,
-            turn_id=pending.turn_id,
-            item_id=pending.item_id,
-            type="approval_resolved",
-            status="resolved",
-            summary=pending.summary,
-            details={"decision": decision},
-        )
-        log_event("approval.resolved", request_id=request_id, decision=decision)
-        return self._public_snapshot(pending.thread_id, pending.turn_id)
+        async with self._approval_lock:
+            pending = self._state.get_pending_request(request_id)
+            if pending is None or pending.method not in _APPROVAL_METHODS:
+                raise ApprovalConflictError("unknown approval request")
+            payload: dict[str, Any]
+            if pending.permission is None:
+                payload = {"decision": decision}
+            elif decision in {"accept", "acceptForSession"}:
+                scope: PermissionGrantScope = (
+                    "session" if decision == "acceptForSession" else "turn"
+                )
+                payload = {
+                    "permissions": deepcopy(pending.permission.requested_permissions),
+                    "scope": scope,
+                }
+            else:
+                payload = {
+                    "permissions": {"fileSystem": None, "network": None},
+                    "scope": "turn",
+                }
+            await self._app_server.respond(request_id, payload)
+            self._state.pop_pending_request(request_id)
+            self._record_activity(
+                thread_id=pending.thread_id,
+                turn_id=pending.turn_id,
+                item_id=pending.item_id,
+                type="approval_resolved",
+                status="resolved",
+                summary=pending.summary,
+                details={"decision": decision},
+            )
+            log_event("approval.resolved", request_id=request_id, decision=decision)
+            return self._public_snapshot(pending.thread_id, pending.turn_id)
 
     async def answer_user_input(
         self, request_id: RequestId, answers: Mapping[str, list[str] | tuple[str, ...]]
@@ -1217,6 +1233,9 @@ class Bridge:
                 "model": None,
                 "reasoning_effort": None,
                 "cli_version": None,
+                "sandbox_mode": None,
+                "approval_policy": None,
+                "approvals_reviewer": None,
             },
             "state": "not_loaded",
             "latest_agent_message": "",

@@ -104,4 +104,7 @@ def test_thread_metadata_is_bounded_to_safe_known_fields() -> None:
         "model": "gpt-5",
         "reasoning_effort": "high",
         "cli_version": "0.1.2",
+        "sandbox_mode": None,
+        "approval_policy": None,
+        "approvals_reviewer": None,
     }
