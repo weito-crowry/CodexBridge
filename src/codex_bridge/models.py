@@ -14,6 +14,16 @@ NormalizedState = Literal[
 RequestId = int | str
 ApprovalDecision = Literal["accept", "acceptForSession", "decline", "cancel"]
 PermissionGrantScope = Literal["turn", "session"]
+SandboxMode = Literal["inherit", "danger-full-access"]
+SANDBOX_MODES = frozenset({"inherit", "danger-full-access"})
+
+
+def validate_sandbox_mode(value: str | None) -> SandboxMode | None:
+    if value is None:
+        return None
+    if value not in SANDBOX_MODES:
+        raise ValueError("unsupported sandbox_mode")
+    return value  # type: ignore[return-value]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,5 +84,8 @@ class ThreadState:
             "model": None,
             "reasoning_effort": None,
             "cli_version": None,
+            "sandbox_mode": None,
+            "approval_policy": None,
+            "approvals_reviewer": None,
         }
     )

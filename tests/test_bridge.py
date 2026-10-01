@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from codex_bridge.activity import ActivityStore
-from codex_bridge.bridge import Bridge, BridgeError
+from codex_bridge.bridge import ApprovalConflictError, Bridge, BridgeError
 from codex_bridge.history import HistoryValidationError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
@@ -36,6 +36,8 @@ class FakeAppServer:
         }
         self.model_pages: dict[str | None, dict[str, Any]] = {}
         self.config_response: dict[str, Any] = {"config": {}}
+        self.thread_start_settings: dict[str, Any] = {}
+        self.thread_resume_settings: dict[str, Any] = {}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
@@ -48,7 +50,8 @@ class FakeAppServer:
                     "model": "gpt-5",
                     "reasoningEffort": "high",
                     "cliVersion": "0.1.2",
-                }
+                },
+                **self.thread_start_settings,
             }
         if method == "model/list":
             return self.model_pages.get(params.get("cursor"), {"data": []})
@@ -64,6 +67,7 @@ class FakeAppServer:
                     "cliVersion": "0.1.2",
                 },
                 "cwd": self.thread_cwds[params["threadId"]],
+                **self.thread_resume_settings,
             }
         if method == "turn/start":
             return {"turn": {"id": "native-turn", "status": "inProgress"}}
@@ -159,6 +163,9 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
         "model": "gpt-5",
         "reasoning_effort": "high",
         "cli_version": "0.1.2",
+        "sandbox_mode": None,
+        "approval_policy": None,
+        "approvals_reviewer": None,
     }
     assert app.methods == ["thread/start", "turn/start"]
     assert app.calls[1][1]["input"] == [{"type": "text", "text": "inspect this"}]
@@ -179,6 +186,71 @@ async def test_start_passes_explicit_model_and_effort_only_to_expected_wire_fiel
     assert app.calls[1][1]["model"] == "model-value"
     assert app.calls[1][1]["effort"] == "high"
     assert "reasoningEffort" not in app.calls[1][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_mode", [None, "inherit"])
+async def test_start_inherit_does_not_send_sandbox(allowed_dir, sandbox_mode) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    await bridge.start(str(allowed_dir), "inspect this", sandbox_mode=sandbox_mode)
+
+    assert app.calls[0] == ("thread/start", {"cwd": str(allowed_dir)})
+
+
+@pytest.mark.asyncio
+async def test_start_full_access_sends_durable_permission_profile_override(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="danger-full-access")
+
+    assert app.calls[0] == (
+        "thread/start",
+        {"cwd": str(allowed_dir), "config": {"default_permissions": ":danger-full-access"}},
+    )
+    assert "approvalPolicy" not in app.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_unsupported_sandbox_mode(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    with pytest.raises(ValueError, match="sandbox_mode"):
+        await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="read-only")
+
+    assert app.calls == []
+
+
+@pytest.mark.asyncio
+async def test_full_access_still_validates_allowed_root(allowed_dir, tmp_path) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    with pytest.raises(PathPolicyError):
+        await bridge.start(
+            str(tmp_path / "outside"), "inspect this", sandbox_mode="danger-full-access"
+        )
+
+    assert app.calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_projects_effective_execution_settings_from_app_server(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_start_settings = {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": {"type": "dangerFullAccess"},
+        "activePermissionProfile": {"id": ":danger-full-access"},
+    }
+
+    result = await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="danger-full-access")
+
+    assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
+    assert result["thread_metadata"]["approval_policy"] == "on-request"
+    assert result["thread_metadata"]["approvals_reviewer"] == "user"
+    assert "active_permission_profile" not in result["thread_metadata"]
+    assert "approvalPolicy" not in app.calls[0][1]
+    assert app.calls[0][1]["config"]["default_permissions"] == ":danger-full-access"
 
 
 @pytest.mark.asyncio
@@ -270,6 +342,30 @@ async def test_continue_resumes_a_thread_not_loaded_in_this_process(allowed_dir)
     await bridge.continue_thread("persisted-thread", "continue")
 
     assert app.methods == ["thread/read", "thread/resume", "turn/start"]
+
+
+@pytest.mark.asyncio
+async def test_cold_resume_uses_effective_metadata_without_sandbox_overrides(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    await bridge.start(str(allowed_dir), "materialize", sandbox_mode="danger-full-access")
+    app.thread_cwds["native-thread"] = str(allowed_dir)
+    app.thread_resume_settings = {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "sandbox": {"type": "dangerFullAccess"},
+        "activePermissionProfile": {"id": ":danger-full-access"},
+    }
+    cold_bridge = Bridge(app, StateStore(), AllowedPathPolicy((str(allowed_dir),)))
+
+    result = await cold_bridge.continue_thread("native-thread", "continue")
+
+    assert app.calls[0] == (
+        "thread/start",
+        {"cwd": str(allowed_dir), "config": {"default_permissions": ":danger-full-access"}},
+    )
+    assert app.calls[3] == ("thread/resume", {"threadId": "native-thread"})
+    assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
+    assert result["thread_metadata"]["approval_policy"] == "on-request"
 
 
 @pytest.mark.asyncio
@@ -1524,6 +1620,9 @@ async def test_status_for_unknown_thread_returns_not_loaded_without_state_creati
             "model": None,
             "reasoning_effort": None,
             "cli_version": None,
+            "sandbox_mode": None,
+            "approval_policy": None,
+            "approvals_reviewer": None,
         },
         "state": "not_loaded",
         "latest_agent_message": "",
@@ -1570,6 +1669,48 @@ async def test_approval_response_is_scoped_to_request_id(allowed_dir) -> None:
 
     assert result["state"] == "in_progress"
     assert app.responses == [("approval-1", {"decision": "accept"})]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_approval_attempts_send_only_one_app_server_response(allowed_dir) -> None:
+    class BlockingAppServer(FakeAppServer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
+            self.responses.append((request_id, result))
+            self.entered.set()
+            await self.release.wait()
+
+    app = BlockingAppServer()
+    bridge = Bridge(app, StateStore(), AllowedPathPolicy((str(allowed_dir),)))
+    await bridge.handle_server_request(
+        {
+            "id": "approval-race",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "thread", "turnId": "turn"},
+        }
+    )
+
+    first = asyncio.create_task(bridge.approve("approval-race", "accept"))
+    await app.entered.wait()
+
+    second_started = asyncio.Event()
+
+    async def second_approval():
+        second_started.set()
+        return await bridge.approve("approval-race", "decline")
+
+    second = asyncio.create_task(second_approval())
+    await second_started.wait()
+    app.release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    assert sum(isinstance(result, ApprovalConflictError) for result in results) == 1
+    assert app.responses == [("approval-race", {"decision": "accept"})]
 
 
 @pytest.mark.asyncio

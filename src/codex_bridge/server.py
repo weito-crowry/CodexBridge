@@ -26,7 +26,7 @@ from .execution_targets import ExecutionTargetRouter
 from .logging_utils import log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
-from .models import ApprovalDecision
+from .models import ApprovalDecision, SandboxMode
 from .observability import MCPObservabilityMiddleware, ObservabilityLogger
 from .paths import AllowedPathPolicy, PathPolicyError
 from .server_instructions import MCP_SERVER_INSTRUCTIONS
@@ -170,7 +170,7 @@ def create_app(
         setup_html,
         name="codexbridge-setup-app",
         title="CodexBridge Setup",
-        description="Choose an execution target, model, and reasoning effort.",
+        description="Choose an execution target, model, reasoning effort, and access mode.",
         csp=ResourceCsp(
             connect_domains=[], resource_domains=[], frame_domains=[], base_uri_domains=[]
         ),
@@ -189,7 +189,7 @@ def create_app(
     @apps.tool(
         resource_uri=app_resource_uri,
         title="CodexBridge Setup",
-        description="Open the CodexBridge target, model, and reasoning setup form.",
+        description="Open the CodexBridge target, model, reasoning, and access setup form.",
     )
     async def codex_setup(ctx: Context) -> dict[str, Any]:
         """Return fresh targets and the setup UI's initial selection data."""
@@ -211,7 +211,8 @@ def create_app(
             message += "\nChoose an execution target before starting Codex."
         if client_supports_apps(ctx):
             message += (
-                "\nUse the CodexBridge Setup UI to select a target, model, and reasoning effort."
+                "\nUse the CodexBridge Setup UI to select a target, model, reasoning effort, "
+                "and access mode."
             )
         else:
             message += "\nA client with MCP Apps support can show the setup selection UI."
@@ -235,11 +236,16 @@ def create_app(
         description="Revalidate and confirm the selected target, model, and reasoning effort.",
     )
     async def codex_setup_confirm(
-        target_id: str, model: str, reasoning_effort: str
+        target_id: str,
+        model: str,
+        reasoning_effort: str,
+        sandbox_mode: SandboxMode = "inherit",
     ) -> dict[str, Any]:
         """Revalidate a setup selection against current target capabilities."""
         return await _run_tool(
-            lambda: execution_router.confirm_setup(target_id, model, reasoning_effort)
+            lambda: execution_router.confirm_setup(
+                target_id, model, reasoning_effort, sandbox_mode=sandbox_mode
+            )
         )
 
     mcp = MCPServer(
@@ -497,10 +503,18 @@ def create_app(
         target_id: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        sandbox_mode: SandboxMode | None = None,
     ) -> dict[str, Any]:
         """Start a native Codex thread and its first turn without waiting for completion."""
         return await _run_tool(
-            lambda: execution_router.codex_start(cwd, prompt, target_id, model, reasoning_effort)
+            lambda: execution_router.codex_start(
+                cwd,
+                prompt,
+                target_id,
+                model,
+                reasoning_effort,
+                sandbox_mode=sandbox_mode,
+            )
         )
 
     @mcp.tool()

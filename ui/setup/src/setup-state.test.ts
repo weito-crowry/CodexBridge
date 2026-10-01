@@ -31,6 +31,10 @@ const capabilities = {
     },
   ],
   defaults: { model: "model-a", reasoning_effort: "high" },
+  execution_modes: [
+    { id: "inherit", display_name: "Default" },
+    { id: "danger-full-access", display_name: "Full access" },
+  ],
 };
 
 describe("setup selection state", () => {
@@ -38,22 +42,38 @@ describe("setup selection state", () => {
     expect(applyCapabilities(capabilities)).toEqual({
       model: "model-a",
       reasoningEffort: "high",
+      sandboxMode: "inherit",
     });
     expect(applyCapabilities(capabilities, { model: "model-b", reasoningEffort: "stale" })).toEqual({
       model: "model-b",
       reasoningEffort: "deep",
+      sandboxMode: "inherit",
     });
+    expect(applyCapabilities(capabilities, {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "danger-full-access",
+    }).sandboxMode).toBe("danger-full-access");
+    expect(applyCapabilities({
+      ...capabilities,
+      execution_modes: [{ id: "inherit", display_name: "Default" }],
+    }, {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "danger-full-access",
+    }).sandboxMode).toBe("inherit");
   });
 
   it("replaces reasoning choices and defaults when the model changes", () => {
     expect(selectModel(capabilities, "model-b", "high")).toEqual({
       model: "model-b",
       reasoningEffort: "deep",
+      sandboxMode: "inherit",
     });
   });
 
   it("clears model and effort when the execution target changes", () => {
-    expect(changeTarget()).toEqual({ model: null, reasoningEffort: null });
+    expect(changeTarget()).toEqual({ model: null, reasoningEffort: null, sandboxMode: "inherit" });
   });
 
   it("ignores stale async responses by generation", () => {
@@ -62,10 +82,28 @@ describe("setup selection state", () => {
   });
 
   it("requires an available target and supported model and effort", () => {
-    expect(selectionIsValid(capabilities, { model: "model-a", reasoningEffort: "high" })).toBe(true);
+    expect(selectionIsValid(capabilities, {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "inherit",
+    })).toBe(true);
+    expect(selectionIsValid(capabilities, {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "danger-full-access",
+    })).toBe(true);
+    expect(selectionIsValid({
+      ...capabilities,
+      execution_modes: [{ id: "inherit", display_name: "Default" }],
+    }, {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "danger-full-access",
+    })).toBe(false);
     expect(selectionIsValid({ ...capabilities, target: { ...capabilities.target, available: false } }, {
       model: "model-a",
       reasoningEffort: "high",
+      sandboxMode: "inherit",
     })).toBe(false);
   });
 
@@ -75,6 +113,7 @@ describe("setup selection state", () => {
       target_name: "PC A",
       model: "model-a",
       reasoning_effort: "high",
+      sandbox_mode: "danger-full-access",
     })).toEqual({
       codexbridge_setup: {
         confirmed: true,
@@ -82,15 +121,21 @@ describe("setup selection state", () => {
         target_name: "PC A",
         model: "model-a",
         reasoning_effort: "high",
+        sandbox_mode: "danger-full-access",
       },
     });
   });
 
   it("creates the server confirmation payload without substituting values", () => {
-    expect(confirmPayload("pc-a", { model: "model-a", reasoningEffort: "high" })).toEqual({
+    expect(confirmPayload("pc-a", {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "danger-full-access",
+    })).toEqual({
       target_id: "pc-a",
       model: "model-a",
       reasoning_effort: "high",
+      sandbox_mode: "danger-full-access",
     });
   });
 });

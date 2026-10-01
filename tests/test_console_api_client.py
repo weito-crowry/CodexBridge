@@ -219,6 +219,74 @@ def test_api_client_posts_authenticated_control_without_token_in_url_or_body() -
     assert reply.deleted
 
 
+def test_api_client_posts_authenticated_approval_json() -> None:
+    _application()
+    token = "A" * 32
+    reply = FakeReply(b'{"status":"approval_resolved"}', status=200)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    successes: list[str] = []
+    failures: list[tuple[str, str]] = []
+    client.control_succeeded.connect(lambda key: successes.append(key))
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_approval(
+        token, request_id=123, decision="accept", key="approval:123"
+    )
+    request = manager.requests[0]
+    assert request.url().toString() == "http://127.0.0.1:8001/ui-api/control/approval"
+    assert bytes(request.rawHeader("Authorization")) == f"Bearer {token}".encode()
+    assert bytes(request.rawHeader("Content-Type")) == b"application/json"
+    assert manager.post_bodies == [b'{"request_id":123,"decision":"accept"}']
+    assert token not in request.url().toString() + manager.post_bodies[0].decode()
+    reply.finished.emit()
+
+    assert successes == ["approval:123"]
+    assert failures == []
+    assert reply.deleted
+
+
+def test_api_client_reports_already_resolved_approval_conflict() -> None:
+    _application()
+    reply = FakeReply(b'{"error":"already_resolved"}', status=409)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, str]] = []
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_approval(
+        "A" * 32, request_id="approval-1", decision="acceptForSession", key="approval:1"
+    )
+    reply.finished.emit()
+
+    assert failures == [("approval:1", "Approval already resolved")]
+
+
+def test_api_client_rejects_malformed_and_oversized_approval_responses() -> None:
+    _application()
+    malformed = FakeReply(b"not-json", status=200)
+    oversized = FakeReply(b"x" * 4097, status=200)
+    manager = FakeManager([malformed, oversized])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, str]] = []
+    client.control_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_approval(
+        "A" * 32, request_id=1, decision="accept", key="approval:malformed"
+    )
+    malformed.finished.emit()
+    assert client.post_control_approval(
+        "A" * 32, request_id=2, decision="decline", key="approval:oversized"
+    )
+    oversized.readyRead.emit()
+
+    assert failures == [
+        ("approval:malformed", "Invalid approval response"),
+        ("approval:oversized", "Bridge control request failed"),
+    ]
+    assert oversized.aborted and oversized.deleted
+
+
 def test_api_client_posts_json_payload() -> None:
     _application()
     reply = FakeReply(b"{}", status=200)

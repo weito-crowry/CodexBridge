@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from typing import Any
 
 import pytest
 from starlette.requests import Request
 
 from codex_bridge.activity import ActivityStore
+from codex_bridge.bridge import ApprovalConflictError
 from codex_bridge.config import BridgeConfig
 from codex_bridge.history import HistoryValidationError
 from codex_bridge.jsonrpc import JsonRpcClosedError, JsonRpcRemoteError
@@ -19,6 +21,7 @@ class FakeBridge:
     def __init__(self) -> None:
         self.app_server_ready = True
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self.approval_error: Exception | None = None
 
     async def threads(
         self,
@@ -106,6 +109,12 @@ class FakeBridge:
                 "secondary": {"windowDurationMins": 10080, "usedPercent": 39},
             }
         }
+
+    async def approve(self, request_id: int | str, decision: str) -> dict[str, Any]:
+        self.calls.append(("approve", (request_id, decision), {}))
+        if self.approval_error is not None:
+            raise self.approval_error
+        return {"state": "in_progress"}
 
 
 def config(tmp_path) -> BridgeConfig:
@@ -416,6 +425,9 @@ async def test_control_route_is_not_registered_without_token_or_callback(tmp_pat
     assert "/ui-api/control/shutdown" not in {
         route.path for route in app.routes if hasattr(route, "path")
     }
+    assert "/ui-api/control/approval" not in {
+        route.path for route in app.routes if hasattr(route, "path")
+    }
 
     sent: list[dict[str, Any]] = []
 
@@ -479,6 +491,115 @@ async def test_control_route_authenticates_and_runs_shutdown_after_response(tmp_
     assert response.background is not None
     await response.background()
     assert calls == ["shutdown"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["accept", "acceptForSession", "decline", "cancel"])
+async def test_approval_control_route_authenticates_and_uses_bridge_approval(
+    tmp_path, decision: str
+) -> None:
+    token = "approval-control-token"
+    bridge = FakeBridge()
+    app = create_ui_app(
+        bridge,
+        ActivityStore(),
+        replace(config(tmp_path), control_token=token),
+    )
+    route = _route(app, "/ui-api/control/approval")
+    response = await route.endpoint(
+        _request(
+            "/ui-api/control/approval",
+            method="POST",
+            authorization=f"Bearer {token}",
+            body=json.dumps({"request_id": 123, "decision": decision}).encode(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert await _json_response(response) == {"status": "approval_resolved"}
+    assert bridge.calls == [("approve", (123, decision), {})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorization", [None, "Bearer", "Basic token", "Bearer wrong"])
+async def test_approval_control_route_rejects_missing_or_invalid_token(
+    tmp_path, authorization: str | None
+) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(
+        bridge,
+        ActivityStore(),
+        replace(config(tmp_path), control_token="valid-token"),
+    )
+
+    response = await _route(app, "/ui-api/control/approval").endpoint(
+        _request(
+            "/ui-api/control/approval",
+            method="POST",
+            authorization=authorization,
+            body=b'{"request_id":1,"decision":"accept"}',
+        )
+    )
+
+    assert response.status_code == 403
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approval_control_route_rejects_unknown_decision_and_malformed_request(
+    tmp_path,
+) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(
+        bridge,
+        ActivityStore(),
+        replace(config(tmp_path), control_token="valid-token"),
+    )
+    route = _route(app, "/ui-api/control/approval")
+
+    invalid_decision = await route.endpoint(
+        _request(
+            "/ui-api/control/approval",
+            method="POST",
+            authorization="Bearer valid-token",
+            body=b'{"request_id":1,"decision":"run arbitrary"}',
+        )
+    )
+    malformed_request = await route.endpoint(
+        _request(
+            "/ui-api/control/approval",
+            method="POST",
+            authorization="Bearer valid-token",
+            body=b'{"request_id":true,"decision":"accept"}',
+        )
+    )
+
+    assert invalid_decision.status_code == 400
+    assert malformed_request.status_code == 400
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approval_control_route_reports_already_resolved_conflict(tmp_path) -> None:
+    bridge = FakeBridge()
+    bridge.approval_error = ApprovalConflictError("unknown approval request")
+    app = create_ui_app(
+        bridge,
+        ActivityStore(),
+        replace(config(tmp_path), control_token="valid-token"),
+    )
+
+    response = await _route(app, "/ui-api/control/approval").endpoint(
+        _request(
+            "/ui-api/control/approval",
+            method="POST",
+            authorization="Bearer valid-token",
+            body=b'{"request_id":"approval-1","decision":"accept"}',
+        )
+    )
+
+    assert response.status_code == 409
+    assert await _json_response(response) == {"error": "already_resolved"}
 
 
 @pytest.mark.asyncio

@@ -279,7 +279,7 @@ LLM-facing tools.
 | Tool | Purpose |
 | --- | --- |
 | `codex_targets` | List configured execution targets and best-effort availability. |
-| `codex_start` | Start a Codex thread/turn with optional target, model, and reasoning effort. |
+| `codex_start` | Start a Codex thread/turn with optional target, model, reasoning effort, and sandbox mode. |
 | `codex_continue` | Start a new turn on an existing thread, resuming it when necessary. |
 | `codex_wait` | Long-poll one turn without creating another turn. |
 | `codex_steer` | Send additional input to the expected active turn. |
@@ -296,10 +296,11 @@ Normalized turn states are `in_progress`, `needs_approval`, `needs_input`, `comp
 
 | Tool | Purpose |
 | --- | --- |
-| `codex_setup` | Open/describe the target, model, and reasoning setup flow. |
+| `codex_setup` | Open/describe the target, model, reasoning, and access-mode setup flow. |
 
 When the client advertises MCP Apps support, `codex_setup` can render the bundled setup UI. The UI
-revalidates the selected target/model/reasoning combination on the server before confirming it.
+revalidates the selected target/model/reasoning/access combination on the server before confirming
+it. Access defaults to `Default` (`inherit`).
 
 ### Diagnostic probes
 
@@ -316,7 +317,8 @@ IDs, or arbitrary metadata values.
 
 ## Recommended Codex workflow
 
-1. Call `codex_start` with an allowed absolute `cwd` and a complete task prompt.
+1. Call `codex_start` with an allowed absolute `cwd` and a complete task prompt. Optionally set
+   `sandbox_mode="danger-full-access"` when the thread needs Full Access.
 2. Call `codex_wait` with the returned `thread_id` and `turn_id`.
 3. If the result is `needs_approval`, inspect `pending_request` and call `codex_approval` with an
    explicit decision.
@@ -329,6 +331,17 @@ Repeating `codex_wait` with the same IDs is expected and does not create a new C
 
 After a bridge restart, `codex_continue` can resume a persisted native Codex thread after its stored
 working directory passes the same allowed-root validation.
+
+## Full Access
+
+`codex_start` accepts `sandbox_mode="inherit"` or `sandbox_mode="danger-full-access"`. The default
+is `inherit`, which leaves the sandbox setting to Codex. Full Access selects Codex's
+`danger-full-access` sandbox mode for that new thread. It does not disable or change the Codex
+approval policy; approvals remain active according to that policy.
+
+The configured `allowed_roots` check remains in force for the thread's working directory. It limits
+which `cwd` CodexBridge can start or resume and is independent of the sandbox mode used after the
+thread starts.
 
 ## Approval and data boundaries
 
@@ -384,13 +397,17 @@ It provides:
 - 5-hour and weekly remaining-percentage series.
 - Confirmed weekly-reset candidate markers/history.
 - CSV export for the selected usage-history range.
+- Review and resolve pending approvals for a Bridge started by this Console, using the same approval
+  handling as the `codex_approval` MCP tool.
 
 Usage snapshots are stored locally in SQLite. On Windows the default location is under
 `%LOCALAPPDATA%\CodexBridge\usage-history.sqlite3`; on other platforms it follows
 `XDG_STATE_HOME` or `~/.local/state`.
 
 The Console never takes ownership of an already-running external Bridge. Lifecycle controls remain
-disabled for external Bridge processes.
+disabled for external Bridge processes. Pending approval details can be viewed, but approval
+controls are unavailable without the Console-owned control token; resolve those requests through an
+MCP client instead.
 
 The local UI API stays bound to `127.0.0.1` and is never exposed through the MCP tunnel.
 

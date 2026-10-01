@@ -7,9 +7,11 @@ from typing import Any, Protocol
 from PySide6.QtCore import QObject, QUrl, QUrlQuery, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
+from ..models import ApprovalDecision, RequestId
 from .sse import SseParser, SseProtocolError, parse_activity_event
 
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024
+_APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
 
 
 class ApiClientError(RuntimeError):
@@ -58,6 +60,8 @@ class ApiClient(QObject):
         self._json_replies: dict[str, Any] = {}
         self._control_replies: dict[str, Any] = {}
         self._control_response_sizes: dict[str, int] = {}
+        self._control_response_bodies: dict[str, bytearray] = {}
+        self._control_kinds: dict[str, str] = {}
         self._stream_reply: Any | None = None
         self._stream_generation: int | None = None
         self._stream_parser: SseParser | None = None
@@ -158,6 +162,45 @@ class ApiClient(QObject):
             return False
         self._control_replies[key] = reply
         self._control_response_sizes[key] = 0
+        self._control_response_bodies[key] = bytearray()
+        self._control_kinds[key] = "shutdown"
+        reply.readyRead.connect(lambda key=key, reply=reply: self._consume_control_data(key, reply))
+        reply.finished.connect(lambda key=key, reply=reply: self._finish_control(key, reply))
+        return True
+
+    def post_control_approval(
+        self,
+        token: str,
+        *,
+        request_id: RequestId,
+        decision: ApprovalDecision,
+        key: str,
+    ) -> bool:
+        if key in self._control_replies:
+            return False
+        if (
+            isinstance(request_id, bool)
+            or not isinstance(request_id, (int, str))
+            or not isinstance(decision, str)
+            or decision not in _APPROVAL_DECISIONS
+        ):
+            self.control_failed.emit(key, "Bridge control request failed")
+            return False
+        try:
+            request = self._request(self._url("/ui-api/control/approval"))
+            request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
+            request.setRawHeader(b"Content-Type", b"application/json")
+            body = json.dumps(
+                {"request_id": request_id, "decision": decision}, separators=(",", ":")
+            ).encode("utf-8")
+            reply = self._manager.post(request, body)
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.control_failed.emit(key, "Bridge control request failed")
+            return False
+        self._control_replies[key] = reply
+        self._control_response_sizes[key] = 0
+        self._control_response_bodies[key] = bytearray()
+        self._control_kinds[key] = "approval"
         reply.readyRead.connect(lambda key=key, reply=reply: self._consume_control_data(key, reply))
         reply.finished.connect(lambda key=key, reply=reply: self._finish_control(key, reply))
         return True
@@ -168,6 +211,8 @@ class ApiClient(QObject):
             return
         self._control_replies.pop(key, None)
         self._control_response_sizes.pop(key, None)
+        self._control_response_bodies.pop(key, None)
+        self._control_kinds.pop(key, None)
         active_reply.abort()
         active_reply.deleteLater()
         self.control_failed.emit(key, "Bridge control request failed")
@@ -186,6 +231,7 @@ class ApiClient(QObject):
         if size > _MAX_CONTROL_RESPONSE_BYTES:
             self._fail_control_reply(key, reply)
             return False
+        self._control_response_bodies.setdefault(key, bytearray()).extend(chunk)
         return True
 
     def _finish_control(self, key: str, reply: Any) -> None:
@@ -196,9 +242,24 @@ class ApiClient(QObject):
             return
         self._control_replies.pop(key, None)
         self._control_response_sizes.pop(key, None)
+        body = bytes(self._control_response_bodies.pop(key, bytearray()))
+        kind = self._control_kinds.pop(key, "shutdown")
         try:
             status = self._status(reply)
-            if self._has_network_error(reply) or status != 202:
+            if self._has_network_error(reply):
+                raise ApiClientError("Bridge control request failed")
+            if kind == "approval":
+                if status == 409:
+                    raise ApiClientError("Approval already resolved")
+                if status != 200:
+                    raise ApiClientError("Bridge control request failed")
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError, TypeError) as exc:
+                    raise ApiClientError("Invalid approval response") from exc
+                if not isinstance(payload, dict) or payload.get("status") != "approval_resolved":
+                    raise ApiClientError("Invalid approval response")
+            elif status != 202:
                 raise ApiClientError("Bridge control request failed")
             self.control_succeeded.emit(key)
         except ApiClientError as exc:
@@ -313,4 +374,6 @@ class ApiClient(QObject):
             reply.deleteLater()
         self._control_replies.clear()
         self._control_response_sizes.clear()
+        self._control_response_bodies.clear()
+        self._control_kinds.clear()
         self.stop_stream()

@@ -46,12 +46,15 @@ class FakeBridge:
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        sandbox_mode: str | None = None,
     ) -> dict[str, Any]:
         kwargs = {}
         if model is not None:
             kwargs["model"] = model
         if reasoning_effort is not None:
             kwargs["reasoning_effort"] = reasoning_effort
+        if sandbox_mode is not None:
+            kwargs["sandbox_mode"] = sandbox_mode
         self.calls.append(("start", (cwd, prompt), kwargs))
         return {"ok": True, "thread_id": "native-local", "turn_id": "turn-local"}
 
@@ -67,6 +70,10 @@ class FakeBridge:
                 }
             ],
             "defaults": {"model": "model-a", "reasoning_effort": "high"},
+            "execution_modes": [
+                {"id": "inherit", "display_name": "Default"},
+                {"id": "danger-full-access", "display_name": "Full access"},
+            ],
         }
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
@@ -219,6 +226,73 @@ async def test_remote_start_forwards_confirmed_model_and_effort_with_metadata() 
 
 
 @pytest.mark.asyncio
+async def test_local_full_access_is_forwarded_and_reported_without_model() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    result = await router.codex_start("D:/repo", "do work", sandbox_mode="danger-full-access")
+
+    assert bridge.calls == [
+        ("start", ("D:/repo", "do work"), {"sandbox_mode": "danger-full-access"})
+    ]
+    assert result["execution_config"] == {
+        "target_id": "main-pc",
+        "model": None,
+        "reasoning_effort": None,
+        "sandbox_mode": "danger-full-access",
+    }
+
+
+@pytest.mark.asyncio
+async def test_remote_full_access_is_forwarded_and_inherit_is_omitted() -> None:
+    class FullAccessRemote(FakeRemote):
+        async def setup_capabilities(self) -> dict[str, Any]:
+            self.calls.append(("codex_setup_capabilities", {"target_id": "local"}))
+            return {
+                "models": [
+                    {
+                        "model": "model-a",
+                        "display_name": "Model A",
+                        "description": None,
+                        "reasoning_efforts": [{"id": "high", "description": None}],
+                        "default_reasoning_effort": "high",
+                    }
+                ],
+                "defaults": {"model": "model-a", "reasoning_effort": "high"},
+                "execution_modes": [
+                    {"id": "inherit", "display_name": "Default"},
+                    {"id": "danger-full-access", "display_name": "Full access"},
+                ],
+            }
+
+    remote = FullAccessRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    full_access = await router.codex_start(
+        "Z:/Notebook/repo", "prompt", "notebook", sandbox_mode="danger-full-access"
+    )
+    inherited = await router.codex_start(
+        "Z:/Notebook/repo", "prompt", "notebook", sandbox_mode="inherit"
+    )
+
+    assert remote.calls == [
+        ("codex_setup_capabilities", {"target_id": "local"}),
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "sandbox_mode": "danger-full-access",
+            },
+        ),
+        ("codex_start", {"cwd": "Z:/Notebook/repo", "prompt": "prompt"}),
+    ]
+    assert full_access["execution_config"]["sandbox_mode"] == "danger-full-access"
+    assert inherited["execution_config"]["sandbox_mode"] == "inherit"
+
+
+@pytest.mark.asyncio
 async def test_setup_capabilities_returns_local_catalog_with_target_metadata() -> None:
     router, _, _ = make_router(LOCAL)
 
@@ -231,6 +305,10 @@ async def test_setup_capabilities_returns_local_catalog_with_target_metadata() -
         "available": True,
     }
     assert result["models"][0]["model"] == "model-a"
+    assert result["execution_modes"] == [
+        {"id": "inherit", "display_name": "Default"},
+        {"id": "danger-full-access", "display_name": "Full access"},
+    ]
     assert "url" not in str(result)
 
 
@@ -372,6 +450,31 @@ async def test_confirm_setup_revalidates_unknown_unavailable_and_stale_selection
         await router.confirm_setup("main-pc", "stale-model", "high")
     with pytest.raises(ExecutionTargetError, match="reasoning effort is not supported"):
         await router.confirm_setup("main-pc", "model-a", "low")
+
+
+@pytest.mark.asyncio
+async def test_confirm_setup_validates_and_returns_sandbox_mode() -> None:
+    router, _, _ = make_router(LOCAL)
+
+    result = await router.confirm_setup(
+        "main-pc", "model-a", "high", sandbox_mode="danger-full-access"
+    )
+
+    assert result["selection"]["sandbox_mode"] == "danger-full-access"
+    with pytest.raises(ExecutionTargetError, match="sandbox_mode"):
+        await router.confirm_setup("main-pc", "model-a", "high", sandbox_mode="unknown")
+
+
+@pytest.mark.asyncio
+async def test_old_remote_refuses_full_access_start() -> None:
+    router, _, remotes = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError, match="sandbox_mode is not supported"):
+        await router.codex_start(
+            "Z:/Notebook/repo", "prompt", "notebook", sandbox_mode="danger-full-access"
+        )
+
+    assert [name for name, _ in remotes["notebook"].calls] == ["codex_setup_capabilities"]
 
 
 @pytest.mark.asyncio
