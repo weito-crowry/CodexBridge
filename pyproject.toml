@@ -36,6 +36,17 @@ codex-bridge-console = "codex_bridge.console_entry:main"
 packages = ["src/codex_bridge"]
 include = ["src/codex_bridge/assets/*.html", "src/codex_bridge/assets/*.ico"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/ui/setup/node_modules/",
+    "/ui/setup/dist/",
+    "/dist/",
+    "/build/",
+    "/.venv/",
+    "/.tools/",
+    "/integration-artifacts/",
+]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 asyncio_mode = "auto"

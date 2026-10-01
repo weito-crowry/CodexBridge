@@ -16,5 +16,6 @@ for (const match of [...html.matchAll(/<link[^>]*href="([^"]+\.css)"[^>]*>/g)]) 
   html = html.replace(match[0], () => replacement);
 }
 html = html.replace(/<link rel="modulepreload"[^>]*>/g, "");
+html = `${html.replace(/\r\n?/g, "\n").replace(/\n+$/, "")}\n`;
 const destination = join(import.meta.dirname, "..", "..", "src", "codex_bridge", "assets", "codexbridge_setup_app.html");
 await writeFile(destination, html, "utf8");

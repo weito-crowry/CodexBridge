@@ -19,6 +19,17 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Keep unrelated ICU DLLs found on the build machine's PATH out of the package.
+# QtCore imports the Windows ICU API; a bundled third-party ICU can shadow it
+# with an incompatible ABI (for example, Poppler's versioned ICU exports).
+a.binaries = [
+    binary
+    for binary in a.binaries
+    if not (
+        Path(binary[0]).name.casefold() == "icuuc.dll"
+        and "pyside6" not in {part.casefold() for part in Path(binary[1]).parts}
+    )
+]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
