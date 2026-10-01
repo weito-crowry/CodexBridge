@@ -11,6 +11,7 @@ from mcp import ClientSession, MCPError, types
 from mcp.server.lowlevel import Server as LowLevelServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
+from starlette.datastructures import Headers
 
 from codex_bridge.config import (
     BridgeConfig,
@@ -102,12 +103,14 @@ class ProbeSession:
 def probe_context(
     meta: dict[str, Any] | None = None,
     client_capabilities: types.ClientCapabilities | None = None,
+    request: Any = None,
 ) -> tuple[Context, ProbeSession]:
     session = ProbeSession(client_capabilities)
     request_context = SimpleNamespace(
         meta=meta,
         protocol_version="2026-07-28",
         session=session,
+        request=request,
     )
     return Context(request_context=request_context), session
 
@@ -156,7 +159,9 @@ def test_server_registers_thirteen_native_tools_plus_local_probe_tools(tmp_path)
         "mcp_long_wait_probe",
         "mcp_long_wait_progress_probe",
         "mcp_progress_token_probe",
+        "mcp_request_headers_probe",
     }
+    assert len(probe_names) == 5
     assert len(names - probe_names) == 13
     assert names - probe_names == {
         "codex_targets",
@@ -370,6 +375,214 @@ async def test_mcp_progress_token_probe_omits_absent_or_malformed_client_info(
         result = await tool.fn(context)
 
         assert result["client_info"] is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_request_headers_probe_reports_standard_headers_without_starting_codex(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_request_headers_probe"
+    )
+    context, _ = probe_context(
+        request=SimpleNamespace(
+            headers=Headers(
+                {
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "tools/call",
+                    "Mcp-Name": "mcp_request_headers_probe",
+                }
+            )
+        )
+    )
+
+    result = await tool.fn(context)
+
+    assert result["probe"] == "mcp_request_headers_probe"
+    assert result["transport_request_available"] is True
+    assert result["mcp_protocol_version_header"] == "2026-07-28"
+    assert result["mcp_method_header"] == "tools/call"
+    assert result["mcp_name_header"] == "mcp_request_headers_probe"
+    assert result["mcp_session_id_present"] is False
+    assert result["protocol_version_from_context"] == "2026-07-28"
+    assert result["protocol_version_matches_context"] is True
+    assert result["method_matches_tools_call"] is True
+    assert result["name_matches_probe"] is True
+    assert result["codex_invoked"] is False
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_request_headers_probe_matches_header_names_case_insensitively(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_request_headers_probe"
+    )
+    context, _ = probe_context(
+        request=SimpleNamespace(
+            headers=Headers(
+                {
+                    "mCp-pRoToCoL-vErSiOn": "2026-07-28",
+                    "MCP-METHOD": "tools/call",
+                    "mCp-NaMe": "mcp_request_headers_probe",
+                }
+            )
+        )
+    )
+
+    result = await tool.fn(context)
+
+    assert result["mcp_protocol_version_header"] == "2026-07-28"
+    assert result["mcp_method_header"] == "tools/call"
+    assert result["mcp_name_header"] == "mcp_request_headers_probe"
+    assert result["protocol_version_matches_context"] is True
+    assert result["method_matches_tools_call"] is True
+    assert result["name_matches_probe"] is True
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_request_headers_probe_reports_session_header_presence_without_value(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_request_headers_probe"
+    )
+    context, _ = probe_context(
+        request=SimpleNamespace(headers=Headers({"Mcp-Session-Id": "SECRET_SESSION_VALUE"}))
+    )
+
+    result = await tool.fn(context)
+    serialized = json.dumps(result, sort_keys=True)
+
+    assert result["transport_request_available"] is True
+    assert result["mcp_session_id_present"] is True
+    assert "SECRET_SESSION_VALUE" not in serialized
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_request_headers_probe_omits_unrelated_sensitive_headers(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_request_headers_probe"
+    )
+    context, _ = probe_context(
+        request=SimpleNamespace(
+            headers=Headers(
+                {
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "tools/call",
+                    "Mcp-Name": "mcp_request_headers_probe",
+                    "Authorization": "Bearer SUPER_SECRET",
+                    "Cookie": "SECRET_COOKIE",
+                    "X-Forwarded-For": "1.2.3.4",
+                    "OpenAI-Secret-Test": "DO_NOT_LEAK",
+                    "Host": "secret.example",
+                    "Origin": "https://secret.example",
+                    "User-Agent": "secret-agent",
+                    "Cloudflare-Trace-Id": "SECRET_CF_ID",
+                }
+            )
+        )
+    )
+
+    result = await tool.fn(context)
+    serialized = json.dumps(result, sort_keys=True)
+
+    for sensitive_value in (
+        "SUPER_SECRET",
+        "SECRET_COOKIE",
+        "1.2.3.4",
+        "DO_NOT_LEAK",
+        "secret.example",
+        "secret-agent",
+        "SECRET_CF_ID",
+    ):
+        assert sensitive_value not in serialized
+    assert "authorization" not in serialized.lower()
+    assert "cookie" not in serialized.lower()
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_request_headers_probe_returns_empty_observations_without_request(
+    tmp_path,
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_request_headers_probe"
+    )
+
+    for request in (None, SimpleNamespace(), SimpleNamespace(headers=None)):
+        context, _ = probe_context(request=request)
+
+        result = await tool.fn(context)
+
+        assert result["transport_request_available"] is False
+        assert result["mcp_protocol_version_header"] is None
+        assert result["mcp_method_header"] is None
+        assert result["mcp_name_header"] is None
+        assert result["mcp_session_id_present"] is False
+        assert result["protocol_version_from_context"] == "2026-07-28"
+        assert result["protocol_version_matches_context"] is None
+        assert result["method_matches_tools_call"] is None
+        assert result["name_matches_probe"] is None
+        assert result["codex_invoked"] is False
+
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_request_headers_probe_sanitizes_malformed_values(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "mcp_request_headers_probe"
+    )
+    context, _ = probe_context(
+        request=SimpleNamespace(
+            headers={
+                "MCP-Protocol-Version": "v" * 129,
+                "Mcp-Method": "tools/call\r\nAuthorization: Bearer NEVER_ECHO",
+                "Mcp-Name": "mcp_request_headers_probe\x00bad",
+            }
+        )
+    )
+
+    result = await tool.fn(context)
+    serialized = json.dumps(result, sort_keys=True)
+
+    assert result["transport_request_available"] is True
+    assert result["mcp_protocol_version_header"] is None
+    assert result["mcp_method_header"] is None
+    assert result["mcp_name_header"] is None
+    assert result["protocol_version_matches_context"] is False
+    assert result["method_matches_tools_call"] is False
+    assert result["name_matches_probe"] is False
+    assert "NEVER_ECHO" not in serialized
+    assert runtime.bridge.start_count == 0
 
 
 @pytest.mark.asyncio

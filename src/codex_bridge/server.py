@@ -414,6 +414,83 @@ def create_app(
         }
 
     @mcp.tool()
+    async def mcp_request_headers_probe(ctx: Context) -> dict[str, Any]:
+        """Report allowlisted MCP routing headers without exposing other headers."""
+        max_header_value_length = 128
+
+        def safe_header_value(value: object) -> str | None:
+            if not isinstance(value, str):
+                return None
+            if len(value) > max_header_value_length or not value.isprintable():
+                return None
+            return value
+
+        header_values: dict[str, str | None] = {
+            "mcp-protocol-version": None,
+            "mcp-method": None,
+            "mcp-name": None,
+        }
+        present_headers: set[str] = set()
+        mcp_session_id_present = False
+        transport_request_available = False
+
+        try:
+            request = ctx.request_context.request
+            headers = getattr(request, "headers", None)
+            if isinstance(headers, Mapping):
+                try:
+                    for name, value in headers.items():
+                        if not isinstance(name, str):
+                            continue
+                        normalized_name = name.lower()
+                        if normalized_name == "mcp-session-id":
+                            mcp_session_id_present = True
+                        elif normalized_name in header_values:
+                            present_headers.add(normalized_name)
+                            header_values[normalized_name] = safe_header_value(value)
+                    transport_request_available = True
+                except Exception:
+                    header_values = {name: None for name in header_values}
+                    present_headers.clear()
+                    mcp_session_id_present = False
+        except Exception:
+            pass
+
+        try:
+            protocol_version_from_context = safe_header_value(ctx.protocol_version)
+        except Exception:
+            protocol_version_from_context = None
+
+        protocol_header = header_values["mcp-protocol-version"]
+        method_header = header_values["mcp-method"]
+        name_header = header_values["mcp-name"]
+
+        return {
+            "probe": "mcp_request_headers_probe",
+            "transport_request_available": transport_request_available,
+            "mcp_protocol_version_header": protocol_header,
+            "mcp_method_header": method_header,
+            "mcp_name_header": name_header,
+            "mcp_session_id_present": mcp_session_id_present,
+            "protocol_version_from_context": protocol_version_from_context,
+            "protocol_version_matches_context": (
+                protocol_header == protocol_version_from_context
+                if "mcp-protocol-version" in present_headers
+                and protocol_version_from_context is not None
+                else None
+            ),
+            "method_matches_tools_call": (
+                method_header == "tools/call" if "mcp-method" in present_headers else None
+            ),
+            "name_matches_probe": (
+                name_header == "mcp_request_headers_probe"
+                if "mcp-name" in present_headers
+                else None
+            ),
+            "codex_invoked": False,
+        }
+
+    @mcp.tool()
     async def codex_start(
         cwd: str,
         prompt: str,
