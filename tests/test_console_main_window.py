@@ -878,9 +878,10 @@ def test_usage_sample_refreshes_only_a_visible_history_window(
     )
 
     history_window.show()
+    assert refresh_calls == [{"rolling": True}, {"rolling": True}]
     current_epoch[0] += 60
     deliver_sample(55)
-    assert refresh_calls == [{"rolling": True}, {"rolling": True}]
+    assert refresh_calls == [{"rolling": True}, {"rolling": True}, {"rolling": True}]
     assert (
         len(get_usage_samples(current_epoch[0] - 1, current_epoch[0], database_path=database_path))
         == 1
