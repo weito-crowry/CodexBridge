@@ -122,6 +122,21 @@ def test_usage_history_presets_replace_range_and_manual_edit_selects_custom(
     window.close()
 
 
+def test_24_hour_preset_uses_rolling_window_and_time_axis(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: float(now))
+
+    assert "24 hours" in window.preset_buttons
+    window.preset_buttons["24 hours"].click()
+
+    assert window.selected_preset == "24 hours"
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == now
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == now - 24 * 60 * 60
+    assert window.time_axis.format() == "HH:mm"
+    window.close()
+
+
 def test_invalid_range_does_not_query_or_crash(tmp_path: Path, monkeypatch) -> None:
     _application()
     now = _epoch(2026, 9, 30)
