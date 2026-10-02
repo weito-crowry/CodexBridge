@@ -18,8 +18,18 @@ from PySide6.QtCharts import (
     QScatterSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QByteArray, QDateTime, QMargins, QSettings, Qt
-from PySide6.QtGui import QBrush, QCloseEvent, QCursor, QFont, QPainter, QPalette, QPen
+from PySide6.QtCore import QByteArray, QDateTime, QMargins, QSettings, Qt, QTimer
+from PySide6.QtGui import (
+    QBrush,
+    QCloseEvent,
+    QCursor,
+    QFont,
+    QHideEvent,
+    QPainter,
+    QPalette,
+    QPen,
+    QShowEvent,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -51,8 +61,9 @@ from .usage_history import (
 
 _DAY = 24 * 60 * 60
 _TARGET_POINTS = 4_000
+_AUTO_REFRESH_INTERVAL_MS = 60_000
 _GEOMETRY_KEY = "console/usageHistory/geometry"
-_PRESETS = (("7 days", 7), ("1 month", 30), ("1 year", 365))
+_PRESETS = (("24 hours", 1), ("7 days", 7), ("1 month", 30), ("1 year", 365))
 
 
 def format_sample_tooltip(sample: UsageHistorySample) -> str:
@@ -113,6 +124,7 @@ def export_usage_history_csv(
 
 class UsageHistoryWindow(QMainWindow):
     preset_object_names = {
+        "24 hours": "usagePreset24Hours",
         "7 days": "usagePreset7Days",
         "1 month": "usagePreset1Month",
         "1 year": "usagePreset1Year",
@@ -136,6 +148,9 @@ class UsageHistoryWindow(QMainWindow):
         self._selected_preset = "1 month"
         self._display_samples: list[UsageHistorySample] = []
         self._events: list[UsageHistoryEvent] = []
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(_AUTO_REFRESH_INTERVAL_MS)
+        self._auto_refresh_timer.timeout.connect(lambda: self.refresh(rolling=True))
 
         self.setWindowTitle("Usage History · CodexBridge Console")
         self.setMinimumSize(900, 580)
@@ -175,7 +190,8 @@ class UsageHistoryWindow(QMainWindow):
         self.preset_group = QButtonGroup(self)
         self.preset_group.setExclusive(True)
         self.preset_buttons: dict[str, QToolButton] = {}
-        for index, label in enumerate(("7 days", "1 month", "1 year", "Custom")):
+        preset_labels = tuple(label for label, _days in _PRESETS) + ("Custom",)
+        for index, label in enumerate(preset_labels):
             button = QToolButton(self)
             button.setText(label)
             button.setCheckable(True)
@@ -192,7 +208,7 @@ class UsageHistoryWindow(QMainWindow):
                 button.setStyleSheet(
                     button.styleSheet() + "QToolButton { border-radius: 5px 0 0 5px; }"
                 )
-            elif index == 3:
+            elif label == "Custom":
                 button.setStyleSheet(
                     button.styleSheet() + "QToolButton { border-radius: 0 5px 5px 0; }"
                 )
@@ -240,7 +256,7 @@ class UsageHistoryWindow(QMainWindow):
         self.start_edit.dateTimeChanged.connect(self._on_range_edited)
         self.end_edit.dateTimeChanged.connect(self._on_range_edited)
         self.axis_mode_combo.currentTextChanged.connect(self._update_axis_format)
-        self.refresh_button.clicked.connect(lambda: self.refresh())
+        self.refresh_button.clicked.connect(lambda: self.refresh(rolling=True))
         self.export_button.clicked.connect(self._export_csv)
 
         summary = QHBoxLayout()
@@ -686,7 +702,17 @@ class UsageHistoryWindow(QMainWindow):
             available.top() + max(0, (available.height() - self.height()) // 2),
         )
 
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self.refresh(rolling=True)
+        self._auto_refresh_timer.start()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        self._auto_refresh_timer.stop()
+        super().hideEvent(event)
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._auto_refresh_timer.stop()
         self._settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
         self._settings.sync()
         super().closeEvent(event)

@@ -57,6 +57,119 @@ def test_usage_history_window_starts_at_one_month_with_auto_axis(tmp_path: Path)
     window.close()
 
 
+def test_usage_history_auto_refresh_timer_uses_one_minute_interval(tmp_path: Path) -> None:
+    _application()
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3")
+
+    assert window._auto_refresh_timer.parent() is window
+    assert window._auto_refresh_timer.interval() == 60_000
+    assert not window._auto_refresh_timer.isActive()
+    window.close()
+
+
+def test_show_refreshes_rolling_range_and_starts_auto_refresh_timer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application = _application()
+    current_time = [_epoch(2026, 9, 30)]
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: float(current_time[0]),
+    )
+    window.preset_buttons["24 hours"].click()
+    current_time[0] += 60 * 60
+    calls: list[bool] = []
+
+    def record_refresh(*, rolling: bool = False) -> bool:
+        calls.append(rolling)
+        return True
+
+    monkeypatch.setattr(window, "refresh", record_refresh)
+
+    window.show()
+    application.processEvents()
+
+    assert calls == [True]
+    assert window._auto_refresh_timer.isActive()
+    window.close()
+
+
+def test_auto_refresh_timeout_requests_rolling_refresh(tmp_path: Path, monkeypatch) -> None:
+    _application()
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3")
+    calls: list[bool] = []
+
+    def record_refresh(*, rolling: bool = False) -> bool:
+        calls.append(rolling)
+        return True
+
+    monkeypatch.setattr(window, "refresh", record_refresh)
+
+    window._auto_refresh_timer.timeout.emit()
+
+    assert calls == [True]
+    window.close()
+
+
+def test_hide_stops_auto_refresh_timer(tmp_path: Path) -> None:
+    application = _application()
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3")
+    window.show()
+    application.processEvents()
+    assert window._auto_refresh_timer.isActive()
+
+    window.hide()
+    application.processEvents()
+
+    assert not window._auto_refresh_timer.isActive()
+    window.close()
+
+
+def test_reshow_refreshes_current_range_and_restarts_auto_refresh_timer(tmp_path: Path) -> None:
+    application = _application()
+    current_time = [_epoch(2026, 9, 30)]
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: float(current_time[0]),
+    )
+    window.preset_buttons["24 hours"].click()
+    current_time[0] += 60 * 60
+
+    window.show()
+    application.processEvents()
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == current_time[0]
+    assert window._auto_refresh_timer.isActive()
+
+    window.hide()
+    application.processEvents()
+    assert not window._auto_refresh_timer.isActive()
+    current_time[0] += 60
+
+    window.show()
+    application.processEvents()
+
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == current_time[0]
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == current_time[0] - 24 * 60 * 60
+    assert window._auto_refresh_timer.isActive()
+    window.close()
+
+
+def test_close_stops_auto_refresh_timer_and_saves_geometry(tmp_path: Path) -> None:
+    application = _application()
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
+    window.show()
+    application.processEvents()
+    assert window._auto_refresh_timer.isActive()
+    expected_geometry = window.saveGeometry()
+
+    window.close()
+    application.processEvents()
+
+    assert not window._auto_refresh_timer.isActive()
+    assert settings.value("console/usageHistory/geometry") == expected_geometry
+
+
 def test_usage_history_summary_cards_use_console_dark_theme_styles(tmp_path: Path) -> None:
     _application()
     window = UsageHistoryWindow(tmp_path / "usage.sqlite3")
@@ -119,6 +232,21 @@ def test_usage_history_presets_replace_range_and_manual_edit_selects_custom(
 
     assert window.selected_preset == "Custom"
     assert window.findChild(QToolButton, window.preset_object_names["Custom"]).isChecked()
+    window.close()
+
+
+def test_24_hour_preset_uses_rolling_window_and_time_axis(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    window = UsageHistoryWindow(tmp_path / "usage.sqlite3", now=lambda: float(now))
+
+    assert "24 hours" in window.preset_buttons
+    window.preset_buttons["24 hours"].click()
+
+    assert window.selected_preset == "24 hours"
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == now
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == now - 24 * 60 * 60
+    assert window.time_axis.format() == "HH:mm"
     window.close()
 
 
@@ -463,6 +591,23 @@ def test_manual_refresh_keeps_custom_range(tmp_path: Path) -> None:
     window.close()
 
 
+def test_refresh_button_rolls_24_hour_preset_to_current_time(tmp_path: Path) -> None:
+    _application()
+    current_time = [_epoch(2026, 9, 30)]
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: float(current_time[0]),
+    )
+    window.preset_buttons["24 hours"].click()
+    current_time[0] += 60 * 60
+
+    window.refresh_button.click()
+
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == current_time[0]
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == current_time[0] - 24 * 60 * 60
+    window.close()
+
+
 def test_rolling_refresh_updates_presets_but_preserves_custom_dates(tmp_path: Path) -> None:
     _application()
     current_time = [_epoch(2026, 9, 30)]
@@ -484,6 +629,28 @@ def test_rolling_refresh_updates_presets_but_preserves_custom_dates(tmp_path: Pa
     current_time[0] += 24 * 60 * 60
 
     assert window.refresh(rolling=True)
+    assert window.selected_preset == "Custom"
+    assert window.start_edit.dateTime().toSecsSinceEpoch() == custom_start
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == custom_end
+    window.close()
+
+
+def test_timer_and_refresh_button_preserve_custom_range(tmp_path: Path) -> None:
+    _application()
+    current_time = [_epoch(2026, 9, 30)]
+    window = UsageHistoryWindow(
+        tmp_path / "usage.sqlite3",
+        now=lambda: float(current_time[0]),
+    )
+    custom_start = current_time[0] - 10 * 24 * 60 * 60
+    custom_end = current_time[0] - 300
+    window.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(custom_start))
+    window.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(custom_end))
+    current_time[0] += 60 * 60
+
+    window._auto_refresh_timer.timeout.emit()
+    window.refresh_button.click()
+
     assert window.selected_preset == "Custom"
     assert window.start_edit.dateTime().toSecsSinceEpoch() == custom_start
     assert window.end_edit.dateTime().toSecsSinceEpoch() == custom_end
