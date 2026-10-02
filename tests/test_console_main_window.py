@@ -349,6 +349,27 @@ def _history_activity(activity_type: str, activity_id: str, thread_id: str) -> d
     }
 
 
+def _complete_history_snapshot(client: FakeClient, generation: int) -> None:
+    client.result(f"selection:{generation}:turns", {"turns": []})
+    client.result(f"selection:{generation}:items", {"items": []})
+
+
+def _history_items(count: int) -> dict[str, object]:
+    return {
+        "items": [
+            {
+                "turn_id": "turn-a",
+                "item": _item(
+                    f"item-{index}",
+                    "agentMessage",
+                    text="\n".join(f"message {index} line {line}" for line in range(8)),
+                ),
+            }
+            for index in reversed(range(count))
+        ]
+    }
+
+
 def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> None:
     _application()
     client = FakeClient()
@@ -1724,7 +1745,7 @@ def test_ready_bridge_with_threads_and_no_selection_prompts_selection() -> None:
 def test_main_window_tracks_selected_turn_activity_without_refresh_fanout() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window = _usage_window(client)
 
     client.result(
         "threads",
@@ -1747,6 +1768,7 @@ def test_main_window_tracks_selected_turn_activity_without_refresh_fanout() -> N
     )
     assert "thread-a" not in window._active_thread_ids
 
+    _complete_history_snapshot(client, window._selection_generation)
     client.requests.clear()
     window.refresh()
     assert sum(path.endswith("/turns") for _, path, _ in client.requests) == 1
@@ -2119,6 +2141,7 @@ def test_history_activity_refresh_is_debounced_and_does_not_request_status() -> 
     client = FakeClient()
     window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-a")
+    _complete_history_snapshot(client, window._selection_generation)
     client.requests.clear()
 
     non_target_activity = _history_activity("approval_requested", "approval", "thread-a")
@@ -2154,6 +2177,7 @@ def test_history_refresh_keeps_one_pending_refresh_while_requests_are_in_flight(
     client = FakeClient()
     window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-a")
+    _complete_history_snapshot(client, window._selection_generation)
     client.requests.clear()
     generation = window._selection_generation
 
@@ -2192,6 +2216,7 @@ def test_history_refresh_state_and_responses_are_isolated_by_thread_selection() 
     client = FakeClient()
     window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-a")
+    _complete_history_snapshot(client, window._selection_generation)
     client.requests.clear()
     first_generation = window._selection_generation
 
@@ -2210,6 +2235,8 @@ def test_history_refresh_state_and_responses_are_isolated_by_thread_selection() 
     window.select_thread("thread-b")
     assert not window._history_refresh_timer.isActive()
     assert window._history_refresh_pending is False
+
+    _complete_history_snapshot(client, window._selection_generation)
 
     old_items_key = next(key for key, _, _ in first_requests if key.endswith(":items"))
     client.result(
@@ -2230,6 +2257,240 @@ def test_history_refresh_state_and_responses_are_isolated_by_thread_selection() 
         key.startswith(f"selection:{window._selection_generation}:history:")
         for key, _, _ in current_requests
     )
+    window.close()
+
+
+@pytest.mark.parametrize("failed_suffix", ["items", "turns"])
+def test_live_history_failure_preserves_timeline_and_scroll_position(failed_suffix: str) -> None:
+    application = _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.resize(1_000, 650)
+    window.show()
+    window.select_thread("thread-a")
+    generation = window._selection_generation
+    client.result(
+        f"selection:{generation}:turns",
+        {"turns": [{"id": "turn-a", "status": "completed"}]},
+    )
+    client.result(f"selection:{generation}:items", _history_items(32))
+    _wait_for_qt_timer(50)
+
+    scrollbar = window.history_pane._scroll.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    for _ in range(4):
+        application.processEvents()
+    old_value = scrollbar.value()
+    old_entries = list(window._timeline_entries)
+    window.history_pane._follow_newest = False
+    assert not window.history_pane._follow_newest
+
+    client.activity(generation, _history_activity("agent_commentary", "live", "thread-a"))
+    _wait_for_qt_timer(300)
+    live_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(live_requests) == 2
+    failed_key = next(key for key, _, _ in live_requests if key.endswith(failed_suffix))
+    client.failure(failed_key, "Temporary live history failure")
+
+    assert window._timeline_entries == old_entries
+    assert any(
+        widget.objectName() == "historyCard"
+        for widget in window.history_pane._content.findChildren(QFrame)
+    )
+    assert not window.history_pane._empty_label.isVisible()
+    assert scrollbar.value() == old_value
+    assert not window.history_pane._follow_newest
+    assert "Temporary live history failure" in window.bottom_status_label.text()
+
+    remaining_key = next(key for key, _, _ in live_requests if key != failed_key)
+    if remaining_key.endswith(":items"):
+        client.result(remaining_key, {"items": []})
+    else:
+        client.result(remaining_key, {"turns": []})
+    window.close()
+
+
+def test_initial_history_request_is_serialized_before_live_reconciliation() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    generation = window._selection_generation
+    initial_items_key = f"selection:{generation}:items"
+    initial_turns_key = f"selection:{generation}:turns"
+
+    client.activity(generation, _history_activity("agent_message", "new-message", "thread-a"))
+    _wait_for_qt_timer(300)
+
+    assert not any(":history:" in key for key, _, _ in client.requests)
+    assert window._history_refresh_pending
+
+    client.result(initial_turns_key, {"turns": [{"id": "turn-a", "status": "in_progress"}]})
+    client.result(
+        initial_items_key,
+        {"items": [{"turn_id": "turn-a", "item": _item("old", "agentMessage", text="old")}]},
+    )
+    _wait_for_qt_timer(300)
+    live_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(live_requests) == 2
+
+    for key, _, _ in live_requests:
+        if key.endswith(":turns"):
+            client.result(key, {"turns": [{"id": "turn-a", "status": "completed"}]})
+        else:
+            client.result(
+                key,
+                {
+                    "items": [
+                        {"turn_id": "turn-a", "item": _item("new", "agentMessage", text="new")}
+                    ]
+                },
+            )
+
+    assert [entry.item_id for entry in window._timeline_entries] == ["old", "new"]
+    assert window._turn_statuses["turn-a"] == "completed"
+    window.close()
+
+
+def test_manual_snapshot_waits_for_active_history_request_and_replaces_it() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    generation = window._selection_generation
+    items_key = f"selection:{generation}:items"
+    turns_key = f"selection:{generation}:turns"
+
+    window.refresh()
+    assert sum(key == items_key for key, _, _ in client.requests) == 1
+    assert sum(key == turns_key for key, _, _ in client.requests) == 1
+
+    client.result(turns_key, {"turns": [{"id": "turn-a", "status": "in_progress"}]})
+    client.result(
+        items_key,
+        {"items": [{"turn_id": "turn-a", "item": _item("old", "agentMessage", text="old")}]},
+    )
+    assert sum(key == items_key for key, _, _ in client.requests) == 2
+    assert sum(key == turns_key for key, _, _ in client.requests) == 2
+
+    client.result(turns_key, {"turns": [{"id": "turn-a", "status": "completed"}]})
+    client.result(
+        items_key,
+        {"items": [{"turn_id": "turn-a", "item": _item("new", "agentMessage", text="new")}]},
+    )
+    assert [entry.item_id for entry in window._timeline_entries] == ["new"]
+    window.close()
+
+
+def test_live_turn_statuses_merge_and_explicit_snapshot_replaces() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    generation = window._selection_generation
+    client.result(
+        f"selection:{generation}:turns",
+        {
+            "turns": [
+                {"id": "turn-old", "status": "completed"},
+                {"id": "turn-latest", "status": "in_progress"},
+            ]
+        },
+    )
+    client.result(
+        f"selection:{generation}:items",
+        {
+            "items": [
+                {"turn_id": "turn-latest", "item": _item("latest", "agentMessage", text="latest")}
+            ],
+            "next_cursor": "older-turn",
+        },
+    )
+    window.load_older()
+    older_key = next(key for key, _, _ in client.requests if ":older:" in key)
+    client.result(
+        older_key,
+        {
+            "items": [
+                {"turn_id": "turn-latest", "item": _item("latest", "agentMessage", text="latest")},
+                {"turn_id": "turn-old", "item": _item("old", "agentMessage", text="old")},
+            ],
+            "next_cursor": None,
+        },
+    )
+
+    client.activity(generation, _history_activity("turn_completed", "completed", "thread-a"))
+    _wait_for_qt_timer(300)
+    live_requests = [request for request in client.requests if ":history:" in request[0]]
+    for key, _, _ in live_requests:
+        if key.endswith(":turns"):
+            client.result(key, {"turns": [{"id": "turn-latest", "status": "completed"}]})
+        else:
+            client.result(
+                key,
+                {
+                    "items": [
+                        {
+                            "turn_id": "turn-latest",
+                            "item": _item("latest", "agentMessage", text="latest updated"),
+                        }
+                    ]
+                },
+            )
+
+    assert window._turn_statuses == {
+        "turn-old": "completed",
+        "turn-latest": "completed",
+    }
+    headers = [label.text() for label in window.history_pane.findChildren(QLabel, "turnSeparator")]
+    assert any("completed" in header for header in headers)
+
+    window._request_snapshot(generation)
+    client.result(
+        f"selection:{generation}:turns",
+        {"turns": [{"id": "turn-latest", "status": "failed"}]},
+    )
+    client.result(
+        f"selection:{generation}:items",
+        {
+            "items": [
+                {
+                    "turn_id": "turn-latest",
+                    "item": _item("latest", "agentMessage", text="latest"),
+                }
+            ]
+        },
+    )
+    assert window._turn_statuses == {"turn-latest": "failed"}
+    window.close()
+
+
+def test_sse_reconnect_schedules_one_history_reconciliation_after_first_connect() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.select_thread("thread-a")
+    generation = window._selection_generation
+    _complete_history_snapshot(client, generation)
+    status_key = f"selection:{generation}:status"
+    client.result(status_key, {"thread_id": "thread-a", "state": "running"})
+
+    client.stream_state_changed.emit(generation, "connected")
+    assert not window._history_refresh_timer.isActive()
+    assert not any(":history:" in key for key, _, _ in client.requests)
+
+    client.stream_state_changed.emit(generation, "disconnected")
+    client.stream_state_changed.emit(generation, "reconnecting")
+    client.stream_state_changed.emit(generation, "connected")
+    client.stream_state_changed.emit(generation, "connected")
+    client.stream_state_changed.emit(generation, "connected")
+    assert window._history_refresh_timer.isActive()
+
+    _wait_for_qt_timer(300)
+    history_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(history_requests) == 2
+    assert {key.rsplit(":", 1)[-1] for key, _, _ in history_requests} == {"turns", "items"}
     window.close()
 
 
@@ -2501,6 +2762,7 @@ def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
     client = FakeClient()
     window = MainWindow(_config(), api_client=client, tray_available=False)
     window.select_thread("thread-a")
+    client.result("selection:1:turns", {"turns": []})
     client.result(
         "selection:1:items",
         {
@@ -2547,8 +2809,9 @@ def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
 def test_live_history_refresh_preserves_loaded_older_entries_and_order() -> None:
     _application()
     client = FakeClient()
-    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window = _usage_window(client)
     window.select_thread("thread-a")
+    client.result("selection:1:turns", {"turns": []})
     client.result(
         "selection:1:items",
         {
