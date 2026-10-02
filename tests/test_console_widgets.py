@@ -1372,6 +1372,32 @@ def test_history_pane_resumes_following_after_user_returns_to_bottom() -> None:
     assert scrollbar.value() == scrollbar.maximum()
 
 
+def test_history_pane_preserves_scroll_position_while_scrollbar_is_dragged() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.resize(720, 420)
+    pane.show()
+    pane.set_timeline(_history_entries(0, 24))
+    _process_layout(application)
+    scrollbar = pane._scroll.verticalScrollBar()
+    old_maximum = scrollbar.maximum()
+    scrollbar.setValue(old_maximum)
+    scrollbar.sliderPressed.emit()
+
+    pane.set_timeline(_history_entries(0, 30))
+    _process_layout(application)
+
+    assert scrollbar.value() == old_maximum
+    assert scrollbar.value() < scrollbar.maximum()
+    assert pane._user_scrolling is True
+
+    scrollbar.sliderReleased.emit()
+    _process_layout(application)
+    assert pane._user_scrolling is False
+    assert pane._follow_newest is False
+
+
 def test_history_pane_shows_load_older_only_at_top() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None

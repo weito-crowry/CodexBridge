@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
 from PySide6.QtGui import QDesktopServices, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -332,6 +332,20 @@ def _activity(activity_id: str, thread_id: str = "thread-b") -> dict[str, object
         "status": "failed",
         "summary": activity_id,
         "details": {},
+    }
+
+
+def _wait_for_qt_timer(milliseconds: int) -> None:
+    loop = QEventLoop()
+    QTimer.singleShot(milliseconds, loop.quit)
+    loop.exec()
+
+
+def _history_activity(activity_type: str, activity_id: str, thread_id: str) -> dict[str, object]:
+    return {
+        **_activity(activity_id, thread_id),
+        "type": activity_type,
+        "status": "in_progress",
     }
 
 
@@ -2100,6 +2114,125 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     window.close()
 
 
+def test_history_activity_refresh_is_debounced_and_does_not_request_status() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    client.requests.clear()
+
+    non_target_activity = _history_activity("approval_requested", "approval", "thread-a")
+    non_target_activity["status"] = "requested"
+    client.activity(window._selection_generation, non_target_activity)
+    assert not window._history_refresh_timer.isActive()
+    assert any(path.endswith("/status") for _, path, _ in client.requests)
+    client.requests.clear()
+
+    for activity_type in ("command_started", "agent_commentary", "file_change_completed"):
+        client.activity(
+            window._selection_generation,
+            _history_activity(activity_type, activity_type, "thread-a"),
+        )
+
+    assert window._history_refresh_timer.isActive()
+    assert window._history_refresh_timer.isSingleShot()
+    assert window._history_refresh_timer.interval() == 250
+    assert client.requests == []
+
+    _wait_for_qt_timer(300)
+
+    history_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert {key.rsplit(":", 1)[-1] for key, _, _ in history_requests} == {"turns", "items"}
+    assert len(history_requests) == 2
+    assert all(path.endswith(("/turns", "/items")) for _, path, _ in history_requests)
+    assert not any(path.endswith("/status") for _, path, _ in client.requests)
+    window.close()
+
+
+def test_history_refresh_keeps_one_pending_refresh_while_requests_are_in_flight() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    client.requests.clear()
+    generation = window._selection_generation
+
+    client.activity(generation, _history_activity("command_started", "first", "thread-a"))
+    _wait_for_qt_timer(300)
+    first_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(first_requests) == 2
+
+    client.activity(generation, _history_activity("command_completed", "second", "thread-a"))
+    _wait_for_qt_timer(300)
+    assert len([request for request in client.requests if ":history:" in request[0]]) == 2
+
+    for key, _, _ in first_requests:
+        if key.endswith(":turns"):
+            client.failure(key, "Bridge unavailable")
+        else:
+            client.result(key, {"items": []})
+    assert window._history_refresh_timer.isActive()
+
+    _wait_for_qt_timer(300)
+    all_history_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(all_history_requests) == 4
+    second_requests = all_history_requests[2:]
+    for key, _, _ in second_requests:
+        if key.endswith(":turns"):
+            client.result(key, {"turns": []})
+        else:
+            client.result(key, {"items": []})
+    _wait_for_qt_timer(300)
+    assert len([request for request in client.requests if ":history:" in request[0]]) == 4
+    window.close()
+
+
+def test_history_refresh_state_and_responses_are_isolated_by_thread_selection() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    client.requests.clear()
+    first_generation = window._selection_generation
+
+    client.activity(
+        first_generation,
+        _history_activity("agent_message", "thread-a-event", "thread-a"),
+    )
+    _wait_for_qt_timer(300)
+    first_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(first_requests) == 2
+    client.activity(
+        first_generation,
+        _history_activity("command_completed", "pending-a", "thread-a"),
+    )
+    _wait_for_qt_timer(300)
+    window.select_thread("thread-b")
+    assert not window._history_refresh_timer.isActive()
+    assert window._history_refresh_pending is False
+
+    old_items_key = next(key for key, _, _ in first_requests if key.endswith(":items"))
+    client.result(
+        old_items_key,
+        {"items": [{"turn_id": "old", "item": _item("stale", "agentMessage", text="STALE")}]},
+    )
+    assert window._timeline_entries == []
+
+    client.requests.clear()
+    client.activity(
+        window._selection_generation,
+        _history_activity("command_started", "thread-b-event", "thread-b"),
+    )
+    _wait_for_qt_timer(300)
+    current_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(current_requests) == 2
+    assert all(
+        key.startswith(f"selection:{window._selection_generation}:history:")
+        for key, _, _ in current_requests
+    )
+    window.close()
+
+
 def test_main_window_resolves_pending_approval_and_refreshes_on_sse() -> None:
     _application()
     client = FakeClient()
@@ -2411,6 +2544,75 @@ def test_history_pagination_prepends_older_page_and_deduplicates() -> None:
     window.close()
 
 
+def test_live_history_refresh_preserves_loaded_older_entries_and_order() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    client.result(
+        "selection:1:items",
+        {
+            "items": [
+                {"turn_id": "t2", "item": _item("latest", "agentMessage", text="latest")},
+                {"turn_id": "t2", "item": _item("current", "agentMessage", text="current")},
+            ],
+            "next_cursor": "older-1",
+        },
+    )
+    window.load_older()
+    older_key = next(key for key, _, _ in client.requests if ":older:" in key)
+    client.result(
+        older_key,
+        {
+            "items": [
+                {"turn_id": "t2", "item": _item("latest", "agentMessage", text="latest")},
+                {"turn_id": "t2", "item": _item("current", "agentMessage", text="current")},
+                {"turn_id": "t1", "item": _item("old", "agentMessage", text="old")},
+            ],
+            "next_cursor": None,
+            "turn_model_metadata": {"t1": {"model_resolution_status": "resolved"}},
+        },
+    )
+
+    client.requests.clear()
+    client.activity(
+        window._selection_generation,
+        _history_activity("agent_message", "new-message", "thread-a"),
+    )
+    _wait_for_qt_timer(300)
+    history_requests = [request for request in client.requests if ":history:" in request[0]]
+    for key, _, _ in history_requests:
+        if key.endswith(":turns"):
+            client.result(key, {"turns": []})
+        else:
+            client.result(
+                key,
+                {
+                    "items": [
+                        {"turn_id": "t3", "item": _item("newest", "agentMessage", text="newest")},
+                        {
+                            "turn_id": "t2",
+                            "item": _item("latest", "agentMessage", text="latest updated"),
+                        },
+                        {"turn_id": "t2", "item": _item("current", "agentMessage", text="current")},
+                    ],
+                    "next_cursor": "newer-page-cursor",
+                    "turn_model_metadata": {"t3": {"model_resolution_status": "resolved"}},
+                },
+            )
+
+    assert [(entry.turn_id, entry.item_id) for entry in window._timeline_entries] == [
+        ("t1", "old"),
+        ("t2", "current"),
+        ("t2", "latest"),
+        ("t3", "newest"),
+    ]
+    assert len({(entry.turn_id, entry.item_id) for entry in window._timeline_entries}) == 4
+    assert set(window._turn_model_metadata) == {"t1", "t3"}
+    assert window._next_cursor is None
+    window.close()
+
+
 def test_main_window_resets_turn_model_metadata_when_selection_changes() -> None:
     _application()
     client = FakeClient()
@@ -2532,6 +2734,7 @@ def test_close_stops_timers_and_aborts_only_client_replies() -> None:
     assert not window.health_timer.isActive()
     assert not window.thread_timer.isActive()
     assert not window.selected_status_timer.isActive()
+    assert not window._history_refresh_timer.isActive()
 
 
 def test_existing_ready_bridge_is_external_and_start_is_disabled() -> None:

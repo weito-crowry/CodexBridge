@@ -607,13 +607,17 @@ class HistoryPane(QWidget):
         self._has_older = False
         self._scroll_update_pending = False
         self._programmatic_scroll = False
+        self._user_scrolling = False
         self._render_generation = 0
         self._scroll_restore_state: tuple[int, int, int, bool, bool, bool] | None = None
         self._scroll_restore_stage = 0
         self._scroll_restore_timer = QTimer(self)
         self._scroll_restore_timer.setSingleShot(True)
         self._scroll_restore_timer.timeout.connect(self._advance_timeline_scroll_restore)
-        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
+        scrollbar = self._scroll.verticalScrollBar()
+        scrollbar.valueChanged.connect(self._on_scroll_value_changed)
+        scrollbar.sliderPressed.connect(self._on_slider_pressed)
+        scrollbar.sliderReleased.connect(self._on_slider_released)
         layout = QVBoxLayout(self)
         layout.addWidget(self.load_older_button)
         layout.addWidget(self._empty_label)
@@ -641,7 +645,7 @@ class HistoryPane(QWidget):
         scrollbar = self._scroll.verticalScrollBar()
         old_value = scrollbar.value()
         old_maximum = scrollbar.maximum()
-        should_follow = self._follow_newest
+        should_follow = self._follow_newest and not self._user_scrolling
         self._render_generation += 1
         generation = self._render_generation
         self._scroll_update_pending = True
@@ -730,7 +734,7 @@ class HistoryPane(QWidget):
                 target = 0
             else:
                 target = old_value + (scrollbar.maximum() - old_maximum)
-        elif should_follow:
+        elif should_follow and not self._user_scrolling:
             target = scrollbar.maximum()
         else:
             target = old_value
@@ -751,7 +755,7 @@ class HistoryPane(QWidget):
     ) -> None:
         if generation != self._render_generation:
             return
-        if not prepend and should_follow and has_entries:
+        if not prepend and should_follow and has_entries and not self._user_scrolling:
             self._set_programmatic_scroll(self._scroll.verticalScrollBar().maximum())
             self._follow_newest = True
         elif not has_entries:
@@ -770,6 +774,28 @@ class HistoryPane(QWidget):
             return
         scrollbar = self._scroll.verticalScrollBar()
         self._follow_newest = scrollbar.maximum() - value <= self._BOTTOM_FOLLOW_THRESHOLD
+        self._update_load_older_visibility()
+
+    def _on_slider_pressed(self) -> None:
+        self._user_scrolling = True
+
+    def _on_slider_released(self) -> None:
+        self._user_scrolling = False
+        scrollbar = self._scroll.verticalScrollBar()
+        self._follow_newest = (
+            scrollbar.maximum() - scrollbar.value() <= self._BOTTOM_FOLLOW_THRESHOLD
+        )
+        state = self._scroll_restore_state
+        if self._scroll_update_pending and state is not None:
+            generation, _, _, _, prepend, has_entries = state
+            self._scroll_restore_state = (
+                generation,
+                scrollbar.value(),
+                scrollbar.maximum(),
+                self._follow_newest,
+                prepend,
+                has_entries,
+            )
         self._update_load_older_visibility()
 
     def _update_load_older_visibility(self) -> None:
@@ -813,6 +839,7 @@ class HistoryPane(QWidget):
         self._scroll_restore_state = None
         self._scroll_restore_stage = 0
         self._scroll_update_pending = False
+        self._user_scrolling = False
         self._follow_newest = True
         self._has_older = False
         self._set_programmatic_scroll(0)
