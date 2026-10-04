@@ -920,9 +920,9 @@ class HistoryPane(QWidget):
         header_label.setSizePolicy(header_policy)
         header.addWidget(header_label)
         header.addStretch(1)
-        spinner = _HistoryRunningSpinner()
-        spinner.setVisible(_item_is_running(entry))
+        spinner = _HistoryRunningSpinner(card)
         header.addWidget(spinner)
+        spinner.setVisible(_item_is_running(entry))
         if entry.kind in {"User", "Agent"}:
             copy_button = QPushButton("Copy")
             copy_button.setObjectName("copyMessageButton")

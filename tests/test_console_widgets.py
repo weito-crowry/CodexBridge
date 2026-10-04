@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from codex_bridge.console import usage as usage_module
+from codex_bridge.console import widgets as widgets_module
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.usage import parse_codex_usage
@@ -1041,6 +1042,32 @@ def test_running_agent_spinner_coexists_with_copy_button() -> None:
     assert card.findChild(QPushButton, "copyMessageButton") is not None
     spinner = card.findChild(QWidget, "historyRunningSpinner")
     assert spinner is not None and spinner.isVisible()
+    pane.close()
+
+
+def test_history_running_spinner_is_created_with_card_parent(monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    created_with_parents: list[QWidget | None] = []
+    spinner_type = widgets_module._HistoryRunningSpinner
+
+    class ParentRecordingSpinner(spinner_type):
+        def __init__(self, parent: QWidget | None = None) -> None:
+            created_with_parents.append(parent)
+            super().__init__(parent)
+
+    monkeypatch.setattr(widgets_module, "_HistoryRunningSpinner", ParentRecordingSpinner)
+    pane = HistoryPane()
+    pane.set_timeline(
+        (TimelineEntry("turn", "item", "Agent", "Agent", "answer", "in_progress", (), 1_000),)
+    )
+
+    card = pane.findChild(QFrame, "historyCard")
+    spinner = pane.findChild(QWidget, "historyRunningSpinner")
+    assert card is not None
+    assert spinner is not None
+    assert created_with_parents == [card]
+    assert spinner.parent() is card
     pane.close()
 
 

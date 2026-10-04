@@ -1211,11 +1211,7 @@ class Bridge:
                             turn_id=turn_id,
                             item_id=item_id if isinstance(item_id, str) else None,
                             type="item_started" if method == "item/started" else "item_completed",
-                            status=(
-                                "completed"
-                                if method == "item/completed"
-                                else self._activity_status(item.get("status"))
-                            ),
+                            status=self._activity_status(item.get("status")),
                         )
                     except Exception as exc:
                         log_event("activity.normalize_error", error_type=exc.__class__.__name__)

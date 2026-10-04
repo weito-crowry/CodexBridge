@@ -764,6 +764,7 @@ async def test_item_lifecycle_notifications_publish_transient_events_and_enrich_
     started = await subscription.get()
     completed = await subscription.get()
     assert (started.type, completed.type) == ("item_started", "item_completed")
+    assert (started.status, completed.status) == ("in_progress", "completed")
     assert activities.get_recent("thread") == ()
 
     app.thread_cwds["thread"] = str(allowed_dir)
@@ -789,6 +790,32 @@ async def test_item_lifecycle_notifications_publish_transient_events_and_enrich_
     assert item["started_at_ms"] == 1_791_101_948_000
     assert item["completed_at_ms"] == 1_791_101_963_000
     assert "private output" not in str(result)
+    subscription.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+async def test_item_completed_transient_event_preserves_item_status_and_stays_ephemeral(
+    allowed_dir, status: str
+) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    subscription = activities.subscribe("thread")
+
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": {"id": "item", "type": "mcpToolCall", "status": status},
+            },
+        }
+    )
+
+    event = await subscription.get()
+    assert event.type == "item_completed"
+    assert event.status == status
+    assert (await bridge.status("thread", "turn"))["recent_activities"] == []
     subscription.close()
 
 
