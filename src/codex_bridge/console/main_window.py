@@ -2398,6 +2398,12 @@ class MainWindow(QMainWindow):
         activity_type = payload.get("type")
         activity_status = payload.get("status")
         turn_id = payload.get("turn_id")
+        if isinstance(activity_type, str) and activity_type in {
+            "item_started",
+            "item_completed",
+        }:
+            self._schedule_selected_history_refresh()
+            return
         if isinstance(thread_id, str) and isinstance(activity_type, str):
             if (
                 activity_type == "turn_started"

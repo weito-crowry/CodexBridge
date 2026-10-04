@@ -24,6 +24,8 @@ ActivityType = Literal[
     "approval_resolved",
     "user_input_requested",
     "user_input_resolved",
+    "item_started",
+    "item_completed",
     "error",
 ]
 ActivityStatus = Literal[
@@ -184,7 +186,53 @@ class ActivityStore:
         summary: str | None = None,
         details: Mapping[str, ActivityDetailValue] | None = None,
     ) -> Activity:
-        activity = Activity(
+        activity = self._make_activity(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            type=type,
+            status=status,
+            item_id=item_id,
+            summary=summary,
+            details=details,
+        )
+        self._activities.setdefault(thread_id, deque(maxlen=_MAX_ACTIVITIES_PER_THREAD)).append(
+            activity
+        )
+        self._publish(activity)
+        return activity
+
+    def publish_transient(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        item_id: str | None,
+        type: Literal["item_started", "item_completed"],
+        status: ActivityStatus,
+    ) -> Activity:
+        """Publish an ephemeral lifecycle event without saving it as Activity history."""
+        activity = self._make_activity(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            type=type,
+            status=status,
+            item_id=item_id,
+        )
+        self._publish(activity)
+        return activity
+
+    @staticmethod
+    def _make_activity(
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        type: ActivityType,
+        status: ActivityStatus,
+        item_id: str | None = None,
+        summary: str | None = None,
+        details: Mapping[str, ActivityDetailValue] | None = None,
+    ) -> Activity:
+        return Activity(
             activity_id=uuid4().hex,
             timestamp=_timestamp(),
             thread_id=thread_id,
@@ -195,12 +243,10 @@ class ActivityStore:
             summary=_bounded_text(summary),
             details=_safe_details(details),
         )
-        self._activities.setdefault(thread_id, deque(maxlen=_MAX_ACTIVITIES_PER_THREAD)).append(
-            activity
-        )
+
+    def _publish(self, activity: Activity) -> None:
         for subscriber in tuple(self._subscribers):
             subscriber._publish(activity)
-        return activity
 
     def get_recent(
         self, thread_id: str, turn_id: str | None = None, *, limit: int = 20

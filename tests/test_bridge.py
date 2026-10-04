@@ -718,8 +718,126 @@ async def test_read_thread_items_preflights_metadata_and_preserves_entry_turn_id
         ),
     ]
     assert result["items"][0]["turn_id"] == "turn-1"
+    assert "started_at_ms" not in result["items"][0]["item"]
+    assert "completed_at_ms" not in result["items"][0]["item"]
     assert result["next_cursor"] == "next"
     assert result["backwards_cursor"] == "back"
+
+
+@pytest.mark.asyncio
+async def test_item_lifecycle_notifications_publish_transient_events_and_enrich_history(
+    allowed_dir,
+) -> None:
+    bridge, app, _, activities = make_activity_bridge(allowed_dir)
+    subscription = activities.subscribe("thread")
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "startedAtMs": 1_791_101_948_000,
+                "item": {"id": "tool-item", "type": "mcpToolCall", "status": "inProgress"},
+            },
+            "emittedAtMs": 1_700_000_000_000,
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 1_791_101_963_000,
+                "item": {
+                    "id": "tool-item",
+                    "type": "mcpToolCall",
+                    "status": "completed",
+                    "server": "github",
+                    "tool": "fetch_file",
+                    "result": "private output",
+                },
+            },
+        }
+    )
+
+    started = await subscription.get()
+    completed = await subscription.get()
+    assert (started.type, completed.type) == ("item_started", "item_completed")
+    assert (started.status, completed.status) == ("in_progress", "completed")
+    assert activities.get_recent("thread") == ()
+
+    app.thread_cwds["thread"] = str(allowed_dir)
+    app.thread_history_modes["thread"] = "paginated"
+    app.items_response = {
+        "data": [
+            {
+                "turnId": "turn",
+                "item": {
+                    "id": "tool-item",
+                    "type": "mcpToolCall",
+                    "status": "completed",
+                    "server": "github",
+                    "tool": "fetch_file",
+                    "result": "private output",
+                },
+            }
+        ]
+    }
+
+    result = await bridge.read_thread_items("thread")
+    item = result["items"][0]["item"]
+    assert item["started_at_ms"] == 1_791_101_948_000
+    assert item["completed_at_ms"] == 1_791_101_963_000
+    assert "private output" not in str(result)
+    subscription.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+async def test_item_completed_transient_event_preserves_item_status_and_stays_ephemeral(
+    allowed_dir, status: str
+) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    subscription = activities.subscribe("thread")
+
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": {"id": "item", "type": "mcpToolCall", "status": status},
+            },
+        }
+    )
+
+    event = await subscription.get()
+    assert event.type == "item_completed"
+    assert event.status == status
+    assert (await bridge.status("thread", "turn"))["recent_activities"] == []
+    subscription.close()
+
+
+def test_item_lifecycle_uses_notification_emitted_timestamp_as_fallback(allowed_dir) -> None:
+    bridge, _, _, _ = make_activity_bridge(allowed_dir)
+
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": {"id": "tool-item", "type": "dynamicToolCall"},
+                "emittedAtMs": 1_791_101_948_000,
+            },
+            "emittedAtMs": 1_700_000_000_000,
+        }
+    )
+
+    lifecycle = bridge._item_lifecycle.get("thread", "turn", "tool-item")
+    assert lifecycle is not None
+    assert lifecycle.started_at_ms == 1_791_101_948_000
 
 
 @pytest.mark.asyncio
@@ -826,6 +944,17 @@ async def test_read_legacy_items_adds_turn_model_metadata_and_fails_soft(allowed
         },
     ]
     app.thread_paths["legacy-thread"] = str(allowed_dir / "missing-rollout.jsonl")
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "legacy-thread",
+                "turnId": "turn-1",
+                "startedAtMs": 1_791_101_948_000,
+                "item": {"id": "item-1", "type": "agentMessage"},
+            },
+        }
+    )
 
     result = await bridge.read_thread_items("legacy-thread")
 
@@ -834,6 +963,8 @@ async def test_read_legacy_items_adds_turn_model_metadata_and_fails_soft(allowed
         "turn-2": {"model_candidates": [], "model_resolution_status": "unavailable"},
         "turn-1": {"model_candidates": [], "model_resolution_status": "unavailable"},
     }
+    assert "started_at_ms" not in result["items"][0]["item"]
+    assert result["items"][1]["item"]["started_at_ms"] == 1_791_101_948_000
     assert app.methods == ["thread/read", "thread/read"]
 
 
