@@ -3,12 +3,25 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from math import ceil
 from typing import Any
 
-from PySide6.QtCore import QDir, QPoint, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette, QResizeEvent, QTextOption
+from PySide6.QtCore import QDir, QPoint, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QDesktopServices,
+    QFont,
+    QHideEvent,
+    QPainter,
+    QPaintEvent,
+    QPalette,
+    QPen,
+    QResizeEvent,
+    QShowEvent,
+    QTextOption,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -41,6 +54,8 @@ class TimelineEntry:
     body: str
     status: str | None
     details: tuple[str, ...]
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
 
 
 def _safe_text(value: object, limit: int = 16_384) -> str:
@@ -49,6 +64,87 @@ def _safe_text(value: object, limit: int = 16_384) -> str:
 
 def _safe_status(value: object) -> str | None:
     return value if isinstance(value, str) and len(value) <= 128 else None
+
+
+_MAX_EPOCH_MILLISECONDS = 253_402_300_799_999
+_TERMINAL_ITEM_STATUSES = {"completed", "failed", "interrupted", "error"}
+
+
+def _safe_epoch_milliseconds(value: object) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _MAX_EPOCH_MILLISECONDS
+    ):
+        return None
+    return value
+
+
+def _local_datetime(value: object) -> datetime | None:
+    timestamp = _safe_epoch_milliseconds(value)
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp / 1_000)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def format_history_timing(started_at_ms: object, completed_at_ms: object) -> str:
+    started = _local_datetime(started_at_ms)
+    completed = _local_datetime(completed_at_ms)
+    show_date = started is not None and completed is not None and started.date() != completed.date()
+
+    def format_one(value: datetime | None) -> str:
+        if value is None:
+            return "—"
+        return value.strftime("%m/%d %H:%M:%S" if show_date else "%H:%M:%S")
+
+    return f"Start {format_one(started)} · End {format_one(completed)}"
+
+
+def _item_is_running(entry: TimelineEntry) -> bool:
+    if entry.status in _TERMINAL_ITEM_STATUSES:
+        return False
+    return entry.status == "in_progress" or (
+        entry.started_at_ms is not None and entry.completed_at_ms is None
+    )
+
+
+class _HistoryRunningSpinner(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("historyRunningSpinner")
+        self.setFixedSize(16, 16)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(90)
+        self._timer.timeout.connect(self._advance)
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self.palette().color(QPalette.ColorRole.Highlight))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(QRectF(3.0, 3.0, 10.0, 10.0), self._angle * 16, 250 * 16)
+        painter.end()
 
 
 def _model_summary(metadata: Mapping[str, object] | None) -> str:
@@ -194,6 +290,11 @@ def timeline_entries(items_payload: Mapping[str, object]) -> tuple[TimelineEntry
         projected = _entry(raw_entry["turn_id"], item)
         if projected is None or (projected.turn_id, projected.item_id) in seen:
             continue
+        projected = replace(
+            projected,
+            started_at_ms=_safe_epoch_milliseconds(item.get("started_at_ms")),
+            completed_at_ms=_safe_epoch_milliseconds(item.get("completed_at_ms")),
+        )
         seen.add((projected.turn_id, projected.item_id))
         entries.append(projected)
     return tuple(entries)
@@ -818,8 +919,11 @@ class HistoryPane(QWidget):
         header_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         header_label.setSizePolicy(header_policy)
         header.addWidget(header_label)
+        header.addStretch(1)
+        spinner = _HistoryRunningSpinner()
+        spinner.setVisible(_item_is_running(entry))
+        header.addWidget(spinner)
         if entry.kind in {"User", "Agent"}:
-            header.addStretch(1)
             copy_button = QPushButton("Copy")
             copy_button.setObjectName("copyMessageButton")
             copy_button.clicked.connect(
@@ -827,6 +931,9 @@ class HistoryPane(QWidget):
             )
             header.addWidget(copy_button)
         layout.addLayout(header)
+        timing = QLabel(format_history_timing(entry.started_at_ms, entry.completed_at_ms))
+        timing.setObjectName("historyTiming")
+        layout.addWidget(timing)
         if entry.body:
             layout.addWidget(_HistoryBody(entry.body))
         if entry.details:

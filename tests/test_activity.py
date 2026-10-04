@@ -155,3 +155,34 @@ async def test_activity_subscriber_drops_oldest_when_queue_is_full() -> None:
 
     assert received[0] == "event-1"
     assert received[-1] == "event-100"
+
+
+@pytest.mark.asyncio
+async def test_transient_item_events_publish_without_using_activity_history() -> None:
+    store = ActivityStore()
+    subscription = store.subscribe(thread_id="thread")
+    saved = store.add(thread_id="thread", turn_id="turn", type="turn_started", status="in_progress")
+    assert await subscription.get() == saved
+
+    store.publish_transient(
+        thread_id="thread",
+        turn_id="turn",
+        item_id="item",
+        type="item_started",
+        status="in_progress",
+    )
+    store.publish_transient(
+        thread_id="thread",
+        turn_id="turn",
+        item_id="item",
+        type="item_completed",
+        status="completed",
+    )
+
+    started = await subscription.get()
+    completed = await subscription.get()
+    assert (started.type, completed.type) == ("item_started", "item_completed")
+    assert started.item_id == completed.item_id == "item"
+    assert store.get_recent("thread") == (saved,)
+    assert store.latest("thread") == saved
+    subscription.close()

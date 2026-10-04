@@ -2173,6 +2173,35 @@ def test_history_activity_refresh_is_debounced_and_does_not_request_status() -> 
     window.close()
 
 
+def test_transient_item_events_refresh_history_without_activity_pane_append() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.select_thread("thread-a")
+    _complete_history_snapshot(client, window._selection_generation)
+    client.requests.clear()
+    activity_count = window.activity_pane.activity_list.count()
+
+    client.activity(
+        window._selection_generation,
+        _history_activity("item_started", "item-start", "thread-a"),
+    )
+    assert window.activity_pane.activity_list.count() == activity_count
+    assert window._history_refresh_timer.isActive()
+    assert window._history_refresh_timer.interval() == 250
+
+    client.activity(
+        window._selection_generation,
+        _history_activity("item_completed", "item-complete", "thread-a"),
+    )
+    _wait_for_qt_timer(300)
+    history_requests = [request for request in client.requests if ":history:" in request[0]]
+    assert len(history_requests) == 2
+    assert {key.rsplit(":", 1)[-1] for key, _, _ in history_requests} == {"turns", "items"}
+    assert window.activity_pane.activity_list.count() == activity_count
+    window.close()
+
+
 def test_history_refresh_keeps_one_pending_refresh_while_requests_are_in_flight() -> None:
     _application()
     client = FakeClient()
@@ -2187,7 +2216,7 @@ def test_history_refresh_keeps_one_pending_refresh_while_requests_are_in_flight(
     first_requests = [request for request in client.requests if ":history:" in request[0]]
     assert len(first_requests) == 2
 
-    client.activity(generation, _history_activity("command_completed", "second", "thread-a"))
+    client.activity(generation, _history_activity("item_completed", "second", "thread-a"))
     _wait_for_qt_timer(300)
     assert len([request for request in client.requests if ":history:" in request[0]]) == 2
 
@@ -2238,6 +2267,12 @@ def test_history_refresh_state_and_responses_are_isolated_by_thread_selection() 
     assert window._history_refresh_pending is False
 
     _complete_history_snapshot(client, window._selection_generation)
+
+    client.activity(
+        first_generation,
+        _history_activity("item_started", "stale-item", "thread-a"),
+    )
+    assert not window._history_refresh_timer.isActive()
 
     old_items_key = next(key for key, _, _ in first_requests if key.endswith(":items"))
     client.result(

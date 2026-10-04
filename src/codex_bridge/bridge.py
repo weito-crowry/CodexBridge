@@ -20,6 +20,7 @@ from .history import (
     validate_history_query,
     validate_legacy_cursor,
 )
+from .item_lifecycle import ItemLifecycleStore
 from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
@@ -93,6 +94,28 @@ _ACTIVITY_LIMIT_MIN = 1
 _ACTIVITY_LIMIT_MAX = 100
 _LOCAL_THREAD_CATALOG_PATH = Path.home() / ".codex" / "sqlite" / "codex-dev.db"
 _LOCAL_THREAD_TITLE_MAX_CHARS = 200
+_MAX_EPOCH_MILLISECONDS = 253_402_300_799_999
+
+
+def _safe_item_timestamp(value: object) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > _MAX_EPOCH_MILLISECONDS
+    ):
+        return None
+    return value
+
+
+def _notification_item_timestamp(
+    message: Mapping[str, Any], params: Mapping[str, Any], field: str
+) -> int | None:
+    for value in (params.get(field), params.get("emittedAtMs"), message.get("emittedAtMs")):
+        timestamp = _safe_item_timestamp(value)
+        if timestamp is not None:
+            return timestamp
+    return None
 
 
 def _read_local_thread_titles(thread_ids: list[str]) -> dict[str, str]:
@@ -331,6 +354,7 @@ class Bridge:
         self._state = state
         self._path_policy = path_policy
         self._activities = activity_store if activity_store is not None else ActivityStore()
+        self._item_lifecycle = ItemLifecycleStore()
         self._wait_default_seconds = wait_default_seconds
         self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
         self._approval_lock = asyncio.Lock()
@@ -935,6 +959,7 @@ class Bridge:
                     policy=self._path_policy,
                     limit=limit,
                 )
+                self._merge_item_lifecycle(thread_id, result)
                 return _with_turn_model_metadata(result, metadata_response)
             except HistoryValidationError as exc:
                 raise BridgeError("malformed thread items response") from exc
@@ -951,9 +976,30 @@ class Bridge:
                 sort_direction=sort_direction,
                 cursor=cursor,
             )
+            self._merge_item_lifecycle(thread_id, result)
             return _with_turn_model_metadata(result, metadata_response)
         except HistoryValidationError as exc:
             raise BridgeError("malformed legacy thread history response") from exc
+
+    def _merge_item_lifecycle(self, thread_id: str, result: dict[str, object]) -> None:
+        items = result.get("items")
+        if not isinstance(items, list):
+            return
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            turn_id = entry.get("turn_id")
+            item = entry.get("item")
+            if not isinstance(turn_id, str) or not isinstance(item, dict):
+                continue
+            item_id = item.get("id")
+            if not isinstance(item_id, str):
+                continue
+            lifecycle = self._item_lifecycle.get(thread_id, turn_id, item_id)
+            if lifecycle is None:
+                continue
+            item["started_at_ms"] = lifecycle.started_at_ms
+            item["completed_at_ms"] = lifecycle.completed_at_ms
 
     async def handle_server_request(self, message: Mapping[str, Any]) -> None:
         request_id = message.get("id")
@@ -1145,7 +1191,32 @@ class Bridge:
                 if isinstance(item, dict):
                     try:
                         self._state.ensure_turn(thread_id, turn_id)
+                        item_id = item.get("id")
+                        timestamp_field = (
+                            "startedAtMs" if method == "item/started" else "completedAtMs"
+                        )
+                        timestamp = _notification_item_timestamp(message, params, timestamp_field)
+                        if isinstance(item_id, str) and timestamp is not None:
+                            if method == "item/started":
+                                self._item_lifecycle.observe_started(
+                                    thread_id, turn_id, item_id, timestamp
+                                )
+                            else:
+                                self._item_lifecycle.observe_completed(
+                                    thread_id, turn_id, item_id, timestamp
+                                )
                         self._record_item_activity(method, thread_id, turn_id, item)
+                        self._activities.publish_transient(
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            item_id=item_id if isinstance(item_id, str) else None,
+                            type="item_started" if method == "item/started" else "item_completed",
+                            status=(
+                                "completed"
+                                if method == "item/completed"
+                                else self._activity_status(item.get("status"))
+                            ),
+                        )
                     except Exception as exc:
                         log_event("activity.normalize_error", error_type=exc.__class__.__name__)
             return

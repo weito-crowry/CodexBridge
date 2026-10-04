@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from inspect import signature
 
 import pytest
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QPalette, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTextBrowser,
     QTreeWidgetItem,
+    QWidget,
 )
 
 from codex_bridge.console import usage as usage_module
@@ -26,6 +27,7 @@ from codex_bridge.console.widgets import (
     ThreadListPane,
     TimelineEntry,
     activity_row,
+    format_history_timing,
     format_thread_content,
     timeline_entries,
 )
@@ -919,6 +921,127 @@ def test_history_pane_shows_turn_status_in_separator() -> None:
 
     assert any("Turn · Model: unavailable" in label.text() for label in pane.findChildren(QLabel))
     assert any("Turn · completed" in label.text() for label in pane.findChildren(QLabel))
+
+
+def test_format_history_timing_uses_local_fixed_formats_and_unknown_markers() -> None:
+    start = datetime.now().astimezone().replace(hour=17, minute=19, second=8, microsecond=0)
+    end = start.replace(second=23)
+    start_ms = int(start.timestamp() * 1_000)
+    end_ms = int(end.timestamp() * 1_000)
+
+    assert format_history_timing(start_ms, end_ms) == "Start 17:19:08 · End 17:19:23"
+    assert format_history_timing(start_ms, None) == "Start 17:19:08 · End —"
+    assert format_history_timing(None, None) == "Start — · End —"
+    assert format_history_timing(True, 10**100) == "Start — · End —"
+
+
+def test_format_history_timing_marks_both_dates_when_item_crosses_midnight() -> None:
+    start = datetime.now().astimezone().replace(hour=23, minute=59, second=59, microsecond=0)
+    end = start + timedelta(seconds=2)
+    start_ms = int(start.timestamp() * 1_000)
+    end_ms = int(end.timestamp() * 1_000)
+    expected = f"Start {start.strftime('%m/%d %H:%M:%S')} · End {end.strftime('%m/%d %H:%M:%S')}"
+
+    assert start.date() != end.date()
+    assert format_history_timing(start_ms, end_ms) == expected
+
+
+def test_timeline_entries_project_optional_item_timestamps() -> None:
+    entries = timeline_entries(
+        {
+            "items": [
+                {
+                    "turn_id": "turn",
+                    "item": {
+                        "id": "command",
+                        "type": "commandExecution",
+                        "command": "pytest",
+                        "started_at_ms": 123,
+                        "completed_at_ms": True,
+                    },
+                }
+            ]
+        }
+    )
+
+    assert len(entries) == 1
+    assert entries[0].started_at_ms == 123
+    assert entries[0].completed_at_ms is None
+
+
+@pytest.mark.parametrize(
+    ("status", "completed_at_ms", "expected"),
+    [
+        ("in_progress", None, True),
+        (None, None, True),
+        ("completed", 2_000, False),
+        ("failed", None, False),
+        ("interrupted", None, False),
+        ("error", None, False),
+    ],
+)
+def test_history_card_shows_spinner_only_for_running_items(
+    status: str | None, completed_at_ms: int | None, expected: bool
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.set_timeline(
+        (
+            TimelineEntry(
+                "turn", "item", "Agent", "Agent", "answer", status, (), 1_000, completed_at_ms
+            ),
+        )
+    )
+    pane.show()
+    _process_layout(application)
+
+    spinner = pane.findChild(QWidget, "historyRunningSpinner")
+    timing = pane.findChild(QLabel, "historyTiming")
+    assert spinner is not None
+    assert timing is not None
+    assert timing.text() == (
+        "Start "
+        + datetime.fromtimestamp(1).strftime("%H:%M:%S")
+        + " · End "
+        + (
+            datetime.fromtimestamp(completed_at_ms / 1_000).strftime("%H:%M:%S")
+            if completed_at_ms is not None
+            else "—"
+        )
+    )
+    assert spinner.isVisible() is expected
+    timer = spinner._timer
+    assert timer.interval() == 90
+    assert timer.isActive() is expected
+    pane.hide()
+    _process_layout(application)
+    assert not timer.isActive()
+    destroyed: list[bool] = []
+    timer.destroyed.connect(lambda *_args: destroyed.append(True))
+    spinner.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert destroyed
+    pane.deleteLater()
+    _process_layout(application)
+
+
+def test_running_agent_spinner_coexists_with_copy_button() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    pane.set_timeline(
+        (TimelineEntry("turn", "item", "Agent", "Agent", "answer", "in_progress", (), 1_000),)
+    )
+    pane.show()
+    _process_layout(application)
+
+    card = pane.findChild(QFrame, "historyCard")
+    assert card is not None
+    assert card.findChild(QPushButton, "copyMessageButton") is not None
+    spinner = card.findChild(QWidget, "historyRunningSpinner")
+    assert spinner is not None and spinner.isVisible()
+    pane.close()
 
 
 def test_history_pane_shows_usage_snapshot_on_a_separate_wrapping_line() -> None:
