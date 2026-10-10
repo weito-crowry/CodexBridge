@@ -2782,12 +2782,10 @@ def test_old_selection_json_and_sse_cannot_update_new_selection() -> None:
     client.activity(1, _activity("stale-activity", "thread-a"))
     client.activity(2, _activity("current-activity", "thread-b"))
 
-    assert (
-        "STALE A"
-        not in window.history_pane._content.findChildren(type(window.history_pane._empty_label))[
-            -1
-        ].text()
-    )
+    history_bodies = [
+        body.toPlainText() for body in window.history_pane._content.findChildren(QTextBrowser)
+    ]
+    assert not {"A only", "STALE A"}.intersection(history_bodies)
     assert window.activity_pane.activity_list.count() == 1
     assert "current-activity" in window.activity_pane.activity_list.item(0).text()
     window.close()
