@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QPen,
     QResizeEvent,
     QShowEvent,
+    QTextDocument,
     QTextOption,
 )
 from PySide6.QtWidgets import (
@@ -669,6 +670,11 @@ class _HistoryBody(QTextBrowser):
         self.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._measurement_document = QTextDocument(self)
+        self._measurement_document.setDocumentMargin(0)
+        self._measurement_document.setDefaultFont(self.document().defaultFont())
+        self._measurement_document.setDefaultTextOption(self.document().defaultTextOption())
+        self._measurement_document.setPlainText(text)
         policy = self.sizePolicy()
         policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
@@ -678,11 +684,27 @@ class _HistoryBody(QTextBrowser):
     def hasHeightForWidth(self) -> bool:
         return True
 
+    def minimumSizeHint(self) -> QSize:
+        if self.width() <= 0:
+            return QSize(0, 0)
+        return QSize(0, self.heightForWidth(self.width()))
+
     def heightForWidth(self, width: int) -> int:
         available_width = max(1, width - self.frameWidth() * 2)
-        self.document().setTextWidth(available_width)
-        document_height = self.document().documentLayout().documentSize().height()
+        self._measurement_document.setTextWidth(available_width)
+        document_height = self._measurement_document.documentLayout().documentSize().height()
         return max(1, ceil(document_height) + self.frameWidth() * 2)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        available_width = max(1, self.width() - self.frameWidth() * 2)
+        document = self.document()
+        if document.textWidth() != available_width:
+            document.setTextWidth(available_width)
+        document_height = document.documentLayout().documentSize().height()
+        content_height = max(1, ceil(document_height) + self.frameWidth() * 2)
+        if self.minimumHeight() != content_height:
+            self.setMinimumHeight(content_height)
 
 
 class HistoryPane(QWidget):
@@ -731,6 +753,8 @@ class HistoryPane(QWidget):
                 continue
             widget = item.widget()
             if widget is not None:
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
 
     def set_timeline(
@@ -919,7 +943,6 @@ class HistoryPane(QWidget):
         header_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         header_label.setSizePolicy(header_policy)
         header.addWidget(header_label)
-        header.addStretch(1)
         spinner = _HistoryRunningSpinner(card)
         header.addWidget(spinner)
         spinner.setVisible(_item_is_running(entry))
