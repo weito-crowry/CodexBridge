@@ -1091,7 +1091,6 @@ class ActivityPane(QWidget):
         self._set_effective_access(snapshot, state)
         pending = snapshot.get("pending_request")
         if isinstance(pending, Mapping):
-            has_pending = True
             self._pending_header.show()
             self.pending_label.show()
             label = "Approval required" if state == "needs_approval" else "Input required"
@@ -1125,7 +1124,6 @@ class ActivityPane(QWidget):
                 self.approval_details_label.hide()
             self._sync_approval_controls()
         else:
-            has_pending = False
             self._pending_header.hide()
             self.pending_label.hide()
             self.pending_label.setText("")
@@ -1138,8 +1136,7 @@ class ActivityPane(QWidget):
             self._approval_feedback.clear()
             self._approval_feedback.hide()
             self._sync_approval_controls()
-        error = _safe_text(snapshot.get("error"), 2_000)
-        self._state_section.setVisible(state != "not_loaded" or has_pending or bool(error))
+        self._state_section.show()
         if reset:
             self.activity_list.clear()
             self._activity_ids.clear()
@@ -1283,6 +1280,10 @@ class ActivityPane(QWidget):
         self._state_section.hide()
         self.activity_list.clear()
         self._activity_ids.clear()
+
+    def set_loading_state(self, text: str) -> None:
+        self.set_empty_state(text)
+        self._state_section.show()
 
     def set_error(self, text: str) -> None:
         self.state_label.setText(text)
