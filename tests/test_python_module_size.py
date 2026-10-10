@@ -140,7 +140,9 @@ def test_exact_production_grandfather_values_are_accepted(checker: ModuleType) -
     assert not report.errors
 
 
-def test_production_baseline_growth_and_shrink_both_fail(checker: ModuleType) -> None:
+def test_production_baseline_growth_and_hard_limit_recovery_fail(
+    checker: ModuleType,
+) -> None:
     path = "src/legacy.py"
     policy = json.loads(json.dumps(EMPTY_POLICY))
     policy["production"]["baselines"] = {
@@ -152,26 +154,64 @@ def test_production_baseline_growth_and_shrink_both_fail(checker: ModuleType) ->
     grown = checker.evaluate_blobs({path: _blob_with_metrics(1501, 65538)}, policy=policy)
     shrunk = checker.evaluate_blobs({path: _blob_with_metrics(1501, 65536)}, policy=policy)
     assert "baseline_growth" in _codes(grown.errors)
-    assert "baseline_shrink" in _codes(shrunk.errors)
+    assert "production_baseline_remove" in _codes(shrunk.errors)
 
 
-def test_lowered_production_baseline_or_removal_at_limit_passes(
-    checker: ModuleType,
-) -> None:
+def test_production_baseline_recovery_requires_metric_removal(checker: ModuleType) -> None:
     path = "src/legacy.py"
-    at_limit = _blob_with_metrics(1500, 65536)
     policy = json.loads(json.dumps(EMPTY_POLICY))
     policy["production"]["baselines"] = {
         path: {
-            "physical_loc": {"value": 1500, "reason": "Ratchet updated to exact size."},
-            "raw_bytes": {"value": 65536, "reason": "Ratchet updated to exact size."},
+            "physical_loc": {"value": 1501, "reason": "Existing reviewed module."},
+            "raw_bytes": {"value": 65537, "reason": "Existing reviewed module."},
         }
     }
-    updated = checker.evaluate_blobs({path: at_limit}, policy=policy)
+
+    both_at_limit = checker.evaluate_blobs({path: _blob_with_metrics(1500, 65536)}, policy=policy)
+    assert [finding.code for finding in both_at_limit.errors] == [
+        "production_baseline_remove",
+        "production_baseline_remove",
+    ]
+    assert {finding.message.split()[0] for finding in both_at_limit.errors} == {
+        "physical_loc",
+        "raw_bytes",
+    }
+
+    loc_recovered = checker.evaluate_blobs({path: _blob_with_metrics(1500, 65537)}, policy=policy)
+    assert [finding.code for finding in loc_recovered.errors] == ["production_baseline_remove"]
+    assert "physical_loc" in loc_recovered.errors[0].message
+
+    bytes_recovered = checker.evaluate_blobs({path: _blob_with_metrics(1501, 65536)}, policy=policy)
+    assert [finding.code for finding in bytes_recovered.errors] == ["production_baseline_remove"]
+    assert "raw_bytes" in bytes_recovered.errors[0].message
+
+    policy["production"]["baselines"][path] = {
+        "raw_bytes": {"value": 65537, "reason": "Still above the byte limit."}
+    }
+    loc_removed = checker.evaluate_blobs({path: _blob_with_metrics(1500, 65537)}, policy=policy)
+    assert not loc_removed.errors
+
+    policy["production"]["baselines"][path] = {
+        "physical_loc": {"value": 1501, "reason": "Still above the LOC limit."}
+    }
+    bytes_removed = checker.evaluate_blobs({path: _blob_with_metrics(1501, 65536)}, policy=policy)
+    assert not bytes_removed.errors
+
     policy["production"]["baselines"] = {}
-    removed = checker.evaluate_blobs({path: at_limit}, policy=policy)
-    assert not updated.errors
-    assert not removed.errors
+    both_removed = checker.evaluate_blobs({path: _blob_with_metrics(1500, 65536)}, policy=policy)
+    assert not both_removed.errors
+
+
+@pytest.mark.parametrize(("metric", "value"), (("physical_loc", 1500), ("raw_bytes", 65536)))
+def test_production_baseline_approval_must_exceed_hard_limit(
+    checker: ModuleType, metric: str, value: int
+) -> None:
+    policy = json.loads(json.dumps(EMPTY_POLICY))
+    policy["production"]["baselines"] = {
+        "src/legacy.py": {metric: {"value": value, "reason": "At the hard limit."}}
+    }
+    with pytest.raises(checker.PolicyError, match="strictly exceed"):
+        checker._validate_policy(policy)
 
 
 def test_test_baseline_growth_and_shrink_ratchet_and_recovery_removal(
@@ -305,3 +345,37 @@ def test_malformed_index_listing_fails_closed(checker: ModuleType) -> None:
         checker._parse_index_listing(b"100644 " + b"a" * 40 + b" 0\tsrc/module.py")
     with pytest.raises(checker.IndexReadError, match="malformed index entry"):
         checker._parse_index_listing(b"broken record\0")
+
+
+def test_stage0_rejects_target_symlink_but_ignores_non_target_symlink(
+    checker: ModuleType, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    regular_oid = _run_git(repo, "hash-object", "-w", "--stdin", input_bytes=b"safe\n").strip()
+    symlink_oid = _run_git(repo, "hash-object", "-w", "--stdin", input_bytes=b"src/evil.py").strip()
+    _run_git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"100644,{regular_oid.decode()},src/good.py",
+    )
+    _run_git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"120000,{symlink_oid.decode()},docs/ignored.py",
+    )
+    assert checker.read_stage0_blobs(repo) == {"src/good.py": b"safe\n"}
+
+    _run_git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"120000,{symlink_oid.decode()},src/evil.py",
+    )
+    with pytest.raises(checker.IndexReadError, match="mode.*src/evil.py|src/evil.py.*mode"):
+        checker.read_stage0_blobs(repo)

@@ -128,8 +128,10 @@ def _validate_policy(policy: object) -> tuple[Mapping[str, Any], Mapping[str, An
         raise PolicyError("production policy has unknown or missing fields")
     if set(tests) != {"review_threshold_bytes", "strong_review_threshold_bytes", "baselines"}:
         raise PolicyError("test policy has unknown or missing fields")
-    _positive_int(production["physical_loc_limit"], "physical_loc_limit")
-    _positive_int(production["raw_bytes_limit"], "raw_bytes_limit")
+    production_limits = {
+        "physical_loc": _positive_int(production["physical_loc_limit"], "physical_loc_limit"),
+        "raw_bytes": _positive_int(production["raw_bytes_limit"], "raw_bytes_limit"),
+    }
     review_limit = _positive_int(tests["review_threshold_bytes"], "review_threshold_bytes")
     strong_limit = _positive_int(
         tests["strong_review_threshold_bytes"], "strong_review_threshold_bytes"
@@ -152,7 +154,12 @@ def _validate_policy(policy: object) -> tuple[Mapping[str, Any], Mapping[str, An
                 record = _as_mapping(record_value, f"{path} {metric} baseline")
                 if set(record) != {"value", "reason"}:
                     raise PolicyError(f"{path} {metric} baseline needs value and reason")
-                _positive_int(record["value"], f"{path} {metric} baseline value")
+                approved = _positive_int(record["value"], f"{path} {metric} baseline value")
+                if expected_kind == "production" and approved <= production_limits[metric]:
+                    raise PolicyError(
+                        f"{path} {metric} baseline value must strictly exceed hard limit "
+                        f"{production_limits[metric]}"
+                    )
                 if not isinstance(record["reason"], str) or not record["reason"].strip():
                     raise PolicyError(f"{path} {metric} baseline needs a substantive reason")
     return production, tests
@@ -273,8 +280,8 @@ def read_stage0_blobs(repo_root: Path) -> dict[str, bytes]:
     for path, object_id, _stage, mode in entries:
         if _classify_path(path) is None:
             continue
-        if mode == "160000":
-            raise IndexReadError(f"Python target is a Git submodule entry: {path}")
+        if mode not in {"100644", "100755"}:
+            raise IndexReadError(f"unsupported Git index mode for Python target {path}: {mode}")
         blob_result = subprocess.run(
             ["git", "cat-file", "blob", object_id],
             cwd=repo_root,
@@ -364,7 +371,16 @@ def evaluate_blobs(
                     continue
                 record = _as_mapping(record_value, f"{path} {metric} baseline")
                 approved = _positive_int(record["value"], f"{path} {metric} baseline value")
-                if actual > approved:
+                if actual <= limit:
+                    errors.append(
+                        _finding(
+                            "production_baseline_remove",
+                            path,
+                            f"{metric} recovered to {actual}, at or below hard limit {limit}; "
+                            "remove this metric baseline",
+                        )
+                    )
+                elif actual > approved:
                     errors.append(
                         _finding(
                             "baseline_growth",
