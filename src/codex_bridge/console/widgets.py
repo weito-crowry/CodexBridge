@@ -68,6 +68,14 @@ def _safe_status(value: object) -> str | None:
 
 _MAX_EPOCH_MILLISECONDS = 253_402_300_799_999
 _TERMINAL_ITEM_STATUSES = {"completed", "failed", "interrupted", "error"}
+_EFFECTIVE_SANDBOX_MODES = {
+    "danger-full-access",
+    "external-sandbox",
+    "read-only",
+    "workspace-write",
+}
+_EFFECTIVE_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
+_EFFECTIVE_APPROVALS_REVIEWERS = {"auto_review", "guardian_subagent", "user"}
 
 
 def _safe_epoch_milliseconds(value: object) -> int | None:
@@ -969,6 +977,26 @@ class ActivityPane(QWidget):
         self.state_label = QLabel("not_loaded")
         self.state_label.setWordWrap(True)
         state_header = QLabel("Current state")
+        self.sandbox_mode_label = QLabel("Sandbox: Unknown")
+        self.sandbox_mode_label.setObjectName("effectiveSandboxMode")
+        self.approval_policy_label = QLabel("Approval policy: Unknown")
+        self.approval_policy_label.setObjectName("effectiveApprovalPolicy")
+        self.approvals_reviewer_label = QLabel("Approvals reviewer: Unknown")
+        self.approvals_reviewer_label.setObjectName("effectiveApprovalsReviewer")
+        self._effective_access_section = QWidget()
+        self._effective_access_section.setObjectName("effectiveThreadAccess")
+        effective_access_layout = QVBoxLayout(self._effective_access_section)
+        effective_access_layout.setContentsMargins(0, 0, 0, 0)
+        effective_access_layout.setSpacing(1)
+        for access_label in (
+            self.sandbox_mode_label,
+            self.approval_policy_label,
+            self.approvals_reviewer_label,
+        ):
+            access_label.setTextFormat(Qt.TextFormat.PlainText)
+            access_label.setWordWrap(True)
+            effective_access_layout.addWidget(access_label)
+        self._sandbox_mode_default_font = QFont(self.sandbox_mode_label.font())
         self.pending_label = QLabel("")
         self.pending_label.setWordWrap(True)
         self._pending_header = QLabel("Pending request")
@@ -1012,6 +1040,7 @@ class ActivityPane(QWidget):
         state_layout.setContentsMargins(0, 0, 0, 0)
         state_layout.addWidget(state_header)
         state_layout.addWidget(self.state_label)
+        state_layout.addWidget(self._effective_access_section)
         state_layout.addWidget(self._pending_header)
         state_layout.addWidget(self.pending_label)
         state_layout.addWidget(self.approval_details_label)
@@ -1036,9 +1065,9 @@ class ActivityPane(QWidget):
     def set_snapshot(self, snapshot: Mapping[str, object], *, reset: bool = False) -> None:
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
         self.state_label.setText(state)
+        self._set_effective_access(snapshot, state)
         pending = snapshot.get("pending_request")
         if isinstance(pending, Mapping):
-            has_pending = True
             self._pending_header.show()
             self.pending_label.show()
             label = "Approval required" if state == "needs_approval" else "Input required"
@@ -1072,7 +1101,6 @@ class ActivityPane(QWidget):
                 self.approval_details_label.hide()
             self._sync_approval_controls()
         else:
-            has_pending = False
             self._pending_header.hide()
             self.pending_label.hide()
             self.pending_label.setText("")
@@ -1085,8 +1113,7 @@ class ActivityPane(QWidget):
             self._approval_feedback.clear()
             self._approval_feedback.hide()
             self._sync_approval_controls()
-        error = _safe_text(snapshot.get("error"), 2_000)
-        self._state_section.setVisible(state != "not_loaded" or has_pending or bool(error))
+        self._state_section.show()
         if reset:
             self.activity_list.clear()
             self._activity_ids.clear()
@@ -1214,6 +1241,7 @@ class ActivityPane(QWidget):
 
     def set_empty_state(self, text: str) -> None:
         self.state_label.setText(text)
+        self._set_effective_access_unavailable("Unknown")
         self.pending_label.clear()
         self._has_approval = False
         self._pending_approval_id = None
@@ -1230,9 +1258,69 @@ class ActivityPane(QWidget):
         self.activity_list.clear()
         self._activity_ids.clear()
 
+    def set_loading_state(self, text: str) -> None:
+        self.set_empty_state(text)
+        self._state_section.show()
+
     def set_error(self, text: str) -> None:
         self.state_label.setText(text)
+        self._set_effective_access_unavailable("Unavailable")
         self.pending_label.clear()
         self._pending_header.hide()
         self.pending_label.hide()
         self._state_section.show()
+
+    def _set_effective_access(self, snapshot: Mapping[str, object], state: str) -> None:
+        metadata: object = snapshot.get("thread_metadata")
+        if state == "not_loaded":
+            metadata = None
+        sandbox_mode = self._effective_metadata_value(
+            metadata, "sandbox_mode", _EFFECTIVE_SANDBOX_MODES
+        )
+        approval_policy = self._effective_metadata_value(
+            metadata, "approval_policy", _EFFECTIVE_APPROVAL_POLICIES
+        )
+        approvals_reviewer = self._effective_metadata_value(
+            metadata, "approvals_reviewer", _EFFECTIVE_APPROVALS_REVIEWERS
+        )
+
+        if sandbox_mode == "danger-full-access":
+            self.sandbox_mode_label.setText("Sandbox: WARNING — Full Access (danger-full-access)")
+            palette = QPalette(self.sandbox_mode_label.palette())
+            palette.setColor(
+                QPalette.ColorRole.WindowText,
+                palette.color(QPalette.ColorRole.BrightText),
+            )
+            self.sandbox_mode_label.setPalette(palette)
+            font = QFont(self._sandbox_mode_default_font)
+            font.setBold(True)
+            self.sandbox_mode_label.setFont(font)
+        else:
+            self.sandbox_mode_label.setText(f"Sandbox: {sandbox_mode}")
+            self.sandbox_mode_label.setPalette(QPalette())
+            self.sandbox_mode_label.setFont(self._sandbox_mode_default_font)
+        self.approval_policy_label.setText(f"Approval policy: {approval_policy}")
+        self.approvals_reviewer_label.setText(f"Approvals reviewer: {approvals_reviewer}")
+
+    @staticmethod
+    def _effective_metadata_value(
+        metadata: object, key: str, allowed_values: Collection[str]
+    ) -> str:
+        if not isinstance(metadata, Mapping):
+            return "Unknown"
+        value = metadata.get(key)
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 128
+            or value not in allowed_values
+        ):
+            return "Unknown"
+        return value
+
+    def _set_effective_access_unavailable(self, value: str) -> None:
+        self.sandbox_mode_label.setText(f"Sandbox: {value}")
+        self.sandbox_mode_label.setPalette(QPalette())
+        self.sandbox_mode_label.setFont(self._sandbox_mode_default_font)
+        self.approval_policy_label.setText(f"Approval policy: {value}")
+        self.approvals_reviewer_label.setText(f"Approvals reviewer: {value}")

@@ -2744,6 +2744,170 @@ def test_history_header_includes_turn_model_metadata() -> None:
     window.close()
 
 
+def test_main_window_uses_current_thread_metadata_not_setup_access_values() -> None:
+    _application()
+    client = FakeClient()
+    window = _usage_window(client)
+
+    window.select_thread("thread-a")
+    status_a = f"selection:{window._selection_generation}:status"
+    client.result(
+        status_a,
+        {
+            "thread_id": "thread-a",
+            "state": "in_progress",
+            "thread_metadata": {
+                "sandbox_mode": "danger-full-access",
+                "approval_policy": "never",
+                "approvals_reviewer": "user",
+            },
+        },
+    )
+    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
+    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
+    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
+    assert sandbox is not None
+    assert policy is not None
+    assert reviewer is not None
+    assert "Full Access" in sandbox.text()
+
+    window.select_thread("thread-b")
+    status_b = f"selection:{window._selection_generation}:status"
+    assert sandbox.text() == "Sandbox: Unknown"
+    assert policy.text() == "Approval policy: Unknown"
+    assert reviewer.text() == "Approvals reviewer: Unknown"
+
+    # A late response for the previous generation must not overwrite thread B.
+    client.result(
+        status_a,
+        {
+            "thread_id": "thread-a",
+            "state": "in_progress",
+            "thread_metadata": {
+                "sandbox_mode": "danger-full-access",
+                "approval_policy": "never",
+                "approvals_reviewer": "user",
+            },
+        },
+    )
+    client.result(
+        status_b,
+        {
+            "thread_id": "thread-b",
+            "state": "in_progress",
+            "thread_metadata": {
+                "sandbox_mode": "workspace-write",
+                "approval_policy": "on-request",
+                "approvals_reviewer": "auto_review",
+            },
+            "setup_selection": {"sandbox_mode": "danger-full-access"},
+            "sandbox_mode": "danger-full-access",
+        },
+    )
+
+    assert sandbox.text() == "Sandbox: workspace-write"
+    assert policy.text() == "Approval policy: on-request"
+    assert reviewer.text() == "Approvals reviewer: auto_review"
+    window.close()
+
+
+def test_main_window_shows_unknown_access_while_selected_thread_status_is_loading() -> None:
+    application = _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    _set_usage_ready(window)
+
+    window.select_thread("thread-a")
+    window.show()
+    application.processEvents()
+
+    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
+    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
+    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
+    assert sandbox is not None
+    assert policy is not None
+    assert reviewer is not None
+    assert sandbox.text() == "Sandbox: Unknown"
+    assert policy.text() == "Approval policy: Unknown"
+    assert reviewer.text() == "Approvals reviewer: Unknown"
+    assert sandbox.isVisible()
+    assert policy.isVisible()
+    assert reviewer.isVisible()
+
+    window.select_thread(None)
+    application.processEvents()
+    assert not sandbox.isVisible()
+    assert not policy.isVisible()
+    assert not reviewer.isVisible()
+    window.close()
+
+
+def test_main_window_clears_effective_access_on_status_error_and_disconnect() -> None:
+    application = _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.show()
+    application.processEvents()
+    window.select_thread("thread-a")
+    status_key = f"selection:{window._selection_generation}:status"
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-a",
+            "state": "in_progress",
+            "thread_metadata": {
+                "sandbox_mode": "workspace-write",
+                "approval_policy": "on-request",
+                "approvals_reviewer": "user",
+            },
+            "recent_activities": [
+                {"activity_id": "activity-1", "type": "turn_started", "summary": "started"}
+            ],
+        },
+    )
+
+    client.failure(status_key, "Status request failed")
+
+    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
+    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
+    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
+    assert sandbox is not None
+    assert policy is not None
+    assert reviewer is not None
+    assert sandbox.text() == "Sandbox: Unavailable"
+    assert policy.text() == "Approval policy: Unavailable"
+    assert reviewer.text() == "Approvals reviewer: Unavailable"
+    assert sandbox.isVisible()
+    assert policy.isVisible()
+    assert reviewer.isVisible()
+    assert window.activity_pane.activity_list.count() == 1
+
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-a",
+            "state": "in_progress",
+            "thread_metadata": {
+                "sandbox_mode": "danger-full-access",
+                "approval_policy": "never",
+                "approvals_reviewer": "user",
+            },
+        },
+    )
+    assert "Full Access" in sandbox.text()
+
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert sandbox.text() == "Sandbox: Unavailable"
+    assert policy.text() == "Approval policy: Unavailable"
+    assert reviewer.text() == "Approvals reviewer: Unavailable"
+    assert sandbox.isVisible()
+    assert policy.isVisible()
+    assert reviewer.isVisible()
+    assert window.activity_pane.activity_list.count() == 1
+    window.close()
+
+
 def test_health_poll_also_refreshes_bridge_status_and_recovers_without_refresh() -> None:
     _application()
     client = FakeClient()
