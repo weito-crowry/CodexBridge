@@ -15,7 +15,9 @@ RequestId = int | str
 ApprovalDecision = Literal["accept", "acceptForSession", "decline", "cancel"]
 PermissionGrantScope = Literal["turn", "session"]
 SandboxMode = Literal["inherit", "danger-full-access"]
+ApprovalsReviewer = Literal["auto_review", "user"]
 SANDBOX_MODES = frozenset({"inherit", "danger-full-access"})
+APPROVALS_REVIEWERS = frozenset({"auto_review", "user"})
 
 
 def validate_sandbox_mode(value: str | None) -> SandboxMode | None:
@@ -23,6 +25,12 @@ def validate_sandbox_mode(value: str | None) -> SandboxMode | None:
         return None
     if value not in SANDBOX_MODES:
         raise ValueError("unsupported sandbox_mode")
+    return value  # type: ignore[return-value]
+
+
+def validate_approvals_reviewer(value: str) -> ApprovalsReviewer:
+    if value not in APPROVALS_REVIEWERS:
+        raise ValueError("unsupported approvals_reviewer")
     return value  # type: ignore[return-value]
 
 

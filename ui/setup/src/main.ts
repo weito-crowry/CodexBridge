@@ -8,6 +8,7 @@ import {
   isCurrentGeneration,
   selectModel,
   selectionIsValid,
+  type ApprovalsReviewer,
   type Capabilities,
   type SandboxMode,
   type Selection,
@@ -29,6 +30,7 @@ type ConfirmResult = {
     model: string;
     reasoning_effort: string;
     sandbox_mode: SandboxMode;
+    approvals_reviewer: ApprovalsReviewer;
   };
 };
 
@@ -38,6 +40,7 @@ const targetSelect = document.querySelector<HTMLSelectElement>("#target")!;
 const modelSelect = document.querySelector<HTMLSelectElement>("#model")!;
 const reasoningSelect = document.querySelector<HTMLSelectElement>("#reasoning")!;
 const accessSelect = document.querySelector<HTMLSelectElement>("#access")!;
+const reviewerSelect = document.querySelector<HTMLSelectElement>("#reviewer")!;
 const modelDescription = document.querySelector<HTMLElement>("#model-description")!;
 const reasoningDescription = document.querySelector<HTMLElement>("#reasoning-description")!;
 const accessWarning = document.querySelector<HTMLElement>("#access-warning")!;
@@ -69,6 +72,7 @@ function updateControls(): void {
   reasoningSelect.disabled = modelSelect.disabled || !selection.model;
   accessSelect.disabled = !hostReady || selectionConfirmed || !capabilities
     || Boolean(capabilities.error) || !capabilities.target.available;
+  reviewerSelect.disabled = !hostReady || selectionConfirmed;
   refreshButton.disabled = !hostReady || selectionConfirmed;
   confirmButton.disabled = !hostReady || selectionConfirmed || !capabilities
     || !selectionIsValid(capabilities, selection);
@@ -115,12 +119,14 @@ function renderModels(): void {
     accessSelect.add(new Option(label, mode.id));
   }
   accessSelect.value = selection.sandboxMode;
+  reviewerSelect.value = selection.approvalsReviewer;
   accessWarning.hidden = selection.sandboxMode !== "danger-full-access";
   updateControls();
 }
 
 function applySetupResult(result: SetupResult): void {
   selectionConfirmed = false;
+  const previousReviewer = selection.approvalsReviewer;
   const previousId = targetSelect.value;
   targets = Array.isArray(result.targets) ? result.targets : [];
   selectionRequired = result.selection_required;
@@ -128,12 +134,12 @@ function applySetupResult(result: SetupResult): void {
   const selectedId = keptTarget?.id ?? (!selectionRequired && targets.length === 1 ? targets[0].id : "");
   renderTargets(selectedId);
   capabilities = null;
-  selection = changeTarget();
+  selection = changeTarget(previousReviewer);
 
   const initialCapabilities = result.capabilities;
   if (initialCapabilities && initialCapabilities.target.id === selectedId) {
     capabilities = initialCapabilities;
-    selection = applyCapabilities(initialCapabilities);
+    selection = applyCapabilities(initialCapabilities, changeTarget(previousReviewer));
     showCapabilityStatus(initialCapabilities);
   } else if (selectedId) {
     void loadCapabilities(selectedId);
@@ -168,7 +174,7 @@ async function loadCapabilities(
 ): Promise<void> {
   const requestGeneration = ++generation;
   capabilities = null;
-  selection = changeTarget();
+  selection = changeTarget(previousSelection.approvalsReviewer);
   renderModels();
   setStatus("Loading models…");
   try {
@@ -191,13 +197,16 @@ async function loadCapabilities(
     });
     if (!isCurrentGeneration(requestGeneration, generation)) return;
     capabilities = readStructured<Capabilities>(result);
-    selection = applyCapabilities(capabilities, previousSelection);
+    selection = applyCapabilities(capabilities, {
+      ...previousSelection,
+      approvalsReviewer: selection.approvalsReviewer,
+    });
     renderModels();
     showCapabilityStatus(capabilities);
   } catch {
     if (!isCurrentGeneration(requestGeneration, generation)) return;
     capabilities = null;
-    selection = changeTarget();
+    selection = changeTarget(selection.approvalsReviewer);
     renderModels();
     setStatus("Model capabilities are unavailable. Refresh to try again.");
   }
@@ -208,7 +217,7 @@ targetSelect.addEventListener("change", () => {
   const targetId = targetSelect.value;
   const previousSelection = selection;
   capabilities = null;
-  selection = changeTarget();
+  selection = changeTarget(previousSelection.approvalsReviewer);
   generation += 1;
   renderModels();
   const target = targets.find((entry) => entry.id === targetId);
@@ -225,7 +234,11 @@ modelSelect.addEventListener("change", () => {
   if (!capabilities) return;
   selectionConfirmed = false;
   selection = selectModel(
-    capabilities, modelSelect.value, selection.reasoningEffort, selection.sandboxMode,
+    capabilities,
+    modelSelect.value,
+    selection.reasoningEffort,
+    selection.sandboxMode,
+    selection.approvalsReviewer,
   );
   renderModels();
 });
@@ -233,6 +246,12 @@ modelSelect.addEventListener("change", () => {
 accessSelect.addEventListener("change", () => {
   selectionConfirmed = false;
   selection = { ...selection, sandboxMode: accessSelect.value as SandboxMode };
+  renderModels();
+});
+
+reviewerSelect.addEventListener("change", () => {
+  selectionConfirmed = false;
+  selection = { ...selection, approvalsReviewer: reviewerSelect.value as ApprovalsReviewer };
   renderModels();
 });
 
@@ -288,6 +307,7 @@ async function confirmSelection(): Promise<void> {
       `model=${confirmed.selection.model}`,
       `reasoning_effort=${confirmed.selection.reasoning_effort}`,
       `sandbox_mode=${confirmed.selection.sandbox_mode}`,
+      `approvals_reviewer=${confirmed.selection.approvals_reviewer}`,
     ].join("\n");
     if (!app.getHostCapabilities()?.updateModelContext) {
       setStatus("This client cannot save the confirmed selection to the conversation.");
@@ -312,7 +332,7 @@ async function confirmSelection(): Promise<void> {
           content: [
             {
               type: "text",
-              text: "CodexBridge setup confirmed. Continue the pending task using the confirmed target, model, reasoning effort, and access mode.",
+              text: "CodexBridge setup confirmed. Continue the pending task using the confirmed target, model, reasoning effort, access mode, and approvals reviewer.",
             },
           ],
         });
@@ -328,7 +348,7 @@ async function confirmSelection(): Promise<void> {
   } catch {
     if (!isCurrentGeneration(requestGeneration, generation)) return;
     capabilities = null;
-    selection = changeTarget();
+    selection = changeTarget(selection.approvalsReviewer);
     renderModels();
     setStatus("Refresh required. The selection may be stale or unavailable.");
   }

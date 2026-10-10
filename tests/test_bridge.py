@@ -11,6 +11,7 @@ import pytest
 from codex_bridge.activity import ActivityStore
 from codex_bridge.bridge import ApprovalConflictError, Bridge, BridgeError
 from codex_bridge.history import HistoryValidationError
+from codex_bridge.jsonrpc import JsonRpcRemoteError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
 
@@ -37,13 +38,16 @@ class FakeAppServer:
         self.model_pages: dict[str | None, dict[str, Any]] = {}
         self.config_response: dict[str, Any] = {"config": {}}
         self.thread_start_settings: dict[str, Any] = {}
+        self.thread_start_error: Exception | None = None
         self.thread_resume_settings: dict[str, Any] = {}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
         self.calls.append((method, params))
         if method == "thread/start":
-            return {
+            if self.thread_start_error is not None:
+                raise self.thread_start_error
+            response = {
                 "thread": {
                     "id": "native-thread",
                     "modelProvider": "openai",
@@ -51,8 +55,12 @@ class FakeAppServer:
                     "reasoningEffort": "high",
                     "cliVersion": "0.1.2",
                 },
-                **self.thread_start_settings,
             }
+            for key in ("approvalPolicy", "approvalsReviewer"):
+                if key in params:
+                    response[key] = params[key]
+            response.update(self.thread_start_settings)
+            return response
         if method == "model/list":
             return self.model_pages.get(params.get("cursor"), {"data": []})
         if method == "config/read":
@@ -164,11 +172,22 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
         "reasoning_effort": "high",
         "cli_version": "0.1.2",
         "sandbox_mode": None,
-        "approval_policy": None,
-        "approvals_reviewer": None,
+        "approval_policy": "on-request",
+        "approvals_reviewer": "auto_review",
     }
+    assert app.calls[0] == (
+        "thread/start",
+        {
+            "cwd": str(allowed_dir),
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+        },
+    )
     assert app.methods == ["thread/start", "turn/start"]
     assert app.calls[1][1]["input"] == [{"type": "text", "text": "inspect this"}]
+    status = await bridge.status(result["thread_id"], result["turn_id"])
+    assert status["thread_metadata"]["approvals_reviewer"] == "auto_review"
+    assert status["thread_metadata"]["approval_policy"] == "on-request"
 
 
 @pytest.mark.asyncio
@@ -181,7 +200,15 @@ async def test_start_passes_explicit_model_and_effort_only_to_expected_wire_fiel
         str(allowed_dir), "inspect this", model="model-value", reasoning_effort="high"
     )
 
-    assert app.calls[0] == ("thread/start", {"cwd": str(allowed_dir), "model": "model-value"})
+    assert app.calls[0] == (
+        "thread/start",
+        {
+            "cwd": str(allowed_dir),
+            "model": "model-value",
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+        },
+    )
     assert app.calls[1][0] == "turn/start"
     assert app.calls[1][1]["model"] == "model-value"
     assert app.calls[1][1]["effort"] == "high"
@@ -195,7 +222,14 @@ async def test_start_inherit_does_not_send_sandbox(allowed_dir, sandbox_mode) ->
 
     await bridge.start(str(allowed_dir), "inspect this", sandbox_mode=sandbox_mode)
 
-    assert app.calls[0] == ("thread/start", {"cwd": str(allowed_dir)})
+    assert app.calls[0] == (
+        "thread/start",
+        {
+            "cwd": str(allowed_dir),
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -206,9 +240,13 @@ async def test_start_full_access_sends_durable_permission_profile_override(allow
 
     assert app.calls[0] == (
         "thread/start",
-        {"cwd": str(allowed_dir), "config": {"default_permissions": ":danger-full-access"}},
+        {
+            "cwd": str(allowed_dir),
+            "config": {"default_permissions": ":danger-full-access"},
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+        },
     )
-    assert "approvalPolicy" not in app.calls[0][1]
 
 
 @pytest.mark.asyncio
@@ -243,14 +281,95 @@ async def test_start_projects_effective_execution_settings_from_app_server(allow
         "activePermissionProfile": {"id": ":danger-full-access"},
     }
 
-    result = await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="danger-full-access")
+    result = await bridge.start(
+        str(allowed_dir),
+        "inspect this",
+        sandbox_mode="danger-full-access",
+        approvals_reviewer="user",
+    )
 
     assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
     assert result["thread_metadata"]["approval_policy"] == "on-request"
     assert result["thread_metadata"]["approvals_reviewer"] == "user"
     assert "active_permission_profile" not in result["thread_metadata"]
-    assert "approvalPolicy" not in app.calls[0][1]
+    assert app.calls[0][1]["approvalPolicy"] == "on-request"
     assert app.calls[0][1]["config"]["default_permissions"] == ":danger-full-access"
+
+
+@pytest.mark.asyncio
+async def test_start_manual_reviewer_preserves_on_request_default_flow(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    result = await bridge.start(str(allowed_dir), "inspect this", approvals_reviewer="user")
+
+    assert app.calls[0] == (
+        "thread/start",
+        {
+            "cwd": str(allowed_dir),
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+        },
+    )
+    assert result["thread_metadata"]["approvals_reviewer"] == "user"
+    assert result["thread_metadata"]["approval_policy"] == "on-request"
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_invalid_reviewer_before_creating_thread(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    with pytest.raises(ValueError, match="approvals_reviewer"):
+        await bridge.start(str(allowed_dir), "inspect this", approvals_reviewer="guardian_subagent")
+
+    assert app.calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_start_turn_if_reviewer_metadata_mismatches(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_start_settings = {"approvalsReviewer": "auto_review"}
+
+    with pytest.raises(BridgeError, match="empty thread native-thread.*approvals_reviewer"):
+        await bridge.start(str(allowed_dir), "inspect this", approvals_reviewer="user")
+
+    assert app.methods == ["thread/start"]
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_start_turn_if_auto_review_policy_metadata_mismatches(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_start_settings = {"approvalPolicy": "never"}
+
+    with pytest.raises(BridgeError, match="empty thread.*approval_policy"):
+        await bridge.start(str(allowed_dir), "inspect this")
+
+    assert app.methods == ["thread/start"]
+
+
+@pytest.mark.asyncio
+async def test_start_manual_reviewer_does_not_start_turn_if_policy_is_not_on_request(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_start_settings = {"approvalPolicy": "never"}
+
+    with pytest.raises(BridgeError, match="empty thread native-thread.*approval_policy"):
+        await bridge.start(str(allowed_dir), "inspect this", approvals_reviewer="user")
+
+    assert app.methods == ["thread/start"]
+
+
+@pytest.mark.asyncio
+async def test_start_reports_rejected_reviewer_without_retry(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_start_error = JsonRpcRemoteError("unknown field approvalsReviewer")
+
+    with pytest.raises(BridgeError, match="App Server rejected.*thread/start"):
+        await bridge.start(str(allowed_dir), "inspect this")
+
+    assert app.methods == ["thread/start"]
 
 
 @pytest.mark.asyncio
@@ -342,6 +461,9 @@ async def test_continue_resumes_a_thread_not_loaded_in_this_process(allowed_dir)
     await bridge.continue_thread("persisted-thread", "continue")
 
     assert app.methods == ["thread/read", "thread/resume", "turn/start"]
+    assert app.calls[1] == ("thread/resume", {"threadId": "persisted-thread"})
+    assert "approvalsReviewer" not in app.calls[2][1]
+    assert "approvalPolicy" not in app.calls[2][1]
 
 
 @pytest.mark.asyncio
@@ -361,7 +483,12 @@ async def test_cold_resume_uses_effective_metadata_without_sandbox_overrides(all
 
     assert app.calls[0] == (
         "thread/start",
-        {"cwd": str(allowed_dir), "config": {"default_permissions": ":danger-full-access"}},
+        {
+            "cwd": str(allowed_dir),
+            "config": {"default_permissions": ":danger-full-access"},
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
+        },
     )
     assert app.calls[3] == ("thread/resume", {"threadId": "native-thread"})
     assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
