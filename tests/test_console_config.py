@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from codex_bridge.console.config import (
@@ -10,35 +12,44 @@ from codex_bridge.console.config import (
 )
 
 
-def test_console_config_defaults_to_fixed_loopback_and_8001(monkeypatch) -> None:
+def _isolated_environ(tmp_path: Path, values: dict[str, str] | None = None) -> dict[str, str]:
+    return {
+        "CODEX_BRIDGE_CONFIG": str(tmp_path / "missing-config.toml"),
+        **(values or {}),
+    }
+
+
+def test_console_config_defaults_to_fixed_loopback_and_8001(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("CODEX_BRIDGE_UI_PORT", raising=False)
 
-    config = ConsoleConfig.from_sources(environ={})
+    config = ConsoleConfig.from_sources(environ=_isolated_environ(tmp_path))
 
     assert config.host == "127.0.0.1"
     assert config.port == 8001
     assert config.base_url == "http://127.0.0.1:8001"
 
 
-def test_environment_port_is_used_when_cli_port_is_absent() -> None:
-    config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_UI_PORT": "8123"})
+def test_environment_port_is_used_when_cli_port_is_absent(tmp_path) -> None:
+    config = ConsoleConfig.from_sources(
+        environ=_isolated_environ(tmp_path, {"CODEX_BRIDGE_UI_PORT": "8123"})
+    )
 
     assert config.port == 8123
 
 
-def test_cli_port_has_priority_over_environment() -> None:
+def test_cli_port_has_priority_over_environment(tmp_path) -> None:
     config = ConsoleConfig.from_sources(
         explicit_port=8124,
-        environ={"CODEX_BRIDGE_UI_PORT": "8123"},
+        environ=_isolated_environ(tmp_path, {"CODEX_BRIDGE_UI_PORT": "8123"}),
     )
 
     assert config.port == 8124
 
 
-def test_cli_codex_executable_has_priority_over_environment() -> None:
+def test_cli_codex_executable_has_priority_over_environment(tmp_path) -> None:
     config = ConsoleConfig.from_sources(
         explicit_codex_executable="cli-codex",
-        environ={"CODEX_BRIDGE_CODEX_EXECUTABLE": "env-codex"},
+        environ=_isolated_environ(tmp_path, {"CODEX_BRIDGE_CODEX_EXECUTABLE": "env-codex"}),
     )
 
     assert config.codex_executable == "cli-codex"
@@ -56,20 +67,23 @@ def test_boundary_console_ports_are_accepted(value: int) -> None:
     assert parse_ui_port(value) == value
 
 
-def test_console_config_defaults_to_codex_bridge_tunnel_profile() -> None:
-    config = ConsoleConfig.from_sources(environ={})
+def test_console_config_defaults_to_codex_bridge_tunnel_profile(tmp_path) -> None:
+    config = ConsoleConfig.from_sources(environ=_isolated_environ(tmp_path))
 
     assert config.tunnel_profile == "codex-bridge"
     assert config.tunnel_executable is None
 
 
-def test_tunnel_environment_overrides_are_read_without_secret_fields() -> None:
+def test_tunnel_environment_overrides_are_read_without_secret_fields(tmp_path) -> None:
     config = ConsoleConfig.from_sources(
-        environ={
-            "CODEX_BRIDGE_TUNNEL_EXECUTABLE": "C:/tools/tunnel-client.exe",
-            "CODEX_BRIDGE_TUNNEL_PROFILE": "work.profile-1",
-            "CONTROL_PLANE_API_KEY": "must-not-be-read-by-config",
-        }
+        environ=_isolated_environ(
+            tmp_path,
+            {
+                "CODEX_BRIDGE_TUNNEL_EXECUTABLE": "C:/tools/tunnel-client.exe",
+                "CODEX_BRIDGE_TUNNEL_PROFILE": "work.profile-1",
+                "CONTROL_PLANE_API_KEY": "must-not-be-read-by-config",
+            },
+        )
     )
 
     assert config.tunnel_executable == "C:/tools/tunnel-client.exe"
