@@ -575,14 +575,11 @@ class Bridge:
         if model is not None:
             thread_params["model"] = model
         thread_params["approvalsReviewer"] = approvals_reviewer
-        if approvals_reviewer == "auto_review":
-            thread_params["approvalPolicy"] = "on-request"
+        thread_params["approvalPolicy"] = "on-request"
         try:
             response = await self._app_server.request("thread/start", thread_params)
         except JsonRpcRemoteError:
-            raise BridgeError(
-                "Codex App Server rejected the selected approvals reviewer settings"
-            ) from None
+            raise BridgeError("Codex App Server rejected the thread/start settings") from None
         thread = response.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise BridgeError("thread/start did not return a thread id")
@@ -592,7 +589,7 @@ class Bridge:
                 "thread/start created empty thread "
                 f"{thread_id} with mismatched approvals_reviewer; turn/start was not issued"
             )
-        if approvals_reviewer == "auto_review" and response.get("approvalPolicy") != "on-request":
+        if response.get("approvalPolicy") != "on-request":
             raise BridgeError(
                 "thread/start created empty thread "
                 f"{thread_id} with mismatched approval_policy; turn/start was not issued"
