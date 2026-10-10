@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEventLoop, QPoint, Qt, QTimer
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPalette, QPixmap
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
+from PySide6.QtGui import QDesktopServices, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -18,7 +17,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTextBrowser,
     QTreeWidgetItem,
-    QWidget,
 )
 
 from codex_bridge.console import main_window as main_window_module
@@ -797,140 +795,6 @@ def test_success_with_unavailable_usage_does_not_save_history(tmp_path: Path) ->
     window.close()
 
 
-def test_status_opens_one_independent_usage_history_window(tmp_path: Path) -> None:
-    _application()
-    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
-    window._show_status()
-
-    assert window.status_dialog.isVisible()
-    assert window.status_dialog.findChild(QWidget, "usageHistoryChart") is None
-    assert window.usage_history_button.text() == "Show usage history"
-    assert not window.status_dialog.isModal()
-
-    window.usage_history_button.click()
-    first_window = window._usage_history_window
-    assert first_window is not None
-    assert first_window.isVisible()
-    window.status_dialog.close()
-    assert first_window.isVisible()
-
-    window.usage_history_button.click()
-    assert window._usage_history_window is first_window
-    window.close()
-
-
-def test_usage_status_label_opens_history_directly_and_reuses_it(tmp_path: Path) -> None:
-    application = _application()
-    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
-    label = window.usage_status_label
-    window.show()
-    application.processEvents()
-
-    QTest.mouseClick(label, Qt.MouseButton.RightButton)
-    assert window._usage_history_window is None
-    QTest.mousePress(label, Qt.MouseButton.LeftButton, pos=label.rect().center())
-    QTest.mouseRelease(label, Qt.MouseButton.LeftButton, pos=QPoint(-1, -1))
-    assert window._usage_history_window is None
-
-    QTest.mouseClick(label, Qt.MouseButton.LeftButton)
-    first_window = window._usage_history_window
-    assert first_window is not None and first_window.isVisible()
-    assert not window.status_dialog.isVisible()
-    assert label.objectName() == "topStatus"
-    assert label.cursor().shape() == Qt.CursorShape.PointingHandCursor
-    assert label.focusPolicy() != Qt.FocusPolicy.NoFocus
-    assert label.accessibleName() == "Codex Usage"
-    assert label.accessibleDescription() == "Open Usage History"
-
-    QTest.mouseClick(label, Qt.MouseButton.LeftButton)
-    assert window._usage_history_window is first_window
-
-    window._show_status()
-    window.usage_history_button.click()
-    assert window._usage_history_window is first_window
-    QTest.mouseClick(label, Qt.MouseButton.LeftButton)
-    assert window._usage_history_window is first_window
-    window.close()
-
-
-@pytest.mark.parametrize(
-    "key",
-    [Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space],
-    ids=["enter", "keypad-enter", "space"],
-)
-def test_usage_status_label_keyboard_opens_history(tmp_path: Path, key: Qt.Key) -> None:
-    application = _application()
-    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
-    window.show()
-    application.processEvents()
-    window.usage_status_label.setFocus()
-
-    QTest.keyClick(window.usage_status_label, key)
-
-    history_window = window._usage_history_window
-    assert history_window is not None and history_window.isVisible()
-    assert not window.status_dialog.isVisible()
-    QTest.keyClick(window.usage_status_label, key)
-    assert window._usage_history_window is history_window
-    window.close()
-
-
-def test_usage_status_shortcut_survives_usage_updates_and_failures(tmp_path: Path) -> None:
-    application = _application()
-    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
-    window.show()
-    application.processEvents()
-
-    assert window.usage_status_label.text() == "Codex Usage  unavailable"
-    QTest.mouseClick(window.usage_status_label, Qt.MouseButton.LeftButton)
-    history_window = window._usage_history_window
-    assert history_window is not None and history_window._display_samples == []
-
-    window._apply_usage({"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 85}}})
-    known_text = "Codex Usage  5h 15% · Week —"
-    known_tooltip = window.usage_status_label.toolTip()
-    known_weight = window.usage_status_label.font().weight()
-    known_color = window.usage_status_label.palette().color(QPalette.ColorRole.WindowText)
-    assert window.usage_status_label.text() == known_text
-    assert "5h: 15% left" in known_tooltip
-    assert known_weight == QFont.Weight.DemiBold
-    assert known_color == window.usage_status_label.palette().color(QPalette.ColorRole.Link)
-
-    window._apply_usage_failure("Bridge unavailable")
-    assert window.usage_status_label.text() == f"{known_text} · refresh failed"
-    assert "Bridge unavailable" in window.usage_status_label.toolTip()
-    assert window.usage_status_label.font().weight() == known_weight
-    assert window.usage_status_label.palette().color(QPalette.ColorRole.WindowText) == known_color
-
-    QTest.mouseClick(window.usage_status_label, Qt.MouseButton.LeftButton)
-    assert window._usage_history_window is history_window
-    assert not window.status_dialog.isVisible()
-    window.close()
-
-
-def test_main_window_exit_closes_its_usage_history_window(tmp_path: Path) -> None:
-    _application()
-    window = MainWindow(
-        _config(),
-        api_client=FakeClient(),
-        codex_probe=FakeCodexProbe(),
-        codex_update_probe=FakeCodexUpdateProbe(),
-        runtime_launcher=FakeLauncher(),
-        tunnel_supervisor=StableTunnel(),
-        tray_available=False,
-        quit_application=lambda: None,
-        usage_history_path=tmp_path / "usage-history.sqlite3",
-    )
-    window.usage_history_button.click()
-    history_window = window._usage_history_window
-    assert history_window is not None and history_window.isVisible()
-
-    window._begin_exit()
-
-    assert not history_window.isVisible()
-    window.close()
-
-
 def test_usage_sample_refreshes_only_a_visible_history_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1040,37 +904,6 @@ def test_usage_history_write_failure_keeps_usage_and_polling(
 
     assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week —"
     assert window.usage_poll_timer.isActive()
-    window.close()
-
-
-@pytest.mark.parametrize("history_error", [sqlite3.OperationalError, OSError])
-def test_status_opens_and_usage_history_reports_read_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    history_error: type[Exception],
-) -> None:
-    _application()
-    window = MainWindow(
-        _config(),
-        api_client=FakeClient(),
-        tray_available=False,
-        usage_history_path=tmp_path / "usage-history.sqlite3",
-    )
-
-    def fail_read(*args: object, **kwargs: object) -> None:
-        raise history_error("history unavailable")
-
-    monkeypatch.setattr(usage_history_window_module, "get_usage_samples_for_display", fail_read)
-
-    window._show_status()
-    window.usage_history_button.click()
-
-    assert window.status_dialog.isVisible()
-    assert window._usage_history_window is not None
-    assert (
-        window._usage_history_window.chart_stack.currentWidget()
-        is window._usage_history_window.error_state_label
-    )
     window.close()
 
 
@@ -2827,170 +2660,6 @@ def test_history_header_includes_turn_model_metadata() -> None:
     headers = {label.text() for label in window.history_pane._content.findChildren(QLabel)}
     assert "Turn · Model: gpt-5 (high)" in headers
     assert "Agent · Model: gpt-5 · Reasoning: high" not in headers
-    window.close()
-
-
-def test_main_window_uses_current_thread_metadata_not_setup_access_values() -> None:
-    _application()
-    client = FakeClient()
-    window = _usage_window(client)
-
-    window.select_thread("thread-a")
-    status_a = f"selection:{window._selection_generation}:status"
-    client.result(
-        status_a,
-        {
-            "thread_id": "thread-a",
-            "state": "in_progress",
-            "thread_metadata": {
-                "sandbox_mode": "danger-full-access",
-                "approval_policy": "never",
-                "approvals_reviewer": "user",
-            },
-        },
-    )
-    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
-    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
-    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
-    assert sandbox is not None
-    assert policy is not None
-    assert reviewer is not None
-    assert "Full Access" in sandbox.text()
-
-    window.select_thread("thread-b")
-    status_b = f"selection:{window._selection_generation}:status"
-    assert sandbox.text() == "Sandbox: Unknown"
-    assert policy.text() == "Approval policy: Unknown"
-    assert reviewer.text() == "Approvals reviewer: Unknown"
-
-    # A late response for the previous generation must not overwrite thread B.
-    client.result(
-        status_a,
-        {
-            "thread_id": "thread-a",
-            "state": "in_progress",
-            "thread_metadata": {
-                "sandbox_mode": "danger-full-access",
-                "approval_policy": "never",
-                "approvals_reviewer": "user",
-            },
-        },
-    )
-    client.result(
-        status_b,
-        {
-            "thread_id": "thread-b",
-            "state": "in_progress",
-            "thread_metadata": {
-                "sandbox_mode": "workspace-write",
-                "approval_policy": "on-request",
-                "approvals_reviewer": "auto_review",
-            },
-            "setup_selection": {"sandbox_mode": "danger-full-access"},
-            "sandbox_mode": "danger-full-access",
-        },
-    )
-
-    assert sandbox.text() == "Sandbox: workspace-write"
-    assert policy.text() == "Approval policy: on-request"
-    assert reviewer.text() == "Approvals reviewer: auto_review"
-    window.close()
-
-
-def test_main_window_shows_unknown_access_while_selected_thread_status_is_loading() -> None:
-    application = _application()
-    client = FakeClient()
-    window = _usage_window(client)
-    _set_usage_ready(window)
-
-    window.select_thread("thread-a")
-    window.show()
-    application.processEvents()
-
-    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
-    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
-    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
-    assert sandbox is not None
-    assert policy is not None
-    assert reviewer is not None
-    assert sandbox.text() == "Sandbox: Unknown"
-    assert policy.text() == "Approval policy: Unknown"
-    assert reviewer.text() == "Approvals reviewer: Unknown"
-    assert sandbox.isVisible()
-    assert policy.isVisible()
-    assert reviewer.isVisible()
-
-    window.select_thread(None)
-    application.processEvents()
-    assert not sandbox.isVisible()
-    assert not policy.isVisible()
-    assert not reviewer.isVisible()
-    window.close()
-
-
-def test_main_window_clears_effective_access_on_status_error_and_disconnect() -> None:
-    application = _application()
-    client = FakeClient()
-    window = _usage_window(client)
-    window.show()
-    application.processEvents()
-    window.select_thread("thread-a")
-    status_key = f"selection:{window._selection_generation}:status"
-    client.result(
-        status_key,
-        {
-            "thread_id": "thread-a",
-            "state": "in_progress",
-            "thread_metadata": {
-                "sandbox_mode": "workspace-write",
-                "approval_policy": "on-request",
-                "approvals_reviewer": "user",
-            },
-            "recent_activities": [
-                {"activity_id": "activity-1", "type": "turn_started", "summary": "started"}
-            ],
-        },
-    )
-
-    client.failure(status_key, "Status request failed")
-
-    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
-    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
-    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
-    assert sandbox is not None
-    assert policy is not None
-    assert reviewer is not None
-    assert sandbox.text() == "Sandbox: Unavailable"
-    assert policy.text() == "Approval policy: Unavailable"
-    assert reviewer.text() == "Approvals reviewer: Unavailable"
-    assert sandbox.isVisible()
-    assert policy.isVisible()
-    assert reviewer.isVisible()
-    assert window.activity_pane.activity_list.count() == 1
-
-    client.result(
-        status_key,
-        {
-            "thread_id": "thread-a",
-            "state": "in_progress",
-            "thread_metadata": {
-                "sandbox_mode": "danger-full-access",
-                "approval_policy": "never",
-                "approvals_reviewer": "user",
-            },
-        },
-    )
-    assert "Full Access" in sandbox.text()
-
-    client.failure("bridge-status", "Bridge unavailable")
-
-    assert sandbox.text() == "Sandbox: Unavailable"
-    assert policy.text() == "Approval policy: Unavailable"
-    assert reviewer.text() == "Approvals reviewer: Unavailable"
-    assert sandbox.isVisible()
-    assert policy.isVisible()
-    assert reviewer.isVisible()
-    assert window.activity_pane.activity_list.count() == 1
     window.close()
 
 

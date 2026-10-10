@@ -11,15 +11,13 @@ from time import monotonic, time
 from typing import Any, cast
 from urllib.parse import quote
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QFont,
     QFontDatabase,
     QIcon,
-    QKeyEvent,
-    QMouseEvent,
     QPalette,
 )
 from PySide6.QtWidgets import (
@@ -56,6 +54,7 @@ from .codex_resolver import (
 from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
+from .history_metadata import _turn_model_metadata_from_payload
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .tunnel_resolver import TunnelResolutionError
@@ -75,6 +74,7 @@ from .usage_history import (
     record_usage_sample,
 )
 from .usage_history_window import UsageHistoryWindow
+from .usage_shortcut_label import UsageShortcutLabel
 from .widgets import (
     ActivityPane,
     HistoryPane,
@@ -135,92 +135,6 @@ _RUNTIME_LABELS = {
     "control_failed": "Runtime: control failed",
     "stop_timed_out": "Runtime: stop timed out",
 }
-
-
-class UsageShortcutLabel(QLabel):
-    activated = Signal()
-
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        self._left_press_active = False
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName("Codex Usage")
-        self.setAccessibleDescription("Open Usage History")
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() != Qt.MouseButton.LeftButton:
-            self._left_press_active = False
-            super().mousePressEvent(event)
-            return
-        self._left_press_active = self.rect().contains(event.position().toPoint())
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
-        event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() != Qt.MouseButton.LeftButton:
-            self._left_press_active = False
-            super().mouseReleaseEvent(event)
-            return
-        should_activate = self._left_press_active and self.rect().contains(
-            event.position().toPoint()
-        )
-        self._left_press_active = False
-        event.accept()
-        if should_activate:
-            self.activated.emit()
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
-            if not event.isAutoRepeat():
-                self.activated.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
-def _turn_model_metadata_from_payload(payload: object) -> dict[str, Mapping[str, object]]:
-    if not isinstance(payload, Mapping):
-        return {}
-    raw_metadata = payload.get("turn_model_metadata")
-    if not isinstance(raw_metadata, Mapping):
-        return {}
-    result: dict[str, Mapping[str, object]] = {}
-    for turn_id, raw_entry in raw_metadata.items():
-        if not isinstance(turn_id, str) or not isinstance(raw_entry, Mapping):
-            continue
-        raw_candidates = raw_entry.get("model_candidates")
-        candidates: list[dict[str, object]] = []
-        if isinstance(raw_candidates, list):
-            for raw_candidate in raw_candidates:
-                if not isinstance(raw_candidate, Mapping):
-                    continue
-                model = raw_candidate.get("model")
-                if not isinstance(model, str) or not model:
-                    continue
-                effort = raw_candidate.get("reasoning_effort")
-                candidates.append(
-                    {
-                        "model": model[:512],
-                        "reasoning_effort": effort[:512]
-                        if isinstance(effort, str) and effort
-                        else None,
-                    }
-                )
-        status = raw_entry.get("model_resolution_status")
-        if not isinstance(status, str) or status not in {"resolved", "multiple", "unavailable"}:
-            status = (
-                "unavailable"
-                if not candidates
-                else "resolved"
-                if len(candidates) == 1
-                else "multiple"
-            )
-        result[turn_id] = {
-            "model_candidates": candidates,
-            "model_resolution_status": status,
-        }
-    return result
 
 
 class MainWindow(QMainWindow):

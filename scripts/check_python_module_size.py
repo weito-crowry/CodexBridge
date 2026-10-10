@@ -16,17 +16,12 @@ POLICY: dict[str, Any] = {
         "baselines": {
             "src/codex_bridge/console/main_window.py": {
                 "physical_loc": {
-                    "value": 2588,
-                    "reason": (
-                        "Existing console file exceeds the LOC ceiling; Issue #45 defers splitting."
-                    ),
+                    "value": 2557,
+                    "reason": "Phase 3 extraction; above the LOC ceiling.",
                 },
                 "raw_bytes": {
-                    "value": 109534,
-                    "reason": (
-                        "Existing console file exceeds the byte ceiling; "
-                        "Issue #45 defers splitting."
-                    ),
+                    "value": 108252,
+                    "reason": "Phase 3 extraction; above the byte ceiling.",
                 },
             }
         },
@@ -36,28 +31,16 @@ POLICY: dict[str, Any] = {
         "strong_review_threshold_bytes": 100000,
         "baselines": {
             "tests/test_bridge.py": {
-                "raw_bytes": {
-                    "value": 76784,
-                    "reason": (
-                        "Existing bridge regression tests stay intact; splitting is out of scope."
-                    ),
-                }
+                "raw_bytes": {"value": 75927, "reason": "Phase 3 fake split; above 50 KB."}
             },
             "tests/test_console_main_window.py": {
                 "raw_bytes": {
-                    "value": 135064,
-                    "reason": (
-                        "Existing main-window tests stay intact; >100 KB needs reviewer attention."
-                    ),
+                    "value": 132552,
+                    "reason": "Phase 3 tests moved; above 100 KB, needs reviewer attention.",
                 }
             },
             "tests/test_console_widgets.py": {
-                "raw_bytes": {
-                    "value": 60460,
-                    "reason": (
-                        "Existing console-widget tests stay intact; splitting is out of scope."
-                    ),
-                }
+                "raw_bytes": {"value": 56627, "reason": "Phase 3 tests moved; above 50 KB."}
             },
         },
     },
