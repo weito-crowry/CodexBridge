@@ -1,0 +1,42 @@
+{
+  "production": {
+    "physical_loc_limit": 1500,
+    "raw_bytes_limit": 65536,
+    "baselines": {
+      "src/codex_bridge/console/main_window.py": {
+        "physical_loc": {
+          "value": 2588,
+          "reason": "Existing console file exceeds the LOC ceiling; Issue #45 defers splitting."
+        },
+        "raw_bytes": {
+          "value": 109534,
+          "reason": "Existing console file exceeds the byte ceiling; Issue #45 defers splitting."
+        }
+      }
+    }
+  },
+  "tests": {
+    "review_threshold_bytes": 50000,
+    "strong_review_threshold_bytes": 100000,
+    "baselines": {
+      "tests/test_bridge.py": {
+        "raw_bytes": {
+          "value": 76784,
+          "reason": "Existing bridge regression tests stay intact; splitting is out of scope."
+        }
+      },
+      "tests/test_console_main_window.py": {
+        "raw_bytes": {
+          "value": 135064,
+          "reason": "Existing main-window tests stay intact; >100 KB needs reviewer attention."
+        }
+      },
+      "tests/test_console_widgets.py": {
+        "raw_bytes": {
+          "value": 60460,
+          "reason": "Existing console-widget tests stay intact; splitting is out of scope."
+        }
+      }
+    }
+  }
+}
