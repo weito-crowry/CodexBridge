@@ -2811,10 +2811,43 @@ def test_main_window_uses_current_thread_metadata_not_setup_access_values() -> N
     window.close()
 
 
-def test_main_window_clears_effective_access_on_status_error_and_disconnect() -> None:
-    _application()
+def test_main_window_shows_unknown_access_while_selected_thread_status_is_loading() -> None:
+    application = _application()
     client = FakeClient()
     window = _usage_window(client)
+    _set_usage_ready(window)
+
+    window.select_thread("thread-a")
+    window.show()
+    application.processEvents()
+
+    sandbox = window.activity_pane.findChild(QLabel, "effectiveSandboxMode")
+    policy = window.activity_pane.findChild(QLabel, "effectiveApprovalPolicy")
+    reviewer = window.activity_pane.findChild(QLabel, "effectiveApprovalsReviewer")
+    assert sandbox is not None
+    assert policy is not None
+    assert reviewer is not None
+    assert sandbox.text() == "Sandbox: Unknown"
+    assert policy.text() == "Approval policy: Unknown"
+    assert reviewer.text() == "Approvals reviewer: Unknown"
+    assert sandbox.isVisible()
+    assert policy.isVisible()
+    assert reviewer.isVisible()
+
+    window.select_thread(None)
+    application.processEvents()
+    assert not sandbox.isVisible()
+    assert not policy.isVisible()
+    assert not reviewer.isVisible()
+    window.close()
+
+
+def test_main_window_clears_effective_access_on_status_error_and_disconnect() -> None:
+    application = _application()
+    client = FakeClient()
+    window = _usage_window(client)
+    window.show()
+    application.processEvents()
     window.select_thread("thread-a")
     status_key = f"selection:{window._selection_generation}:status"
     client.result(
@@ -2844,6 +2877,9 @@ def test_main_window_clears_effective_access_on_status_error_and_disconnect() ->
     assert sandbox.text() == "Sandbox: Unavailable"
     assert policy.text() == "Approval policy: Unavailable"
     assert reviewer.text() == "Approvals reviewer: Unavailable"
+    assert sandbox.isVisible()
+    assert policy.isVisible()
+    assert reviewer.isVisible()
     assert window.activity_pane.activity_list.count() == 1
 
     client.result(
@@ -2865,6 +2901,9 @@ def test_main_window_clears_effective_access_on_status_error_and_disconnect() ->
     assert sandbox.text() == "Sandbox: Unavailable"
     assert policy.text() == "Approval policy: Unavailable"
     assert reviewer.text() == "Approvals reviewer: Unavailable"
+    assert sandbox.isVisible()
+    assert policy.isVisible()
+    assert reviewer.isVisible()
     assert window.activity_pane.activity_list.count() == 1
     window.close()
 

@@ -2039,7 +2039,7 @@ class MainWindow(QMainWindow):
             self._sync_empty_state()
             return
         self.history_pane.set_empty_state("Loading history…")
-        self.activity_pane.set_empty_state("Loading activity…")
+        self.activity_pane.set_loading_state("Loading activity…")
         self.selected_status_timer.start()
         self._request_snapshot(generation)
 
