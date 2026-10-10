@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEventLoop, Qt, QTimer
-from PySide6.QtGui import QDesktopServices, QIcon, QPalette, QPixmap
+from PySide6.QtCore import QCoreApplication, QEventLoop, QPoint, Qt, QTimer
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -302,7 +303,7 @@ def _thread_item(window: MainWindow, thread_id: str) -> QTreeWidgetItem:
     )
 
 
-def _usage_window(client: FakeClient) -> MainWindow:
+def _usage_window(client: FakeClient, usage_history_path: Path | None = None) -> MainWindow:
     return MainWindow(
         _config(),
         api_client=client,
@@ -310,6 +311,7 @@ def _usage_window(client: FakeClient) -> MainWindow:
         codex_update_probe=FakeCodexUpdateProbe(),
         tunnel_supervisor=StableTunnel(),
         tray_available=False,
+        usage_history_path=usage_history_path,
     )
 
 
@@ -797,12 +799,7 @@ def test_success_with_unavailable_usage_does_not_save_history(tmp_path: Path) ->
 
 def test_status_opens_one_independent_usage_history_window(tmp_path: Path) -> None:
     _application()
-    window = MainWindow(
-        _config(),
-        api_client=FakeClient(),
-        tray_available=False,
-        usage_history_path=tmp_path / "usage-history.sqlite3",
-    )
+    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
     window._show_status()
 
     assert window.status_dialog.isVisible()
@@ -819,6 +816,95 @@ def test_status_opens_one_independent_usage_history_window(tmp_path: Path) -> No
 
     window.usage_history_button.click()
     assert window._usage_history_window is first_window
+    window.close()
+
+
+def test_usage_status_label_opens_history_directly_and_reuses_it(tmp_path: Path) -> None:
+    application = _application()
+    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
+    label = window.usage_status_label
+    window.show()
+    application.processEvents()
+
+    QTest.mouseClick(label, Qt.MouseButton.RightButton)
+    assert window._usage_history_window is None
+    QTest.mousePress(label, Qt.MouseButton.LeftButton, pos=label.rect().center())
+    QTest.mouseRelease(label, Qt.MouseButton.LeftButton, pos=QPoint(-1, -1))
+    assert window._usage_history_window is None
+
+    QTest.mouseClick(label, Qt.MouseButton.LeftButton)
+    first_window = window._usage_history_window
+    assert first_window is not None and first_window.isVisible()
+    assert not window.status_dialog.isVisible()
+    assert label.objectName() == "topStatus"
+    assert label.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert label.focusPolicy() != Qt.FocusPolicy.NoFocus
+    assert label.accessibleName() == "Codex Usage"
+    assert label.accessibleDescription() == "Open Usage History"
+
+    QTest.mouseClick(label, Qt.MouseButton.LeftButton)
+    assert window._usage_history_window is first_window
+
+    window._show_status()
+    window.usage_history_button.click()
+    assert window._usage_history_window is first_window
+    QTest.mouseClick(label, Qt.MouseButton.LeftButton)
+    assert window._usage_history_window is first_window
+    window.close()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space],
+    ids=["enter", "keypad-enter", "space"],
+)
+def test_usage_status_label_keyboard_opens_history(tmp_path: Path, key: Qt.Key) -> None:
+    application = _application()
+    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
+    window.show()
+    application.processEvents()
+    window.usage_status_label.setFocus()
+
+    QTest.keyClick(window.usage_status_label, key)
+
+    history_window = window._usage_history_window
+    assert history_window is not None and history_window.isVisible()
+    assert not window.status_dialog.isVisible()
+    QTest.keyClick(window.usage_status_label, key)
+    assert window._usage_history_window is history_window
+    window.close()
+
+
+def test_usage_status_shortcut_survives_usage_updates_and_failures(tmp_path: Path) -> None:
+    application = _application()
+    window = _usage_window(FakeClient(), tmp_path / "usage-history.sqlite3")
+    window.show()
+    application.processEvents()
+
+    assert window.usage_status_label.text() == "Codex Usage  unavailable"
+    QTest.mouseClick(window.usage_status_label, Qt.MouseButton.LeftButton)
+    history_window = window._usage_history_window
+    assert history_window is not None and history_window._display_samples == []
+
+    window._apply_usage({"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 85}}})
+    known_text = "Codex Usage  5h 15% · Week —"
+    known_tooltip = window.usage_status_label.toolTip()
+    known_weight = window.usage_status_label.font().weight()
+    known_color = window.usage_status_label.palette().color(QPalette.ColorRole.WindowText)
+    assert window.usage_status_label.text() == known_text
+    assert "5h: 15% left" in known_tooltip
+    assert known_weight == QFont.Weight.DemiBold
+    assert known_color == window.usage_status_label.palette().color(QPalette.ColorRole.Link)
+
+    window._apply_usage_failure("Bridge unavailable")
+    assert window.usage_status_label.text() == f"{known_text} · refresh failed"
+    assert "Bridge unavailable" in window.usage_status_label.toolTip()
+    assert window.usage_status_label.font().weight() == known_weight
+    assert window.usage_status_label.palette().color(QPalette.ColorRole.WindowText) == known_color
+
+    QTest.mouseClick(window.usage_status_label, Qt.MouseButton.LeftButton)
+    assert window._usage_history_window is history_window
+    assert not window.status_dialog.isVisible()
     window.close()
 
 

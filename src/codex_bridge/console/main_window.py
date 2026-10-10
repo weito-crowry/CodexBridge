@@ -11,8 +11,17 @@ from time import monotonic, time
 from typing import Any, cast
 from urllib.parse import quote
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QFont, QFontDatabase, QIcon, QPalette
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QKeyEvent,
+    QMouseEvent,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -126,6 +135,48 @@ _RUNTIME_LABELS = {
     "control_failed": "Runtime: control failed",
     "stop_timed_out": "Runtime: stop timed out",
 }
+
+
+class UsageShortcutLabel(QLabel):
+    activated = Signal()
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._left_press_active = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName("Codex Usage")
+        self.setAccessibleDescription("Open Usage History")
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            self._left_press_active = False
+            super().mousePressEvent(event)
+            return
+        self._left_press_active = self.rect().contains(event.position().toPoint())
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            self._left_press_active = False
+            super().mouseReleaseEvent(event)
+            return
+        should_activate = self._left_press_active and self.rect().contains(
+            event.position().toPoint()
+        )
+        self._left_press_active = False
+        event.accept()
+        if should_activate:
+            self.activated.emit()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            if not event.isAutoRepeat():
+                self.activated.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 def _turn_model_metadata_from_payload(payload: object) -> dict[str, Mapping[str, object]]:
@@ -390,7 +441,7 @@ class MainWindow(QMainWindow):
         self.config_status_label.setToolTip(self._config.roots_error or "Allowed roots are ready")
         self.overall_status_label = QLabel("● Starting")
         self.overall_detail_label = QLabel("● Starting")
-        self.usage_status_label = QLabel(format_codex_usage(self._usage))
+        self.usage_status_label = UsageShortcutLabel(format_codex_usage(self._usage))
         self.codex_update_banner_label = QLabel("")
         self.codex_update_banner_label.setVisible(False)
         self.status_button = QPushButton("Status")
@@ -427,6 +478,7 @@ class MainWindow(QMainWindow):
         self.overall_status_label.setObjectName("topStatus")
         self.overall_detail_label.setObjectName("detailStatus")
         self.usage_status_label.setObjectName("topStatus")
+        self.usage_status_label.setProperty("usageShortcut", True)
         self.usage_status_label.setToolTip(format_codex_usage_tooltip(self._usage))
 
         self.usage_detail_label = QLabel(format_codex_usage_detail(self._usage))
@@ -590,6 +642,8 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget { background: #202124; color: #e8eaed; }
             QLabel { color: #d8dbe0; }
             QLabel#topStatus { padding: 3px 8px; border: 1px solid #3c4043; border-radius: 3px; }
+            QLabel#topStatus[usageShortcut="true"]:hover { background: #2b2d30; }
+            QLabel#topStatus[usageShortcut="true"]:focus { border-color: #8ab4f8; }
             QLabel#bottomStatus { color: #aeb4bd; padding: 4px 6px; border-top: 1px solid #3c4043; }
             QLineEdit, QTreeWidget, QTextEdit, QPlainTextEdit {
                 background: #292a2d; color: #f1f3f4; border: 1px solid #4a4d50;
@@ -658,6 +712,7 @@ class MainWindow(QMainWindow):
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
         self.status_button.clicked.connect(self._show_status)
+        self.usage_status_label.activated.connect(self._create_or_show_usage_history_window)
         self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
         self.status_refresh_button.clicked.connect(self._refresh_status)
         self.status_close_button.clicked.connect(self.status_dialog.close)
