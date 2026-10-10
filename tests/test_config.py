@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from codex_bridge.config import BridgeConfig, ConfigurationError
+
+
+@pytest.fixture(autouse=True)
+def isolate_user_config_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for name in tuple(os.environ):
+        if name.startswith("CODEX_BRIDGE_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CODEX_BRIDGE_CONFIG", str(tmp_path / "missing-config.toml"))
 
 
 def test_empty_allowed_roots_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
