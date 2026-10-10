@@ -17,7 +17,14 @@ from mcp.client.streamable_http import (  # type: ignore[attr-defined]
 
 from .config import ExecutionTargetConfig
 from .logging_utils import log_event
-from .models import ApprovalDecision, RequestId, SandboxMode, validate_sandbox_mode
+from .models import (
+    ApprovalDecision,
+    ApprovalsReviewer,
+    RequestId,
+    SandboxMode,
+    validate_approvals_reviewer,
+    validate_sandbox_mode,
+)
 from .setup_capabilities import project_public_capabilities
 
 _REQUIRED_TARGET_TOOLS = frozenset(
@@ -62,6 +69,7 @@ class BridgePort(Protocol):
         model: str | None = None,
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
+        approvals_reviewer: ApprovalsReviewer = "auto_review",
     ) -> dict[str, Any]: ...
 
     async def model_capabilities(self) -> dict[str, Any]: ...
@@ -438,9 +446,14 @@ class ExecutionTargetRouter:
         model: str,
         reasoning_effort: str,
         sandbox_mode: SandboxMode = "inherit",
+        approvals_reviewer: ApprovalsReviewer = "auto_review",
     ) -> dict[str, Any]:
         try:
             sandbox_mode = validate_sandbox_mode(sandbox_mode) or "inherit"
+        except ValueError as exc:
+            raise ExecutionTargetError(str(exc)) from None
+        try:
+            approvals_reviewer = validate_approvals_reviewer(approvals_reviewer)
         except ValueError as exc:
             raise ExecutionTargetError(str(exc)) from None
         capabilities = await self.setup_capabilities(target_id)
@@ -477,6 +490,7 @@ class ExecutionTargetRouter:
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "sandbox_mode": sandbox_mode,
+                "approvals_reviewer": approvals_reviewer,
             },
         }
 
@@ -580,9 +594,14 @@ class ExecutionTargetRouter:
         model: str | None = None,
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
+        approvals_reviewer: ApprovalsReviewer = "auto_review",
     ) -> dict[str, Any]:
         try:
             sandbox_mode = validate_sandbox_mode(sandbox_mode)
+        except ValueError as exc:
+            raise ExecutionTargetError(str(exc)) from None
+        try:
+            approvals_reviewer = validate_approvals_reviewer(approvals_reviewer)
         except ValueError as exc:
             raise ExecutionTargetError(str(exc)) from None
         if reasoning_effort is not None and model is None:
@@ -629,6 +648,7 @@ class ExecutionTargetRouter:
             arguments["model"] = model
         if reasoning_effort is not None:
             arguments["reasoning_effort"] = reasoning_effort
+        arguments["approvals_reviewer"] = approvals_reviewer
         if sandbox_mode == "danger-full-access":
             arguments["sandbox_mode"] = sandbox_mode
         bridge = self._bridge() if target.kind == "local" else None
@@ -636,16 +656,13 @@ class ExecutionTargetRouter:
         async def local_start() -> dict[str, Any] | None:
             if bridge is None:
                 return None
-            if model is None and reasoning_effort is None:
-                if sandbox_mode is None:
-                    return await bridge.start(cwd, prompt)
-                return await bridge.start(cwd, prompt, sandbox_mode=sandbox_mode)
             return await bridge.start(
                 cwd,
                 prompt,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 **({"sandbox_mode": sandbox_mode} if sandbox_mode is not None else {}),
+                approvals_reviewer=approvals_reviewer,
             )
 
         result = await self._call(
@@ -654,11 +671,12 @@ class ExecutionTargetRouter:
             arguments,
             local_start,
         )
-        if model is not None or sandbox_mode is not None:
+        if model is not None or sandbox_mode is not None or approvals_reviewer != "auto_review":
             execution_config: dict[str, Any] = {
                 "target_id": target.id,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "approvals_reviewer": approvals_reviewer,
             }
             if sandbox_mode is not None:
                 execution_config["sandbox_mode"] = sandbox_mode
