@@ -696,7 +696,7 @@ def test_activity_rows_distinguish_commentary_from_final_agent_message() -> None
     assert "Agent" in final
 
 
-def test_activity_pane_hides_empty_and_unloaded_state_but_keeps_recent_activities() -> None:
+def test_activity_pane_hides_empty_state_but_shows_unloaded_access_and_recent_activities() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     pane = ActivityPane()
@@ -714,12 +714,26 @@ def test_activity_pane_hides_empty_and_unloaded_state_but_keeps_recent_activitie
         }
     )
 
-    assert not pane.state_label.isVisibleTo(pane)
+    pane.show()
+    application.processEvents()
+    access_labels = (
+        pane.findChild(QLabel, "effectiveSandboxMode"),
+        pane.findChild(QLabel, "effectiveApprovalPolicy"),
+        pane.findChild(QLabel, "effectiveApprovalsReviewer"),
+    )
+    assert all(label is not None for label in access_labels)
+    assert tuple(label.text() for label in access_labels if label is not None) == (
+        "Sandbox: Unknown",
+        "Approval policy: Unknown",
+        "Approvals reviewer: Unknown",
+    )
+    assert all(label.isVisible() for label in access_labels if label is not None)
     recent_header = next(
         label for label in pane.findChildren(QLabel) if label.text() == "Recent activities"
     )
     assert recent_header.isVisibleTo(pane)
     assert pane.activity_list.count() == 1
+    pane.close()
 
 
 def test_activity_pane_shows_active_pending_and_failure_states() -> None:
@@ -979,6 +993,8 @@ def test_activity_pane_reviews_command_file_and_permission_approvals() -> None:
         lambda request_id, decision: requested.append((request_id, decision))
     )
     pane.set_control_available(True)
+    pane.show()
+    application.processEvents()
 
     pane.set_snapshot(
         {
@@ -1006,6 +1022,8 @@ def test_activity_pane_reviews_command_file_and_permission_approvals() -> None:
     assert "pytest tests/test_example.py" in command_details
     assert "Thread: thread-1" in command_details
     assert "Turn: turn-1" in command_details
+    assert pane.approval_details_label.isVisible()
+    assert pane.approval_buttons_widget.isVisible()
 
     pane.allow_once_button.click()
     pane.allow_for_session_button.click()
@@ -1062,6 +1080,7 @@ def test_activity_pane_reviews_command_file_and_permission_approvals() -> None:
     assert "Requested filesystem permissions" in permission_details
     assert "Requested network permissions" in permission_details
     assert "Allowed scopes: turn, session" in permission_details
+    pane.close()
 
 
 def test_activity_pane_disables_console_approval_without_control_and_clears_resolved() -> None:
