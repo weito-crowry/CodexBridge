@@ -9,9 +9,9 @@
 - 100,000 bytes 以上のテストは `REVIEW` として強く表示します。これは自動的な分割要求ではなく、レビュー時の明示確認です。
 - `tests/**/test_*.py` 以外の test support Python ファイルには、このサイズ gate を適用しません。
 
-### 現在の例外 baseline（Phase 4E-4 変更後）
+### 現在の例外 baseline
 
-Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらの履歴値は以下の現在の承認値と区別します。本表は統合ブランチの値であり、`origin/main` の現行値を示すものではありません。
+Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらは履歴値であり、以下の現在の承認値とは区別します。
 
 Phase 3 では、本番 2 モジュールの抽出、Fake の移動、テストの移設を行いました（いずれも純粋移動）。
 
@@ -31,10 +31,11 @@ Phase 4E-3 では、thread操作・選択更新を `ThreadInteractionController`
 
 Phase 4E-4 では、Console timer bootstrap を `timer_bootstrap.py` へ抽出しました。`main_window.py` は 1,520 LOC / 62,439 bytes から 1,479 LOC / 59,572 bytes となり、41 physical LOC を減らして、物理行数と raw bytes の両方で production 上限内に達しました。`main_window.py` の production exception を削除し、production module はすべて共通の 1,500 LOC / 65,536-byte 上限で検査します。新しい `timer_bootstrap.py` は 76 LOC / 3,756 bytes です。
 
+今回、`tests/test_console_main_window.py` を UI/diagnostics・Codex update・thread interaction のテストとして残し、usage、history/SSE/approval、runtime/tunnel lifecycle の各テストを別モジュールへ移しました。共有テスト doubles と helper は `tests/console_main_window_test_support.py` に置いています。4つの test module を合わせた collection は、parameterized case を含めて 131 件です。この分割で旧ファイルの baseline を削除しました。
+
 | Path | Metric | Exact baseline | 理由 |
 | --- | --- | ---: | --- |
 | `tests/test_bridge.py` | raw bytes | 75,927 | Phase 3 で Fake を移動。50 KB 超。 |
-| `tests/test_console_main_window.py` | raw bytes | 132,552 | Phase 3 でテストを移設。100 KB 超のため REVIEW 通知による明示確認が必要。 |
 | `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |
 
 新しく上限超過した production module、未登録の 50,000 bytes 以上の test module、または baseline より増えたファイルは失敗します。別の例外を追加する場合は、checker 内の `POLICY` とこの文書に指定した JSON policy の両方を、レビュー対象の値・理由で一致させます。
