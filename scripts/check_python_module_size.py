@@ -13,17 +13,7 @@ POLICY: dict[str, Any] = {
     "production": {
         "physical_loc_limit": 1500,
         "raw_bytes_limit": 65536,
-        "baselines": {
-            "src/codex_bridge/console/main_window.py": {
-                "physical_loc": {
-                    "value": 1520,
-                    "reason": (
-                        "Phase 4E-3 ThreadInteractionController and DiagnosticsPanelController "
-                        "extraction; reduced from 1,626 to 1,520 physical LOC, still 20 over limit."
-                    ),
-                },
-            }
-        },
+        "baselines": {},
     },
     "tests": {
         "review_threshold_bytes": 50000,
