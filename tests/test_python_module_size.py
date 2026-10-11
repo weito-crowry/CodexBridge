@@ -71,8 +71,16 @@ def test_checker_policy_matches_checker_owned_exceptions(checker: ModuleType) ->
     assert loaded == checker.POLICY
     production = loaded["production"]["baselines"]
     tests = loaded["tests"]["baselines"]
-    assert production["src/codex_bridge/console/main_window.py"]["physical_loc"]["value"] == 2035
-    assert production["src/codex_bridge/console/main_window.py"]["raw_bytes"]["value"] == 84173
+    main_window = production["src/codex_bridge/console/main_window.py"]
+    assert main_window["physical_loc"]["value"] == 1950
+    assert main_window["physical_loc"]["reason"] == (
+        "Phase 4D-1 Codex updater controller extraction; "
+        "physical LOC reduced but still exceeds limit."
+    )
+    assert main_window["raw_bytes"]["value"] == 80567
+    assert main_window["raw_bytes"]["reason"] == (
+        "Phase 4D-1 Codex updater controller extraction; raw bytes reduced but still exceed limit."
+    )
     assert tests["tests/test_bridge.py"]["raw_bytes"]["value"] == 75927
     assert tests["tests/test_console_main_window.py"]["raw_bytes"]["value"] == 132552
     assert tests["tests/test_console_widgets.py"]["raw_bytes"]["value"] == 52244

@@ -27,13 +27,15 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
     QStyle,
     QSystemTrayIcon,
     QWidget,
+)
+from PySide6.QtWidgets import (
+    QMessageBox as QMessageBox,
 )
 
 from ..models import ApprovalDecision
@@ -50,7 +52,8 @@ from .codex_resolver import (
     CodexVersionProbe,
     enumerate_candidates,
 )
-from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
+from .codex_update_controller import CodexUpdateController
+from .codex_updates import CodexUpdateProbe
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
 from .history_requests import (
@@ -240,9 +243,6 @@ class MainWindow(QMainWindow):
         self._usage_attempts = 0
         self._usage_request_in_flight = False
         self._usage_request_mode: str | None = None
-        self._codex_update_info: CodexUpdateInfo | None = None
-        self._codex_update_busy = False
-        self._codex_update_auto_check_started = False
         self._codex_resolution: CodexResolution | None = None
         self._bridge_seen_ready = False
         self._health_observed = False
@@ -270,6 +270,7 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._connect_client()
         self._build_timers()
+        self._codex_update_controller = CodexUpdateController(self)
         self._bridge_managed_retry_coordinator = BridgeManagedRetryCoordinator(
             self.bridge_start_retry_timer,
             get_is_closing=lambda: self._closing,
@@ -846,124 +847,38 @@ class MainWindow(QMainWindow):
         self._sync_codex_update_controls()
 
     def _sync_codex_update_controls(self) -> None:
-        has_resolution = self._codex_resolution is not None
-        self.codex_update_check_button.setEnabled(has_resolution and not self._codex_update_busy)
-        can_update = (
-            self._codex_update_info is not None
-            and self._codex_update_info.can_update
-            and not self._codex_update_busy
-        )
-        self.codex_update_button.setEnabled(can_update)
+        self._codex_update_controller.sync_codex_update_controls()
 
     def _schedule_codex_update_auto_check(self) -> None:
-        if (
-            self._closing
-            or self._codex_update_auto_check_started
-            or not self._usage_ready
-            or self._codex_resolution is None
-        ):
-            return
-        if not self.codex_update_auto_timer.isActive():
-            self.codex_update_auto_timer.start()
+        self._codex_update_controller.schedule_codex_update_auto_check()
 
     def _on_codex_update_auto_timeout(self) -> None:
-        if self._codex_update_auto_check_started:
-            return
-        if not self._usage_ready or self._codex_resolution is None:
-            return
-        self._codex_update_auto_check_started = True
-        self._check_codex_updates()
+        self._codex_update_controller.on_codex_update_auto_timeout()
 
     def _apply_codex_update_busy(self, busy: bool) -> None:
-        if self._closing:
-            return
-        self._codex_update_busy = busy
-        self._sync_codex_update_controls()
+        self._codex_update_controller.apply_codex_update_busy(busy)
 
     def _check_codex_updates(self) -> None:
-        resolution = self._codex_resolution
-        if self._closing or resolution is None or self._codex_update_busy:
-            return
-        self._codex_update_busy = True
-        self.codex_update_status_label.setText("Checking…")
-        self.codex_update_message_label.setText("")
-        self._sync_codex_update_controls()
-        if not self._codex_update_probe.check_for_updates(resolution):
-            self._apply_codex_update_check_error("Codex update check failed")
+        self._codex_update_controller.check_codex_updates()
 
     def _apply_codex_update_check(self, payload: object) -> None:
-        if self._closing or self._codex_resolution is None:
-            return
-        info = (
-            payload
-            if isinstance(payload, CodexUpdateInfo)
-            else parse_codex_update_info(
-                payload, current_version=self._codex_resolution.version or ""
-            )
-        )
-        self._codex_update_info = info
-        self.codex_latest_label.setText(info.latest_version or "Unavailable")
-        self.codex_update_status_label.setText(info.display_status)
-        self.codex_update_message_label.setText(
-            f"Last checked: {info.last_checked_at}" if info.last_checked_at else ""
-        )
-        self.codex_update_banner_label.setText(
-            "↑ Codex update available" if info.update_available else ""
-        )
-        self.codex_update_banner_label.setVisible(info.update_available)
-        self._sync_codex_update_controls()
+        self._codex_update_controller.apply_codex_update_check(payload)
 
     def _apply_codex_update_check_error(self, message: str) -> None:
-        if self._closing:
-            return
-        self._codex_update_busy = False
-        self._codex_update_info = None
-        self.codex_latest_label.setText("Unavailable")
-        self.codex_update_status_label.setText("Unavailable")
-        self.codex_update_message_label.setText(message)
-        self.codex_update_banner_label.clear()
-        self.codex_update_banner_label.setVisible(False)
-        self._sync_codex_update_controls()
+        self._codex_update_controller.apply_codex_update_check_error(message)
 
     def _update_codex(self) -> None:
-        resolution = self._codex_resolution
-        info = self._codex_update_info
-        if self._closing or resolution is None or info is None or not info.can_update:
-            return
-        answer = QMessageBox.question(
-            self,
-            "Update Codex",
-            "Install the available Codex update now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self._codex_update_busy = True
-        self.codex_update_status_label.setText("Updating…")
-        self.codex_update_message_label.setText("")
-        self._sync_codex_update_controls()
-        if not self._codex_update_probe.update(resolution):
-            self._apply_codex_update_failure("Codex update failed")
+        self._codex_update_controller.update_codex()
 
     def _apply_codex_update_success(self) -> None:
-        if self._closing:
-            return
-        self._codex_update_busy = False
-        self._codex_update_info = None
-        self.codex_update_status_label.setText("Update completed; restart required")
-        self.codex_update_message_label.setText("")
-        self.codex_update_banner_label.clear()
-        self.codex_update_banner_label.setVisible(False)
-        self._sync_codex_update_controls()
+        self._codex_update_controller.apply_codex_update_success()
 
     def _apply_codex_update_failure(self, message: str) -> None:
-        if self._closing:
-            return
-        self._codex_update_busy = False
-        self.codex_update_status_label.setText("Update failed")
-        self.codex_update_message_label.setText(message)
-        self._sync_codex_update_controls()
+        self._codex_update_controller.apply_codex_update_failure(message)
+
+    @property
+    def _codex_update_auto_check_started(self) -> bool:
+        return self._codex_update_controller.auto_check_started
 
     def _set_runtime_state(self, state: str, *, label: str | None = None) -> None:
         self._runtime_state = state
