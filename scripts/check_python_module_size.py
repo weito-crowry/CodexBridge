@@ -16,12 +16,12 @@ POLICY: dict[str, Any] = {
         "baselines": {
             "src/codex_bridge/console/main_window.py": {
                 "physical_loc": {
-                    "value": 2364,
-                    "reason": "Phase 4A layout extraction; above the LOC ceiling.",
+                    "value": 2273,
+                    "reason": "Phase 4B-1 history request extraction; above the LOC ceiling.",
                 },
                 "raw_bytes": {
-                    "value": 98456,
-                    "reason": "Phase 4A layout extraction; above the byte ceiling.",
+                    "value": 94707,
+                    "reason": "Phase 4B-1 history request extraction; above the byte ceiling.",
                 },
             }
         },

@@ -17,8 +17,8 @@ Phase 3 では、本番 2 モジュールの抽出、Fake の移動、テスト�
 
 | Path | Metric | Exact baseline | 理由 |
 | --- | --- | ---: | --- |
-| `src/codex_bridge/console/main_window.py` | physical LOC | 2,364 | Phase 4A のUI生成処理抽出後も LOC 上限超過。 |
-| `src/codex_bridge/console/main_window.py` | raw bytes | 98,456 | Phase 4A のUI生成処理抽出後も byte 上限超過。 |
+| `src/codex_bridge/console/main_window.py` | physical LOC | 2,273 | Phase 4B-1 の履歴request coordinator抽出後も LOC 上限超過。 |
+| `src/codex_bridge/console/main_window.py` | raw bytes | 94,707 | Phase 4B-1 の履歴request coordinator抽出後も byte 上限超過。 |
 | `tests/test_bridge.py` | raw bytes | 75,927 | Phase 3 で Fake を移動。50 KB 超。 |
 | `tests/test_console_main_window.py` | raw bytes | 132,552 | Phase 3 でテストを移設。100 KB 超のため REVIEW 通知による明示確認が必要。 |
 | `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |
