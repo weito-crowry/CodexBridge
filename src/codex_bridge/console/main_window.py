@@ -87,6 +87,7 @@ from .usage_history import (
     record_usage_sample,
 )
 from .usage_history_window import UsageHistoryWindow
+from .usage_requests import UsageRequestCoordinator
 from .usage_shortcut_label import UsageShortcutLabel
 from .widgets import (
     ActivityPane,
@@ -102,7 +103,6 @@ _READINESS_INTERVAL_MS = 350
 _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 60 * 1_000
-_USAGE_MAX_ATTEMPTS = 3
 _USAGE_SNAPSHOT_DELAY_MS = 1_000
 _USAGE_SNAPSHOT_DEFER_MS = 500
 _USAGE_SNAPSHOT_MAX_ENTRIES = 500
@@ -239,10 +239,7 @@ class MainWindow(QMainWindow):
         )
         self._pending_usage_snapshot_turns: set[tuple[str, str]] = set()
         self._usage_snapshot_request_turns: set[tuple[str, str]] = set()
-        self._usage_sequence_active = False
-        self._usage_attempts = 0
-        self._usage_request_in_flight = False
-        self._usage_request_mode: str | None = None
+        self._usage_requests = UsageRequestCoordinator(self)
         self._codex_resolution: CodexResolution | None = None
         self._bridge_seen_ready = False
         self._health_observed = False
@@ -889,78 +886,64 @@ class MainWindow(QMainWindow):
         self._sync_overall_status()
 
     def _request_usage(self, *, force: bool = False) -> None:
-        if self._closing:
-            return
-        if force:
-            if self._usage_request_in_flight:
-                return
-            self.usage_initial_timer.stop()
-            self.usage_retry_timer.stop()
-            self._usage_sequence_active = False
-            self._usage_attempts = 0
-            self._usage_request_mode = "manual"
-            self._start_usage_request("manual")
-            return
-        self._start_usage_request("initial")
+        self._usage_requests.request_usage(force=force)
 
     @property
     def _usage_ready(self) -> bool:
         return self._bridge_ready and self._app_server_ready
 
+    @property
+    def _usage_sequence_active(self) -> bool:
+        return self._usage_requests.sequence_active
+
+    @_usage_sequence_active.setter
+    def _usage_sequence_active(self, value: bool) -> None:
+        self._usage_requests.sequence_active = value
+
+    @property
+    def _usage_attempts(self) -> int:
+        return self._usage_requests.attempts
+
+    @_usage_attempts.setter
+    def _usage_attempts(self, value: int) -> None:
+        self._usage_requests.attempts = value
+
+    @property
+    def _usage_request_in_flight(self) -> bool:
+        return self._usage_requests.request_in_flight
+
+    @_usage_request_in_flight.setter
+    def _usage_request_in_flight(self, value: bool) -> None:
+        self._usage_requests.request_in_flight = value
+
+    @property
+    def _usage_request_mode(self) -> str | None:
+        return self._usage_requests.request_mode
+
+    @_usage_request_mode.setter
+    def _usage_request_mode(self, value: str | None) -> None:
+        self._usage_requests.request_mode = value
+
     def _begin_usage_sequence(self) -> None:
-        self._usage_sequence_active = True
-        self._usage_attempts = 0
-        if not self._usage_request_in_flight:
-            self._usage_request_mode = None
-        self.usage_initial_timer.start()
-        self.usage_retry_timer.stop()
-        self.usage_poll_timer.start()
-        if self._pending_usage_snapshot_turns and not self.turn_usage_snapshot_timer.isActive():
-            self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
+        self._usage_requests.begin_sequence()
 
     def _invalidate_usage_sequence(self) -> None:
-        self._usage_sequence_active = False
-        self._usage_attempts = 0
-        self.usage_initial_timer.stop()
-        self.usage_retry_timer.stop()
-        self.usage_poll_timer.stop()
-        self.turn_usage_snapshot_timer.stop()
-        if self._usage_request_in_flight:
-            self._client.abort_json_group("usage")
-        if self._usage_request_mode == "turn_snapshot":
-            self._usage_snapshot_request_turns.clear()
-        self._usage_request_in_flight = False
-        self._usage_request_mode = None
+        self._usage_requests.invalidate_sequence()
 
     def _start_usage_request(self, mode: str) -> bool:
-        if self._closing or self._usage_request_in_flight:
-            return False
-        if mode != "manual" and not self._usage_ready:
-            return False
-        if mode == "initial":
-            if not self._usage_sequence_active or self._usage_attempts >= _USAGE_MAX_ATTEMPTS:
-                return False
-            self._usage_attempts += 1
-        if self._client.get_json("/ui-api/account/rate-limits", key="usage"):
-            self._usage_request_in_flight = True
-            self._usage_request_mode = mode
-            return True
-        elif mode == "initial":
-            self._usage_attempts -= 1
-        return False
+        return self._usage_requests.start_request(mode)
 
     def _on_usage_initial_timeout(self) -> None:
-        self.usage_initial_timer.stop()
-        self._start_usage_request("initial")
+        self._usage_requests.initial_timeout()
 
     def _on_usage_retry_timeout(self) -> None:
-        self.usage_retry_timer.stop()
-        if self._usage_sequence_active:
-            self._start_usage_request("initial")
+        self._usage_requests.retry_timeout()
 
     def _on_usage_poll_timeout(self) -> None:
-        if self._usage_ready:
-            self._start_usage_request("periodic")
+        self._usage_requests.poll_timeout()
+
+    def _start_usage_snapshot_timer(self) -> None:
+        self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
 
     def _schedule_turn_usage_snapshot(self, thread_id: str, turn_id: str) -> None:
         key = (thread_id, turn_id)
@@ -1638,25 +1621,7 @@ class MainWindow(QMainWindow):
             self._sync_empty_state()
             return
         if key == "usage":
-            mode = self._usage_request_mode
-            snapshot_candidates = (
-                set(self._usage_snapshot_request_turns) if mode == "turn_snapshot" else set()
-            )
-            self._usage_request_in_flight = False
-            self._usage_request_mode = None
-            self._usage_snapshot_request_turns.clear()
-            if mode != "turn_snapshot":
-                self._usage_sequence_active = False
-                self.usage_initial_timer.stop()
-                self.usage_retry_timer.stop()
-            if self._usage_ready:
-                self.usage_poll_timer.start()
-            if mode == "turn_snapshot":
-                snapshot_usage = parse_codex_usage(payload)
-                self._finish_turn_usage_snapshot(snapshot_candidates, snapshot_usage)
-            else:
-                self._apply_usage(payload)
-                self._record_usage_history()
+            self._usage_requests.apply_result(payload)
             return
         if key == "launch:health":
             self._apply_launch_health(payload)
@@ -1785,34 +1750,7 @@ class MainWindow(QMainWindow):
             self._sync_empty_state()
             return
         if key == "usage":
-            if not self._usage_request_in_flight:
-                return
-            mode = self._usage_request_mode
-            snapshot_candidates = (
-                set(self._usage_snapshot_request_turns) if mode == "turn_snapshot" else set()
-            )
-            self._usage_request_in_flight = False
-            self._usage_request_mode = None
-            self._usage_snapshot_request_turns.clear()
-            self._apply_usage_failure(message)
-            if mode == "turn_snapshot":
-                for candidate in snapshot_candidates:
-                    self._pending_usage_snapshot_turns.discard(candidate)
-                if (
-                    self._pending_usage_snapshot_turns
-                    and not self.turn_usage_snapshot_timer.isActive()
-                ):
-                    self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
-            if mode != "turn_snapshot":
-                if (
-                    mode == "initial"
-                    and self._usage_sequence_active
-                    and self._usage_ready
-                    and self._usage_attempts < _USAGE_MAX_ATTEMPTS
-                ):
-                    self.usage_retry_timer.start()
-                else:
-                    self._usage_sequence_active = False
+            self._usage_requests.apply_error(message)
             return
         selection = self._is_current_selection(key)
         if selection is None:
