@@ -9,7 +9,7 @@
 - 100,000 bytes 以上のテストは `REVIEW` として強く表示します。これは自動的な分割要求ではなく、レビュー時の明示確認です。
 - `tests/**/test_*.py` 以外の test support Python ファイルには、このサイズ gate を適用しません。
 
-### 現在の承認済み baseline（Phase 4E-1 変更後）
+### 現在の例外 baseline（Phase 4E-3 変更後）
 
 Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらの履歴値は以下の現在の承認値と区別します。本表は統合ブランチの値であり、`origin/main` の現行値を示すものではありません。
 
@@ -27,10 +27,11 @@ Phase 4E-1 では、Runtime状態に応じたUI表示更新を `RuntimeUiPresent
 
 Phase 4E-2 では、tray構築・表示切替・activation・closeイベント処理を `TrayController` へ抽出しました。`main_window.py` は 1,704 LOC / 69,370 bytes から 1,626 LOC / 66,539 bytes に縮小しましたが、どちらも上限以下にはまだ達していません。
 
+Phase 4E-3 では、thread操作・選択更新を `ThreadInteractionController`、diagnostics pane の表示と polling を `DiagnosticsPanelController` へ抽出しました。`main_window.py` は 1,626 LOC / 66,539 bytes から 1,520 LOC / 62,439 bytes に縮小しました。raw bytes は上限以下に達したため例外を削除し、physical LOC は上限を 20 行超えるため例外値を 1,520 に ratchet しました。新しい controller modules は両方とも production 上限内です。
+
 | Path | Metric | Exact baseline | 理由 |
 | --- | --- | ---: | --- |
-| `src/codex_bridge/console/main_window.py` | physical LOC | 1,626 | Phase 4E-2 TrayController extraction; reduced from 1,704 to 1,626 physical LOC, still above limit. |
-| `src/codex_bridge/console/main_window.py` | raw bytes | 66,539 | Phase 4E-2 TrayController extraction; reduced from 69,370 to 66,539 raw bytes, still above limit. |
+| `src/codex_bridge/console/main_window.py` | physical LOC | 1,520 | Phase 4E-3 extraction; reduced from 1,626, still 20 above the 1,500 line limit. |
 | `tests/test_bridge.py` | raw bytes | 75,927 | Phase 3 で Fake を移動。50 KB 超。 |
 | `tests/test_console_main_window.py` | raw bytes | 132,552 | Phase 3 でテストを移設。100 KB 超のため REVIEW 通知による明示確認が必要。 |
 | `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |

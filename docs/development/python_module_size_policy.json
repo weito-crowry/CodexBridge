@@ -5,12 +5,8 @@
     "baselines": {
       "src/codex_bridge/console/main_window.py": {
         "physical_loc": {
-          "value": 1626,
-          "reason": "Phase 4E-2 TrayController extraction; reduced from 1,704 to 1,626 physical LOC, still above limit."
-        },
-        "raw_bytes": {
-          "value": 66539,
-          "reason": "Phase 4E-2 TrayController extraction; reduced from 69,370 to 66,539 raw bytes, still above limit."
+          "value": 1520,
+          "reason": "Phase 4E-3 ThreadInteractionController and DiagnosticsPanelController extraction; reduced from 1,626 to 1,520 physical LOC, still 20 over limit."
         }
       }
     }
