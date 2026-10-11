@@ -41,10 +41,7 @@ class BridgeRuntimeObserver:
                 return
         window._tunnel.set_bridge_ready(ready)
         if ready:
-            window.bridge_start_retry_timer.stop()
-            window._bridge_start_retry_index = 0
-            window._bridge_start_retry_exhausted = False
-            window._managed_start_active = False
+            window._bridge_managed_retry_coordinator.reset_after_ready()
             window._bridge_seen_ready = True
             if window._detached_launch_started:
                 window._launch_in_progress = False
@@ -88,7 +85,7 @@ class BridgeRuntimeObserver:
         window = self._window
         self._bridge_loss_count = _BRIDGE_LOSS_THRESHOLD
         if window._detached_launch_started and window._control_token is not None:
-            window._managed_start_active = True
+            window._bridge_managed_retry_coordinator.activate()
             window._begin_bridge_transition(
                 "restart", tunnel_running=window._tunnel_owned_running()
             )
