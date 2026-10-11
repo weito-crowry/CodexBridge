@@ -13,13 +13,28 @@ from codex_bridge.server import create_app
 
 
 class DogfoodBridge:
-    async def start(self, cwd: str, prompt: str) -> dict[str, Any]:
+    async def start(
+        self,
+        cwd: str,
+        prompt: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        sandbox_mode: str | None = None,
+        approvals_reviewer: str = "auto_review",
+    ) -> dict[str, Any]:
         return {
             "ok": True,
             "cwd": cwd,
             "accepted_prompt": prompt,
             "thread_id": "native-dogfood-thread",
             "turn_id": "native-dogfood-turn",
+            "received_start_options": {
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "sandbox_mode": sandbox_mode,
+                "approvals_reviewer": approvals_reviewer,
+            },
         }
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
@@ -146,6 +161,12 @@ async def test_local_gateway_routes_to_real_single_target_mcp_node(tmp_path) -> 
         assert targets["targets"][1]["available"] is True
         assert started["thread_id"] == "notebook::native-dogfood-thread"
         assert started["cwd"] == str(tmp_path / "remote-path-does-not-need-local-validation")
+        assert started["received_start_options"] == {
+            "model": None,
+            "reasoning_effort": None,
+            "sandbox_mode": None,
+            "approvals_reviewer": "auto_review",
+        }
         assert waited["thread_id"] == started["thread_id"]
         assert status["thread_id"] == started["thread_id"]
         await gateway.close()
