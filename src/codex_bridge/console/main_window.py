@@ -53,6 +53,11 @@ from .history_requests import (
     HistoryRequestContext,
     HistoryRequestCoordinator,
 )
+from .history_stream import (
+    TERMINAL_TURN_STATES,
+    HistoryStreamContext,
+    HistoryStreamCoordinator,
+)
 from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
 from .main_window_layout import build_main_window_ui
 from .project_names import read_local_project_names
@@ -85,7 +90,6 @@ from .widgets import (
     timeline_entries,
 )
 
-_RECONNECT_MS = 1_500
 _READINESS_INTERVAL_MS = 350
 _READINESS_TIMEOUT_SECONDS = 10.0
 _BRIDGE_START_RETRY_DELAYS_MS = (2_000, 5_000, 10_000)
@@ -95,27 +99,12 @@ _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 60 * 1_000
 _USAGE_MAX_ATTEMPTS = 3
 _USAGE_SNAPSHOT_DELAY_MS = 1_000
-_HISTORY_REFRESH_ACTIVITY_TYPES = frozenset(
-    {
-        "turn_started",
-        "turn_completed",
-        "turn_failed",
-        "turn_interrupted",
-        "command_started",
-        "command_completed",
-        "file_change_started",
-        "file_change_completed",
-        "agent_commentary",
-        "agent_message",
-    }
-)
 _USAGE_SNAPSHOT_DEFER_MS = 500
 _USAGE_SNAPSHOT_MAX_ENTRIES = 500
 _DIAGNOSTICS_POLL_INTERVAL_MS = 1_000
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
-_TERMINAL_TURN_STATES = {"completed", "interrupted", "failed", "error"}
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
     "external": "Runtime: external",
@@ -238,10 +227,6 @@ class MainWindow(QMainWindow):
         self._pending_rename_names: dict[str, str] = {}
         self._thread_copy_sequence = 0
         self._pending_thread_copies: dict[str, tuple[str, list[TimelineEntry]]] = {}
-        self._stream_sync_pending = False
-        self._reconnect_scheduled = False
-        self._stream_connected = False
-        self._stream_ever_connected = False
         self._runtime_state = "unavailable"
         self._usage = CodexUsage()
         self._usage_refresh_error: str | None = None
@@ -302,6 +287,19 @@ class MainWindow(QMainWindow):
             self._client,
             self._history_refresh_timer,
         )
+        self._history_stream = HistoryStreamCoordinator(
+            self.activity_pane,
+            self.stream_status_label,
+            self.bottom_status_label,
+            context_provider=self._history_stream_context,
+            request_selected_status=self._request_selected_status,
+            schedule_selected_history_refresh=self._schedule_selected_history_refresh,
+            set_thread_active=self._set_thread_active,
+            update_thread_activity=self._update_thread_activity,
+            schedule_turn_usage_snapshot=self._schedule_turn_usage_snapshot,
+            sync_approval_controls=self._sync_approval_controls,
+            start_stream=self._client.start_stream,
+        )
         self._connect_runtime()
         self._build_tray()
         self._update_tunnel_client_status()
@@ -324,6 +322,13 @@ class MainWindow(QMainWindow):
             generation=self._selection_generation,
             selected_thread_id=self._selected_thread_id,
             next_cursor=self._next_cursor,
+            closing=self._closing,
+        )
+
+    def _history_stream_context(self) -> HistoryStreamContext:
+        return HistoryStreamContext(
+            generation=self._selection_generation,
+            thread_id=self._selected_thread_id,
             closing=self._closing,
         )
 
@@ -1726,11 +1731,8 @@ class MainWindow(QMainWindow):
         generation = self._selection_generation
         self._selected_thread_id = thread_id
         self._history_requests.reset()
-        self._stream_connected = False
-        self._stream_ever_connected = False
+        self._history_stream.reset_selection(thread_id)
         self._history_timeline.reset()
-        self._stream_sync_pending = thread_id is not None
-        self._reconnect_scheduled = False
         self._client.abort_json_group("selection:")
         self._client.stop_stream()
         self.selected_status_timer.stop()
@@ -1902,20 +1904,7 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_status(self, payload: object) -> None:
-        if not isinstance(payload, Mapping):
-            return
-        thread_id = payload.get("thread_id")
-        if not isinstance(thread_id, str):
-            thread_id = self._selected_thread_id
-        state = payload.get("state")
-        if isinstance(thread_id, str) and isinstance(state, str):
-            self._update_thread_activity(thread_id, state)
-        self.activity_pane.set_snapshot(payload)
-        self._sync_approval_controls()
-        self.bottom_status_label.setText("Thread snapshot updated")
-        if self._stream_sync_pending and self._selected_thread_id is not None:
-            self._stream_sync_pending = False
-            self._client.start_stream(self._selected_thread_id, self._selection_generation)
+        self._history_stream.apply_status(payload)
 
     def _set_thread_active(self, thread_id: str, active: bool) -> None:
         if active:
@@ -1927,7 +1916,7 @@ class MainWindow(QMainWindow):
     def _update_thread_activity(self, thread_id: str, state: str) -> None:
         if state in ACTIVE_TURN_STATES:
             self._set_thread_active(thread_id, True)
-        elif state in _TERMINAL_TURN_STATES or state == "not_loaded":
+        elif state in TERMINAL_TURN_STATES or state == "not_loaded":
             self._set_thread_active(thread_id, False)
 
     def load_older(self) -> None:
@@ -2023,63 +2012,11 @@ class MainWindow(QMainWindow):
             if not live_refresh:
                 self.history_pane.set_error(message)
         if suffix == "status":
-            self.activity_pane.set_error(message)
-            if self._stream_sync_pending:
-                self._schedule_reconnect(self._selection_generation)
+            self._history_stream.status_request_failed(message)
         self._finish_selected_history_request(key)
 
     def _apply_activity(self, generation: int, payload: object) -> None:
-        if (
-            self._closing
-            or generation != self._selection_generation
-            or self._selected_thread_id is None
-            or not isinstance(payload, Mapping)
-            or payload.get("thread_id") != self._selected_thread_id
-        ):
-            return
-        thread_id = payload.get("thread_id")
-        activity_type = payload.get("type")
-        activity_status = payload.get("status")
-        turn_id = payload.get("turn_id")
-        if isinstance(activity_type, str) and activity_type in {
-            "item_started",
-            "item_completed",
-        }:
-            self._schedule_selected_history_refresh()
-            return
-        if isinstance(thread_id, str) and isinstance(activity_type, str):
-            if (
-                activity_type == "turn_started"
-                or activity_status == "in_progress"
-                or activity_type in {"approval_requested", "user_input_requested"}
-                and activity_status == "requested"
-            ):
-                self._set_thread_active(thread_id, True)
-            elif (
-                activity_type
-                in {
-                    "turn_completed",
-                    "turn_failed",
-                    "turn_interrupted",
-                    "error",
-                }
-                and activity_status in _TERMINAL_TURN_STATES
-            ):
-                self._set_thread_active(thread_id, False)
-            if (
-                activity_type == "turn_completed"
-                and activity_status == "completed"
-                and isinstance(turn_id, str)
-            ):
-                self._schedule_turn_usage_snapshot(thread_id, turn_id)
-            if activity_type == "approval_requested" and activity_status == "requested":
-                self._request_selected_status()
-            elif activity_type == "approval_resolved" and activity_status == "resolved":
-                self.activity_pane.mark_approval_resolved()
-                self._request_selected_status()
-        self.activity_pane.append_activity(payload)
-        if isinstance(activity_type, str) and activity_type in _HISTORY_REFRESH_ACTIVITY_TYPES:
-            self._schedule_selected_history_refresh()
+        self._history_stream.apply_activity(generation, payload)
 
     def _sync_approval_controls(self) -> None:
         self.activity_pane.set_control_available(
@@ -2112,40 +2049,13 @@ class MainWindow(QMainWindow):
             self._apply_control_failure("control:approval", "Bridge control request failed")
 
     def _apply_stream_state(self, generation: int, state: str) -> None:
-        if self._closing or generation != self._selection_generation:
-            return
-        if state == "disconnected" and self._selected_thread_id is None:
-            self.stream_status_label.setText("Stream: idle")
-        else:
-            self.stream_status_label.setText(f"Stream: {state}")
-        if state == "connected":
-            is_reconnected = self._stream_ever_connected and not self._stream_connected
-            self._stream_connected = True
-            self._stream_ever_connected = True
-            if is_reconnected:
-                self._schedule_selected_history_refresh()
-        elif state in {"disconnected", "reconnecting"}:
-            self._stream_connected = False
-        if state == "disconnected" and self._selected_thread_id is not None:
-            self._schedule_reconnect(generation)
+        self._history_stream.apply_stream_state(generation, state)
 
     def _schedule_reconnect(self, generation: int) -> None:
-        if self._reconnect_scheduled or self._closing:
-            return
-        self._reconnect_scheduled = True
-        self.stream_status_label.setText("Stream: reconnecting")
-        QTimer.singleShot(_RECONNECT_MS, lambda: self._reconnect(generation))
+        self._history_stream.schedule_reconnect(generation)
 
     def _reconnect(self, generation: int) -> None:
-        self._reconnect_scheduled = False
-        if (
-            self._closing
-            or generation != self._selection_generation
-            or self._selected_thread_id is None
-        ):
-            return
-        self._stream_sync_pending = True
-        self._request_selected_status()
+        self._history_stream.reconnect(generation)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._closing:

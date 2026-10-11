@@ -5,12 +5,12 @@
     "baselines": {
       "src/codex_bridge/console/main_window.py": {
         "physical_loc": {
-          "value": 2226,
-          "reason": "Phase 4B-2a history timeline extraction; above the LOC ceiling."
+          "value": 2136,
+          "reason": "Phase 4B-2b history stream extraction; above the LOC ceiling."
         },
         "raw_bytes": {
-          "value": 92284,
-          "reason": "Phase 4B-2a history timeline extraction; above the byte ceiling."
+          "value": 88484,
+          "reason": "Phase 4B-2b history stream extraction; above the byte ceiling."
         }
       }
     }
