@@ -22,12 +22,6 @@ POLICY: dict[str, Any] = {
             "tests/test_bridge.py": {
                 "raw_bytes": {"value": 75927, "reason": "Phase 3 fake split; above 50 KB."}
             },
-            "tests/test_console_main_window.py": {
-                "raw_bytes": {
-                    "value": 132552,
-                    "reason": "Phase 3 tests moved; above 100 KB, needs reviewer attention.",
-                }
-            },
             "tests/test_console_widgets.py": {
                 "raw_bytes": {
                     "value": 52244,
