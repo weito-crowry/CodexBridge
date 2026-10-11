@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
@@ -32,220 +32,215 @@ if TYPE_CHECKING:
 
 
 def build_main_window_ui(window: MainWindow) -> None:
-    ui_window = cast(Any, window)
-    ui_window.bridge_status_label = QLabel("Bridge: disconnected")
-    ui_window.app_server_status_label = QLabel("App Server: failed")
-    ui_window.stream_status_label = QLabel("Stream: idle")
-    ui_window.codex_status_label = QLabel("Codex: checking")
-    ui_window.runtime_status_label = QLabel("Runtime: unavailable")
-    ui_window.tunnel_status_label = QLabel("Tunnel: unavailable")
-    ui_window.tunnel_client_status_label = QLabel("Tunnel Client: unavailable")
-    config_state = "ready" if ui_window._config.roots_ready else "error"
-    ui_window.config_status_label = QLabel(
-        f"Config: {config_state} · roots {ui_window._config.roots_count}"
+    window.bridge_status_label = QLabel("Bridge: disconnected")
+    window.app_server_status_label = QLabel("App Server: failed")
+    window.stream_status_label = QLabel("Stream: idle")
+    window.codex_status_label = QLabel("Codex: checking")
+    window.runtime_status_label = QLabel("Runtime: unavailable")
+    window.tunnel_status_label = QLabel("Tunnel: unavailable")
+    window.tunnel_client_status_label = QLabel("Tunnel Client: unavailable")
+    config_state = "ready" if window._config.roots_ready else "error"
+    window.config_status_label = QLabel(
+        f"Config: {config_state} · roots {window._config.roots_count}"
     )
-    ui_window.config_status_label.setToolTip(
-        ui_window._config.roots_error or "Allowed roots are ready"
-    )
-    ui_window.overall_status_label = QLabel("● Starting")
-    ui_window.overall_detail_label = QLabel("● Starting")
-    ui_window.usage_status_label = UsageShortcutLabel(format_codex_usage(ui_window._usage))
-    ui_window.codex_update_banner_label = QLabel("")
-    ui_window.codex_update_banner_label.setVisible(False)
-    ui_window.status_button = QPushButton("Status")
-    ui_window.diagnostics_toggle_button = QPushButton("Diagnostics")
-    ui_window.diagnostics_clear_button = QPushButton("Clear")
-    ui_window.retry_now_button = QPushButton("Retry now")
-    ui_window.restart_codexbridge_button = QPushButton("Restart CodexBridge")
-    ui_window.advanced_toggle_button = QPushButton("Advanced")
-    ui_window.advanced_toggle_button.setCheckable(True)
-    ui_window.start_bridge_button = QPushButton("Start Bridge")
-    ui_window.stop_bridge_button = QPushButton("Stop Bridge")
-    ui_window.restart_bridge_button = QPushButton("Restart Bridge")
-    ui_window.start_tunnel_button = QPushButton("Start Tunnel")
-    ui_window.stop_tunnel_button = QPushButton("Stop Tunnel")
-    ui_window.restart_tunnel_button = QPushButton("Restart Tunnel")
-    ui_window.start_bridge_button.setEnabled(False)
-    ui_window.stop_bridge_button.setEnabled(False)
-    ui_window.restart_bridge_button.setEnabled(False)
-    ui_window.stop_tunnel_button.setEnabled(False)
-    ui_window.restart_tunnel_button.setEnabled(False)
-    ui_window.retry_now_button.setEnabled(False)
-    ui_window.restart_codexbridge_button.setEnabled(False)
+    window.config_status_label.setToolTip(window._config.roots_error or "Allowed roots are ready")
+    window.overall_status_label = QLabel("● Starting")
+    window.overall_detail_label = QLabel("● Starting")
+    window.usage_status_label = UsageShortcutLabel(format_codex_usage(window._usage))
+    window.codex_update_banner_label = QLabel("")
+    window.codex_update_banner_label.setVisible(False)
+    window.status_button = QPushButton("Status")
+    window.diagnostics_toggle_button = QPushButton("Diagnostics")
+    window.diagnostics_clear_button = QPushButton("Clear")
+    window.retry_now_button = QPushButton("Retry now")
+    window.restart_codexbridge_button = QPushButton("Restart CodexBridge")
+    window.advanced_toggle_button = QPushButton("Advanced")
+    window.advanced_toggle_button.setCheckable(True)
+    window.start_bridge_button = QPushButton("Start Bridge")
+    window.stop_bridge_button = QPushButton("Stop Bridge")
+    window.restart_bridge_button = QPushButton("Restart Bridge")
+    window.start_tunnel_button = QPushButton("Start Tunnel")
+    window.stop_tunnel_button = QPushButton("Stop Tunnel")
+    window.restart_tunnel_button = QPushButton("Restart Tunnel")
+    window.start_bridge_button.setEnabled(False)
+    window.stop_bridge_button.setEnabled(False)
+    window.restart_bridge_button.setEnabled(False)
+    window.stop_tunnel_button.setEnabled(False)
+    window.restart_tunnel_button.setEnabled(False)
+    window.retry_now_button.setEnabled(False)
+    window.restart_codexbridge_button.setEnabled(False)
     for label in (
-        ui_window.bridge_status_label,
-        ui_window.app_server_status_label,
-        ui_window.stream_status_label,
-        ui_window.codex_status_label,
-        ui_window.runtime_status_label,
-        ui_window.tunnel_status_label,
-        ui_window.tunnel_client_status_label,
-        ui_window.config_status_label,
+        window.bridge_status_label,
+        window.app_server_status_label,
+        window.stream_status_label,
+        window.codex_status_label,
+        window.runtime_status_label,
+        window.tunnel_status_label,
+        window.tunnel_client_status_label,
+        window.config_status_label,
     ):
         label.setObjectName("detailStatus")
-    ui_window.overall_status_label.setObjectName("topStatus")
-    ui_window.overall_detail_label.setObjectName("detailStatus")
-    ui_window.usage_status_label.setObjectName("topStatus")
-    ui_window.usage_status_label.setProperty("usageShortcut", True)
-    ui_window.usage_status_label.setToolTip(format_codex_usage_tooltip(ui_window._usage))
+    window.overall_status_label.setObjectName("topStatus")
+    window.overall_detail_label.setObjectName("detailStatus")
+    window.usage_status_label.setObjectName("topStatus")
+    window.usage_status_label.setProperty("usageShortcut", True)
+    window.usage_status_label.setToolTip(format_codex_usage_tooltip(window._usage))
 
-    ui_window.usage_detail_label = QLabel(format_codex_usage_detail(ui_window._usage))
-    ui_window.usage_detail_label.setWordWrap(True)
-    ui_window.usage_history_button = QPushButton("Show usage history")
-    ui_window.usage_history_button.setObjectName("showUsageHistory")
-    ui_window.usage_history_button.setFlat(True)
-    ui_window.usage_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
-    ui_window.usage_history_button.setStyleSheet(
+    window.usage_detail_label = QLabel(format_codex_usage_detail(window._usage))
+    window.usage_detail_label.setWordWrap(True)
+    window.usage_history_button = QPushButton("Show usage history")
+    window.usage_history_button.setObjectName("showUsageHistory")
+    window.usage_history_button.setFlat(True)
+    window.usage_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+    window.usage_history_button.setStyleSheet(
         "QPushButton { color: palette(link); text-decoration: underline; "
         "border: 0; padding: 2px 0; text-align: left; }"
         "QPushButton:hover { color: palette(highlight); }"
     )
-    ui_window.codex_latest_label = QLabel("Not checked")
-    ui_window.codex_update_status_label = QLabel("Not checked")
-    ui_window.codex_update_message_label = QLabel("")
-    ui_window.codex_update_message_label.setWordWrap(True)
-    ui_window.codex_update_check_button = QPushButton("Check for updates")
-    ui_window.codex_update_button = QPushButton("Update")
-    ui_window.codex_update_check_button.setEnabled(False)
-    ui_window.codex_update_button.setEnabled(False)
+    window.codex_latest_label = QLabel("Not checked")
+    window.codex_update_status_label = QLabel("Not checked")
+    window.codex_update_message_label = QLabel("")
+    window.codex_update_message_label.setWordWrap(True)
+    window.codex_update_check_button = QPushButton("Check for updates")
+    window.codex_update_button = QPushButton("Update")
+    window.codex_update_check_button.setEnabled(False)
+    window.codex_update_button.setEnabled(False)
     codex_update_controls = QWidget(window)
     codex_update_controls_layout = QHBoxLayout(codex_update_controls)
     codex_update_controls_layout.setContentsMargins(0, 0, 0, 0)
-    codex_update_controls_layout.addWidget(ui_window.codex_update_check_button)
-    codex_update_controls_layout.addWidget(ui_window.codex_update_button)
-    ui_window.status_refresh_button = QPushButton("Refresh")
-    ui_window.status_close_button = QPushButton("Close")
+    codex_update_controls_layout.addWidget(window.codex_update_check_button)
+    codex_update_controls_layout.addWidget(window.codex_update_button)
+    window.status_refresh_button = QPushButton("Refresh")
+    window.status_close_button = QPushButton("Close")
 
-    ui_window.status_dialog = QDialog(window)
-    ui_window.status_dialog.setWindowTitle("CodexBridge Status")
-    ui_window.status_dialog.setModal(False)
-    dialog_layout = QVBoxLayout(ui_window.status_dialog)
+    window.status_dialog = QDialog(window)
+    window.status_dialog.setWindowTitle("CodexBridge Status")
+    window.status_dialog.setModal(False)
+    dialog_layout = QVBoxLayout(window.status_dialog)
 
     def add_section(title: str, rows: list[tuple[str, QWidget]]) -> None:
-        group = QGroupBox(title, ui_window.status_dialog)
+        group = QGroupBox(title, window.status_dialog)
         form = QFormLayout(group)
         for name, widget in rows:
             form.addRow(name, widget)
         dialog_layout.addWidget(group)
 
-    add_section("Overall", [("State", ui_window.overall_detail_label)])
+    add_section("Overall", [("State", window.overall_detail_label)])
     add_section(
         "Connection",
         [
-            ("Bridge", ui_window.bridge_status_label),
-            ("App Server", ui_window.app_server_status_label),
-            ("Stream", ui_window.stream_status_label),
+            ("Bridge", window.bridge_status_label),
+            ("App Server", window.app_server_status_label),
+            ("Stream", window.stream_status_label),
         ],
     )
     add_section(
         "Codex",
         [
-            ("Version", ui_window.codex_status_label),
-            ("Latest", ui_window.codex_latest_label),
-            ("Update", ui_window.codex_update_status_label),
+            ("Version", window.codex_status_label),
+            ("Latest", window.codex_latest_label),
+            ("Update", window.codex_update_status_label),
             ("", codex_update_controls),
-            ("Status", ui_window.codex_update_message_label),
-            ("Runtime", ui_window.runtime_status_label),
+            ("Status", window.codex_update_message_label),
+            ("Runtime", window.runtime_status_label),
         ],
     )
     add_section(
         "Usage",
-        [("Codex Usage", ui_window.usage_detail_label), ("", ui_window.usage_history_button)],
+        [("Codex Usage", window.usage_detail_label), ("", window.usage_history_button)],
     )
     add_section(
         "Tunnel",
         [
-            ("Tunnel", ui_window.tunnel_status_label),
-            ("Client", ui_window.tunnel_client_status_label),
+            ("Tunnel", window.tunnel_status_label),
+            ("Client", window.tunnel_client_status_label),
         ],
     )
-    add_section("Configuration", [("Config", ui_window.config_status_label)])
+    add_section("Configuration", [("Config", window.config_status_label)])
 
     lifecycle_controls = QHBoxLayout()
-    lifecycle_controls.addWidget(ui_window.retry_now_button)
-    lifecycle_controls.addWidget(ui_window.restart_codexbridge_button)
+    lifecycle_controls.addWidget(window.retry_now_button)
+    lifecycle_controls.addWidget(window.restart_codexbridge_button)
     dialog_layout.addLayout(lifecycle_controls)
-    dialog_layout.addWidget(ui_window.advanced_toggle_button)
+    dialog_layout.addWidget(window.advanced_toggle_button)
 
-    ui_window.advanced_controls = QWidget(ui_window.status_dialog)
-    bridge_controls = QHBoxLayout(ui_window.advanced_controls)
+    window.advanced_controls = QWidget(window.status_dialog)
+    bridge_controls = QHBoxLayout(window.advanced_controls)
     bridge_controls.setContentsMargins(0, 0, 0, 0)
     for button in (
-        ui_window.start_bridge_button,
-        ui_window.stop_bridge_button,
-        ui_window.restart_bridge_button,
-        ui_window.start_tunnel_button,
-        ui_window.stop_tunnel_button,
-        ui_window.restart_tunnel_button,
+        window.start_bridge_button,
+        window.stop_bridge_button,
+        window.restart_bridge_button,
+        window.start_tunnel_button,
+        window.stop_tunnel_button,
+        window.restart_tunnel_button,
     ):
         bridge_controls.addWidget(button)
-    dialog_layout.addWidget(ui_window.advanced_controls)
-    ui_window.advanced_controls.setVisible(False)
+    dialog_layout.addWidget(window.advanced_controls)
+    window.advanced_controls.setVisible(False)
     dialog_buttons = QHBoxLayout()
     dialog_buttons.addStretch(1)
-    dialog_buttons.addWidget(ui_window.status_refresh_button)
-    dialog_buttons.addWidget(ui_window.status_close_button)
+    dialog_buttons.addWidget(window.status_refresh_button)
+    dialog_buttons.addWidget(window.status_close_button)
     dialog_layout.addLayout(dialog_buttons)
-    ui_window.status_dialog.adjustSize()
+    window.status_dialog.adjustSize()
 
     status_bar = QHBoxLayout()
-    status_bar.addWidget(ui_window.overall_status_label)
+    status_bar.addWidget(window.overall_status_label)
     status_bar.addStretch(1)
-    status_bar.addWidget(ui_window.codex_update_banner_label)
-    status_bar.addWidget(ui_window.usage_status_label)
-    status_bar.addWidget(ui_window.status_button)
+    status_bar.addWidget(window.codex_update_banner_label)
+    status_bar.addWidget(window.usage_status_label)
+    status_bar.addWidget(window.status_button)
 
-    ui_window.thread_pane = ThreadListPane()
-    ui_window.history_pane = HistoryPane()
-    ui_window.activity_pane = ActivityPane()
-    ui_window.splitter = QSplitter(Qt.Orientation.Horizontal)
-    ui_window.splitter.addWidget(ui_window.thread_pane)
-    ui_window.splitter.addWidget(ui_window.history_pane)
-    ui_window.splitter.addWidget(ui_window.activity_pane)
-    ui_window.splitter.setStretchFactor(0, 0)
-    ui_window.splitter.setStretchFactor(1, 1)
-    ui_window.splitter.setStretchFactor(2, 0)
-    ui_window.splitter.setSizes([300, 760, 340])
+    window.thread_pane = ThreadListPane()
+    window.history_pane = HistoryPane()
+    window.activity_pane = ActivityPane()
+    window.splitter = QSplitter(Qt.Orientation.Horizontal)
+    window.splitter.addWidget(window.thread_pane)
+    window.splitter.addWidget(window.history_pane)
+    window.splitter.addWidget(window.activity_pane)
+    window.splitter.setStretchFactor(0, 0)
+    window.splitter.setStretchFactor(1, 1)
+    window.splitter.setStretchFactor(2, 0)
+    window.splitter.setSizes([300, 760, 340])
 
-    ui_window.diagnostics_pane = QWidget()
-    diagnostics_layout = QVBoxLayout(ui_window.diagnostics_pane)
+    window.diagnostics_pane = QWidget()
+    diagnostics_layout = QVBoxLayout(window.diagnostics_pane)
     diagnostics_layout.setContentsMargins(0, 4, 0, 4)
     diagnostics_header = QHBoxLayout()
-    ui_window.diagnostics_title_label = QLabel("Diagnostics")
-    diagnostics_header.addWidget(ui_window.diagnostics_title_label)
+    window.diagnostics_title_label = QLabel("Diagnostics")
+    diagnostics_header.addWidget(window.diagnostics_title_label)
     diagnostics_header.addStretch(1)
-    diagnostics_header.addWidget(ui_window.diagnostics_clear_button)
+    diagnostics_header.addWidget(window.diagnostics_clear_button)
     diagnostics_layout.addLayout(diagnostics_header)
-    ui_window.diagnostics_text = QPlainTextEdit()
-    ui_window.diagnostics_text.setReadOnly(True)
-    ui_window.diagnostics_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-    ui_window.diagnostics_text.setMaximumBlockCount(2000)
-    ui_window.diagnostics_text.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
-    diagnostics_layout.addWidget(ui_window.diagnostics_text)
-    ui_window.diagnostics_pane.setVisible(False)
-    ui_window.diagnostics_toggle_button.clicked.connect(lambda: ui_window.toggle_diagnostics())
-    ui_window.diagnostics_clear_button.clicked.connect(ui_window.diagnostics_text.clear)
+    window.diagnostics_text = QPlainTextEdit()
+    window.diagnostics_text.setReadOnly(True)
+    window.diagnostics_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    window.diagnostics_text.setMaximumBlockCount(2000)
+    window.diagnostics_text.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+    diagnostics_layout.addWidget(window.diagnostics_text)
+    window.diagnostics_pane.setVisible(False)
+    window.diagnostics_toggle_button.clicked.connect(lambda: window.toggle_diagnostics())
+    window.diagnostics_clear_button.clicked.connect(window.diagnostics_text.clear)
 
-    ui_window.bottom_status_label = QLabel("Starting…")
-    ui_window.bottom_status_label.setObjectName("bottomStatus")
-    ui_window.bottom_status_label.setSizePolicy(
-        QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-    )
+    window.bottom_status_label = QLabel("Starting…")
+    window.bottom_status_label.setObjectName("bottomStatus")
+    window.bottom_status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     root = QWidget()
     layout = QVBoxLayout(root)
     layout.addLayout(status_bar)
-    layout.addWidget(ui_window.splitter, 1)
-    layout.addWidget(ui_window.diagnostics_pane)
+    layout.addWidget(window.splitter, 1)
+    layout.addWidget(window.diagnostics_pane)
     bottom_bar = QHBoxLayout()
-    bottom_bar.addWidget(ui_window.bottom_status_label, 1)
-    bottom_bar.addWidget(ui_window.diagnostics_toggle_button)
+    bottom_bar.addWidget(window.bottom_status_label, 1)
+    bottom_bar.addWidget(window.diagnostics_toggle_button)
     layout.addLayout(bottom_bar)
-    ui_window.setCentralWidget(root)
+    window.setCentralWidget(root)
     application = QApplication.instance()
     if isinstance(application, QApplication):
         application.setStyle("Fusion")
-    ui_window.setStyleSheet(
+    window.setStyleSheet(
         """
         QMainWindow, QWidget { background: #202124; color: #e8eaed; }
         QLabel { color: #d8dbe0; }
