@@ -71,8 +71,8 @@ def test_checker_policy_matches_checker_owned_exceptions(checker: ModuleType) ->
     assert loaded == checker.POLICY
     production = loaded["production"]["baselines"]
     tests = loaded["tests"]["baselines"]
-    assert production["src/codex_bridge/console/main_window.py"]["physical_loc"]["value"] == 2106
-    assert production["src/codex_bridge/console/main_window.py"]["raw_bytes"]["value"] == 87119
+    assert production["src/codex_bridge/console/main_window.py"]["physical_loc"]["value"] == 2046
+    assert production["src/codex_bridge/console/main_window.py"]["raw_bytes"]["value"] == 84598
     assert tests["tests/test_bridge.py"]["raw_bytes"]["value"] == 75927
     assert tests["tests/test_console_main_window.py"]["raw_bytes"]["value"] == 132552
     assert tests["tests/test_console_widgets.py"]["raw_bytes"]["value"] == 52244

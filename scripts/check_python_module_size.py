@@ -16,12 +16,12 @@ POLICY: dict[str, Any] = {
         "baselines": {
             "src/codex_bridge/console/main_window.py": {
                 "physical_loc": {
-                    "value": 2106,
-                    "reason": "Phase 4C-2b Bridge transition extraction; LOC exceeds limit.",
+                    "value": 2046,
+                    "reason": "Phase 4C-3a runtime observation extraction; LOC exceeds limit.",
                 },
                 "raw_bytes": {
-                    "value": 87119,
-                    "reason": "Phase 4C-2b Bridge transition extraction; bytes exceed limit.",
+                    "value": 84598,
+                    "reason": "Phase 4C-3a runtime observation extraction; bytes exceed limit.",
                 },
             }
         },

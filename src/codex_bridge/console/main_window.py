@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from ..models import ApprovalDecision
 from .api_client import ApiClient
 from .bridge_readiness import BridgeReadinessCoordinator
+from .bridge_runtime_observer import BridgeRuntimeObserver
 from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
 from .bridge_transition import BridgeTransitionContext, BridgeTransitionCoordinator
 from .codex_links import codex_thread_uri, open_codex_uri
@@ -95,7 +96,6 @@ from .widgets import (
 
 _READINESS_INTERVAL_MS = 350
 _BRIDGE_START_RETRY_DELAYS_MS = (2_000, 5_000, 10_000)
-_BRIDGE_LOSS_THRESHOLD = 2
 _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 60 * 1_000
@@ -250,7 +250,7 @@ class MainWindow(QMainWindow):
         self._health_ok = False
         self._bridge_ready = False
         self._app_server_ready = False
-        self._bridge_loss_count = 0
+        self._bridge_runtime_observer = BridgeRuntimeObserver(self)
         self._launch_in_progress = False
         self._managed_start_active = False
         self._bridge_start_retry_index = 0
@@ -332,6 +332,10 @@ class MainWindow(QMainWindow):
     @property
     def runtime_state(self) -> str:
         return self._runtime_state
+
+    @property
+    def _bridge_loss_count(self) -> int:
+        return self._bridge_runtime_observer.loss_count
 
     @property
     def _stop_confirmation_active(self) -> bool:
@@ -1333,7 +1337,7 @@ class MainWindow(QMainWindow):
         self._bridge_ready = True
         self._app_server_ready = True
         self._bridge_seen_ready = True
-        self._bridge_loss_count = 0
+        self._bridge_runtime_observer.reset_loss_count()
         self.bridge_start_retry_timer.stop()
         self._bridge_start_retry_index = 0
         self._bridge_start_retry_exhausted = False
@@ -1466,7 +1470,7 @@ class MainWindow(QMainWindow):
         self._detached_pid = None
         self._detached_launch_started = False
         self._bridge_seen_ready = False
-        self._bridge_loss_count = 0
+        self._bridge_runtime_observer.reset_loss_count()
         self._launch_in_progress = False
         self._tunnel.set_bridge_ready(False)
         self._bridge_transition_coordinator.clear_pending_action()
@@ -1489,77 +1493,13 @@ class MainWindow(QMainWindow):
         self.bottom_status_label.setText("Bridge stopped")
 
     def _apply_runtime_observation(self) -> None:
-        ready = self._health_ok and self._bridge_ready and self._app_server_ready
-        if self._bridge_transition or self._bridge_stop_confirmation.active:
-            self._tunnel.set_bridge_ready(False)
-            return
-        if self._stop_outcome_uncertain:
-            fresh_observations = self._health_observed and self._status_observed
-            if fresh_observations and ready:
-                self._stop_outcome_uncertain = False
-                self._bridge_transition_coordinator.clear_pending_action()
-            elif fresh_observations and (
-                not self._health_ok and not self._bridge_ready and not self._app_server_ready
-            ):
-                self._confirm_bridge_stopped()
-                return
-            else:
-                self._tunnel.set_bridge_ready(False)
-                return
-        self._tunnel.set_bridge_ready(ready)
-        if ready:
-            self.bridge_start_retry_timer.stop()
-            self._bridge_start_retry_index = 0
-            self._bridge_start_retry_exhausted = False
-            self._managed_start_active = False
-            self._bridge_seen_ready = True
-            if self._detached_launch_started:
-                self._launch_in_progress = False
-                self.readiness_timer.stop()
-                self._set_runtime_state("console_started", label="Runtime: started by Console")
-                self._restore_restarted_tunnel()
-            else:
-                self._set_runtime_state("external")
-            return
-        if self._detached_launch_started:
-            if not self._launch_in_progress and self._runtime_state != "launch_timed_out":
-                self._set_runtime_state(
-                    "console_started_unreachable",
-                    label="Runtime: started by Console (not reachable)",
-                )
-        elif self._bridge_seen_ready:
-            self._set_runtime_state(
-                "external_unreachable",
-                label="Runtime: external (not reachable)",
-            )
-        else:
-            self._set_runtime_state("unavailable")
-        self._maybe_auto_start_bridge()
+        self._bridge_runtime_observer.apply_runtime_observation()
 
     def _record_bridge_status_observation(self, available: bool) -> None:
-        if available:
-            self._bridge_loss_count = 0
-            return
-        self._bridge_loss_count += 1
-        if (
-            self._bridge_loss_count < _BRIDGE_LOSS_THRESHOLD
-            or self._closing
-            or self._bridge_transition
-            or self._launch_in_progress
-        ):
-            return
-        self._recover_bridge_after_loss()
+        self._bridge_runtime_observer.record_bridge_status_observation(available)
 
     def _recover_bridge_after_loss(self) -> None:
-        self._bridge_loss_count = _BRIDGE_LOSS_THRESHOLD
-        if self._detached_launch_started and self._control_token is not None:
-            self._managed_start_active = True
-            self._begin_bridge_transition("restart", tunnel_running=self._tunnel_owned_running())
-            return
-        self._bridge_seen_ready = False
-        self._runtime_state = "unavailable"
-        self._update_start_button()
-        self._maybe_auto_start_bridge()
+        self._bridge_runtime_observer.recover_bridge_after_loss()
 
     def _request_health(self) -> None:
         self._client.get_json("/healthz", key="health")
