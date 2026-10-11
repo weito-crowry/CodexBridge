@@ -48,12 +48,12 @@ from .codex_resolver import (
 from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
-from .history_metadata import _turn_model_metadata_from_payload
 from .history_requests import (
     HISTORY_REFRESH_DEBOUNCE_MS,
     HistoryRequestContext,
     HistoryRequestCoordinator,
 )
+from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
 from .main_window_layout import build_main_window_ui
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
@@ -115,12 +115,6 @@ _DIAGNOSTICS_POLL_INTERVAL_MS = 1_000
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
-_ACTIVE_TURN_STATES = {
-    "in_progress",
-    "needs_approval",
-    "needs_input",
-    "needs_user_input",
-}
 _TERMINAL_TURN_STATES = {"completed", "interrupted", "failed", "error"}
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
@@ -239,15 +233,11 @@ class MainWindow(QMainWindow):
         self._exit_finished = False
         self._selection_generation = 0
         self._selected_thread_id: str | None = None
-        self._timeline_entries: list[TimelineEntry] = []
-        self._turn_model_metadata: dict[str, Mapping[str, object]] = {}
-        self._turn_statuses: dict[str, str] = {}
+        self._history_timeline = HistoryTimelineState()
         self._active_thread_ids: set[str] = set()
         self._pending_rename_names: dict[str, str] = {}
         self._thread_copy_sequence = 0
         self._pending_thread_copies: dict[str, tuple[str, list[TimelineEntry]]] = {}
-        self._next_cursor: str | None = None
-        self._has_loaded_older = False
         self._stream_sync_pending = False
         self._reconnect_scheduled = False
         self._stream_connected = False
@@ -1711,6 +1701,26 @@ class MainWindow(QMainWindow):
     def _finish_selected_history_request(self, key: str) -> None:
         self._history_requests.finish_request(key, self._history_request_context())
 
+    @property
+    def _timeline_entries(self) -> list[TimelineEntry]:
+        return self._history_timeline.entries
+
+    @_timeline_entries.setter
+    def _timeline_entries(self, value: list[TimelineEntry]) -> None:
+        self._history_timeline.entries = value
+
+    @property
+    def _turn_model_metadata(self) -> dict[str, Mapping[str, object]]:
+        return self._history_timeline.turn_model_metadata
+
+    @property
+    def _turn_statuses(self) -> dict[str, str]:
+        return self._history_timeline.turn_statuses
+
+    @property
+    def _next_cursor(self) -> str | None:
+        return self._history_timeline.next_cursor
+
     def select_thread(self, thread_id: str | None) -> None:
         self._selection_generation += 1
         generation = self._selection_generation
@@ -1718,11 +1728,7 @@ class MainWindow(QMainWindow):
         self._history_requests.reset()
         self._stream_connected = False
         self._stream_ever_connected = False
-        self._timeline_entries = []
-        self._turn_model_metadata = {}
-        self._turn_statuses = {}
-        self._next_cursor = None
-        self._has_loaded_older = False
+        self._history_timeline.reset()
         self._stream_sync_pending = thread_id is not None
         self._reconnect_scheduled = False
         self._client.abort_json_group("selection:")
@@ -1864,22 +1870,9 @@ class MainWindow(QMainWindow):
         if suffix == "detail":
             return
         if suffix == "turns":
-            if isinstance(payload, Mapping) and isinstance(payload.get("turns"), list):
-                refreshed_statuses = {
-                    turn["id"]: turn["status"]
-                    for turn in payload["turns"]
-                    if isinstance(turn, Mapping)
-                    and isinstance(turn.get("id"), str)
-                    and isinstance(turn.get("status"), str)
-                }
-                if live_refresh:
-                    self._turn_statuses.update(refreshed_statuses)
-                else:
-                    self._turn_statuses = refreshed_statuses
-                statuses_for_activity = (
-                    refreshed_statuses.values() if live_refresh else self._turn_statuses.values()
-                )
-                if any(status in _ACTIVE_TURN_STATES for status in statuses_for_activity):
+            has_active_turn = self._history_timeline.apply_turns(payload, live_refresh=live_refresh)
+            if has_active_turn is not None:
+                if has_active_turn:
                     if self._selected_thread_id is not None:
                         self._set_thread_active(self._selected_thread_id, True)
                 self._render_timeline()
@@ -1897,54 +1890,14 @@ class MainWindow(QMainWindow):
             self._finish_selected_history_request(key)
 
     def _apply_items(self, payload: object, *, prepend: bool, live_refresh: bool = False) -> None:
-        if not isinstance(payload, Mapping):
-            return
-        new_entries = timeline_entries(payload)
-        page_metadata = _turn_model_metadata_from_payload(payload)
-        if prepend:
-            self._turn_model_metadata.update(page_metadata)
-            self._has_loaded_older = True
-        elif live_refresh:
-            self._turn_model_metadata.update(page_metadata)
-        else:
-            self._has_loaded_older = False
-            self._turn_model_metadata = page_metadata
-        if prepend:
-            existing = {(entry.turn_id, entry.item_id) for entry in self._timeline_entries}
-            new_entries = tuple(
-                entry for entry in new_entries if (entry.turn_id, entry.item_id) not in existing
-            )
-            self._timeline_entries = list(new_entries) + self._timeline_entries
-        elif live_refresh:
-            refreshed_by_id = {(entry.turn_id, entry.item_id): entry for entry in new_entries}
-            existing_ids = {(entry.turn_id, entry.item_id) for entry in self._timeline_entries}
-            self._timeline_entries = [
-                refreshed_by_id.pop((entry.turn_id, entry.item_id), entry)
-                for entry in self._timeline_entries
-            ]
-            self._timeline_entries.extend(
-                entry for entry in new_entries if (entry.turn_id, entry.item_id) not in existing_ids
-            )
-        else:
-            self._timeline_entries = list(new_entries)
-        if not live_refresh or not self._has_loaded_older:
-            next_cursor = payload.get("next_cursor")
-            self._next_cursor = next_cursor if isinstance(next_cursor, str) else None
-        self._render_timeline(prepend=prepend)
+        if self._history_timeline.apply_items(payload, prepend=prepend, live_refresh=live_refresh):
+            self._render_timeline(prepend=prepend)
 
     def _render_timeline(self, *, prepend: bool = False) -> None:
-        selected_thread_id = self._selected_thread_id
-        turn_usage_snapshots = {
-            turn_id: snapshot
-            for (thread_id, turn_id), snapshot in self._usage_snapshots.items()
-            if thread_id == selected_thread_id and snapshot is not None
-        }
-        self.history_pane.set_timeline(
-            self._timeline_entries,
-            has_older=self._next_cursor is not None,
-            turn_statuses=self._turn_statuses,
-            turn_model_metadata=self._turn_model_metadata,
-            turn_usage_snapshots=turn_usage_snapshots,
+        self._history_timeline.render(
+            self.history_pane,
+            selected_thread_id=self._selected_thread_id,
+            usage_snapshots=self._usage_snapshots,
             prepend=prepend,
         )
 
@@ -1972,7 +1925,7 @@ class MainWindow(QMainWindow):
         self.thread_pane.set_active_thread_ids(self._active_thread_ids)
 
     def _update_thread_activity(self, thread_id: str, state: str) -> None:
-        if state in _ACTIVE_TURN_STATES:
+        if state in ACTIVE_TURN_STATES:
             self._set_thread_active(thread_id, True)
         elif state in _TERMINAL_TURN_STATES or state == "not_loaded":
             self._set_thread_active(thread_id, False)
