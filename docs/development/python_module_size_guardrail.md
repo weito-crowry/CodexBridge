@@ -9,16 +9,18 @@
 - 100,000 bytes 以上のテストは `REVIEW` として強く表示します。これは自動的な分割要求ではなく、レビュー時の明示確認です。
 - `tests/**/test_*.py` 以外の test support Python ファイルには、このサイズ gate を適用しません。
 
-### 現在の承認済み baseline（Phase 4C-3b 変更後）
+### 現在の承認済み baseline（Phase 4D-1 変更後）
 
 Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらの履歴値は以下の現在の承認値と区別します。本表は統合ブランチの値であり、`origin/main` の現行値を示すものではありません。
 
 Phase 3 では、本番 2 モジュールの抽出、Fake の移動、テストの移設を行いました（いずれも純粋移動）。
 
+Phase 4D-1 では、Codex updater の状態と操作を `CodexUpdateController` へ抽出しました。
+
 | Path | Metric | Exact baseline | 理由 |
 | --- | --- | ---: | --- |
-| `src/codex_bridge/console/main_window.py` | physical LOC | 2,035 | Phase 4C-3b managed retry coordinator extraction; physical LOC reduced but still exceeds limit. |
-| `src/codex_bridge/console/main_window.py` | raw bytes | 84,173 | Phase 4C-3b managed retry coordinator extraction; raw bytes reduced but still exceed limit. |
+| `src/codex_bridge/console/main_window.py` | physical LOC | 1,950 | Phase 4D-1 Codex updater controller extraction; physical LOC reduced but still exceeds limit. |
+| `src/codex_bridge/console/main_window.py` | raw bytes | 80,567 | Phase 4D-1 Codex updater controller extraction; raw bytes reduced but still exceed limit. |
 | `tests/test_bridge.py` | raw bytes | 75,927 | Phase 3 で Fake を移動。50 KB 超。 |
 | `tests/test_console_main_window.py` | raw bytes | 132,552 | Phase 3 でテストを移設。100 KB 超のため REVIEW 通知による明示確認が必要。 |
 | `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |
