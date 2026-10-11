@@ -7,7 +7,6 @@ from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
 from typing import Any, Literal, cast
-from urllib.parse import quote
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import (
@@ -20,7 +19,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QPlainTextEdit,
@@ -41,7 +39,7 @@ from .bridge_readiness import BridgeReadinessCoordinator
 from .bridge_runtime_observer import BridgeRuntimeObserver
 from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
 from .bridge_transition import BridgeTransitionContext, BridgeTransitionCoordinator
-from .codex_links import codex_thread_uri, open_codex_uri
+from .codex_links import open_codex_uri
 from .codex_resolver import (
     CodexResolution,
     CodexResolutionError,
@@ -52,6 +50,7 @@ from .codex_update_controller import CodexUpdateController
 from .codex_updates import CodexUpdateProbe
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
+from .diagnostics_panel import DiagnosticsPanelController
 from .history_requests import (
     HISTORY_REFRESH_DEBOUNCE_MS,
     HistoryRequestContext,
@@ -67,6 +66,7 @@ from .main_window_layout import build_main_window_ui
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .runtime_ui import RuntimeUiPresenter
+from .thread_interactions import ThreadInteractionController
 from .tray_controller import TrayController
 from .tunnel_resolver import TunnelResolutionError
 from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
@@ -90,8 +90,6 @@ from .widgets import (
     ThreadListPane,
     TimelineEntry,
     copy_to_clipboard,
-    format_thread_content,
-    timeline_entries,
 )
 
 _READINESS_INTERVAL_MS = 350
@@ -220,9 +218,6 @@ class MainWindow(QMainWindow):
         self._selected_thread_id: str | None = None
         self._history_timeline = HistoryTimelineState()
         self._active_thread_ids: set[str] = set()
-        self._pending_rename_names: dict[str, str] = {}
-        self._thread_copy_sequence = 0
-        self._pending_thread_copies: dict[str, tuple[str, list[TimelineEntry]]] = {}
         self._runtime_state = "unavailable"
         self._usage_presentation = UsagePresentationController(self)
         self._usage_snapshot_store = UsageSnapshotStore(self)
@@ -252,8 +247,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CodexBridge Console")
         self._build_ui()
         self._set_initial_size()
-        self._connect_client()
         self._build_timers()
+        self._thread_interactions = ThreadInteractionController(self)
+        self._diagnostics_panel = DiagnosticsPanelController(self)
+        self._connect_client()
         self._codex_update_controller = CodexUpdateController(self)
         self._bridge_managed_retry_coordinator = BridgeManagedRetryCoordinator(
             self.bridge_start_retry_timer,
@@ -323,6 +320,18 @@ class MainWindow(QMainWindow):
     @property
     def runtime_state(self) -> str:
         return self._runtime_state
+
+    @property
+    def _pending_rename_names(self) -> dict[str, str]:
+        return self._thread_interactions._pending_rename_names
+
+    @property
+    def _thread_copy_sequence(self) -> int:
+        return self._thread_interactions._thread_copy_sequence
+
+    @property
+    def _pending_thread_copies(self) -> dict[str, tuple[str, list[TimelineEntry]]]:
+        return self._thread_interactions._pending_thread_copies
 
     @property
     def _managed_start_active(self) -> bool:
@@ -590,38 +599,16 @@ class MainWindow(QMainWindow):
         self.signal_timer.start()
 
     def toggle_diagnostics(self) -> None:
-        self._set_diagnostics_visible(self.diagnostics_pane.isHidden())
+        self._diagnostics_panel.toggle_diagnostics()
 
     def _set_diagnostics_visible(self, visible: bool) -> None:
-        self.diagnostics_pane.setVisible(visible)
-        self.diagnostics_toggle_button.setText("Hide Diagnostics" if visible else "Diagnostics")
-        if visible:
-            self.diagnostics_text.clear()
-            self._diagnostics_reader.reset()
-            self._on_diagnostics_timeout()
-            self.diagnostics_timer.start()
-        else:
-            self.diagnostics_timer.stop()
+        self._diagnostics_panel._set_diagnostics_visible(visible)
 
     def _on_diagnostics_timeout(self) -> None:
-        try:
-            lines = self._diagnostics_reader.poll()
-        except Exception:
-            return
-        if lines:
-            self._append_diagnostics_lines(lines)
+        self._diagnostics_panel._on_diagnostics_timeout()
 
     def _append_diagnostics_lines(self, lines: list[str]) -> None:
-        if not lines:
-            return
-        scrollbar = self.diagnostics_text.verticalScrollBar()
-        follow = scrollbar.maximum() - scrollbar.value() <= 1
-        previous_value = scrollbar.value()
-        self.diagnostics_text.appendPlainText("\n".join(lines))
-        if follow:
-            scrollbar.setValue(scrollbar.maximum())
-        else:
-            scrollbar.setValue(min(previous_value, scrollbar.maximum()))
+        self._diagnostics_panel._append_diagnostics_lines(lines)
 
     def request_sigint(self) -> None:
         self._sigint_requested = True
@@ -1157,101 +1144,35 @@ class MainWindow(QMainWindow):
         self._client.get_json("/ui-api/threads", key="threads", query={"limit": 100})
 
     def _rename_thread(self, thread_id: str) -> None:
-        name, accepted = QInputDialog.getText(
-            self,
-            "名前を変更",
-            "名前:",
-            QLineEdit.EchoMode.Normal,
-            self.thread_pane.thread_name(thread_id),
-        )
-        if not accepted or not name.strip():
-            return
-        key = f"rename:{thread_id}"
-        if key in self._pending_rename_names:
-            return
-        if self._client.post_json(
-            f"/ui-api/threads/{quote(thread_id, safe='')}/name",
-            {"name": name},
-            key=key,
-        ):
-            self._pending_rename_names[key] = name
+        self._thread_interactions._rename_thread(thread_id, get_text=QInputDialog.getText)
 
     def _open_thread_in_codex(self, thread_id: str) -> None:
-        try:
-            opened = self._codex_uri_opener(codex_thread_uri(thread_id))
-        except Exception:
-            opened = False
-        if not opened:
-            self.bottom_status_label.setText(
-                "Could not open thread in Codex App. "
-                "Check that the codex:// URI handler is available."
-            )
+        self._thread_interactions._open_thread_in_codex(thread_id)
 
     def _copy_thread_content(self, thread_id: str) -> None:
-        self._thread_copy_sequence += 1
-        key = f"copy-thread:{self._thread_copy_sequence}"
-        self._pending_thread_copies[key] = (thread_id, [])
-        if not self._request_thread_copy_page(key, thread_id):
-            self._pending_thread_copies.pop(key, None)
+        self._thread_interactions._copy_thread_content(thread_id)
 
     def _request_thread_copy_page(
         self, key: str, thread_id: str, cursor: str | None = None
     ) -> bool:
-        query: dict[str, object] = {"limit": 100, "sort_direction": "desc"}
-        if cursor is not None:
-            query["cursor"] = cursor
-        return self._client.get_json(
-            f"/ui-api/threads/{quote(thread_id, safe='')}/items",
-            key=key,
-            query=query,
-        )
+        return self._thread_interactions._request_thread_copy_page(key, thread_id, cursor)
 
     def _apply_thread_copy_page(self, key: str, payload: object) -> None:
-        pending = self._pending_thread_copies.get(key)
-        if pending is None or not isinstance(payload, Mapping):
-            self._pending_thread_copies.pop(key, None)
-            return
-        thread_id, entries = pending
-        existing = {(entry.turn_id, entry.item_id) for entry in entries}
-        page_entries = tuple(
-            entry
-            for entry in timeline_entries(payload)
-            if (entry.turn_id, entry.item_id) not in existing
+        self._thread_interactions._apply_thread_copy_page(
+            key, payload, copy_to_clipboard=copy_to_clipboard
         )
-        entries[0:0] = page_entries
-        next_cursor = payload.get("next_cursor")
-        if isinstance(next_cursor, str) and next_cursor:
-            if self._request_thread_copy_page(key, thread_id, next_cursor):
-                return
-            self._pending_thread_copies.pop(key, None)
-            return
-        copy_to_clipboard(format_thread_content(entries))
-        self._pending_thread_copies.pop(key, None)
 
     def _thread_path(self, suffix: str = "") -> str:
-        assert self._selected_thread_id is not None
-        return f"/ui-api/threads/{quote(self._selected_thread_id, safe='')}{suffix}"
+        return self._thread_interactions._thread_path(suffix)
 
     def _request_snapshot(self, generation: int) -> None:
-        if generation != self._selection_generation or self._selected_thread_id is None:
-            return
-        prefix = f"selection:{generation}:"
-        self._client.get_json(self._thread_path(), key=prefix + "detail")
-        self._request_history_snapshot(generation)
-        self._client.get_json(
-            self._thread_path("/status"),
-            key=prefix + "status",
-            query={"activity_limit": 50},
-        )
+        self._thread_interactions._request_snapshot(generation)
 
     def _request_history_snapshot(self, generation: int) -> None:
         self._history_requests.request_snapshot(generation, self._history_request_context())
 
     def _request_selected_status(self) -> None:
-        if self._selected_thread_id is None:
-            return
-        key = f"selection:{self._selection_generation}:status"
-        self._client.get_json(self._thread_path("/status"), key=key, query={"activity_limit": 50})
+        self._thread_interactions._request_selected_status()
 
     def _schedule_selected_history_refresh(self) -> None:
         self._history_requests.schedule_selected_history_refresh(self._history_request_context())
@@ -1283,48 +1204,21 @@ class MainWindow(QMainWindow):
         return self._history_timeline.next_cursor
 
     def select_thread(self, thread_id: str | None) -> None:
-        self._selection_generation += 1
-        generation = self._selection_generation
-        self._selected_thread_id = thread_id
-        self._history_requests.reset()
-        self._history_stream.reset_selection(thread_id)
-        self._history_timeline.reset()
-        self._client.abort_json_group("selection:")
-        self._client.stop_stream()
-        self.selected_status_timer.stop()
-        if thread_id is None:
-            self.stream_status_label.setText("Stream: idle")
-            self._sync_empty_state()
-            return
-        self.history_pane.set_empty_state("Loading history…")
-        self.activity_pane.set_loading_state("Loading activity…")
-        self.selected_status_timer.start()
-        self._request_snapshot(generation)
+        self._thread_interactions.select_thread(thread_id)
 
     @staticmethod
     def _selection_key(key: str) -> tuple[int, str] | None:
-        parts = key.split(":", 2)
-        if len(parts) != 3 or parts[0] != "selection":
-            return None
-        try:
-            return int(parts[1]), parts[2]
-        except ValueError:
-            return None
+        return ThreadInteractionController._selection_key(key)
 
     def _is_current_selection(self, key: str) -> tuple[int, str] | None:
-        parsed = self._selection_key(key)
-        if parsed is None or parsed[0] != self._selection_generation:
-            return None
-        return parsed
+        return self._thread_interactions._is_current_selection(key)
 
     def apply_json_result(self, key: str, payload: object) -> None:
         if key in self._pending_thread_copies:
             self._apply_thread_copy_page(key, payload)
             return
         if key.startswith("rename:"):
-            name = self._pending_rename_names.pop(key, None)
-            if name is not None:
-                self.thread_pane.update_thread_name(key.removeprefix("rename:"), name)
+            self._thread_interactions.apply_rename_success(key)
             return
         if self._bridge_stop_confirmation.active and key in {"health", "bridge-status"}:
             if key == "health":
@@ -1464,10 +1358,10 @@ class MainWindow(QMainWindow):
 
     def _apply_json_error(self, key: str, message: str) -> None:
         if key in self._pending_thread_copies:
-            self._pending_thread_copies.pop(key, None)
+            self._thread_interactions.discard_copy(key)
             return
         if key.startswith("rename:"):
-            self._pending_rename_names.pop(key, None)
+            self._thread_interactions.discard_rename(key)
             return
         if key == "launch:health":
             self._bridge_readiness.fail_health()
