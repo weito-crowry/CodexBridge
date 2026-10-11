@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 from inspect import signature
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QPalette, QTextOption
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtGui import QPalette, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -393,125 +393,6 @@ def test_single_relative_cwd_displays_other_without_friendly_name() -> None:
     assert parent.data(0, Qt.ItemDataRole.UserRole) is None
     assert parent.childCount() == 1
     assert parent.child(0).data(0, Qt.ItemDataRole.UserRole) == "relative"
-
-
-def test_parent_and_empty_placeholder_have_no_thread_context_menu(tmp_path) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads([{"id": "a", "cwd": str(tmp_path)}])
-
-    assert pane._context_menu_for_item(pane.list_widget.topLevelItem(0)) is None
-    pane.set_empty_state("No threads found.")
-    placeholder = pane.list_widget.topLevelItem(0)
-    assert not placeholder.flags() & Qt.ItemFlag.ItemIsSelectable
-    assert pane._context_menu_for_item(placeholder) is None
-
-
-def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads(
-        [
-            {"id": "selected", "name": "Selected", "cwd": str(tmp_path / "selected")},
-            {
-                "id": "target",
-                "name": "Target",
-                "cwd": str(tmp_path),
-                "preview": "must not copy",
-            },
-        ],
-        active_thread_ids={"target"},
-    )
-    pane.list_widget.setCurrentItem(_thread_item(pane, "selected"))
-    renamed: list[str] = []
-    pane.thread_rename_requested.connect(renamed.append)
-    opened: list[str] = []
-    pane.thread_open_requested.connect(opened.append)
-    copied_threads: list[str] = []
-    pane.thread_copy_requested.connect(copied_threads.append)
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-    actions = menu.actions()
-
-    assert [action.text() for action in actions] == [
-        "名前を変更...",
-        "Open in Codex App",
-        "スレッドIDをコピー",
-        "スレッド情報をコピー",
-        "Copy thread content",
-        "",
-        "作業フォルダを開く",
-    ]
-    actions[0].trigger()
-    assert renamed == ["target"]
-
-    actions[1].trigger()
-    assert opened == ["target"]
-
-    actions[2].trigger()
-    assert application.clipboard().text() == "target"
-    application.processEvents()
-
-    actions[3].trigger()
-    assert application.clipboard().text() == (
-        f"Name: Target\nThread ID: target\nCWD: {tmp_path}\nStatus: active"
-    )
-    assert "must not copy" not in application.clipboard().text()
-    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "selected"
-
-    actions[4].trigger()
-    assert copied_threads == ["target"]
-    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "selected"
-
-
-def test_thread_context_menu_disables_folder_action_without_valid_cwd(tmp_path) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads([{"id": "target", "name": "Target"}])
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-
-    assert menu.actions()[-1].text() == "作業フォルダを開く"
-    assert not menu.actions()[-1].isEnabled()
-
-
-def test_thread_context_menu_opens_existing_absolute_cwd(tmp_path, monkeypatch) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads([{"id": "target", "cwd": str(tmp_path)}])
-    opened: list[QUrl] = []
-    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-    menu.actions()[-1].trigger()
-
-    assert len(opened) == 1
-    assert os.path.normcase(os.path.normpath(opened[0].toLocalFile())) == os.path.normcase(
-        os.path.normpath(str(tmp_path))
-    )
-
-
-def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
-    tmp_path, monkeypatch
-) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    missing_cwd = str(tmp_path / "not-created")
-    pane.set_threads([{"id": "target", "name": "Target", "cwd": missing_cwd}])
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-    copied: list[str] = []
-    monkeypatch.setattr(pane, "_copy_text", copied.append)
-    menu.actions()[3].trigger()
-
-    assert len(copied) == 1
-    assert f"CWD: {missing_cwd}" in copied[0]
-    assert not menu.actions()[-1].isEnabled()
 
 
 def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:

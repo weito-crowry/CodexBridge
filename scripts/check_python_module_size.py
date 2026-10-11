@@ -40,7 +40,10 @@ POLICY: dict[str, Any] = {
                 }
             },
             "tests/test_console_widgets.py": {
-                "raw_bytes": {"value": 56627, "reason": "Phase 3 tests moved; above 50 KB."}
+                "raw_bytes": {
+                    "value": 52244,
+                    "reason": "Phase 4-C context-menu tests moved; above 50 KB.",
+                }
             },
         },
     },

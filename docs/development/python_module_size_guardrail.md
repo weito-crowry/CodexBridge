@@ -21,7 +21,7 @@ Phase 3 では、本番 2 モジュールの抽出、Fake の移動、テスト�
 | `src/codex_bridge/console/main_window.py` | raw bytes | 108,252 | Phase 3 の本番モジュール抽出後も byte 上限超過。 |
 | `tests/test_bridge.py` | raw bytes | 75,927 | Phase 3 で Fake を移動。50 KB 超。 |
 | `tests/test_console_main_window.py` | raw bytes | 132,552 | Phase 3 でテストを移設。100 KB 超のため REVIEW 通知による明示確認が必要。 |
-| `tests/test_console_widgets.py` | raw bytes | 56,627 | Phase 3 でテストを移設。50 KB 超。 |
+| `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |
 
 新しく上限超過した production module、未登録の 50,000 bytes 以上の test module、または baseline より増えたファイルは失敗します。別の例外を追加する場合は、checker 内の `POLICY` とこの文書に指定した JSON policy の両方を、レビュー対象の値・理由で一致させます。
 

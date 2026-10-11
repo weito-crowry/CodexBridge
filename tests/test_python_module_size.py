@@ -75,7 +75,7 @@ def test_checker_policy_matches_checker_owned_exceptions(checker: ModuleType) ->
     assert production["src/codex_bridge/console/main_window.py"]["raw_bytes"]["value"] == 108252
     assert tests["tests/test_bridge.py"]["raw_bytes"]["value"] == 75927
     assert tests["tests/test_console_main_window.py"]["raw_bytes"]["value"] == 132552
-    assert tests["tests/test_console_widgets.py"]["raw_bytes"]["value"] == 56627
+    assert tests["tests/test_console_widgets.py"]["raw_bytes"]["value"] == 52244
 
 
 def test_production_line_limit_accepts_1500_and_rejects_1501(checker: ModuleType) -> None:
