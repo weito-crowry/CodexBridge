@@ -67,6 +67,7 @@ from .main_window_layout import build_main_window_ui
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .runtime_ui import RuntimeUiPresenter
+from .tray_controller import TrayController
 from .tunnel_resolver import TunnelResolutionError
 from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
 from .tunnel_supervisor import TunnelSupervisor, tunnel_state_label
@@ -309,6 +310,7 @@ class MainWindow(QMainWindow):
             start_stream=self._client.start_stream,
         )
         self._connect_runtime()
+        self._tray_controller = TrayController(self)
         self._build_tray()
         self._runtime_ui = RuntimeUiPresenter(self)
         self._update_tunnel_client_status()
@@ -520,76 +522,16 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _build_tray(self) -> None:
-        if not self._tray_available or self._window_icon.isNull():
-            return
-        try:
-            self.tray_icon = self._tray_factory(self)
-            set_icon = getattr(self.tray_icon, "setIcon", None)
-            if not callable(set_icon):
-                self.tray_icon = None
-                return
-            set_icon(self._window_icon)
-            self.tray_icon.setToolTip("CodexBridge Console")
-        except Exception:
-            self.tray_icon = None
-            return
-        menu = QMenu(self)
-        self.tray_menu = menu
-        for text, callback in (
-            ("Show Console", self._show_console),
-            ("Hide Console", self._hide_console),
-        ):
-            action = QAction(text, self)
-            action.triggered.connect(callback)
-            menu.addAction(action)
-            self._tray_actions[text] = action
-        menu.addSeparator()
-        for text, callback in (
-            ("Start Bridge", self._start_bridge),
-            ("Stop Bridge", self._stop_bridge),
-            ("Restart Bridge", self._restart_bridge),
-        ):
-            action = QAction(text, self)
-            action.triggered.connect(callback)
-            menu.addAction(action)
-            self._tray_actions[text] = action
-        menu.addSeparator()
-        for text, callback in (
-            ("Start Tunnel", self._start_tunnel),
-            ("Stop Tunnel", self._stop_tunnel),
-            ("Restart Tunnel", self._restart_tunnel),
-        ):
-            action = QAction(text, self)
-            action.triggered.connect(callback)
-            menu.addAction(action)
-            self._tray_actions[text] = action
-        menu.addSeparator()
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self._begin_exit)
-        menu.addAction(exit_action)
-        self._tray_actions["Exit"] = exit_action
-        try:
-            self.tray_icon.setContextMenu(menu)
-            self.tray_icon.activated.connect(self._on_tray_activated)
-            self.tray_icon.show()
-        except Exception:
-            self.tray_icon = None
-            self.tray_menu = None
-            self._tray_actions.clear()
-            return
-        self._tray_usable = True
+        self._tray_controller.build()
 
     def _show_console(self) -> None:
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        self._tray_controller.show_console()
 
     def _hide_console(self) -> None:
-        self.hide()
+        self._tray_controller.hide_console()
 
     def _on_tray_activated(self, reason: object) -> None:
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self._show_console()
+        self._tray_controller.on_activated(reason)
 
     def _build_timers(self) -> None:
         self.health_timer = QTimer(self)
@@ -1626,27 +1568,7 @@ class MainWindow(QMainWindow):
         self._history_stream.reconnect(generation)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._closing:
-            event.accept()
-            return
-        if self._tray_usable:
-            self.hide()
-            if not self._tray_notified and self.tray_icon is not None:
-                show_message = getattr(self.tray_icon, "showMessage", None)
-                if callable(show_message):
-                    try:
-                        show_message(
-                            "CodexBridge Console",
-                            "Console is still running in the system tray.",
-                        )
-                    except Exception:
-                        pass
-                self._tray_notified = True
-            event.ignore()
-            return
-        self._begin_exit()
-        self.hide()
-        event.ignore()
+        self._tray_controller.handle_close_event(event)
 
     def _begin_exit(self) -> None:
         if self._closing:
