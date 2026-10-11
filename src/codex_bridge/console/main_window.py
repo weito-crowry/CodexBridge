@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 from PySide6.QtCore import QTimer
@@ -40,6 +40,7 @@ from ..models import ApprovalDecision
 from .api_client import ApiClient
 from .bridge_readiness import BridgeReadinessCoordinator
 from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
+from .bridge_transition import BridgeTransitionContext, BridgeTransitionCoordinator
 from .codex_links import codex_thread_uri, open_codex_uri
 from .codex_resolver import (
     CodexResolution,
@@ -260,9 +261,6 @@ class MainWindow(QMainWindow):
         self._approval_control_pending = False
         self._launch_generation = 0
         self._bridge_transition = False
-        self._pending_bridge_action: str | None = None
-        self._restart_tunnel_was_running = False
-        self._control_request_pending = False
         self._stop_outcome_uncertain = False
         self._exit_shutdown_pending = False
         self._exit_deadline = 0.0
@@ -281,6 +279,19 @@ class MainWindow(QMainWindow):
             on_timed_out=self._on_stop_confirmation_timed_out,
             request_health=self._request_health,
             clock=monotonic,
+        )
+        self._bridge_transition_coordinator = BridgeTransitionCoordinator(
+            get_context=lambda: BridgeTransitionContext(
+                self._closing, self._control_token, self._stop_confirmation_active
+            ),
+            stop_tunnel=lambda on_finished: self._tunnel.stop(on_finished=on_finished),
+            post_shutdown=lambda token: self._client.post_control_shutdown(
+                token, key="control:shutdown"
+            ),
+            on_transition_started=self._on_bridge_transition_started,
+            on_request_failure=lambda: self._apply_control_failure(
+                "control:shutdown", "Bridge control request failed"
+            ),
         )
         self._bridge_readiness = BridgeReadinessCoordinator(
             self.readiness_timer,
@@ -1253,8 +1264,7 @@ class MainWindow(QMainWindow):
             return
         if managed:
             self._managed_start_active = True
-        self._pending_bridge_action = None
-        self._restart_tunnel_was_running = False
+        self._bridge_transition_coordinator.reset_for_launch()
         self._bridge_transition = True
         self._sync_tunnel_controls()
         self._launch_bridge(resolution.path)
@@ -1336,8 +1346,7 @@ class MainWindow(QMainWindow):
         self._restore_restarted_tunnel()
 
     def _restore_restarted_tunnel(self) -> None:
-        if self._restart_tunnel_was_running:
-            self._restart_tunnel_was_running = False
+        if self._bridge_transition_coordinator.consume_restart_tunnel_flag():
             self._tunnel.start()
 
     def _bridge_control_allowed(self) -> bool:
@@ -1367,38 +1376,21 @@ class MainWindow(QMainWindow):
             return
         self._begin_bridge_transition("restart", tunnel_running=self._tunnel_owned_running())
 
-    def _begin_bridge_transition(self, action: str, *, tunnel_running: bool) -> None:
+    def _begin_bridge_transition(
+        self, action: Literal["stop", "restart"], *, tunnel_running: bool
+    ) -> None:
+        self._bridge_transition_coordinator.begin_transition(action, tunnel_running=tunnel_running)
+
+    def _on_bridge_transition_started(self, action: str) -> None:
         self._bridge_transition = True
-        self._pending_bridge_action = action
-        self._restart_tunnel_was_running = tunnel_running
         self._sync_tunnel_controls()
         self._set_runtime_state("restarting" if action == "restart" else "stopping")
-        if tunnel_running:
-            started = self._tunnel.stop(on_finished=self._on_tunnel_stopped_for_bridge)
-            if not started and not self._control_request_pending:
-                self._request_bridge_shutdown()
-        else:
-            self._request_bridge_shutdown()
 
     def _on_tunnel_stopped_for_bridge(self) -> None:
-        self._request_bridge_shutdown()
+        self._bridge_transition_coordinator.on_tunnel_stopped()
 
     def _request_bridge_shutdown(self, *, allow_closing: bool = False) -> None:
-        if (
-            (self._closing and not allow_closing)
-            or self._control_request_pending
-            or self._stop_confirmation_active
-        ):
-            return
-        token = self._control_token
-        if token is None:
-            self._apply_control_failure("control:shutdown", "Bridge control request failed")
-            return
-        self._control_request_pending = True
-        if not self._client.post_control_shutdown(token, key="control:shutdown"):
-            self._control_request_pending = False
-            self._apply_control_failure("control:shutdown", "Bridge control request failed")
-            return
+        self._bridge_transition_coordinator.request_shutdown(allow_closing=allow_closing)
 
     def _apply_control_success(self, key: str) -> None:
         if key == "control:approval" and self._approval_control_pending:
@@ -1407,9 +1399,10 @@ class MainWindow(QMainWindow):
             self.activity_pane.set_approval_feedback("Approval sent. Refreshing status…")
             self._request_selected_status()
             return
-        if key != "control:shutdown" or not self._control_request_pending:
+        if key != "control:shutdown" or not (
+            self._bridge_transition_coordinator.acknowledge_shutdown_success()
+        ):
             return
-        self._control_request_pending = False
         self._bridge_stop_confirmation.begin()
         self.bottom_status_label.setText("Bridge shutdown requested")
         self._request_health()
@@ -1429,7 +1422,7 @@ class MainWindow(QMainWindow):
             return
         if key != "control:shutdown":
             return
-        self._control_request_pending = False
+        self._bridge_transition_coordinator.mark_shutdown_failed()
         self._bridge_stop_confirmation.cancel()
         if self._exit_shutdown_pending:
             self._finish_exit()
@@ -1462,7 +1455,7 @@ class MainWindow(QMainWindow):
         self.bottom_status_label.setText("Bridge stop timed out")
 
     def _confirm_bridge_stopped(self) -> None:
-        action = self._pending_bridge_action
+        action = self._bridge_transition_coordinator.pending_action
         stop_outcome_was_uncertain = self._stop_outcome_uncertain
         self._bridge_stop_confirmation.complete()
         self._stop_outcome_uncertain = False
@@ -1476,18 +1469,18 @@ class MainWindow(QMainWindow):
         self._bridge_loss_count = 0
         self._launch_in_progress = False
         self._tunnel.set_bridge_ready(False)
-        self._pending_bridge_action = None
+        self._bridge_transition_coordinator.clear_pending_action()
         if action == "restart" and not stop_outcome_was_uncertain:
             resolution = self._codex_resolution
             if resolution is None:
                 self._bridge_transition = False
-                self._restart_tunnel_was_running = False
+                self._bridge_transition_coordinator.clear_restart_flag()
                 self._set_runtime_state("launch_failed")
                 self.bottom_status_label.setText("Bridge relaunch failed")
                 return
             self._launch_bridge(resolution.path)
             return
-        self._restart_tunnel_was_running = False
+        self._bridge_transition_coordinator.clear_restart_flag()
         self._bridge_transition = False
         self._sync_tunnel_controls()
         self.bridge_status_label.setText("Bridge: disconnected")
@@ -1504,7 +1497,7 @@ class MainWindow(QMainWindow):
             fresh_observations = self._health_observed and self._status_observed
             if fresh_observations and ready:
                 self._stop_outcome_uncertain = False
-                self._pending_bridge_action = None
+                self._bridge_transition_coordinator.clear_pending_action()
             elif fresh_observations and (
                 not self._health_ok and not self._bridge_ready and not self._app_server_ready
             ):
