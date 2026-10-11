@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from ..models import ApprovalDecision
 from .api_client import ApiClient
+from .bridge_readiness import BridgeReadinessCoordinator
 from .codex_links import codex_thread_uri, open_codex_uri
 from .codex_resolver import (
     CodexResolution,
@@ -91,7 +92,6 @@ from .widgets import (
 )
 
 _READINESS_INTERVAL_MS = 350
-_READINESS_TIMEOUT_SECONDS = 10.0
 _BRIDGE_START_RETRY_DELAYS_MS = (2_000, 5_000, 10_000)
 _BRIDGE_LOSS_THRESHOLD = 2
 _USAGE_INITIAL_DELAY_MS = 1_500
@@ -268,10 +268,6 @@ class MainWindow(QMainWindow):
         self._stop_confirmation_status_unavailable = False
         self._stop_confirmation_deadline = 0.0
         self._stop_outcome_uncertain = False
-        self._readiness_deadline = 0.0
-        self._readiness_health_ok = False
-        self._readiness_bridge_ready = False
-        self._readiness_app_server_ready = False
         self._exit_shutdown_pending = False
         self._exit_deadline = 0.0
         self._sigint_requested = False
@@ -283,6 +279,16 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._connect_client()
         self._build_timers()
+        self._bridge_readiness = BridgeReadinessCoordinator(
+            self.readiness_timer,
+            self._client,
+            self.bridge_status_label,
+            self.app_server_status_label,
+            is_closing=lambda: self._closing,
+            is_launch_in_progress=lambda: self._launch_in_progress,
+            on_ready=self._finish_launch_if_ready,
+            on_timeout=self._on_launch_readiness_timeout,
+        )
         self._history_requests = HistoryRequestCoordinator(
             self._client,
             self._history_refresh_timer,
@@ -312,6 +318,14 @@ class MainWindow(QMainWindow):
     @property
     def runtime_state(self) -> str:
         return self._runtime_state
+
+    @property
+    def _readiness_deadline(self) -> float:
+        return self._bridge_readiness.deadline
+
+    @_readiness_deadline.setter
+    def _readiness_deadline(self, value: float) -> None:
+        self._bridge_readiness.deadline = value
 
     @property
     def _history_refresh_pending(self) -> bool:
@@ -1261,62 +1275,32 @@ class MainWindow(QMainWindow):
             return
         self._detached_launch_started = True
         self._detached_pid = result.pid
-        self._readiness_deadline = monotonic() + _READINESS_TIMEOUT_SECONDS
-        self._readiness_health_ok = False
-        self._readiness_bridge_ready = False
-        self._readiness_app_server_ready = False
-        self.readiness_timer.start()
-        self._request_launch_readiness()
+        self._bridge_readiness.begin()
 
     def _request_launch_readiness(self) -> None:
-        if self._closing or not self._launch_in_progress:
-            return
-        self._client.get_json("/healthz", key="launch:health")
-        self._client.get_json("/ui-api/status", key="launch:status")
+        self._bridge_readiness.request()
 
     def _on_readiness_tick(self) -> None:
-        if self._closing or not self._launch_in_progress:
-            self.readiness_timer.stop()
-            return
-        if monotonic() >= self._readiness_deadline:
-            self.readiness_timer.stop()
-            self._launch_in_progress = False
-            self._bridge_transition = False
-            if self._managed_start_active:
-                self._set_runtime_state("launch_failed")
-            else:
-                self._set_runtime_state("launch_timed_out")
-            self.bottom_status_label.setText("Bridge launch timed out; it may still be starting")
-            self._schedule_managed_bridge_retry()
-            return
-        self._request_launch_readiness()
+        self._bridge_readiness.tick()
 
     def _apply_launch_health(self, payload: object) -> None:
-        self._readiness_health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
-        self._finish_launch_if_ready()
+        self._bridge_readiness.apply_health(payload)
 
     def _apply_launch_status(self, payload: object) -> None:
-        if not isinstance(payload, Mapping):
-            return
-        bridge = payload.get("bridge")
-        app_server = payload.get("app_server")
-        self._readiness_bridge_ready = bridge in {"ready", "connected"}
-        self._readiness_app_server_ready = app_server in {"ready", "connected"}
-        self.bridge_status_label.setText(
-            "Bridge: connected" if self._readiness_bridge_ready else "Bridge: disconnected"
-        )
-        self.app_server_status_label.setText(
-            "App Server: ready" if self._readiness_app_server_ready else "App Server: failed"
-        )
-        self._finish_launch_if_ready()
+        self._bridge_readiness.apply_status(payload)
+
+    def _on_launch_readiness_timeout(self) -> None:
+        self._launch_in_progress = False
+        self._bridge_transition = False
+        if self._managed_start_active:
+            self._set_runtime_state("launch_failed")
+        else:
+            self._set_runtime_state("launch_timed_out")
+        self.bottom_status_label.setText("Bridge launch timed out; it may still be starting")
+        self._schedule_managed_bridge_retry()
 
     def _finish_launch_if_ready(self) -> None:
-        if not (
-            self._launch_in_progress
-            and self._readiness_health_ok
-            and self._readiness_bridge_ready
-            and self._readiness_app_server_ready
-        ):
+        if not self._bridge_readiness.ready():
             return
         self.readiness_timer.stop()
         self._launch_in_progress = False
@@ -1932,11 +1916,10 @@ class MainWindow(QMainWindow):
             self._pending_rename_names.pop(key, None)
             return
         if key == "launch:health":
-            self._readiness_health_ok = False
+            self._bridge_readiness.fail_health()
             return
         if key == "launch:status":
-            self._readiness_bridge_ready = False
-            self._readiness_app_server_ready = False
+            self._bridge_readiness.fail_status()
             return
         if self._stop_confirmation_active and key in {"health", "bridge-status"}:
             if key == "health":
