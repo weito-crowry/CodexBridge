@@ -1,5 +1,3 @@
-# The imported fixture intentionally shares its name with pytest test parameters.
-# ruff: noqa: F811
 from __future__ import annotations
 
 import sqlite3
@@ -10,10 +8,9 @@ import pytest
 from codex_bridge.history import HistoryValidationError
 from codex_bridge.paths import PathPolicyError
 from tests.bridge_test_fakes import make_activity_bridge, make_bridge
-from tests.bridge_test_support import (
-    allowed_dir,  # noqa: F401
-    write_rollout,
-)
+from tests.bridge_test_support import write_rollout
+
+pytest_plugins = ("tests.bridge_test_support",)
 
 
 @pytest.mark.asyncio

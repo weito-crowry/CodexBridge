@@ -1,5 +1,3 @@
-# The imported fixture intentionally shares its name with pytest test parameters.
-# ruff: noqa: F811
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +5,8 @@ import asyncio
 import pytest
 
 from tests.bridge_test_fakes import make_activity_bridge, make_bridge
-from tests.bridge_test_support import allowed_dir  # noqa: F401
+
+pytest_plugins = ("tests.bridge_test_support",)
 
 
 @pytest.mark.asyncio

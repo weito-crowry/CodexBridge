@@ -1,5 +1,3 @@
-# The imported fixture intentionally shares its name with pytest test parameters.
-# ruff: noqa: F811
 from __future__ import annotations
 
 import pytest
@@ -9,7 +7,8 @@ from codex_bridge.jsonrpc import JsonRpcRemoteError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
 from tests.bridge_test_fakes import make_bridge
-from tests.bridge_test_support import allowed_dir  # noqa: F401
+
+pytest_plugins = ("tests.bridge_test_support",)
 
 
 @pytest.mark.asyncio
