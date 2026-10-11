@@ -66,6 +66,7 @@ from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
 from .main_window_layout import build_main_window_ui
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
+from .runtime_ui import RuntimeUiPresenter
 from .tunnel_resolver import TunnelResolutionError
 from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
 from .tunnel_supervisor import TunnelSupervisor, tunnel_state_label
@@ -309,6 +310,7 @@ class MainWindow(QMainWindow):
         )
         self._connect_runtime()
         self._build_tray()
+        self._runtime_ui = RuntimeUiPresenter(self)
         self._update_tunnel_client_status()
         self._sync_tunnel_controls()
         self._sync_bridge_controls()
@@ -696,37 +698,14 @@ class MainWindow(QMainWindow):
             self._sync_overall_status()
 
     def _update_tunnel_client_status(self) -> None:
-        version = getattr(self._tunnel, "client_version", None)
-        source = getattr(self._tunnel, "resolution_source", "unavailable")
-        executable = getattr(self._tunnel, "executable", None)
-        if version is None:
-            text = "Tunnel Client: unavailable"
-        else:
-            text = f"Tunnel Client: {version} · {source}"
-        self.tunnel_client_status_label.setText(text)
-        if executable is not None:
-            self.tunnel_client_status_label.setToolTip(executable)
-        if self._tunnel_resolution_error is not None:
-            self.tunnel_client_status_label.setToolTip(self._tunnel_resolution_error)
+        self._runtime_ui._update_tunnel_client_status()
 
     def _apply_tunnel_message(self, message: str) -> None:
         if not self._closing:
             self.bottom_status_label.setText(message)
 
     def _apply_tunnel_controls(self, start: bool, stop: bool, restart: bool) -> None:
-        if self._bridge_transition:
-            start = stop = restart = False
-        self.start_tunnel_button.setEnabled(start)
-        self.stop_tunnel_button.setEnabled(stop)
-        self.restart_tunnel_button.setEnabled(restart)
-        for name, enabled in (
-            ("Start Tunnel", start),
-            ("Stop Tunnel", stop),
-            ("Restart Tunnel", restart),
-        ):
-            action = self._tray_actions.get(name)
-            if action is not None:
-                action.setEnabled(enabled)
+        self._runtime_ui._apply_tunnel_controls(start, stop, restart)
 
     def _tunnel_is_transitioning(self) -> bool:
         return getattr(self._tunnel, "state", "unavailable") in {
@@ -736,43 +715,13 @@ class MainWindow(QMainWindow):
         }
 
     def _update_bridge_controls(self) -> None:
-        enabled = (
-            not self._closing
-            and self._runtime_state == "console_started"
-            and self._bridge_ready
-            and self._app_server_ready
-            and self._control_token is not None
-            and not self._bridge_transition
-            and not self._tunnel_is_transitioning()
-        )
-        self.stop_bridge_button.setEnabled(enabled)
-        self.restart_bridge_button.setEnabled(enabled)
-        self.restart_codexbridge_button.setEnabled(enabled)
-        if self._runtime_state == "external" and self._bridge_ready and self._app_server_ready:
-            self.restart_codexbridge_button.setToolTip(
-                "Disabled while the Bridge is managed externally."
-            )
-        else:
-            self.restart_codexbridge_button.setToolTip("Restart the Console-managed Bridge.")
-        for name in ("Stop Bridge", "Restart Bridge"):
-            action = self._tray_actions.get(name)
-            if action is not None:
-                action.setEnabled(enabled)
-        start_action = self._tray_actions.get("Start Bridge")
-        if start_action is not None:
-            start_action.setEnabled(self.start_bridge_button.isEnabled())
+        self._runtime_ui._update_bridge_controls()
 
     def _sync_bridge_controls(self) -> None:
-        self._update_start_button()
-        self._update_bridge_controls()
+        self._runtime_ui._sync_bridge_controls()
 
     def _sync_tunnel_controls(self) -> None:
-        actions = self._tunnel.action_state
-        self._apply_tunnel_controls(
-            actions.start_enabled,
-            actions.stop_enabled,
-            actions.restart_enabled,
-        )
+        self._runtime_ui._sync_tunnel_controls()
 
     def _start_tunnel(self) -> None:
         self._tunnel.start()
@@ -784,20 +733,7 @@ class MainWindow(QMainWindow):
         self._tunnel.restart()
 
     def _sync_empty_state(self) -> None:
-        if not self._bridge_ready:
-            location = f"{self._config.host}:{self._config.port}"
-            self.history_pane.set_empty_state(
-                f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
-            )
-            self.activity_pane.set_error("Bridge unavailable")
-            return
-        if getattr(self.thread_pane, "thread_count", 0) == 0:
-            self.history_pane.set_empty_state("No threads found.")
-            self.activity_pane.set_empty_state("No thread selected.")
-            return
-        if self._selected_thread_id is None:
-            self.history_pane.set_empty_state("Select a thread to view history.")
-            self.activity_pane.set_empty_state("Select a thread to view activity.")
+        self._runtime_ui._sync_empty_state()
 
     def _set_unavailable_state(self) -> None:
         self._bridge_ready = False
@@ -979,58 +915,13 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_overall_status(self) -> None:
-        bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
-        if bridge_ready:
-            if self._tunnel_state == "ready":
-                state = "Ready"
-            elif self._tunnel_state in {"checking", "starting", "running", "stopping"}:
-                state = "Starting"
-            else:
-                state = "Degraded"
-        elif (
-            self._launch_in_progress
-            or self._bridge_transition
-            or self._managed_start_active
-            or self._runtime_state
-            in {
-                "launching",
-                "restarting",
-                "stopping",
-                "external_unreachable",
-                "console_started_unreachable",
-            }
-        ):
-            state = "Starting"
-        elif self._bridge_start_retry_exhausted or self._runtime_state in {
-            "launch_failed",
-            "control_failed",
-            "stop_timed_out",
-        }:
-            state = "Error"
-        elif not self._health_observed and not self._status_observed:
-            state = "Starting"
-        else:
-            state = "Error"
-        text = f"● {state}"
-        self.overall_status_label.setText(text)
-        self.overall_detail_label.setText(text)
+        self._runtime_ui._sync_overall_status()
 
     def _update_start_button(self) -> None:
-        self.start_bridge_button.setEnabled(self._can_start_bridge())
-        start_action = self._tray_actions.get("Start Bridge")
-        if start_action is not None:
-            start_action.setEnabled(self.start_bridge_button.isEnabled())
-        self._update_lifecycle_controls()
+        self._runtime_ui._update_start_button()
 
     def _update_lifecycle_controls(self) -> None:
-        bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
-        retry_enabled = (
-            not self._closing
-            and not self._launch_in_progress
-            and not self._bridge_transition
-            and (not bridge_ready or self._tunnel_state != "ready")
-        )
-        self.retry_now_button.setEnabled(retry_enabled)
+        self._runtime_ui._update_lifecycle_controls()
 
     def _can_start_bridge(self) -> bool:
         return (

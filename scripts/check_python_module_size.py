@@ -16,17 +16,17 @@ POLICY: dict[str, Any] = {
         "baselines": {
             "src/codex_bridge/console/main_window.py": {
                 "physical_loc": {
-                    "value": 1813,
+                    "value": 1704,
                     "reason": (
-                        "Phase 4D-2c UsagePresentationController extraction; "
-                        "physical LOC reduced but still exceeds limit."
+                        "Phase 4E-1 RuntimeUiPresenter extraction; reduced from 1,813 to "
+                        "1,704 physical LOC, still above limit."
                     ),
                 },
                 "raw_bytes": {
-                    "value": 74115,
+                    "value": 69370,
                     "reason": (
-                        "Phase 4D-2c UsagePresentationController extraction; "
-                        "raw bytes reduced but still exceed limit."
+                        "Phase 4E-1 RuntimeUiPresenter extraction; reduced from 74,115 to "
+                        "69,370 raw bytes, still above limit."
                     ),
                 },
             }

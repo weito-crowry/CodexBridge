@@ -9,7 +9,7 @@
 - 100,000 bytes 以上のテストは `REVIEW` として強く表示します。これは自動的な分割要求ではなく、レビュー時の明示確認です。
 - `tests/**/test_*.py` 以外の test support Python ファイルには、このサイズ gate を適用しません。
 
-### 現在の承認済み baseline（Phase 4D-2c 変更後）
+### 現在の承認済み baseline（Phase 4E-1 変更後）
 
 Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらの履歴値は以下の現在の承認値と区別します。本表は統合ブランチの値であり、`origin/main` の現行値を示すものではありません。
 
@@ -23,10 +23,12 @@ Phase 4D-2b では、turn別Usage snapshot stateとtimeout処理を `UsageSnapsh
 
 Phase 4D-2c では、通常Usageの状態・表示・SQLite履歴記録を `UsagePresentationController` へ抽出しました。
 
+Phase 4E-1 では、Runtime状態に応じたUI表示更新を `RuntimeUiPresenter` へ抽出しました。`main_window.py` は 1,813 LOC / 74,115 bytes から 1,704 LOC / 69,370 bytes に縮小し、どちらも上限以下にはまだ達していません。
+
 | Path | Metric | Exact baseline | 理由 |
 | --- | --- | ---: | --- |
-| `src/codex_bridge/console/main_window.py` | physical LOC | 1,813 | Phase 4D-2c UsagePresentationController extraction; physical LOC reduced but still exceeds limit. |
-| `src/codex_bridge/console/main_window.py` | raw bytes | 74,115 | Phase 4D-2c UsagePresentationController extraction; raw bytes reduced but still exceed limit. |
+| `src/codex_bridge/console/main_window.py` | physical LOC | 1,704 | Phase 4E-1 RuntimeUiPresenter extraction; reduced from 1,813 to 1,704 physical LOC, still above limit. |
+| `src/codex_bridge/console/main_window.py` | raw bytes | 69,370 | Phase 4E-1 RuntimeUiPresenter extraction; reduced from 74,115 to 69,370 raw bytes, still above limit. |
 | `tests/test_bridge.py` | raw bytes | 75,927 | Phase 3 で Fake を移動。50 KB 超。 |
 | `tests/test_console_main_window.py` | raw bytes | 132,552 | Phase 3 でテストを移設。100 KB 超のため REVIEW 通知による明示確認が必要。 |
 | `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |
