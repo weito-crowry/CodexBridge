@@ -6,9 +6,11 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from PySide6.QtCore import QTimer
+if TYPE_CHECKING:
+    from PySide6.QtCore import QTimer
+
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -52,7 +54,6 @@ from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
 from .diagnostics_panel import DiagnosticsPanelController
 from .history_requests import (
-    HISTORY_REFRESH_DEBOUNCE_MS,
     HistoryRequestContext,
     HistoryRequestCoordinator,
 )
@@ -67,6 +68,7 @@ from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .runtime_ui import RuntimeUiPresenter
 from .thread_interactions import ThreadInteractionController
+from .timer_bootstrap import build_console_timers
 from .tray_controller import TrayController
 from .tunnel_resolver import TunnelResolutionError
 from .tunnel_resolver import enumerate_candidates as enumerate_tunnel_candidates
@@ -83,7 +85,7 @@ from .usage_history_window import UsageHistoryWindow
 from .usage_presentation import UsagePresentationController
 from .usage_requests import UsageRequestCoordinator
 from .usage_shortcut_label import UsageShortcutLabel
-from .usage_snapshots import _USAGE_SNAPSHOT_DELAY_MS, UsageSnapshotStore
+from .usage_snapshots import UsageSnapshotStore
 from .widgets import (
     ActivityPane,
     HistoryPane,
@@ -92,12 +94,6 @@ from .widgets import (
     copy_to_clipboard,
 )
 
-_READINESS_INTERVAL_MS = 350
-_USAGE_INITIAL_DELAY_MS = 1_500
-_USAGE_RETRY_DELAY_MS = 3_000
-_USAGE_POLL_INTERVAL_MS = 60 * 1_000
-_DIAGNOSTICS_POLL_INTERVAL_MS = 1_000
-_STOP_CONFIRMATION_INTERVAL_MS = 350
 _EXIT_TIMEOUT_SECONDS = 12.0
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
@@ -115,6 +111,22 @@ _RUNTIME_LABELS = {
 
 class MainWindow(QMainWindow):
     """Read-only desktop view over the existing localhost UI API."""
+
+    health_timer: QTimer
+    thread_timer: QTimer
+    selected_status_timer: QTimer
+    _history_refresh_timer: QTimer
+    readiness_timer: QTimer
+    bridge_start_retry_timer: QTimer
+    usage_initial_timer: QTimer
+    usage_retry_timer: QTimer
+    usage_poll_timer: QTimer
+    turn_usage_snapshot_timer: QTimer
+    codex_update_auto_timer: QTimer
+    stop_confirmation_timer: QTimer
+    diagnostics_timer: QTimer
+    exit_timer: QTimer
+    signal_timer: QTimer
 
     bridge_status_label: QLabel
     app_server_status_label: QLabel
@@ -543,60 +555,7 @@ class MainWindow(QMainWindow):
         self._tray_controller.on_activated(reason)
 
     def _build_timers(self) -> None:
-        self.health_timer = QTimer(self)
-        self.health_timer.setInterval(5_000)
-        self.health_timer.timeout.connect(self._request_health)
-        self.thread_timer = QTimer(self)
-        self.thread_timer.setInterval(10_000)
-        self.thread_timer.timeout.connect(self._request_threads)
-        self.selected_status_timer = QTimer(self)
-        self.selected_status_timer.setInterval(5_000)
-        self.selected_status_timer.timeout.connect(self._request_selected_status)
-        self._history_refresh_timer = QTimer(self)
-        self._history_refresh_timer.setSingleShot(True)
-        self._history_refresh_timer.setInterval(HISTORY_REFRESH_DEBOUNCE_MS)
-        self._history_refresh_timer.timeout.connect(self._request_selected_history)
-        self.readiness_timer = QTimer(self)
-        self.readiness_timer.setInterval(_READINESS_INTERVAL_MS)
-        self.readiness_timer.timeout.connect(self._on_readiness_tick)
-        self.bridge_start_retry_timer = QTimer(self)
-        self.bridge_start_retry_timer.setSingleShot(True)
-        self.bridge_start_retry_timer.timeout.connect(self._on_bridge_start_retry_timeout)
-        self.usage_initial_timer = QTimer(self)
-        self.usage_initial_timer.setSingleShot(True)
-        self.usage_initial_timer.setInterval(_USAGE_INITIAL_DELAY_MS)
-        self.usage_initial_timer.timeout.connect(self._on_usage_initial_timeout)
-        self.usage_retry_timer = QTimer(self)
-        self.usage_retry_timer.setSingleShot(True)
-        self.usage_retry_timer.setInterval(_USAGE_RETRY_DELAY_MS)
-        self.usage_retry_timer.timeout.connect(self._on_usage_retry_timeout)
-        self.usage_poll_timer = QTimer(self)
-        self.usage_poll_timer.setInterval(_USAGE_POLL_INTERVAL_MS)
-        self.usage_poll_timer.timeout.connect(self._on_usage_poll_timeout)
-        self.turn_usage_snapshot_timer = QTimer(self)
-        self.turn_usage_snapshot_timer.setSingleShot(True)
-        self.turn_usage_snapshot_timer.setInterval(_USAGE_SNAPSHOT_DELAY_MS)
-        self.turn_usage_snapshot_timer.timeout.connect(self._on_turn_usage_snapshot_timeout)
-        self.codex_update_auto_timer = QTimer(self)
-        self.codex_update_auto_timer.setSingleShot(True)
-        self.codex_update_auto_timer.setInterval(5_000)
-        self.codex_update_auto_timer.timeout.connect(self._on_codex_update_auto_timeout)
-        self.stop_confirmation_timer = QTimer(self)
-        self.stop_confirmation_timer.setInterval(_STOP_CONFIRMATION_INTERVAL_MS)
-        self.stop_confirmation_timer.timeout.connect(self._on_stop_confirmation_tick)
-        self.diagnostics_timer = QTimer(self)
-        self.diagnostics_timer.setInterval(_DIAGNOSTICS_POLL_INTERVAL_MS)
-        self.diagnostics_timer.timeout.connect(self._on_diagnostics_timeout)
-        self.exit_timer = QTimer(self)
-        self.exit_timer.setSingleShot(True)
-        self.exit_timer.setInterval(int(_EXIT_TIMEOUT_SECONDS * 1_000))
-        self.exit_timer.timeout.connect(self._on_exit_timeout)
-        self.signal_timer = QTimer(self)
-        self.signal_timer.setInterval(50)
-        self.signal_timer.timeout.connect(self._on_signal_tick)
-        self.health_timer.start()
-        self.thread_timer.start()
-        self.signal_timer.start()
+        build_console_timers(self, exit_timeout_seconds=_EXIT_TIMEOUT_SECONDS)
 
     def toggle_diagnostics(self) -> None:
         self._diagnostics_panel.toggle_diagnostics()

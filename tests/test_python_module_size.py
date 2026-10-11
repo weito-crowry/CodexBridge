@@ -71,13 +71,8 @@ def test_checker_policy_matches_checker_owned_exceptions(checker: ModuleType) ->
     assert loaded == checker.POLICY
     production = loaded["production"]["baselines"]
     tests = loaded["tests"]["baselines"]
-    main_window = production["src/codex_bridge/console/main_window.py"]
-    assert main_window["physical_loc"]["value"] == 1520
-    assert main_window["physical_loc"]["reason"] == (
-        "Phase 4E-3 ThreadInteractionController and DiagnosticsPanelController "
-        "extraction; reduced from 1,626 to 1,520 physical LOC, still 20 over limit."
-    )
-    assert "raw_bytes" not in main_window
+    assert "src/codex_bridge/console/main_window.py" not in production
+    assert production == {}
     assert tests["tests/test_bridge.py"]["raw_bytes"]["value"] == 75927
     assert tests["tests/test_console_main_window.py"]["raw_bytes"]["value"] == 132552
     assert tests["tests/test_console_widgets.py"]["raw_bytes"]["value"] == 52244
