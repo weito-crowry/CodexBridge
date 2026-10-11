@@ -73,9 +73,10 @@ def test_checker_policy_matches_checker_owned_exceptions(checker: ModuleType) ->
     tests = loaded["tests"]["baselines"]
     assert "src/codex_bridge/console/main_window.py" not in production
     assert production == {}
-    assert set(tests) == {"tests/test_bridge.py", "tests/test_console_widgets.py"}
+    assert len(tests) == 1
+    assert set(tests) == {"tests/test_console_widgets.py"}
+    assert "tests/test_bridge.py" not in tests
     assert "tests/test_console_main_window.py" not in tests
-    assert tests["tests/test_bridge.py"]["raw_bytes"]["value"] == 75927
     assert tests["tests/test_console_widgets.py"]["raw_bytes"]["value"] == 52244
 
 
