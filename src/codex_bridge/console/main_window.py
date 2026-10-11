@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from ..models import ApprovalDecision
 from .api_client import ApiClient
 from .bridge_readiness import BridgeReadinessCoordinator
+from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
 from .codex_links import codex_thread_uri, open_codex_uri
 from .codex_resolver import (
     CodexResolution,
@@ -103,7 +104,6 @@ _USAGE_SNAPSHOT_DEFER_MS = 500
 _USAGE_SNAPSHOT_MAX_ENTRIES = 500
 _DIAGNOSTICS_POLL_INTERVAL_MS = 1_000
 _STOP_CONFIRMATION_INTERVAL_MS = 350
-_STOP_CONFIRMATION_TIMEOUT_SECONDS = 10.0
 _EXIT_TIMEOUT_SECONDS = 12.0
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
@@ -263,10 +263,6 @@ class MainWindow(QMainWindow):
         self._pending_bridge_action: str | None = None
         self._restart_tunnel_was_running = False
         self._control_request_pending = False
-        self._stop_confirmation_active = False
-        self._stop_confirmation_health_unavailable = False
-        self._stop_confirmation_status_unavailable = False
-        self._stop_confirmation_deadline = 0.0
         self._stop_outcome_uncertain = False
         self._exit_shutdown_pending = False
         self._exit_deadline = 0.0
@@ -279,6 +275,13 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._connect_client()
         self._build_timers()
+        self._bridge_stop_confirmation = BridgeStopConfirmationCoordinator(
+            self.stop_confirmation_timer,
+            on_confirmed=self._on_stop_confirmation_confirmed,
+            on_timed_out=self._on_stop_confirmation_timed_out,
+            request_health=self._request_health,
+            clock=monotonic,
+        )
         self._bridge_readiness = BridgeReadinessCoordinator(
             self.readiness_timer,
             self._client,
@@ -318,6 +321,18 @@ class MainWindow(QMainWindow):
     @property
     def runtime_state(self) -> str:
         return self._runtime_state
+
+    @property
+    def _stop_confirmation_active(self) -> bool:
+        return self._bridge_stop_confirmation.active
+
+    @property
+    def _stop_confirmation_deadline(self) -> float:
+        return self._bridge_stop_confirmation.deadline
+
+    @_stop_confirmation_deadline.setter
+    def _stop_confirmation_deadline(self, value: float) -> None:
+        self._bridge_stop_confirmation.deadline = value
 
     @property
     def _readiness_deadline(self) -> float:
@@ -1395,11 +1410,7 @@ class MainWindow(QMainWindow):
         if key != "control:shutdown" or not self._control_request_pending:
             return
         self._control_request_pending = False
-        self._stop_confirmation_active = True
-        self._stop_confirmation_health_unavailable = False
-        self._stop_confirmation_status_unavailable = False
-        self._stop_confirmation_deadline = monotonic() + _STOP_CONFIRMATION_TIMEOUT_SECONDS
-        self.stop_confirmation_timer.start()
+        self._bridge_stop_confirmation.begin()
         self.bottom_status_label.setText("Bridge shutdown requested")
         self._request_health()
 
@@ -1419,8 +1430,7 @@ class MainWindow(QMainWindow):
         if key != "control:shutdown":
             return
         self._control_request_pending = False
-        self._stop_confirmation_active = False
-        self.stop_confirmation_timer.stop()
+        self._bridge_stop_confirmation.cancel()
         if self._exit_shutdown_pending:
             self._finish_exit()
             return
@@ -1429,48 +1439,32 @@ class MainWindow(QMainWindow):
         self.bottom_status_label.setText("Bridge control request failed")
 
     def _maybe_finish_stop_confirmation(self) -> None:
-        if (
-            self._stop_confirmation_active
-            and self._stop_confirmation_health_unavailable
-            and self._stop_confirmation_status_unavailable
-        ):
-            if self._exit_shutdown_pending:
-                self._finish_exit()
-                return
-            self._confirm_bridge_stopped()
+        self._bridge_stop_confirmation.maybe_finish()
 
     def _on_stop_confirmation_tick(self) -> None:
-        if not self._stop_confirmation_active:
-            self.stop_confirmation_timer.stop()
+        self._bridge_stop_confirmation.tick()
+
+    def _on_stop_confirmation_confirmed(self) -> None:
+        if self._exit_shutdown_pending:
+            self._finish_exit()
             return
-        if (
-            self._stop_confirmation_health_unavailable
-            and self._stop_confirmation_status_unavailable
-        ):
-            if self._exit_shutdown_pending:
-                self._finish_exit()
-                return
-            self._confirm_bridge_stopped()
-        elif monotonic() >= self._stop_confirmation_deadline:
-            self._stop_confirmation_active = False
-            self.stop_confirmation_timer.stop()
-            if self._exit_shutdown_pending:
-                self._finish_exit()
-                return
-            self._bridge_transition = False
-            self._stop_outcome_uncertain = True
-            self._health_observed = False
-            self._status_observed = False
-            self._set_runtime_state("stop_timed_out")
-            self.bottom_status_label.setText("Bridge stop timed out")
-        else:
-            self._request_health()
+        self._confirm_bridge_stopped()
+
+    def _on_stop_confirmation_timed_out(self) -> None:
+        if self._exit_shutdown_pending:
+            self._finish_exit()
+            return
+        self._bridge_transition = False
+        self._stop_outcome_uncertain = True
+        self._health_observed = False
+        self._status_observed = False
+        self._set_runtime_state("stop_timed_out")
+        self.bottom_status_label.setText("Bridge stop timed out")
 
     def _confirm_bridge_stopped(self) -> None:
         action = self._pending_bridge_action
         stop_outcome_was_uncertain = self._stop_outcome_uncertain
-        self._stop_confirmation_active = False
-        self.stop_confirmation_timer.stop()
+        self._bridge_stop_confirmation.complete()
         self._stop_outcome_uncertain = False
         self._bridge_ready = False
         self._app_server_ready = False
@@ -1503,7 +1497,7 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_observation(self) -> None:
         ready = self._health_ok and self._bridge_ready and self._app_server_ready
-        if self._bridge_transition or self._stop_confirmation_active:
+        if self._bridge_transition or self._bridge_stop_confirmation.active:
             self._tunnel.set_bridge_ready(False)
             return
         if self._stop_outcome_uncertain:
@@ -1754,16 +1748,16 @@ class MainWindow(QMainWindow):
             if name is not None:
                 self.thread_pane.update_thread_name(key.removeprefix("rename:"), name)
             return
-        if self._stop_confirmation_active and key in {"health", "bridge-status"}:
+        if self._bridge_stop_confirmation.active and key in {"health", "bridge-status"}:
             if key == "health":
                 self._health_observed = True
                 self._health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
-                self._stop_confirmation_health_unavailable = False
+                self._bridge_stop_confirmation.observe_health(True)
             elif isinstance(payload, Mapping):
                 self._status_observed = True
                 self._bridge_ready = payload.get("bridge") in {"ready", "connected"}
                 self._app_server_ready = payload.get("app_server") in {"ready", "connected"}
-                self._stop_confirmation_status_unavailable = False
+                self._bridge_stop_confirmation.observe_status(True)
             self._maybe_finish_stop_confirmation()
             return
         if key == "health":
@@ -1921,18 +1915,18 @@ class MainWindow(QMainWindow):
         if key == "launch:status":
             self._bridge_readiness.fail_status()
             return
-        if self._stop_confirmation_active and key in {"health", "bridge-status"}:
+        if self._bridge_stop_confirmation.active and key in {"health", "bridge-status"}:
             if key == "health":
                 self._health_observed = True
                 self._health_ok = False
-                self._stop_confirmation_health_unavailable = True
                 self.bridge_status_label.setText("Bridge: disconnected")
+                self._bridge_stop_confirmation.observe_health(False)
             else:
                 self._status_observed = True
                 self._bridge_ready = False
                 self._app_server_ready = False
-                self._stop_confirmation_status_unavailable = True
                 self.app_server_status_label.setText("App Server: failed")
+                self._bridge_stop_confirmation.observe_status(False)
             self._maybe_finish_stop_confirmation()
             return
         if key in {"health", "bridge-status"}:
