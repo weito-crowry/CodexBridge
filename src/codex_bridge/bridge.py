@@ -21,9 +21,11 @@ from .history import (
     validate_legacy_cursor,
 )
 from .item_lifecycle import ItemLifecycleStore
+from .jsonrpc import JsonRpcRemoteError
 from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
+    ApprovalsReviewer,
     NormalizedState,
     PendingRequest,
     PermissionGrantScope,
@@ -32,6 +34,7 @@ from .models import (
     SandboxMode,
     UserInputAnswer,
     UserInputQuestion,
+    validate_approvals_reviewer,
     validate_sandbox_mode,
 )
 from .paths import AllowedPathPolicy
@@ -559,8 +562,10 @@ class Bridge:
         model: str | None = None,
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
+        approvals_reviewer: ApprovalsReviewer = "auto_review",
     ) -> dict[str, Any]:
         sandbox_mode = validate_sandbox_mode(sandbox_mode)
+        approvals_reviewer = validate_approvals_reviewer(approvals_reviewer)
         if reasoning_effort is not None and model is None:
             raise BridgeError("reasoning_effort requires an explicit model")
         canonical_cwd = self._path_policy.validate_cwd(cwd)
@@ -569,11 +574,26 @@ class Bridge:
             thread_params["config"] = {"default_permissions": ":danger-full-access"}
         if model is not None:
             thread_params["model"] = model
-        response = await self._app_server.request("thread/start", thread_params)
+        thread_params["approvalsReviewer"] = approvals_reviewer
+        thread_params["approvalPolicy"] = "on-request"
+        try:
+            response = await self._app_server.request("thread/start", thread_params)
+        except JsonRpcRemoteError:
+            raise BridgeError("Codex App Server rejected the thread/start settings") from None
         thread = response.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
+        if response.get("approvalsReviewer") != approvals_reviewer:
+            raise BridgeError(
+                "thread/start created empty thread "
+                f"{thread_id} with mismatched approvals_reviewer; turn/start was not issued"
+            )
+        if response.get("approvalPolicy") != "on-request":
+            raise BridgeError(
+                "thread/start created empty thread "
+                f"{thread_id} with mismatched approval_policy; turn/start was not issued"
+            )
         self._state.mark_loaded(thread_id, canonical_cwd, thread)
         self._state.update_thread_metadata(thread_id, response)
         log_event("thread.start", thread_id=thread_id)

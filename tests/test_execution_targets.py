@@ -47,6 +47,7 @@ class FakeBridge:
         model: str | None = None,
         reasoning_effort: str | None = None,
         sandbox_mode: str | None = None,
+        approvals_reviewer: str = "auto_review",
     ) -> dict[str, Any]:
         kwargs = {}
         if model is not None:
@@ -55,6 +56,7 @@ class FakeBridge:
             kwargs["reasoning_effort"] = reasoning_effort
         if sandbox_mode is not None:
             kwargs["sandbox_mode"] = sandbox_mode
+        kwargs["approvals_reviewer"] = approvals_reviewer
         self.calls.append(("start", (cwd, prompt), kwargs))
         return {"ok": True, "thread_id": "native-local", "turn_id": "turn-local"}
 
@@ -145,7 +147,9 @@ async def test_single_local_target_start_keeps_native_thread_id() -> None:
 
     result = await router.codex_start("D:/repo", "do work")
 
-    assert bridge.calls == [("start", ("D:/repo", "do work"), {})]
+    assert bridge.calls == [
+        ("start", ("D:/repo", "do work"), {"approvals_reviewer": "auto_review"})
+    ]
     assert result["thread_id"] == "native-local"
     assert result["native_thread_id"] == "native-local"
     assert result["target_id"] == "main-pc"
@@ -168,7 +172,16 @@ async def test_remote_start_forwards_remote_cwd_and_routes_public_thread_id() ->
 
     result = await router.codex_start("Z:/Notebook/repo", "prompt", "notebook")
 
-    assert remote.calls == [("codex_start", {"cwd": "Z:/Notebook/repo", "prompt": "prompt"})]
+    assert remote.calls == [
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "approvals_reviewer": "auto_review",
+            },
+        )
+    ]
     assert result["thread_id"] == "notebook::019abc"
     assert result["native_thread_id"] == "019abc"
     assert result["target_id"] == "notebook"
@@ -214,6 +227,7 @@ async def test_remote_start_forwards_confirmed_model_and_effort_with_metadata() 
                 "prompt": "prompt",
                 "model": "model-a",
                 "reasoning_effort": "high",
+                "approvals_reviewer": "auto_review",
             },
         ),
     ]
@@ -222,6 +236,7 @@ async def test_remote_start_forwards_confirmed_model_and_effort_with_metadata() 
         "target_id": "notebook",
         "model": "model-a",
         "reasoning_effort": "high",
+        "approvals_reviewer": "auto_review",
     }
 
 
@@ -232,13 +247,18 @@ async def test_local_full_access_is_forwarded_and_reported_without_model() -> No
     result = await router.codex_start("D:/repo", "do work", sandbox_mode="danger-full-access")
 
     assert bridge.calls == [
-        ("start", ("D:/repo", "do work"), {"sandbox_mode": "danger-full-access"})
+        (
+            "start",
+            ("D:/repo", "do work"),
+            {"sandbox_mode": "danger-full-access", "approvals_reviewer": "auto_review"},
+        )
     ]
     assert result["execution_config"] == {
         "target_id": "main-pc",
         "model": None,
         "reasoning_effort": None,
         "sandbox_mode": "danger-full-access",
+        "approvals_reviewer": "auto_review",
     }
 
 
@@ -284,12 +304,22 @@ async def test_remote_full_access_is_forwarded_and_inherit_is_omitted() -> None:
                 "cwd": "Z:/Notebook/repo",
                 "prompt": "prompt",
                 "sandbox_mode": "danger-full-access",
+                "approvals_reviewer": "auto_review",
             },
         ),
-        ("codex_start", {"cwd": "Z:/Notebook/repo", "prompt": "prompt"}),
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "approvals_reviewer": "auto_review",
+            },
+        ),
     ]
     assert full_access["execution_config"]["sandbox_mode"] == "danger-full-access"
+    assert full_access["execution_config"]["approvals_reviewer"] == "auto_review"
     assert inherited["execution_config"]["sandbox_mode"] == "inherit"
+    assert inherited["execution_config"]["approvals_reviewer"] == "auto_review"
 
 
 @pytest.mark.asyncio
@@ -411,12 +441,13 @@ async def test_explicit_start_config_is_validated_and_added_to_result() -> None:
     assert bridge.calls[0] == (
         "start",
         ("D:/repo", "do work"),
-        {"model": "model-a", "reasoning_effort": "high"},
+        {"model": "model-a", "reasoning_effort": "high", "approvals_reviewer": "auto_review"},
     )
     assert result["execution_config"] == {
         "target_id": "main-pc",
         "model": "model-a",
         "reasoning_effort": "high",
+        "approvals_reviewer": "auto_review",
     }
 
 
@@ -461,8 +492,65 @@ async def test_confirm_setup_validates_and_returns_sandbox_mode() -> None:
     )
 
     assert result["selection"]["sandbox_mode"] == "danger-full-access"
+    assert result["selection"]["approvals_reviewer"] == "auto_review"
+    manual = await router.confirm_setup("main-pc", "model-a", "high", approvals_reviewer="user")
+    assert manual["selection"]["approvals_reviewer"] == "user"
     with pytest.raises(ExecutionTargetError, match="sandbox_mode"):
         await router.confirm_setup("main-pc", "model-a", "high", sandbox_mode="unknown")
+
+
+@pytest.mark.asyncio
+async def test_confirm_setup_rejects_invalid_reviewer() -> None:
+    router, _, _ = make_router(LOCAL)
+
+    with pytest.raises(ExecutionTargetError, match="approvals_reviewer"):
+        await router.confirm_setup(
+            "main-pc", "model-a", "high", approvals_reviewer="guardian_subagent"
+        )
+
+
+@pytest.mark.asyncio
+async def test_remote_start_forwards_manual_reviewer_without_retrying_unsupported_argument() -> (
+    None
+):
+    class UnsupportedReviewerRemote(FakeRemote):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            raise RuntimeError("unsupported approvals_reviewer")
+
+    remote = UnsupportedReviewerRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported approvals_reviewer"):
+        await router.codex_start(
+            "Z:/Notebook/repo", "prompt", "notebook", approvals_reviewer="user"
+        )
+
+    assert remote.calls == [
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "approvals_reviewer": "user",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_invalid_reviewer_before_target_call() -> None:
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError, match="approvals_reviewer"):
+        await router.codex_start(
+            "Z:/Notebook/repo", "prompt", "notebook", approvals_reviewer="guardian_subagent"
+        )
+
+    assert bridge.calls == []
+    assert remotes["notebook"].calls == []
 
 
 @pytest.mark.asyncio

@@ -43,16 +43,24 @@ describe("setup selection state", () => {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "inherit",
+      approvalsReviewer: "auto_review",
     });
-    expect(applyCapabilities(capabilities, { model: "model-b", reasoningEffort: "stale" })).toEqual({
+    expect(applyCapabilities(capabilities, {
+      model: "model-b",
+      reasoningEffort: "stale",
+      sandboxMode: "inherit",
+      approvalsReviewer: "user",
+    })).toEqual({
       model: "model-b",
       reasoningEffort: "deep",
       sandboxMode: "inherit",
+      approvalsReviewer: "user",
     });
     expect(applyCapabilities(capabilities, {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "danger-full-access",
+      approvalsReviewer: "user",
     }).sandboxMode).toBe("danger-full-access");
     expect(applyCapabilities({
       ...capabilities,
@@ -61,6 +69,7 @@ describe("setup selection state", () => {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "danger-full-access",
+      approvalsReviewer: "user",
     }).sandboxMode).toBe("inherit");
   });
 
@@ -69,11 +78,20 @@ describe("setup selection state", () => {
       model: "model-b",
       reasoningEffort: "deep",
       sandboxMode: "inherit",
+      approvalsReviewer: "auto_review",
     });
+    expect(selectModel(capabilities, "model-b", "high", "inherit", "user").approvalsReviewer)
+      .toBe("user");
   });
 
   it("clears model and effort when the execution target changes", () => {
-    expect(changeTarget()).toEqual({ model: null, reasoningEffort: null, sandboxMode: "inherit" });
+    expect(changeTarget()).toEqual({
+      model: null,
+      reasoningEffort: null,
+      sandboxMode: "inherit",
+      approvalsReviewer: "auto_review",
+    });
+    expect(changeTarget("user").approvalsReviewer).toBe("user");
   });
 
   it("ignores stale async responses by generation", () => {
@@ -86,11 +104,13 @@ describe("setup selection state", () => {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "inherit",
+      approvalsReviewer: "auto_review",
     })).toBe(true);
     expect(selectionIsValid(capabilities, {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "danger-full-access",
+      approvalsReviewer: "auto_review",
     })).toBe(true);
     expect(selectionIsValid({
       ...capabilities,
@@ -99,11 +119,13 @@ describe("setup selection state", () => {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "danger-full-access",
+      approvalsReviewer: "auto_review",
     })).toBe(false);
     expect(selectionIsValid({ ...capabilities, target: { ...capabilities.target, available: false } }, {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "inherit",
+      approvalsReviewer: "auto_review",
     })).toBe(false);
   });
 
@@ -114,6 +136,7 @@ describe("setup selection state", () => {
       model: "model-a",
       reasoning_effort: "high",
       sandbox_mode: "danger-full-access",
+      approvals_reviewer: "user",
     })).toEqual({
       codexbridge_setup: {
         confirmed: true,
@@ -122,6 +145,7 @@ describe("setup selection state", () => {
         model: "model-a",
         reasoning_effort: "high",
         sandbox_mode: "danger-full-access",
+        approvals_reviewer: "user",
       },
     });
   });
@@ -131,11 +155,19 @@ describe("setup selection state", () => {
       model: "model-a",
       reasoningEffort: "high",
       sandboxMode: "danger-full-access",
+      approvalsReviewer: "user",
     })).toEqual({
       target_id: "pc-a",
       model: "model-a",
       reasoning_effort: "high",
       sandbox_mode: "danger-full-access",
+      approvals_reviewer: "user",
     });
+    expect(confirmPayload("pc-a", {
+      model: "model-a",
+      reasoningEffort: "high",
+      sandboxMode: "inherit",
+      approvalsReviewer: "auto_review",
+    }).approvals_reviewer).toBe("auto_review");
   });
 });

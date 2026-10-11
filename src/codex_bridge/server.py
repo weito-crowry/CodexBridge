@@ -19,14 +19,14 @@ from starlette.routing import Mount
 
 from .activity import ActivityStore
 from .app_server import AppServerClient
-from .bridge import Bridge
+from .bridge import Bridge, BridgeError
 from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .execution_targets import ExecutionTargetRouter
 from .logging_utils import log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
-from .models import ApprovalDecision, SandboxMode
+from .models import ApprovalDecision, ApprovalsReviewer, SandboxMode
 from .observability import MCPObservabilityMiddleware, ObservabilityLogger
 from .paths import AllowedPathPolicy, PathPolicyError
 from .server_instructions import MCP_SERVER_INSTRUCTIONS
@@ -147,6 +147,8 @@ async def _run_tool(operation: Callable[[], Awaitable[dict[str, Any]]]) -> dict[
     except PathPolicyError as exc:
         message = "cwd is outside CODEX_BRIDGE_ALLOWED_ROOTS" if "outside" in str(exc) else str(exc)
         raise ToolError(message) from None
+    except BridgeError as exc:
+        raise ToolError(str(exc)) from None
     except ValueError as exc:
         raise ToolError(str(exc)) from None
 
@@ -212,7 +214,8 @@ def create_app(
         if client_supports_apps(ctx):
             message += (
                 "\nUse the CodexBridge Setup UI to select a target, model, reasoning effort, "
-                "and access mode."
+                "access mode, and approval reviewer. Auto-review is the default; Manual uses "
+                "the user reviewer."
             )
         else:
             message += "\nA client with MCP Apps support can show the setup selection UI."
@@ -233,18 +236,26 @@ def create_app(
         resource_uri=app_resource_uri,
         visibility=["app"],
         title="Confirm CodexBridge setup",
-        description="Revalidate and confirm the selected target, model, and reasoning effort.",
+        description=(
+            "Revalidate and confirm the selected target, model, reasoning effort, access mode, "
+            "and approvals reviewer."
+        ),
     )
     async def codex_setup_confirm(
         target_id: str,
         model: str,
         reasoning_effort: str,
         sandbox_mode: SandboxMode = "inherit",
+        approvals_reviewer: ApprovalsReviewer = "auto_review",
     ) -> dict[str, Any]:
         """Revalidate a setup selection against current target capabilities."""
         return await _run_tool(
             lambda: execution_router.confirm_setup(
-                target_id, model, reasoning_effort, sandbox_mode=sandbox_mode
+                target_id,
+                model,
+                reasoning_effort,
+                sandbox_mode=sandbox_mode,
+                approvals_reviewer=approvals_reviewer,
             )
         )
 
@@ -504,8 +515,9 @@ def create_app(
         model: str | None = None,
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
+        approvals_reviewer: ApprovalsReviewer = "auto_review",
     ) -> dict[str, Any]:
-        """Start a native Codex thread and its first turn without waiting for completion."""
+        """Start a Codex thread; approvals_reviewer is auto_review by default or user."""
         return await _run_tool(
             lambda: execution_router.codex_start(
                 cwd,
@@ -514,6 +526,7 @@ def create_app(
                 model,
                 reasoning_effort,
                 sandbox_mode=sandbox_mode,
+                approvals_reviewer=approvals_reviewer,
             )
         )
 

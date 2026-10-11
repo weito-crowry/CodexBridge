@@ -41,6 +41,12 @@
           Approval handling remains enabled according to the Codex approval policy.
         </p>
 
+        <label for="reviewer">Reviewer</label>
+        <select id="reviewer" name="reviewer" disabled>
+          <option value="auto_review" selected>Auto-review (default)</option>
+          <option value="user">Manual (user)</option>
+        </select>
+
         <div class="actions">
           <button id="refresh" type="button" disabled>Refresh</button>
           <button id="confirm" type="submit" disabled>Confirm</button>

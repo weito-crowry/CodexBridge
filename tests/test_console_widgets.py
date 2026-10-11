@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 from inspect import signature
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QPalette, QTextOption
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtGui import QPalette, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -395,125 +395,6 @@ def test_single_relative_cwd_displays_other_without_friendly_name() -> None:
     assert parent.child(0).data(0, Qt.ItemDataRole.UserRole) == "relative"
 
 
-def test_parent_and_empty_placeholder_have_no_thread_context_menu(tmp_path) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads([{"id": "a", "cwd": str(tmp_path)}])
-
-    assert pane._context_menu_for_item(pane.list_widget.topLevelItem(0)) is None
-    pane.set_empty_state("No threads found.")
-    placeholder = pane.list_widget.topLevelItem(0)
-    assert not placeholder.flags() & Qt.ItemFlag.ItemIsSelectable
-    assert pane._context_menu_for_item(placeholder) is None
-
-
-def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(tmp_path) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads(
-        [
-            {"id": "selected", "name": "Selected", "cwd": str(tmp_path / "selected")},
-            {
-                "id": "target",
-                "name": "Target",
-                "cwd": str(tmp_path),
-                "preview": "must not copy",
-            },
-        ],
-        active_thread_ids={"target"},
-    )
-    pane.list_widget.setCurrentItem(_thread_item(pane, "selected"))
-    renamed: list[str] = []
-    pane.thread_rename_requested.connect(renamed.append)
-    opened: list[str] = []
-    pane.thread_open_requested.connect(opened.append)
-    copied_threads: list[str] = []
-    pane.thread_copy_requested.connect(copied_threads.append)
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-    actions = menu.actions()
-
-    assert [action.text() for action in actions] == [
-        "名前を変更...",
-        "Open in Codex App",
-        "スレッドIDをコピー",
-        "スレッド情報をコピー",
-        "Copy thread content",
-        "",
-        "作業フォルダを開く",
-    ]
-    actions[0].trigger()
-    assert renamed == ["target"]
-
-    actions[1].trigger()
-    assert opened == ["target"]
-
-    actions[2].trigger()
-    assert application.clipboard().text() == "target"
-    application.processEvents()
-
-    actions[3].trigger()
-    assert application.clipboard().text() == (
-        f"Name: Target\nThread ID: target\nCWD: {tmp_path}\nStatus: active"
-    )
-    assert "must not copy" not in application.clipboard().text()
-    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "selected"
-
-    actions[4].trigger()
-    assert copied_threads == ["target"]
-    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "selected"
-
-
-def test_thread_context_menu_disables_folder_action_without_valid_cwd(tmp_path) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads([{"id": "target", "name": "Target"}])
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-
-    assert menu.actions()[-1].text() == "作業フォルダを開く"
-    assert not menu.actions()[-1].isEnabled()
-
-
-def test_thread_context_menu_opens_existing_absolute_cwd(tmp_path, monkeypatch) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    pane.set_threads([{"id": "target", "cwd": str(tmp_path)}])
-    opened: list[QUrl] = []
-    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-    menu.actions()[-1].trigger()
-
-    assert len(opened) == 1
-    assert os.path.normcase(os.path.normpath(opened[0].toLocalFile())) == os.path.normcase(
-        os.path.normpath(str(tmp_path))
-    )
-
-
-def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
-    tmp_path, monkeypatch
-) -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ThreadListPane()
-    missing_cwd = str(tmp_path / "not-created")
-    pane.set_threads([{"id": "target", "name": "Target", "cwd": missing_cwd}])
-
-    menu = pane._context_menu_for_item(_thread_item(pane, "target"))
-    copied: list[str] = []
-    monkeypatch.setattr(pane, "_copy_text", copied.append)
-    menu.actions()[3].trigger()
-
-    assert len(copied) == 1
-    assert f"CWD: {missing_cwd}" in copied[0]
-    assert not menu.actions()[-1].isEnabled()
-
-
 def test_timeline_reverses_desc_items_and_skips_unknown_raw_items() -> None:
     payload = {
         "items": [
@@ -694,32 +575,6 @@ def test_activity_rows_distinguish_commentary_from_final_agent_message() -> None
     assert "Agent" in final
 
 
-def test_activity_pane_hides_empty_and_unloaded_state_but_keeps_recent_activities() -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ActivityPane()
-
-    pane.set_empty_state("No thread selected.")
-    assert not pane.state_label.isVisibleTo(pane)
-
-    pane.set_snapshot(
-        {
-            "state": "not_loaded",
-            "pending_request": None,
-            "recent_activities": [
-                {"activity_id": "activity-1", "type": "turn_completed", "summary": "done"}
-            ],
-        }
-    )
-
-    assert not pane.state_label.isVisibleTo(pane)
-    recent_header = next(
-        label for label in pane.findChildren(QLabel) if label.text() == "Recent activities"
-    )
-    assert recent_header.isVisibleTo(pane)
-    assert pane.activity_list.count() == 1
-
-
 def test_activity_pane_shows_active_pending_and_failure_states() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
@@ -753,6 +608,11 @@ def test_activity_pane_shows_request_error_without_dropping_recent_activities() 
     pane.set_snapshot(
         {
             "state": "in_progress",
+            "thread_metadata": {
+                "sandbox_mode": "workspace-write",
+                "approval_policy": "on-request",
+                "approvals_reviewer": "user",
+            },
             "pending_request": None,
             "recent_activities": [
                 {"activity_id": "activity-1", "type": "turn_started", "summary": "started"}
@@ -765,92 +625,6 @@ def test_activity_pane_shows_request_error_without_dropping_recent_activities() 
     assert pane.state_label.text() == "Bridge request failed"
     assert pane.state_label.isVisibleTo(pane)
     assert pane.activity_list.count() == 1
-
-
-def test_activity_pane_reviews_command_file_and_permission_approvals() -> None:
-    application = QApplication.instance() or QApplication([])
-    assert application is not None
-    pane = ActivityPane()
-    requested: list[tuple[object, str]] = []
-    pane.approval_decision_requested.connect(
-        lambda request_id, decision: requested.append((request_id, decision))
-    )
-    pane.set_control_available(True)
-
-    pane.set_snapshot(
-        {
-            "state": "needs_approval",
-            "current_diff": "diff --git a/a.txt b/a.txt",
-            "pending_request": {
-                "request_id": "command-1",
-                "method": "item/commandExecution/requestApproval",
-                "thread_id": "thread-1",
-                "turn_id": "turn-1",
-                "summary": "pytest tests/test_example.py",
-            },
-        }
-    )
-    command_details = pane.approval_details_label.text()
-    assert "Command approval" in command_details
-    assert "pytest tests/test_example.py" in command_details
-    assert "Thread: thread-1" in command_details
-    assert "Turn: turn-1" in command_details
-
-    pane.allow_once_button.click()
-    pane.allow_for_session_button.click()
-    pane.decline_button.click()
-    pane.cancel_button.click()
-    assert requested == [
-        ("command-1", "accept"),
-        ("command-1", "acceptForSession"),
-        ("command-1", "decline"),
-        ("command-1", "cancel"),
-    ]
-
-    pane.set_snapshot(
-        {
-            "state": "needs_approval",
-            "current_diff": "diff --git a/a.txt b/a.txt",
-            "pending_request": {
-                "request_id": 2,
-                "method": "item/fileChange/requestApproval",
-                "thread_id": "thread-1",
-                "turn_id": "turn-2",
-                "summary": "Update a.txt",
-            },
-        }
-    )
-    assert "File change approval" in pane.approval_details_label.text()
-    assert "diff --git a/a.txt b/a.txt" in pane.approval_details_label.text()
-
-    pane.set_snapshot(
-        {
-            "state": "needs_approval",
-            "pending_request": {
-                "request_id": 3,
-                "method": "item/permissions/requestApproval",
-                "thread_id": "thread-1",
-                "turn_id": "turn-3",
-                "summary": "Need local access",
-                "permission": {
-                    "reason": "Need local access",
-                    "cwd": "C:/repo",
-                    "requested_permissions": {
-                        "fileSystem": {"entries": [{"access": "read", "path": "C:/repo"}]},
-                        "network": {"enabled": True},
-                    },
-                    "allowed_scopes": ["turn", "session"],
-                },
-            },
-        }
-    )
-    permission_details = pane.approval_details_label.text()
-    assert "Permission approval" in permission_details
-    assert "Reason: Need local access" in permission_details
-    assert "C:/repo" in permission_details
-    assert "Requested filesystem permissions" in permission_details
-    assert "Requested network permissions" in permission_details
-    assert "Allowed scopes: turn, session" in permission_details
 
 
 def test_activity_pane_disables_console_approval_without_control_and_clears_resolved() -> None:

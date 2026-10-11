@@ -18,3 +18,14 @@ def test_setup_app_asset_exposes_default_and_full_access_with_warning() -> None:
     assert "Approval handling remains enabled according to the Codex approval policy." in html
     assert "sandbox_mode:" in html
     assert "sandbox_mode=" in html
+
+
+def test_setup_app_asset_exposes_auto_review_default_and_manual_choice() -> None:
+    html = SETUP_HTML.read_text(encoding="utf-8")
+
+    assert 'id="reviewer"' in html
+    assert 'value="auto_review"' in html
+    assert 'value="user"' in html
+    assert "Auto-review" in html
+    assert "Manual" in html
+    assert "approvals_reviewer=" in html

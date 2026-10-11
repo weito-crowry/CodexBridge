@@ -12,7 +12,14 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QFont, QFontDatabase, QIcon, QPalette
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -47,6 +54,7 @@ from .codex_resolver import (
 from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update_info
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
+from .history_metadata import _turn_model_metadata_from_payload
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .tunnel_resolver import TunnelResolutionError
@@ -66,6 +74,7 @@ from .usage_history import (
     record_usage_sample,
 )
 from .usage_history_window import UsageHistoryWindow
+from .usage_shortcut_label import UsageShortcutLabel
 from .widgets import (
     ActivityPane,
     HistoryPane,
@@ -126,50 +135,6 @@ _RUNTIME_LABELS = {
     "control_failed": "Runtime: control failed",
     "stop_timed_out": "Runtime: stop timed out",
 }
-
-
-def _turn_model_metadata_from_payload(payload: object) -> dict[str, Mapping[str, object]]:
-    if not isinstance(payload, Mapping):
-        return {}
-    raw_metadata = payload.get("turn_model_metadata")
-    if not isinstance(raw_metadata, Mapping):
-        return {}
-    result: dict[str, Mapping[str, object]] = {}
-    for turn_id, raw_entry in raw_metadata.items():
-        if not isinstance(turn_id, str) or not isinstance(raw_entry, Mapping):
-            continue
-        raw_candidates = raw_entry.get("model_candidates")
-        candidates: list[dict[str, object]] = []
-        if isinstance(raw_candidates, list):
-            for raw_candidate in raw_candidates:
-                if not isinstance(raw_candidate, Mapping):
-                    continue
-                model = raw_candidate.get("model")
-                if not isinstance(model, str) or not model:
-                    continue
-                effort = raw_candidate.get("reasoning_effort")
-                candidates.append(
-                    {
-                        "model": model[:512],
-                        "reasoning_effort": effort[:512]
-                        if isinstance(effort, str) and effort
-                        else None,
-                    }
-                )
-        status = raw_entry.get("model_resolution_status")
-        if not isinstance(status, str) or status not in {"resolved", "multiple", "unavailable"}:
-            status = (
-                "unavailable"
-                if not candidates
-                else "resolved"
-                if len(candidates) == 1
-                else "multiple"
-            )
-        result[turn_id] = {
-            "model_candidates": candidates,
-            "model_resolution_status": status,
-        }
-    return result
 
 
 class MainWindow(QMainWindow):
@@ -390,7 +355,7 @@ class MainWindow(QMainWindow):
         self.config_status_label.setToolTip(self._config.roots_error or "Allowed roots are ready")
         self.overall_status_label = QLabel("● Starting")
         self.overall_detail_label = QLabel("● Starting")
-        self.usage_status_label = QLabel(format_codex_usage(self._usage))
+        self.usage_status_label = UsageShortcutLabel(format_codex_usage(self._usage))
         self.codex_update_banner_label = QLabel("")
         self.codex_update_banner_label.setVisible(False)
         self.status_button = QPushButton("Status")
@@ -427,6 +392,7 @@ class MainWindow(QMainWindow):
         self.overall_status_label.setObjectName("topStatus")
         self.overall_detail_label.setObjectName("detailStatus")
         self.usage_status_label.setObjectName("topStatus")
+        self.usage_status_label.setProperty("usageShortcut", True)
         self.usage_status_label.setToolTip(format_codex_usage_tooltip(self._usage))
 
         self.usage_detail_label = QLabel(format_codex_usage_detail(self._usage))
@@ -590,6 +556,8 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget { background: #202124; color: #e8eaed; }
             QLabel { color: #d8dbe0; }
             QLabel#topStatus { padding: 3px 8px; border: 1px solid #3c4043; border-radius: 3px; }
+            QLabel#topStatus[usageShortcut="true"]:hover { background: #2b2d30; }
+            QLabel#topStatus[usageShortcut="true"]:focus { border-color: #8ab4f8; }
             QLabel#bottomStatus { color: #aeb4bd; padding: 4px 6px; border-top: 1px solid #3c4043; }
             QLineEdit, QTreeWidget, QTextEdit, QPlainTextEdit {
                 background: #292a2d; color: #f1f3f4; border: 1px solid #4a4d50;
@@ -658,6 +626,7 @@ class MainWindow(QMainWindow):
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
         self.status_button.clicked.connect(self._show_status)
+        self.usage_status_label.activated.connect(self._create_or_show_usage_history_window)
         self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
         self.status_refresh_button.clicked.connect(self._refresh_status)
         self.status_close_button.clicked.connect(self.status_dialog.close)
@@ -2039,7 +2008,7 @@ class MainWindow(QMainWindow):
             self._sync_empty_state()
             return
         self.history_pane.set_empty_state("Loading history…")
-        self.activity_pane.set_empty_state("Loading activity…")
+        self.activity_pane.set_loading_state("Loading activity…")
         self.selected_status_timer.start()
         self._request_snapshot(generation)
 

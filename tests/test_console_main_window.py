@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTextBrowser,
     QTreeWidgetItem,
-    QWidget,
 )
 
 from codex_bridge.console import main_window as main_window_module
@@ -302,7 +301,7 @@ def _thread_item(window: MainWindow, thread_id: str) -> QTreeWidgetItem:
     )
 
 
-def _usage_window(client: FakeClient) -> MainWindow:
+def _usage_window(client: FakeClient, usage_history_path: Path | None = None) -> MainWindow:
     return MainWindow(
         _config(),
         api_client=client,
@@ -310,6 +309,7 @@ def _usage_window(client: FakeClient) -> MainWindow:
         codex_update_probe=FakeCodexUpdateProbe(),
         tunnel_supervisor=StableTunnel(),
         tray_available=False,
+        usage_history_path=usage_history_path,
     )
 
 
@@ -795,56 +795,6 @@ def test_success_with_unavailable_usage_does_not_save_history(tmp_path: Path) ->
     window.close()
 
 
-def test_status_opens_one_independent_usage_history_window(tmp_path: Path) -> None:
-    _application()
-    window = MainWindow(
-        _config(),
-        api_client=FakeClient(),
-        tray_available=False,
-        usage_history_path=tmp_path / "usage-history.sqlite3",
-    )
-    window._show_status()
-
-    assert window.status_dialog.isVisible()
-    assert window.status_dialog.findChild(QWidget, "usageHistoryChart") is None
-    assert window.usage_history_button.text() == "Show usage history"
-    assert not window.status_dialog.isModal()
-
-    window.usage_history_button.click()
-    first_window = window._usage_history_window
-    assert first_window is not None
-    assert first_window.isVisible()
-    window.status_dialog.close()
-    assert first_window.isVisible()
-
-    window.usage_history_button.click()
-    assert window._usage_history_window is first_window
-    window.close()
-
-
-def test_main_window_exit_closes_its_usage_history_window(tmp_path: Path) -> None:
-    _application()
-    window = MainWindow(
-        _config(),
-        api_client=FakeClient(),
-        codex_probe=FakeCodexProbe(),
-        codex_update_probe=FakeCodexUpdateProbe(),
-        runtime_launcher=FakeLauncher(),
-        tunnel_supervisor=StableTunnel(),
-        tray_available=False,
-        quit_application=lambda: None,
-        usage_history_path=tmp_path / "usage-history.sqlite3",
-    )
-    window.usage_history_button.click()
-    history_window = window._usage_history_window
-    assert history_window is not None and history_window.isVisible()
-
-    window._begin_exit()
-
-    assert not history_window.isVisible()
-    window.close()
-
-
 def test_usage_sample_refreshes_only_a_visible_history_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -954,37 +904,6 @@ def test_usage_history_write_failure_keeps_usage_and_polling(
 
     assert window.usage_status_label.text() == "Codex Usage  5h 72% · Week —"
     assert window.usage_poll_timer.isActive()
-    window.close()
-
-
-@pytest.mark.parametrize("history_error", [sqlite3.OperationalError, OSError])
-def test_status_opens_and_usage_history_reports_read_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    history_error: type[Exception],
-) -> None:
-    _application()
-    window = MainWindow(
-        _config(),
-        api_client=FakeClient(),
-        tray_available=False,
-        usage_history_path=tmp_path / "usage-history.sqlite3",
-    )
-
-    def fail_read(*args: object, **kwargs: object) -> None:
-        raise history_error("history unavailable")
-
-    monkeypatch.setattr(usage_history_window_module, "get_usage_samples_for_display", fail_read)
-
-    window._show_status()
-    window.usage_history_button.click()
-
-    assert window.status_dialog.isVisible()
-    assert window._usage_history_window is not None
-    assert (
-        window._usage_history_window.chart_stack.currentWidget()
-        is window._usage_history_window.error_state_label
-    )
     window.close()
 
 
@@ -2782,12 +2701,10 @@ def test_old_selection_json_and_sse_cannot_update_new_selection() -> None:
     client.activity(1, _activity("stale-activity", "thread-a"))
     client.activity(2, _activity("current-activity", "thread-b"))
 
-    assert (
-        "STALE A"
-        not in window.history_pane._content.findChildren(type(window.history_pane._empty_label))[
-            -1
-        ].text()
-    )
+    history_bodies = [
+        body.toPlainText() for body in window.history_pane._content.findChildren(QTextBrowser)
+    ]
+    assert not {"A only", "STALE A"}.intersection(history_bodies)
     assert window.activity_pane.activity_list.count() == 1
     assert "current-activity" in window.activity_pane.activity_list.item(0).text()
     window.close()

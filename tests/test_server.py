@@ -37,12 +37,14 @@ class FakeBridge:
         model: str | None = None,
         reasoning_effort: str | None = None,
         sandbox_mode: str | None = None,
+        approvals_reviewer: str = "auto_review",
     ) -> dict[str, Any]:
         self.start_count += 1
         self.start_options = {
             "model": model,
             "reasoning_effort": reasoning_effort,
             "sandbox_mode": sandbox_mode,
+            "approvals_reviewer": approvals_reviewer,
         }
         if self.error is not None:
             raise self.error
@@ -684,6 +686,8 @@ def test_server_publishes_codex_delegation_instructions(tmp_path) -> None:
         "ユーザーに選択を求めて",
         "codex_setup",
         "confirmed target/model/reasoning",
+        "approvals_reviewer",
+        "Auto-review",
     ):
         assert anchor in instructions
 
@@ -699,6 +703,13 @@ async def test_execution_target_tool_schemas_are_explicit_and_optional(tmp_path)
     assert "codex_targets" in tools
     assert "target_id" in tools["codex_start"].input_schema["properties"]
     assert "target_id" not in tools["codex_start"].input_schema.get("required", [])
+    assert tools["codex_start"].input_schema["properties"]["approvals_reviewer"]["enum"] == [
+        "auto_review",
+        "user",
+    ]
+    assert tools["codex_setup_confirm"].input_schema["properties"]["approvals_reviewer"][
+        "enum"
+    ] == ["auto_review", "user"]
     assert "target_id" in tools["codex_threads"].input_schema["properties"]
     assert "target_id" not in tools["codex_threads"].input_schema.get("required", [])
 
@@ -845,8 +856,24 @@ async def test_setup_confirm_tool_returns_explicit_validated_selection(tmp_path)
             "model": "test-model",
             "reasoning_effort": "effort-a",
             "sandbox_mode": "inherit",
+            "approvals_reviewer": "auto_review",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_setup_confirm_tool_echoes_manual_reviewer_choice(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_setup_confirm"
+    )
+
+    async with app.router.lifespan_context(app):
+        result = await tool.fn("local", "test-model", "effort-a", approvals_reviewer="user")
+
+    assert result["selection"]["approvals_reviewer"] == "user"
 
 
 @pytest.mark.asyncio
@@ -883,13 +910,48 @@ async def test_start_tool_passes_full_access_without_model(tmp_path) -> None:
         "model": None,
         "reasoning_effort": None,
         "sandbox_mode": "danger-full-access",
+        "approvals_reviewer": "auto_review",
     }
     assert result["execution_config"] == {
         "target_id": "local",
         "model": None,
         "reasoning_effort": None,
         "sandbox_mode": "danger-full-access",
+        "approvals_reviewer": "auto_review",
     }
+
+
+@pytest.mark.asyncio
+async def test_start_tool_forwards_manual_reviewer_to_local_bridge(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    start = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_start"
+    )
+
+    async with app.router.lifespan_context(app):
+        await start.fn(str(tmp_path), "prompt", approvals_reviewer="user")
+
+    assert runtime.bridge.start_options["approvals_reviewer"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_start_tool_rejects_invalid_reviewer_as_a_tool_error(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    start = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_start"
+    )
+
+    async with app.router.lifespan_context(app):
+        with pytest.raises(ToolError, match="approvals_reviewer"):
+            await start.fn(str(tmp_path), "prompt", approvals_reviewer="guardian_subagent")
+
+    assert runtime.bridge.start_count == 0
 
 
 @pytest.mark.asyncio
