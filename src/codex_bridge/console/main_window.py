@@ -4,7 +4,6 @@ import os
 import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from datetime import datetime
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
@@ -89,6 +88,7 @@ from .usage_history import (
 from .usage_history_window import UsageHistoryWindow
 from .usage_requests import UsageRequestCoordinator
 from .usage_shortcut_label import UsageShortcutLabel
+from .usage_snapshots import _USAGE_SNAPSHOT_DELAY_MS, UsageSnapshotStore
 from .widgets import (
     ActivityPane,
     HistoryPane,
@@ -103,9 +103,6 @@ _READINESS_INTERVAL_MS = 350
 _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 60 * 1_000
-_USAGE_SNAPSHOT_DELAY_MS = 1_000
-_USAGE_SNAPSHOT_DEFER_MS = 500
-_USAGE_SNAPSHOT_MAX_ENTRIES = 500
 _DIAGNOSTICS_POLL_INTERVAL_MS = 1_000
 _STOP_CONFIRMATION_INTERVAL_MS = 350
 _EXIT_TIMEOUT_SECONDS = 12.0
@@ -234,11 +231,7 @@ class MainWindow(QMainWindow):
         self._runtime_state = "unavailable"
         self._usage = CodexUsage()
         self._usage_refresh_error: str | None = None
-        self._usage_snapshots: OrderedDict[tuple[str, str], CodexUsageSnapshot | None] = (
-            OrderedDict()
-        )
-        self._pending_usage_snapshot_turns: set[tuple[str, str]] = set()
-        self._usage_snapshot_request_turns: set[tuple[str, str]] = set()
+        self._usage_snapshot_store = UsageSnapshotStore(self)
         self._usage_requests = UsageRequestCoordinator(self)
         self._codex_resolution: CodexResolution | None = None
         self._bridge_seen_ready = False
@@ -924,6 +917,18 @@ class MainWindow(QMainWindow):
     def _usage_request_mode(self, value: str | None) -> None:
         self._usage_requests.request_mode = value
 
+    @property
+    def _usage_snapshots(self) -> OrderedDict[tuple[str, str], CodexUsageSnapshot | None]:
+        return self._usage_snapshot_store.usage_snapshots
+
+    @property
+    def _pending_usage_snapshot_turns(self) -> set[tuple[str, str]]:
+        return self._usage_snapshot_store.pending_turns
+
+    @property
+    def _usage_snapshot_request_turns(self) -> set[tuple[str, str]]:
+        return self._usage_snapshot_store.request_turns
+
     def _begin_usage_sequence(self) -> None:
         self._usage_requests.begin_sequence()
 
@@ -943,60 +948,20 @@ class MainWindow(QMainWindow):
         self._usage_requests.poll_timeout()
 
     def _start_usage_snapshot_timer(self) -> None:
-        self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
+        self._usage_snapshot_store.start_timer()
 
     def _schedule_turn_usage_snapshot(self, thread_id: str, turn_id: str) -> None:
-        key = (thread_id, turn_id)
-        if key in self._usage_snapshots:
-            return
-        self._usage_snapshots[key] = None
-        self._pending_usage_snapshot_turns.add(key)
-        while len(self._usage_snapshots) > _USAGE_SNAPSHOT_MAX_ENTRIES:
-            oldest, _snapshot = self._usage_snapshots.popitem(last=False)
-            self._pending_usage_snapshot_turns.discard(oldest)
-            self._usage_snapshot_request_turns.discard(oldest)
-        if self._pending_usage_snapshot_turns and not self.turn_usage_snapshot_timer.isActive():
-            self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DELAY_MS)
+        self._usage_snapshot_store.schedule_turn(thread_id, turn_id)
 
     def _on_turn_usage_snapshot_timeout(self) -> None:
-        if self._closing or not self._pending_usage_snapshot_turns:
-            return
-        if (
-            self._usage_request_in_flight
-            or self.usage_initial_timer.isActive()
-            or self.usage_retry_timer.isActive()
-        ):
-            self.turn_usage_snapshot_timer.start(_USAGE_SNAPSHOT_DEFER_MS)
-            return
-        if not self._usage_ready:
-            return
-        candidates = set(self._pending_usage_snapshot_turns)
-        if not self._start_usage_request("turn_snapshot"):
-            return
-        self._usage_snapshot_request_turns = candidates
+        self._usage_snapshot_store.on_timeout()
 
     def _finish_turn_usage_snapshot(
         self,
         candidates: set[tuple[str, str]],
         usage: CodexUsage,
     ) -> None:
-        has_usage = usage.five_hour is not None or usage.weekly is not None
-        snapshot = CodexUsageSnapshot(usage, datetime.now().astimezone()) if has_usage else None
-        for key in candidates:
-            if key in self._usage_snapshots and snapshot is not None:
-                self._usage_snapshots[key] = snapshot
-            self._pending_usage_snapshot_turns.discard(key)
-
-        selected_thread_id = self._selected_thread_id
-        snapshot_turn_ids = {
-            turn_id
-            for thread_id, turn_id in candidates
-            if thread_id == selected_thread_id and snapshot is not None
-        }
-        if snapshot_turn_ids and any(
-            entry.turn_id in snapshot_turn_ids for entry in self._timeline_entries
-        ):
-            self._render_timeline()
+        self._usage_snapshot_store.finish(candidates, usage)
 
     def _apply_usage(self, payload: object) -> None:
         self._usage = parse_codex_usage(payload)
