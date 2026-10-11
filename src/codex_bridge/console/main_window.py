@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -14,9 +13,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
-    QFont,
     QIcon,
-    QPalette,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -75,17 +72,13 @@ from .tunnel_supervisor import TunnelSupervisor, tunnel_state_label
 from .usage import (
     CodexUsage,
     CodexUsageSnapshot,
-    format_codex_usage,
-    format_codex_usage_detail,
-    format_codex_usage_tooltip,
-    parse_codex_usage,
-    usage_level,
 )
 from .usage_history import (
     default_usage_history_path,
     record_usage_sample,
 )
 from .usage_history_window import UsageHistoryWindow
+from .usage_presentation import UsagePresentationController
 from .usage_requests import UsageRequestCoordinator
 from .usage_shortcut_label import UsageShortcutLabel
 from .usage_snapshots import _USAGE_SNAPSHOT_DELAY_MS, UsageSnapshotStore
@@ -229,8 +222,7 @@ class MainWindow(QMainWindow):
         self._thread_copy_sequence = 0
         self._pending_thread_copies: dict[str, tuple[str, list[TimelineEntry]]] = {}
         self._runtime_state = "unavailable"
-        self._usage = CodexUsage()
-        self._usage_refresh_error: str | None = None
+        self._usage_presentation = UsagePresentationController(self)
         self._usage_snapshot_store = UsageSnapshotStore(self)
         self._usage_requests = UsageRequestCoordinator(self)
         self._codex_resolution: CodexResolution | None = None
@@ -886,6 +878,14 @@ class MainWindow(QMainWindow):
         return self._bridge_ready and self._app_server_ready
 
     @property
+    def _usage(self) -> CodexUsage:
+        return self._usage_presentation.usage
+
+    @property
+    def _usage_refresh_error(self) -> str | None:
+        return self._usage_presentation.refresh_error
+
+    @property
     def _usage_sequence_active(self) -> bool:
         return self._usage_requests.sequence_active
 
@@ -964,59 +964,19 @@ class MainWindow(QMainWindow):
         self._usage_snapshot_store.finish(candidates, usage)
 
     def _apply_usage(self, payload: object) -> None:
-        self._usage = parse_codex_usage(payload)
-        self._usage_refresh_error = None
-        self._render_usage_status()
+        self._usage_presentation.apply_usage(payload)
 
     def _apply_usage_failure(self, message: str) -> None:
-        bounded_message = " ".join(message.split())[:256]
-        self._usage_refresh_error = bounded_message or "request failed"
-        self._render_usage_status()
+        self._usage_presentation.apply_usage_failure(message)
 
     def _render_usage_status(self) -> None:
-        status_text = format_codex_usage(self._usage)
-        tooltip = format_codex_usage_tooltip(self._usage)
-        detail = format_codex_usage_detail(self._usage)
-        if self._usage_refresh_error is not None:
-            failure_detail = f"Refresh failed: {self._usage_refresh_error}"
-            status_text += " · refresh failed"
-            tooltip += f"\n{failure_detail}"
-            detail += f"\n{failure_detail}"
-        self.usage_status_label.setText(status_text)
-        self.usage_status_label.setToolTip(tooltip)
-        self.usage_detail_label.setText(detail)
-        level = usage_level(self._usage)
-        font = self.usage_status_label.font()
-        font.setBold(level != "normal")
-        if level == "error":
-            font.setWeight(QFont.Weight.Bold)
-        elif level == "warning":
-            font.setWeight(QFont.Weight.DemiBold)
-        else:
-            font.setWeight(QFont.Weight.Normal)
-        self.usage_status_label.setFont(font)
-        palette = self.usage_status_label.palette()
-        role = {
-            "normal": QPalette.ColorRole.Text,
-            "warning": QPalette.ColorRole.Link,
-            "error": QPalette.ColorRole.BrightText,
-        }[level]
-        palette.setColor(QPalette.ColorRole.WindowText, palette.color(role))
-        self.usage_status_label.setPalette(palette)
+        self._usage_presentation.render_usage_status()
 
     def _record_usage_history(self) -> None:
-        captured_at_epoch = time()
-        try:
-            sample = record_usage_sample(
-                self._usage,
-                captured_at_epoch=captured_at_epoch,
-                database_path=self._usage_history_path,
-            )
-        except (OSError, sqlite3.Error):
-            return
-        history_window = self._usage_history_window
-        if sample is not None and history_window is not None and history_window.isVisible():
-            history_window.refresh(rolling=True)
+        self._usage_presentation.record_usage_history(
+            captured_at_epoch=time(),
+            record_sample=record_usage_sample,
+        )
 
     def _sync_overall_status(self) -> None:
         bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
