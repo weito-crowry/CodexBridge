@@ -49,6 +49,11 @@ from .codex_updates import CodexUpdateInfo, CodexUpdateProbe, parse_codex_update
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
 from .history_metadata import _turn_model_metadata_from_payload
+from .history_requests import (
+    HISTORY_REFRESH_DEBOUNCE_MS,
+    HistoryRequestContext,
+    HistoryRequestCoordinator,
+)
 from .main_window_layout import build_main_window_ui
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
@@ -90,7 +95,6 @@ _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 60 * 1_000
 _USAGE_MAX_ATTEMPTS = 3
 _USAGE_SNAPSHOT_DELAY_MS = 1_000
-_HISTORY_REFRESH_DEBOUNCE_MS = 250
 _HISTORY_REFRESH_ACTIVITY_TYPES = frozenset(
     {
         "turn_started",
@@ -235,11 +239,6 @@ class MainWindow(QMainWindow):
         self._exit_finished = False
         self._selection_generation = 0
         self._selected_thread_id: str | None = None
-        self._history_refresh_pending = False
-        self._history_refresh_generation: int | None = None
-        self._history_refresh_in_flight_keys: set[str] = set()
-        self._history_snapshot_pending = False
-        self._history_older_pending = False
         self._timeline_entries: list[TimelineEntry] = []
         self._turn_model_metadata: dict[str, Mapping[str, object]] = {}
         self._turn_statuses: dict[str, str] = {}
@@ -309,6 +308,10 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._connect_client()
         self._build_timers()
+        self._history_requests = HistoryRequestCoordinator(
+            self._client,
+            self._history_refresh_timer,
+        )
         self._connect_runtime()
         self._build_tray()
         self._update_tunnel_client_status()
@@ -321,6 +324,18 @@ class MainWindow(QMainWindow):
     @property
     def runtime_state(self) -> str:
         return self._runtime_state
+
+    @property
+    def _history_refresh_pending(self) -> bool:
+        return self._history_requests.pending_live
+
+    def _history_request_context(self) -> HistoryRequestContext:
+        return HistoryRequestContext(
+            generation=self._selection_generation,
+            selected_thread_id=self._selected_thread_id,
+            next_cursor=self._next_cursor,
+            closing=self._closing,
+        )
 
     def _new_codex_probe(self) -> CodexVersionProbe:
         environ = dict(os.environ)
@@ -548,7 +563,7 @@ class MainWindow(QMainWindow):
         self.selected_status_timer.timeout.connect(self._request_selected_status)
         self._history_refresh_timer = QTimer(self)
         self._history_refresh_timer.setSingleShot(True)
-        self._history_refresh_timer.setInterval(_HISTORY_REFRESH_DEBOUNCE_MS)
+        self._history_refresh_timer.setInterval(HISTORY_REFRESH_DEBOUNCE_MS)
         self._history_refresh_timer.timeout.connect(self._request_selected_history)
         self.readiness_timer = QTimer(self)
         self.readiness_timer.setInterval(_READINESS_INTERVAL_MS)
@@ -1679,14 +1694,7 @@ class MainWindow(QMainWindow):
         )
 
     def _request_history_snapshot(self, generation: int) -> None:
-        if generation != self._selection_generation or self._selected_thread_id is None:
-            return
-        self._history_refresh_timer.stop()
-        self._history_refresh_pending = False
-        if self._history_refresh_in_flight_keys:
-            self._history_snapshot_pending = True
-            return
-        self._start_history_request_group(generation, "snapshot")
+        self._history_requests.request_snapshot(generation, self._history_request_context())
 
     def _request_selected_status(self) -> None:
         if self._selected_thread_id is None:
@@ -1695,109 +1703,19 @@ class MainWindow(QMainWindow):
         self._client.get_json(self._thread_path("/status"), key=key, query={"activity_limit": 50})
 
     def _schedule_selected_history_refresh(self) -> None:
-        if self._closing or self._selected_thread_id is None:
-            return
-        self._history_refresh_timer.start(_HISTORY_REFRESH_DEBOUNCE_MS)
+        self._history_requests.schedule_selected_history_refresh(self._history_request_context())
 
     def _request_selected_history(self) -> None:
-        if self._closing or self._selected_thread_id is None:
-            return
-        if self._history_refresh_in_flight_keys:
-            self._history_refresh_pending = True
-            return
-
-        self._start_history_request_group(self._selection_generation, "live")
-
-    def _start_history_request_group(self, generation: int, kind: str) -> None:
-        if (
-            generation != self._selection_generation
-            or self._selected_thread_id is None
-            or self._closing
-            or self._history_refresh_in_flight_keys
-        ):
-            return
-
-        prefix = f"selection:{generation}:"
-        if kind == "live":
-            prefix += "history:"
-        requests: tuple[tuple[str, str, dict[str, object]], ...]
-        if kind == "older":
-            cursor = self._next_cursor
-            if cursor is None:
-                return
-            requests = (
-                (
-                    prefix + f"older:{cursor}",
-                    self._thread_path("/items"),
-                    {"limit": 100, "sort_direction": "desc", "cursor": cursor},
-                ),
-            )
-        else:
-            requests = (
-                (
-                    prefix + "turns",
-                    self._thread_path("/turns"),
-                    {"limit": 20, "sort_direction": "desc"},
-                ),
-                (
-                    prefix + "items",
-                    self._thread_path("/items"),
-                    {"limit": 100, "sort_direction": "desc"},
-                ),
-            )
-        self._history_refresh_generation = generation
-        self._history_refresh_in_flight_keys = {key for key, _, _ in requests}
-        if kind == "live":
-            self._history_refresh_pending = False
-        rejected_keys: list[str] = []
-        for key, path, query in requests:
-            if not self._client.get_json(path, key=key, query=query):
-                rejected_keys.append(key)
-        for key in rejected_keys:
-            self._finish_selected_history_request(key)
+        self._history_requests.request_selected_history(self._history_request_context())
 
     def _finish_selected_history_request(self, key: str) -> None:
-        if key not in self._history_refresh_in_flight_keys:
-            return
-        self._history_refresh_in_flight_keys.discard(key)
-        if self._history_refresh_in_flight_keys:
-            return
-
-        generation = self._history_refresh_generation
-        self._history_refresh_generation = None
-        if generation is not None:
-            self._dispatch_pending_history_request(generation)
-
-    def _dispatch_pending_history_request(self, generation: int) -> None:
-        if (
-            generation != self._selection_generation
-            or self._closing
-            or self._selected_thread_id is None
-            or self._history_refresh_in_flight_keys
-        ):
-            return
-        if self._history_snapshot_pending:
-            self._history_snapshot_pending = False
-            self._start_history_request_group(generation, "snapshot")
-            return
-        if self._history_older_pending:
-            self._history_older_pending = False
-            self._start_history_request_group(generation, "older")
-            if self._history_refresh_in_flight_keys:
-                return
-        if self._history_refresh_pending and not self._history_refresh_timer.isActive():
-            self._history_refresh_timer.start(_HISTORY_REFRESH_DEBOUNCE_MS)
+        self._history_requests.finish_request(key, self._history_request_context())
 
     def select_thread(self, thread_id: str | None) -> None:
         self._selection_generation += 1
         generation = self._selection_generation
         self._selected_thread_id = thread_id
-        self._history_refresh_timer.stop()
-        self._history_refresh_pending = False
-        self._history_refresh_generation = None
-        self._history_refresh_in_flight_keys.clear()
-        self._history_snapshot_pending = False
-        self._history_older_pending = False
+        self._history_requests.reset()
         self._stream_connected = False
         self._stream_ever_connected = False
         self._timeline_entries = []
@@ -2062,11 +1980,7 @@ class MainWindow(QMainWindow):
     def load_older(self) -> None:
         if self._selected_thread_id is None or self._next_cursor is None:
             return
-        if self._history_refresh_in_flight_keys:
-            self._history_older_pending = True
-            return
-        generation = self._selection_generation
-        self._start_history_request_group(generation, "older")
+        self._history_requests.request_older(self._history_request_context())
 
     def _apply_json_error(self, key: str, message: str) -> None:
         if key in self._pending_thread_copies:
@@ -2310,12 +2224,7 @@ class MainWindow(QMainWindow):
         self.health_timer.stop()
         self.thread_timer.stop()
         self.selected_status_timer.stop()
-        self._history_refresh_timer.stop()
-        self._history_refresh_pending = False
-        self._history_refresh_generation = None
-        self._history_refresh_in_flight_keys.clear()
-        self._history_snapshot_pending = False
-        self._history_older_pending = False
+        self._history_requests.reset()
         self.diagnostics_timer.stop()
         self.readiness_timer.stop()
         self.bridge_start_retry_timer.stop()
