@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from codex_bridge.console.bridge_managed_retry import BridgeManagedRetryCoordinator
 from codex_bridge.console.bridge_runtime_observer import BridgeRuntimeObserver
 
 
@@ -9,9 +10,21 @@ class _Timer:
     def __init__(self, trace: list[tuple[object, ...]], name: str) -> None:
         self._trace = trace
         self._name = name
+        self.active = False
 
     def stop(self) -> None:
         self._trace.append((self._name,))
+        self.active = False
+
+    def start(self) -> None:
+        self._trace.append((f"{self._name}_start",))
+        self.active = True
+
+    def setInterval(self, interval: int) -> None:
+        self._trace.append((f"{self._name}_interval", interval))
+
+    def isActive(self) -> bool:
+        return self.active
 
 
 class _Tunnel:
@@ -46,20 +59,42 @@ class _Window:
         self._stop_outcome_uncertain = False
         self._health_observed = False
         self._status_observed = False
+        self._closing = False
         self._bridge_transition_coordinator = _TransitionCoordinator(self.trace)
         self._tunnel = _Tunnel(self.trace)
         self.bridge_start_retry_timer = _Timer(self.trace, "retry_timer_stop")
+        self._bridge_managed_retry_coordinator = BridgeManagedRetryCoordinator(
+            self.bridge_start_retry_timer,
+            get_is_closing=lambda: self._closing,
+            can_start_bridge=lambda: False,
+            start_bridge_managed=lambda: None,
+            update_start_button=lambda: None,
+        )
+        self._bridge_managed_retry_coordinator.activate()
+        for _ in range(3):
+            self._bridge_managed_retry_coordinator.schedule_retry()
+        self._bridge_managed_retry_coordinator.schedule_retry()
+        self._bridge_managed_retry_coordinator.activate()
+        self.trace.clear()
         self.readiness_timer = _Timer(self.trace, "readiness_timer_stop")
-        self._bridge_start_retry_index = 3
-        self._bridge_start_retry_exhausted = True
-        self._managed_start_active = True
         self._bridge_seen_ready = False
         self._detached_launch_started = False
         self._launch_in_progress = False
         self._runtime_state = "unavailable"
-        self._closing = False
         self._control_token: str | None = None
         self._bridge_loss_count = 0
+
+    @property
+    def _managed_start_active(self) -> bool:
+        return self._bridge_managed_retry_coordinator.managed_active
+
+    @property
+    def _bridge_start_retry_index(self) -> int:
+        return self._bridge_managed_retry_coordinator.retry_index
+
+    @property
+    def _bridge_start_retry_exhausted(self) -> bool:
+        return self._bridge_managed_retry_coordinator.retry_exhausted
 
     def _set_runtime_state(self, state: str, *, label: str | None = None) -> None:
         self._runtime_state = state

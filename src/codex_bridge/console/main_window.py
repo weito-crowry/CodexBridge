@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from ..models import ApprovalDecision
 from .api_client import ApiClient
+from .bridge_managed_retry import BridgeManagedRetryCoordinator
 from .bridge_readiness import BridgeReadinessCoordinator
 from .bridge_runtime_observer import BridgeRuntimeObserver
 from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
@@ -95,7 +96,6 @@ from .widgets import (
 )
 
 _READINESS_INTERVAL_MS = 350
-_BRIDGE_START_RETRY_DELAYS_MS = (2_000, 5_000, 10_000)
 _USAGE_INITIAL_DELAY_MS = 1_500
 _USAGE_RETRY_DELAY_MS = 3_000
 _USAGE_POLL_INTERVAL_MS = 60 * 1_000
@@ -252,9 +252,6 @@ class MainWindow(QMainWindow):
         self._app_server_ready = False
         self._bridge_runtime_observer = BridgeRuntimeObserver(self)
         self._launch_in_progress = False
-        self._managed_start_active = False
-        self._bridge_start_retry_index = 0
-        self._bridge_start_retry_exhausted = False
         self._detached_launch_started = False
         self._detached_pid: int | None = None
         self._control_token: str | None = None
@@ -273,6 +270,13 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._connect_client()
         self._build_timers()
+        self._bridge_managed_retry_coordinator = BridgeManagedRetryCoordinator(
+            self.bridge_start_retry_timer,
+            get_is_closing=lambda: self._closing,
+            can_start_bridge=self._can_start_bridge,
+            start_bridge_managed=lambda: self._start_bridge(managed=True),
+            update_start_button=self._update_start_button,
+        )
         self._bridge_stop_confirmation = BridgeStopConfirmationCoordinator(
             self.stop_confirmation_timer,
             on_confirmed=self._on_stop_confirmation_confirmed,
@@ -332,6 +336,18 @@ class MainWindow(QMainWindow):
     @property
     def runtime_state(self) -> str:
         return self._runtime_state
+
+    @property
+    def _managed_start_active(self) -> bool:
+        return self._bridge_managed_retry_coordinator.managed_active
+
+    @property
+    def _bridge_start_retry_index(self) -> int:
+        return self._bridge_managed_retry_coordinator.retry_index
+
+    @property
+    def _bridge_start_retry_exhausted(self) -> bool:
+        return self._bridge_managed_retry_coordinator.retry_exhausted
 
     @property
     def _bridge_loss_count(self) -> int:
@@ -1214,12 +1230,7 @@ class MainWindow(QMainWindow):
         )
 
     def _maybe_auto_start_bridge(self) -> None:
-        if self._bridge_start_retry_exhausted or self._managed_start_active:
-            return
-        if not self._can_start_bridge():
-            return
-        self._managed_start_active = True
-        self._start_bridge(managed=True)
+        self._bridge_managed_retry_coordinator.maybe_auto_start_bridge()
 
     def _retry_now(self) -> None:
         if self._closing or self._launch_in_progress or self._bridge_transition:
@@ -1230,10 +1241,7 @@ class MainWindow(QMainWindow):
             if callable(retry_now):
                 retry_now()
             return
-        self.bridge_start_retry_timer.stop()
-        self._bridge_start_retry_index = 0
-        self._bridge_start_retry_exhausted = False
-        self._managed_start_active = True
+        self._bridge_managed_retry_coordinator.reset_for_retry_now()
         if self._can_start_bridge():
             self._start_bridge(managed=True)
 
@@ -1241,33 +1249,17 @@ class MainWindow(QMainWindow):
         self._restart_bridge()
 
     def _schedule_managed_bridge_retry(self) -> None:
-        if self._closing or not self._managed_start_active:
-            return
-        if self._bridge_start_retry_index >= len(_BRIDGE_START_RETRY_DELAYS_MS):
-            self._bridge_start_retry_exhausted = True
-            self._managed_start_active = False
-            self._update_start_button()
-            return
-        delay = _BRIDGE_START_RETRY_DELAYS_MS[self._bridge_start_retry_index]
-        self._bridge_start_retry_index += 1
-        self.bridge_start_retry_timer.setInterval(delay)
-        self.bridge_start_retry_timer.start()
+        self._bridge_managed_retry_coordinator.schedule_retry()
 
     def _on_bridge_start_retry_timeout(self) -> None:
-        self.bridge_start_retry_timer.stop()
-        if self._closing or self._bridge_start_retry_exhausted:
-            return
-        if self._can_start_bridge():
-            self._start_bridge(managed=True)
-        else:
-            self._managed_start_active = False
+        self._bridge_managed_retry_coordinator.on_retry_timeout()
 
     def _start_bridge(self, *, managed: bool = False) -> None:
         resolution = self._codex_resolution
         if resolution is None or not self._can_start_bridge():
             return
         if managed:
-            self._managed_start_active = True
+            self._bridge_managed_retry_coordinator.activate()
         self._bridge_transition_coordinator.reset_for_launch()
         self._bridge_transition = True
         self._sync_tunnel_controls()
@@ -1338,10 +1330,7 @@ class MainWindow(QMainWindow):
         self._app_server_ready = True
         self._bridge_seen_ready = True
         self._bridge_runtime_observer.reset_loss_count()
-        self.bridge_start_retry_timer.stop()
-        self._bridge_start_retry_index = 0
-        self._bridge_start_retry_exhausted = False
-        self._managed_start_active = False
+        self._bridge_managed_retry_coordinator.reset_after_ready()
         self._bridge_transition = False
         self._set_runtime_state("console_started", label="Runtime: started by Console")
         self.bottom_status_label.setText("Bridge started by Console")

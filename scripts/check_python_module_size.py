@@ -16,12 +16,18 @@ POLICY: dict[str, Any] = {
         "baselines": {
             "src/codex_bridge/console/main_window.py": {
                 "physical_loc": {
-                    "value": 2046,
-                    "reason": "Phase 4C-3a runtime observation extraction; LOC exceeds limit.",
+                    "value": 2035,
+                    "reason": (
+                        "Phase 4C-3b managed retry coordinator extraction; "
+                        "physical LOC reduced but still exceeds limit."
+                    ),
                 },
                 "raw_bytes": {
-                    "value": 84598,
-                    "reason": "Phase 4C-3a runtime observation extraction; bytes exceed limit.",
+                    "value": 84173,
+                    "reason": (
+                        "Phase 4C-3b managed retry coordinator extraction; "
+                        "raw bytes reduced but still exceed limit."
+                    ),
                 },
             }
         },
