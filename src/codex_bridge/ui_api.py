@@ -21,6 +21,7 @@ from .history import HistoryValidationError, project_thread_metadata, validate_c
 from .jsonrpc import JsonRpcClosedError
 from .models import ApprovalDecision, RequestId
 from .paths import PathPolicyError
+from .thread_titles import normalize_explicit_title
 
 
 class UiBridge(Protocol):
@@ -28,7 +29,9 @@ class UiBridge(Protocol):
         self, request_id: RequestId, decision: ApprovalDecision
     ) -> dict[str, Any]: ...
 
-    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]: ...
+    async def rename_thread(
+        self, thread_id: str, name: str, *, only_if_untitled: bool = False
+    ) -> dict[str, Any]: ...
 
     async def threads(
         self,
@@ -218,7 +221,19 @@ def create_ui_app(
             name = payload.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("invalid name")
+            only_if_untitled = payload.get("only_if_untitled", False)
+            if not isinstance(only_if_untitled, bool):
+                raise ValueError("invalid conditional rename flag")
             thread_id = request.path_params["thread_id"]
+            if only_if_untitled:
+                normalized_name = normalize_explicit_title(name)
+                result = await bridge.rename_thread(
+                    thread_id, normalized_name, only_if_untitled=True
+                )
+                status = result.get("status")
+                if status not in {"renamed", "skipped"}:
+                    raise BridgeError("conditional rename returned an invalid status")
+                return JSONResponse({"thread_id": thread_id, "status": status})
             await bridge.rename_thread(thread_id, name)
             return JSONResponse({"thread_id": thread_id, "name": name})
         except Exception as exc:

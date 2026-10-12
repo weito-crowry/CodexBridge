@@ -897,9 +897,33 @@ class Bridge:
             "backwards_cursor": response.get("backwardsCursor"),
         }
 
-    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]:
+    async def rename_thread(
+        self,
+        thread_id: str,
+        name: str,
+        *,
+        only_if_untitled: bool = False,
+    ) -> dict[str, Any]:
         if not name.strip():
             raise ValueError("name must not be blank")
+        if only_if_untitled:
+            metadata = await self._app_server.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+            thread = self._thread_from_response(metadata)
+            self._validate_thread_metadata(thread, thread_id)
+            self._remember_thread_metadata(thread)
+            current_name = thread.get("name")
+            if isinstance(current_name, str) and current_name.strip():
+                return {"status": "skipped", "reason": "already_named"}
+            local_titles = _read_local_thread_titles([thread_id])
+            if (
+                _usable_local_display_title(local_titles.get(thread_id), thread.get("preview"))
+                is not None
+            ):
+                return {"status": "skipped", "reason": "already_named"}
+            await self._app_server.request("thread/name/set", {"threadId": thread_id, "name": name})
+            return {"status": "renamed"}
         return await self._app_server.request(
             "thread/name/set", {"threadId": thread_id, "name": name}
         )

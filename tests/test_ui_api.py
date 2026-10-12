@@ -65,8 +65,13 @@ class FakeBridge:
             "backwards_cursor": "back",
         }
 
-    async def rename_thread(self, thread_id: str, name: str) -> dict[str, Any]:
-        self.calls.append(("rename_thread", (thread_id, name), {}))
+    async def rename_thread(
+        self, thread_id: str, name: str, *, only_if_untitled: bool = False
+    ) -> dict[str, Any]:
+        kwargs = {"only_if_untitled": True} if only_if_untitled else {}
+        self.calls.append(("rename_thread", (thread_id, name), kwargs))
+        if only_if_untitled:
+            return {"status": "skipped"}
         return {"thread": {"id": thread_id, "name": name}}
 
     async def read_thread_turns(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -243,6 +248,65 @@ async def test_ui_api_rename_delegates_target_and_name_to_bridge(tmp_path) -> No
         "name": "Renamed",
     }
     assert bridge.calls[-1] == ("rename_thread", ("thread-b", "Renamed"), {})
+
+
+@pytest.mark.asyncio
+async def test_ui_api_conditional_rename_returns_batch_status(tmp_path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _route(app, "/ui-api/threads/{thread_id}/name").endpoint(
+        _request(
+            "/ui-api/threads/thread-b/name",
+            path_params={"thread_id": "thread-b"},
+            method="POST",
+            body=b'{"name":"Renamed","only_if_untitled":true}',
+        )
+    )
+
+    assert response.status_code == 200
+    assert await _json_response(response) == {"thread_id": "thread-b", "status": "skipped"}
+    assert bridge.calls[-1] == (
+        "rename_thread",
+        ("thread-b", "Renamed"),
+        {"only_if_untitled": True},
+    )
+
+
+@pytest.mark.asyncio
+async def test_ui_api_conditional_rename_requires_a_strict_boolean_flag(tmp_path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _route(app, "/ui-api/threads/{thread_id}/name").endpoint(
+        _request(
+            "/ui-api/threads/thread-b/name",
+            path_params={"thread_id": "thread-b"},
+            method="POST",
+            body=b'{"name":"Renamed","only_if_untitled":1}',
+        )
+    )
+
+    assert response.status_code == 400
+    assert await _json_response(response) == {"error": "invalid request"}
+    assert not bridge.calls
+
+
+@pytest.mark.asyncio
+async def test_ui_api_conditional_rename_hides_invalid_title_input(tmp_path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _route(app, "/ui-api/threads/{thread_id}/name").endpoint(
+        _request(
+            "/ui-api/threads/thread-b/name",
+            path_params={"thread_id": "thread-b"},
+            method="POST",
+            body=b'{"name":"secret\\u0001value","only_if_untitled":true}',
+        )
+    )
+
+    assert response.status_code == 400
+    assert await _json_response(response) == {"error": "invalid request"}
+    assert "secret" not in response.body.decode("utf-8")
+    assert not bridge.calls
 
 
 @pytest.mark.asyncio

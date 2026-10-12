@@ -41,6 +41,7 @@ from .bridge_readiness import BridgeReadinessCoordinator
 from .bridge_runtime_observer import BridgeRuntimeObserver
 from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
 from .bridge_transition import BridgeTransitionContext, BridgeTransitionCoordinator
+from .bulk_thread_naming import BulkThreadNamingController
 from .codex_links import open_codex_uri
 from .codex_resolver import (
     CodexResolution,
@@ -261,6 +262,7 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._build_timers()
         self._thread_interactions = ThreadInteractionController(self)
+        self._bulk_thread_naming = BulkThreadNamingController(self)
         self._diagnostics_panel = DiagnosticsPanelController(self)
         self._connect_client()
         self._codex_update_controller = CodexUpdateController(self)
@@ -1176,6 +1178,8 @@ class MainWindow(QMainWindow):
         if key in self._pending_thread_copies:
             self._apply_thread_copy_page(key, payload)
             return
+        if self._bulk_thread_naming.handle_result(key, payload):
+            return
         if key.startswith("rename:"):
             self._thread_interactions.apply_rename_success(key)
             return
@@ -1318,6 +1322,8 @@ class MainWindow(QMainWindow):
     def _apply_json_error(self, key: str, message: str) -> None:
         if key in self._pending_thread_copies:
             self._thread_interactions.discard_copy(key)
+            return
+        if self._bulk_thread_naming.handle_error(key, message):
             return
         if key.startswith("rename:"):
             self._thread_interactions.discard_rename(key)

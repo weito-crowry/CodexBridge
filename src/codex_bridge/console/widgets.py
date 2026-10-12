@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .bulk_thread_naming import build_thread_list_header, loaded_untitled_thread_rows
 from .project_names import normalize_cwd
 from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
 
@@ -354,6 +355,7 @@ def activity_row(activity: Mapping[str, object]) -> str:
 
 class ThreadListPane(QWidget):
     refresh_requested = Signal()
+    bulk_thread_naming_requested = Signal()
     thread_selected = Signal(str)
     thread_rename_requested = Signal(str)
     thread_open_requested = Signal(str)
@@ -385,10 +387,9 @@ class ThreadListPane(QWidget):
         self.list_widget.itemExpanded.connect(self._group_expanded)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
-        header = QHBoxLayout()
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(self.refresh_button)
+        header, self.name_untitled_button = build_thread_list_header(
+            title, self.refresh_button, self.bulk_thread_naming_requested.emit
+        )
         layout = QVBoxLayout(self)
         layout.addLayout(header)
         layout.addWidget(self.filter_edit)
@@ -418,6 +419,9 @@ class ThreadListPane(QWidget):
     @property
     def thread_count(self) -> int:
         return len(self._threads)
+
+    def loaded_untitled_threads(self) -> list[dict[str, object]]:
+        return loaded_untitled_thread_rows(self._threads, self._project_names)
 
     def _render(self) -> None:
         query = self.filter_edit.text().casefold()

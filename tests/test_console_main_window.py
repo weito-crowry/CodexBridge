@@ -639,6 +639,47 @@ def test_rename_cancel_or_blank_does_not_call_api(monkeypatch, dialog_result) ->
     window.close()
 
 
+def test_bulk_thread_naming_routes_batch_results_and_refreshes_once() -> None:
+    application = _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result(
+        "threads",
+        {
+            "threads": [
+                {"id": "untitled", "preview": "# A useful task"},
+                {"id": "named", "name": "New Thread", "preview": "# Keep this title"},
+            ]
+        },
+    )
+    client.requests.clear()
+
+    window.thread_pane.name_untitled_button.click()
+
+    dialog = window._bulk_thread_naming.dialog
+    assert dialog is not None
+    assert dialog.table.rowCount() == 1
+    assert not client.json_posts
+    dialog.confirm_button.click()
+    application.processEvents()
+    assert client.json_posts == [
+        (
+            "bulk-rename:1",
+            "/ui-api/threads/untitled/name",
+            {"name": "A useful task", "only_if_untitled": True},
+        )
+    ]
+
+    client.json_failed.emit("bulk-rename:1", "private detail")
+    application.processEvents()
+
+    assert window.thread_pane.thread_name("named") == "New Thread"
+    assert dialog.table.item(0, 4).text() == "Failed"
+    assert "private detail" not in dialog.progress_label.text()
+    assert [key for key, _, _ in client.requests] == ["threads"]
+    window.close()
+
+
 def test_open_in_codex_app_uses_right_clicked_thread_id_and_preserves_selection() -> None:
     _application()
     client = FakeClient()
