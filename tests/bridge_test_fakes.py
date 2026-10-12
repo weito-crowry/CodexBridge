@@ -31,6 +31,8 @@ class FakeAppServer:
         self.config_response: dict[str, Any] = {"config": {}}
         self.thread_start_settings: dict[str, Any] = {}
         self.thread_start_error: Exception | None = None
+        self.thread_id = "native-thread"
+        self.thread_name_error: Exception | None = None
         self.thread_resume_settings: dict[str, Any] = {}
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -41,7 +43,7 @@ class FakeAppServer:
                 raise self.thread_start_error
             response = {
                 "thread": {
-                    "id": "native-thread",
+                    "id": self.thread_id,
                     "modelProvider": "openai",
                     "model": "gpt-5",
                     "reasoningEffort": "high",
@@ -76,6 +78,8 @@ class FakeAppServer:
         if method == "turn/interrupt":
             return {}
         if method == "thread/name/set":
+            if self.thread_name_error is not None:
+                raise self.thread_name_error
             return {"thread": {"id": params["threadId"], "name": params["name"]}}
         if method == "thread/list":
             return {"data": self.thread_list}

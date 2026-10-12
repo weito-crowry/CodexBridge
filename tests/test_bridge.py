@@ -47,8 +47,8 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
             "approvalsReviewer": "auto_review",
         },
     )
-    assert app.methods == ["thread/start", "turn/start"]
-    assert app.calls[1][1]["input"] == [{"type": "text", "text": "inspect this"}]
+    assert app.methods == ["thread/start", "thread/name/set", "turn/start"]
+    assert app.calls[2][1]["input"] == [{"type": "text", "text": "inspect this"}]
     status = await bridge.status(result["thread_id"], result["turn_id"])
     assert status["thread_metadata"]["approvals_reviewer"] == "auto_review"
     assert status["thread_metadata"]["approval_policy"] == "on-request"
@@ -73,10 +73,10 @@ async def test_start_passes_explicit_model_and_effort_only_to_expected_wire_fiel
             "approvalsReviewer": "auto_review",
         },
     )
-    assert app.calls[1][0] == "turn/start"
-    assert app.calls[1][1]["model"] == "model-value"
-    assert app.calls[1][1]["effort"] == "high"
-    assert "reasoningEffort" not in app.calls[1][1]
+    assert app.calls[2][0] == "turn/start"
+    assert app.calls[2][1]["model"] == "model-value"
+    assert app.calls[2][1]["effort"] == "high"
+    assert "reasoningEffort" not in app.calls[2][1]
 
 
 @pytest.mark.asyncio
@@ -118,7 +118,9 @@ async def test_start_rejects_unsupported_sandbox_mode(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
 
     with pytest.raises(ValueError, match="sandbox_mode"):
-        await bridge.start(str(allowed_dir), "inspect this", sandbox_mode="read-only")
+        await bridge.start(
+            str(allowed_dir), "inspect this", sandbox_mode="read-only", title="Thread title"
+        )
 
     assert app.calls == []
 
@@ -354,7 +356,7 @@ async def test_cold_resume_uses_effective_metadata_without_sandbox_overrides(all
             "approvalsReviewer": "auto_review",
         },
     )
-    assert app.calls[3] == ("thread/resume", {"threadId": "native-thread"})
+    assert app.calls[4] == ("thread/resume", {"threadId": "native-thread"})
     assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
     assert result["thread_metadata"]["approval_policy"] == "on-request"
 

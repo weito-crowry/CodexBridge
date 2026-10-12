@@ -516,6 +516,7 @@ def create_app(
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
         approvals_reviewer: ApprovalsReviewer = "auto_review",
+        title: str | None = None,
     ) -> dict[str, Any]:
         """Start a Codex thread; approvals_reviewer is auto_review by default or user."""
         return await _run_tool(
@@ -527,6 +528,7 @@ def create_app(
                 reasoning_effort,
                 sandbox_mode=sandbox_mode,
                 approvals_reviewer=approvals_reviewer,
+                title=title,
             )
         )
 

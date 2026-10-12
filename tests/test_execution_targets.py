@@ -48,6 +48,7 @@ class FakeBridge:
         reasoning_effort: str | None = None,
         sandbox_mode: str | None = None,
         approvals_reviewer: str = "auto_review",
+        title: str | None = None,
     ) -> dict[str, Any]:
         kwargs = {}
         if model is not None:
@@ -56,6 +57,8 @@ class FakeBridge:
             kwargs["reasoning_effort"] = reasoning_effort
         if sandbox_mode is not None:
             kwargs["sandbox_mode"] = sandbox_mode
+        if title is not None:
+            kwargs["title"] = title
         kwargs["approvals_reviewer"] = approvals_reviewer
         self.calls.append(("start", (cwd, prompt), kwargs))
         return {"ok": True, "thread_id": "native-local", "turn_id": "turn-local"}
@@ -156,6 +159,21 @@ async def test_single_local_target_start_keeps_native_thread_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_local_start_forwards_explicit_title() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    await router.codex_start("D:/repo", "do work", title="Research title")
+
+    assert bridge.calls == [
+        (
+            "start",
+            ("D:/repo", "do work"),
+            {"title": "Research title", "approvals_reviewer": "auto_review"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_multiple_targets_require_explicit_target_selection() -> None:
     router, _, _ = make_router(LOCAL, NOTEBOOK)
 
@@ -185,6 +203,28 @@ async def test_remote_start_forwards_remote_cwd_and_routes_public_thread_id() ->
     assert result["thread_id"] == "notebook::019abc"
     assert result["native_thread_id"] == "019abc"
     assert result["target_id"] == "notebook"
+
+
+@pytest.mark.asyncio
+async def test_remote_start_forwards_explicit_title() -> None:
+    remote = FakeRemote({"ok": True, "thread_id": "native-remote", "turn_id": "turn-1"})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_start("Z:/Notebook/repo", "prompt", "notebook", title="Fix startup")
+
+    assert remote.calls == [
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "approvals_reviewer": "auto_review",
+                "title": "Fix startup",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -535,6 +575,34 @@ async def test_remote_start_forwards_manual_reviewer_without_retrying_unsupporte
                 "cwd": "Z:/Notebook/repo",
                 "prompt": "prompt",
                 "approvals_reviewer": "user",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_title_rejection_from_old_remote_is_visible_and_not_retried() -> None:
+    class UnsupportedTitleRemote(FakeRemote):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            raise ExecutionTargetError("execution target returned an upstream tool error")
+
+    remote = UnsupportedTitleRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    with pytest.raises(ExecutionTargetError, match="upstream tool error"):
+        await router.codex_start("Z:/Notebook/repo", "prompt", "notebook", title="Fix startup")
+
+    assert remote.calls == [
+        (
+            "codex_start",
+            {
+                "cwd": "Z:/Notebook/repo",
+                "prompt": "prompt",
+                "approvals_reviewer": "auto_review",
+                "title": "Fix startup",
             },
         )
     ]

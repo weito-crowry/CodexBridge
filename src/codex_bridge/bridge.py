@@ -21,7 +21,7 @@ from .history import (
     validate_legacy_cursor,
 )
 from .item_lifecycle import ItemLifecycleStore
-from .jsonrpc import JsonRpcRemoteError
+from .jsonrpc import JsonRpcClosedError, JsonRpcRemoteError
 from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
@@ -41,6 +41,7 @@ from .paths import AllowedPathPolicy
 from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unavailable_metadata
 from .setup_capabilities import normalize_capabilities
 from .state import StateStore
+from .thread_titles import derive_thread_title, normalize_explicit_title
 
 
 class AppServerPort(Protocol):
@@ -563,12 +564,14 @@ class Bridge:
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
         approvals_reviewer: ApprovalsReviewer = "auto_review",
+        title: str | None = None,
     ) -> dict[str, Any]:
         sandbox_mode = validate_sandbox_mode(sandbox_mode)
         approvals_reviewer = validate_approvals_reviewer(approvals_reviewer)
         if reasoning_effort is not None and model is None:
             raise BridgeError("reasoning_effort requires an explicit model")
         canonical_cwd = self._path_policy.validate_cwd(cwd)
+        normalized_title = normalize_explicit_title(title) if title is not None else None
         thread_params: dict[str, Any] = {"cwd": canonical_cwd}
         if sandbox_mode == "danger-full-access":
             thread_params["config"] = {"default_permissions": ":danger-full-access"}
@@ -581,7 +584,11 @@ class Bridge:
         except JsonRpcRemoteError:
             raise BridgeError("Codex App Server rejected the thread/start settings") from None
         thread = response.get("thread")
-        if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+        if (
+            not isinstance(thread, dict)
+            or not isinstance(thread.get("id"), str)
+            or not thread["id"].strip()
+        ):
             raise BridgeError("thread/start did not return a thread id")
         thread_id = thread["id"]
         if response.get("approvalsReviewer") != approvals_reviewer:
@@ -597,9 +604,23 @@ class Bridge:
         self._state.mark_loaded(thread_id, canonical_cwd, thread)
         self._state.update_thread_metadata(thread_id, response)
         log_event("thread.start", thread_id=thread_id)
-        return await self._start_turn(
+        assigned_title = normalized_title or derive_thread_title(prompt, thread_id)
+        title_failed = False
+        try:
+            await self._app_server.request(
+                "thread/name/set", {"threadId": thread_id, "name": assigned_title}
+            )
+        except (JsonRpcRemoteError, JsonRpcClosedError, OSError, TimeoutError):
+            title_failed = True
+        snapshot = await self._start_turn(
             thread_id, prompt, model=model, reasoning_effort=reasoning_effort
         )
+        snapshot["title_assignment"] = (
+            {"status": "failed"} if title_failed else {"status": "assigned", "name": assigned_title}
+        )
+        if title_failed:
+            snapshot["title_warning"] = "Thread name could not be set"
+        return snapshot
 
     async def model_capabilities(self) -> dict[str, Any]:
         pages: list[dict[str, Any]] = []

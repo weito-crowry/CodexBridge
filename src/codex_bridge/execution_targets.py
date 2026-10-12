@@ -70,6 +70,7 @@ class BridgePort(Protocol):
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
         approvals_reviewer: ApprovalsReviewer = "auto_review",
+        title: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def model_capabilities(self) -> dict[str, Any]: ...
@@ -595,6 +596,7 @@ class ExecutionTargetRouter:
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
         approvals_reviewer: ApprovalsReviewer = "auto_review",
+        title: str | None = None,
     ) -> dict[str, Any]:
         try:
             sandbox_mode = validate_sandbox_mode(sandbox_mode)
@@ -649,6 +651,8 @@ class ExecutionTargetRouter:
         if reasoning_effort is not None:
             arguments["reasoning_effort"] = reasoning_effort
         arguments["approvals_reviewer"] = approvals_reviewer
+        if title is not None:
+            arguments["title"] = title
         if sandbox_mode == "danger-full-access":
             arguments["sandbox_mode"] = sandbox_mode
         bridge = self._bridge() if target.kind == "local" else None
@@ -656,14 +660,16 @@ class ExecutionTargetRouter:
         async def local_start() -> dict[str, Any] | None:
             if bridge is None:
                 return None
-            return await bridge.start(
-                cwd,
-                prompt,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                **({"sandbox_mode": sandbox_mode} if sandbox_mode is not None else {}),
-                approvals_reviewer=approvals_reviewer,
-            )
+            local_arguments: dict[str, Any] = {
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "approvals_reviewer": approvals_reviewer,
+            }
+            if sandbox_mode is not None:
+                local_arguments["sandbox_mode"] = sandbox_mode
+            if title is not None:
+                local_arguments["title"] = title
+            return await bridge.start(cwd, prompt, **local_arguments)
 
         result = await self._call(
             target,

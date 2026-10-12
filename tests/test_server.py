@@ -38,6 +38,7 @@ class FakeBridge:
         reasoning_effort: str | None = None,
         sandbox_mode: str | None = None,
         approvals_reviewer: str = "auto_review",
+        title: str | None = None,
     ) -> dict[str, Any]:
         self.start_count += 1
         self.start_options = {
@@ -45,6 +46,7 @@ class FakeBridge:
             "reasoning_effort": reasoning_effort,
             "sandbox_mode": sandbox_mode,
             "approvals_reviewer": approvals_reviewer,
+            "title": title,
         }
         if self.error is not None:
             raise self.error
@@ -703,6 +705,11 @@ async def test_execution_target_tool_schemas_are_explicit_and_optional(tmp_path)
     assert "codex_targets" in tools
     assert "target_id" in tools["codex_start"].input_schema["properties"]
     assert "target_id" not in tools["codex_start"].input_schema.get("required", [])
+    assert tools["codex_start"].input_schema["properties"]["title"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "null"},
+    ]
+    assert "title" not in tools["codex_start"].input_schema.get("required", [])
     assert tools["codex_start"].input_schema["properties"]["approvals_reviewer"]["enum"] == [
         "auto_review",
         "user",
@@ -911,6 +918,7 @@ async def test_start_tool_passes_full_access_without_model(tmp_path) -> None:
         "reasoning_effort": None,
         "sandbox_mode": "danger-full-access",
         "approvals_reviewer": "auto_review",
+        "title": None,
     }
     assert result["execution_config"] == {
         "target_id": "local",
@@ -935,6 +943,22 @@ async def test_start_tool_forwards_manual_reviewer_to_local_bridge(tmp_path) -> 
         await start.fn(str(tmp_path), "prompt", approvals_reviewer="user")
 
     assert runtime.bridge.start_options["approvals_reviewer"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_start_tool_forwards_explicit_title_to_local_bridge(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    start = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_start"
+    )
+
+    async with app.router.lifespan_context(app):
+        await start.fn(str(tmp_path), "prompt", title="Review startup")
+
+    assert runtime.bridge.start_options["title"] == "Review startup"
 
 
 @pytest.mark.asyncio
