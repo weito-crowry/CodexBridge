@@ -32,6 +32,25 @@ if TYPE_CHECKING:
     from .main_window import MainWindow
 
 
+def _toggle_activity_pane(window: MainWindow) -> None:
+    splitter = window.splitter
+    activity = window.activity_pane
+    if activity.isHidden():
+        activity.show()
+        saved_sizes = window.history_pane.saved_activity_splitter_sizes()
+        if isinstance(saved_sizes, list) and len(saved_sizes) == splitter.count():
+            splitter.setSizes(saved_sizes)
+        window.history_pane.set_activity_visible(True)
+        return
+
+    sizes = splitter.sizes()
+    if len(sizes) == splitter.count():
+        window.history_pane.remember_activity_splitter_sizes(sizes)
+    activity.hide()
+    splitter.setSizes([sizes[0], sizes[1] + sizes[2], 0])
+    window.history_pane.set_activity_visible(False)
+
+
 def build_main_window_ui(window: MainWindow) -> None:
     window.bridge_status_label = QLabel("Bridge: disconnected")
     window.app_server_status_label = QLabel("App Server: failed")
@@ -204,6 +223,10 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.splitter.setStretchFactor(1, 1)
     window.splitter.setStretchFactor(2, 0)
     window.splitter.setSizes([300, 760, 340])
+    window.history_pane.activity_visibility_requested.connect(lambda: _toggle_activity_pane(window))
+    window.activity_pane.pending_state_changed.connect(
+        window.history_pane.set_pending_request_state
+    )
 
     window.diagnostics_pane = QWidget()
     diagnostics_layout = QVBoxLayout(window.diagnostics_pane)

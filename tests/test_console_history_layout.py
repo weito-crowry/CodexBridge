@@ -14,14 +14,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from codex_bridge.console.widgets import HistoryPane, TimelineEntry
-from tests.test_console_widgets import _process_layout
+from codex_bridge.console.widgets import TimelineEntry
+from tests.test_console_widgets import _details_history_pane, _process_layout
 
 
 def test_history_pane_hides_and_detaches_old_cards_before_deferred_delete() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(760, 520)
     pane.show()
     pane.set_timeline(
@@ -88,7 +88,7 @@ def test_history_pane_hides_and_detaches_old_cards_before_deferred_delete() -> N
 def test_user_and_agent_copy_buttons_keep_compact_width_at_all_card_sizes() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = (
         TimelineEntry(
             "turn",
@@ -147,7 +147,7 @@ def test_user_and_agent_copy_buttons_keep_compact_width_at_all_card_sizes() -> N
 def test_history_body_height_for_width_does_not_change_render_document_width() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 520)
     pane.show()
     pane.set_timeline(
@@ -178,7 +178,7 @@ def test_history_body_height_for_width_does_not_change_render_document_width() -
 def test_completed_command_cards_keep_compact_order_and_text_height_when_resized() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     command_one = "\n".join(
         (
             "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command `",
@@ -328,7 +328,7 @@ def test_completed_command_cards_keep_compact_order_and_text_height_when_resized
 def test_history_pane_keeps_card_geometry_stable_during_rapid_refresh_and_resize() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(940, 640)
     pane.show()
     _process_layout(application)

@@ -39,6 +39,12 @@ from tests.console_main_window_test_support import (
 )
 
 
+def _details_history_pane() -> HistoryPane:
+    pane = HistoryPane()
+    pane.set_mode("Details")
+    return pane
+
+
 def _usage_snapshot() -> CodexUsageSnapshot:
     return CodexUsageSnapshot(
         parse_codex_usage(
@@ -129,7 +135,7 @@ def test_format_thread_content_preserves_order_roles_and_plain_bodies() -> None:
 def test_history_pane_adds_copy_action_only_to_user_and_agent_messages(monkeypatch) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(640, 420)
     pane.show()
     pane.set_timeline(
@@ -349,7 +355,7 @@ def test_activity_pane_caps_rows_and_deduplicates_current_rows() -> None:
 def test_history_pane_shows_turn_status_in_separator() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = (
         TimelineEntry("turn-1", "item-1", "User", "User", "old", None, ()),
         TimelineEntry("turn-2", "item-2", "Agent", "Agent", "new", None, ()),
@@ -423,7 +429,7 @@ def test_history_card_shows_spinner_only_for_running_items(
 ) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.set_timeline(
         (
             TimelineEntry(
@@ -467,7 +473,7 @@ def test_history_card_shows_spinner_only_for_running_items(
 def test_running_agent_spinner_coexists_with_copy_button() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.set_timeline(
         (TimelineEntry("turn", "item", "Agent", "Agent", "answer", "in_progress", (), 1_000),)
     )
@@ -494,7 +500,7 @@ def test_history_running_spinner_is_created_with_card_parent(monkeypatch) -> Non
             super().__init__(parent)
 
     monkeypatch.setattr(widgets_module, "_HistoryRunningSpinner", ParentRecordingSpinner)
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.set_timeline(
         (TimelineEntry("turn", "item", "Agent", "Agent", "answer", "in_progress", (), 1_000),)
     )
@@ -511,7 +517,7 @@ def test_history_running_spinner_is_created_with_card_parent(monkeypatch) -> Non
 def test_history_pane_shows_usage_snapshot_on_a_separate_wrapping_line() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     snapshot = _usage_snapshot()
     assert "turn_usage_snapshots" in signature(pane.set_timeline).parameters
     pane.resize(420, 300)
@@ -534,7 +540,7 @@ def test_history_pane_shows_usage_snapshot_on_a_separate_wrapping_line() -> None
 def test_history_pane_omits_usage_snapshot_when_turn_has_none() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
 
     pane.set_timeline((TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),))
 
@@ -544,7 +550,7 @@ def test_history_pane_omits_usage_snapshot_when_turn_has_none() -> None:
 def test_history_pane_preserves_manual_scroll_position_when_snapshot_is_added() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = tuple(
         TimelineEntry(f"turn-{index}", f"item-{index}", "Agent", "Agent", "answer", None, ())
         for index in range(30)
@@ -570,7 +576,7 @@ def test_history_pane_preserves_manual_scroll_position_when_snapshot_is_added() 
 def test_history_pane_keeps_cards_and_scroll_for_identical_refreshes() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = _history_entries(0, 24)
     pane.resize(640, 320)
     pane.show()
@@ -622,7 +628,7 @@ def test_history_pane_keeps_cards_and_scroll_for_identical_refreshes() -> None:
 def test_history_pane_rerenders_when_visible_entry_fields_change(field: str, value: object) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entry = TimelineEntry("turn", "agent", "Agent", "Agent", "original answer", None, ())
     pane.resize(640, 420)
     pane.show()
@@ -664,7 +670,7 @@ def test_history_pane_rerenders_when_visible_entry_fields_change(field: str, val
 def test_history_pane_rerenders_when_turn_display_strings_change_in_place() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = (TimelineEntry("turn", "agent", "Agent", "Agent", "answer", None, ()),)
     statuses = {"turn": "in_progress"}
     metadata: dict[str, dict[str, object]] = {
@@ -746,7 +752,7 @@ def test_history_pane_rerenders_when_turn_display_strings_change_in_place() -> N
 def test_history_pane_can_render_the_same_timeline_after_empty_state() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = _history_entries(0, 1)
     pane.resize(640, 420)
     pane.show()
@@ -771,7 +777,7 @@ def test_history_pane_can_render_the_same_timeline_after_empty_state() -> None:
 def test_history_pane_shows_each_message_in_full_without_inner_scroll() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     message = "first line\nsecond line with <literal> text"
 
     pane.set_timeline((TimelineEntry("turn", "item", "Agent", "Agent", message, None, ()),))
@@ -790,7 +796,7 @@ def test_history_pane_shows_each_message_in_full_without_inner_scroll() -> None:
 def test_history_pane_disables_horizontal_scrolling() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
 
     assert pane._scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
@@ -798,7 +804,7 @@ def test_history_pane_disables_horizontal_scrolling() -> None:
 def test_history_pane_reflows_long_content_to_viewport_and_preserves_copy(monkeypatch) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     body_text = "https://" + "u" * 6_000
     command = "powershell -NoProfile -Command " + "x" * 3_000
     path = "C:\\" + ("nested\\" * 400) + "result.txt"
@@ -857,7 +863,7 @@ def test_history_pane_reflows_long_content_to_viewport_and_preserves_copy(monkey
 def test_history_pane_adds_model_metadata_to_each_turn_header_only() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     entries = (
         TimelineEntry("turn", "agent", "Agent", "Agent", "answer", None, ()),
         TimelineEntry("turn", "user", "User", "User", "question", None, ()),
@@ -885,7 +891,7 @@ def test_history_pane_adds_model_metadata_to_each_turn_header_only() -> None:
 def test_history_pane_formats_missing_effort_and_missing_status() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
 
     pane.set_timeline(
         (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
@@ -903,7 +909,7 @@ def test_history_pane_formats_missing_effort_and_missing_status() -> None:
 def test_history_pane_formats_multiple_candidates_in_source_order() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
 
     pane.set_timeline(
         (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
@@ -926,7 +932,7 @@ def test_history_pane_formats_multiple_candidates_in_source_order() -> None:
 def test_history_pane_formats_unavailable_model() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
 
     pane.set_timeline(
         (TimelineEntry("turn", "item", "Agent", "Agent", "answer", None, ()),),
@@ -946,7 +952,7 @@ def test_history_pane_formats_unavailable_model() -> None:
 def test_history_pane_shrinks_scroll_content_after_long_timeline_is_replaced() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(900, 600)
     long_body = "line " * 2000
     long_entries = tuple(
@@ -1069,7 +1075,7 @@ def _history_payload(thread_id: str, count: int) -> dict[str, object]:
 def test_history_pane_starts_at_bottom_after_initial_long_timeline() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
 
@@ -1084,7 +1090,7 @@ def test_history_pane_starts_at_bottom_after_initial_long_timeline() -> None:
 def test_history_pane_follows_new_content_when_already_at_bottom() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 18))
@@ -1100,7 +1106,7 @@ def test_history_pane_follows_new_content_when_already_at_bottom() -> None:
 def test_history_pane_does_not_jump_to_bottom_after_user_scrolls_up() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 24))
@@ -1120,7 +1126,7 @@ def test_history_pane_does_not_jump_to_bottom_after_user_scrolls_up() -> None:
 def test_history_pane_keeps_the_same_visible_card_after_normal_update() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 24))
@@ -1143,7 +1149,7 @@ def test_history_pane_keeps_the_same_visible_card_after_normal_update() -> None:
 def test_history_pane_resumes_following_after_user_returns_to_bottom() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 24))
@@ -1163,7 +1169,7 @@ def test_history_pane_resumes_following_after_user_returns_to_bottom() -> None:
 def test_history_pane_preserves_scroll_position_while_scrollbar_is_dragged() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 24))
@@ -1189,7 +1195,7 @@ def test_history_pane_preserves_scroll_position_while_scrollbar_is_dragged() -> 
 def test_history_pane_shows_load_older_only_at_top() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 24), has_older=True)
@@ -1212,7 +1218,7 @@ def test_history_pane_shows_load_older_only_at_top() -> None:
 def test_history_pane_keeps_viewport_anchor_when_prepending_older_entries() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     current = _history_entries(0, 18)
@@ -1242,7 +1248,7 @@ def test_history_pane_keeps_viewport_anchor_when_prepending_older_entries() -> N
 def test_history_pane_does_not_jump_to_bottom_when_short_timeline_is_prepended() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     current = _history_entries(0, 1)
@@ -1263,7 +1269,7 @@ def test_history_pane_does_not_jump_to_bottom_when_short_timeline_is_prepended()
 def test_history_pane_hides_load_older_when_no_older_page_exists() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(720, 420)
     pane.show()
     pane.set_timeline(_history_entries(0, 24), has_older=True)

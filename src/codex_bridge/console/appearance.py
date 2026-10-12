@@ -188,6 +188,38 @@ def stylesheet_for_theme(theme: AppearanceTheme) -> str:
         QFrame#historyCard {{
             background-color: {surface}; border: 1px solid {border}; border-radius: 4px;
         }}
+        QFrame#conversationUser, QFrame#conversationAgent,
+        QFrame#conversationCommentary, QFrame#conversationPlan {{
+            border: 1px solid {border}; border-radius: 5px;
+        }}
+        QFrame#conversationUser {{
+            background-color: {alternate}; border-left: 3px solid {link};
+        }}
+        QFrame#conversationAgent {{
+            background-color: {surface}; border-left: 3px solid {selection};
+        }}
+        QFrame#conversationCommentary {{
+            background-color: {window}; border-left: 2px solid {border};
+        }}
+        QFrame#conversationPlan {{
+            background-color: {alternate}; border-left: 2px solid {strong_border};
+        }}
+        QFrame#conversationEvent {{
+            background-color: {window}; border: 0; border-bottom: 1px solid {border};
+        }}
+        QTextBrowser#conversationTextBody {{
+            background-color: transparent; color: {text}; border: 0;
+        }}
+        QLabel#conversationMessageKind, QLabel#conversationEventTitle {{
+            color: {text}; font-weight: 600;
+        }}
+        QLabel#conversationMetadata, QLabel#conversationEventMetadata {{ color: {muted}; }}
+        QLabel#activityPendingNotice {{
+            color: {_css(colors.warning)}; font-weight: 600;
+        }}
+        QPushButton#historyModeButton {{ padding: 3px 8px; }}
+        QPushButton#activityVisibilityButton {{ padding: 3px 8px; }}
+        QPushButton#conversationDisclosure {{ color: {link}; padding: 2px 4px; }}
         QLabel#topStatus {{ padding: 3px 8px; border: 1px solid {border}; border-radius: 3px; }}
         QLabel#topStatus[usageShortcut="true"]:hover {{ background-color: {alternate}; }}
         QLabel#topStatus[usageShortcut="true"]:focus {{ border-color: {link}; }}

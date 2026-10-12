@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QTextBrowser, Q
 
 from codex_bridge.console import widgets as widgets_module
 from codex_bridge.console.widgets import HistoryPane, TimelineEntry
-from tests.test_console_widgets import _process_layout, _usage_snapshot
+from tests.test_console_widgets import _details_history_pane, _process_layout, _usage_snapshot
 
 
 def _ordered_widgets(pane: HistoryPane, object_name: str) -> list[QWidget]:
@@ -25,7 +25,7 @@ def _ordered_widgets(pane: HistoryPane, object_name: str) -> list[QWidget]:
 def test_appending_history_rows_preserves_existing_card_and_header_widgets() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(760, 560)
     pane.show()
     initial_entries = (
@@ -61,7 +61,7 @@ def test_appending_history_rows_preserves_existing_card_and_header_widgets() -> 
 def test_changed_card_is_replaced_alone_and_copy_uses_latest_body(monkeypatch) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(760, 560)
     pane.show()
     entries = (
@@ -118,7 +118,7 @@ def test_changed_card_is_replaced_alone_and_copy_uses_latest_body(monkeypatch) -
 def test_turn_header_and_usage_snapshot_changes_preserve_cards_and_update_in_place() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(700, 520)
     pane.show()
     entries = (
@@ -180,7 +180,7 @@ def test_turn_header_and_usage_snapshot_changes_preserve_cards_and_update_in_pla
 def test_load_older_prepends_rows_without_replacing_cards_or_losing_view_anchor() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(640, 340)
     pane.show()
     entries = tuple(
@@ -230,7 +230,7 @@ def test_reorder_duplicate_ids_and_item_deletion_use_full_rebuild_fallback() -> 
         (initial[0], initial[2]),
     )
     for changed in changed_timelines:
-        pane = HistoryPane()
+        pane = _details_history_pane()
         pane.resize(640, 460)
         pane.show()
         pane.set_timeline(initial)
@@ -253,7 +253,7 @@ def test_reorder_duplicate_ids_and_item_deletion_use_full_rebuild_fallback() -> 
 def test_manual_scroll_does_not_follow_new_rows_but_bottom_scroll_does() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(640, 340)
     pane.show()
     entries = tuple(
@@ -292,7 +292,7 @@ def test_manual_scroll_does_not_follow_new_rows_but_bottom_scroll_does() -> None
 def test_identical_prepend_refresh_is_a_true_noop_and_thread_reset_rebuilds() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
-    pane = HistoryPane()
+    pane = _details_history_pane()
     pane.resize(640, 320)
     pane.show()
     entries = tuple(

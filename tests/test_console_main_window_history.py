@@ -202,10 +202,14 @@ def test_history_refresh_state_and_responses_are_isolated_by_thread_selection() 
 
 
 @pytest.mark.parametrize("failed_suffix", ["items", "turns"])
-def test_live_history_failure_preserves_timeline_and_scroll_position(failed_suffix: str) -> None:
+@pytest.mark.parametrize("mode", ["Conversation", "Details"])
+def test_live_history_failure_preserves_timeline_and_scroll_position(
+    failed_suffix: str, mode: str
+) -> None:
     application = _application()
     client = FakeClient()
     window = _usage_window(client)
+    window.history_pane.set_mode(mode)
     window.resize(1_000, 650)
     window.show()
     window.select_thread("thread-a")
@@ -235,8 +239,16 @@ def test_live_history_failure_preserves_timeline_and_scroll_position(failed_suff
     client.failure(failed_key, "Temporary live history failure")
 
     assert window._timeline_entries == old_entries
+    display_rows = {
+        "historyCard",
+        "conversationUser",
+        "conversationAgent",
+        "conversationCommentary",
+        "conversationPlan",
+        "conversationEvent",
+    }
     assert any(
-        widget.objectName() == "historyCard"
+        widget.objectName() in display_rows
         for widget in window.history_pane._content.findChildren(QFrame)
     )
     assert not window.history_pane._empty_label.isVisible()
@@ -845,6 +857,7 @@ def test_main_window_keeps_history_when_turn_model_metadata_is_unavailable() -> 
     _application()
     client = FakeClient()
     window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.history_pane.set_mode("Details")
 
     window.select_thread("thread-a")
     client.result(
