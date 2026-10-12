@@ -18,14 +18,7 @@ POLICY: dict[str, Any] = {
     "tests": {
         "review_threshold_bytes": 50000,
         "strong_review_threshold_bytes": 100000,
-        "baselines": {
-            "tests/test_console_widgets.py": {
-                "raw_bytes": {
-                    "value": 52244,
-                    "reason": "Phase 4-C context-menu tests moved; above 50 KB.",
-                }
-            },
-        },
+        "baselines": {},
     },
 }
 

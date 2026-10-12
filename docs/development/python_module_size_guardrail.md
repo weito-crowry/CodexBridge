@@ -11,7 +11,14 @@
 
 ### 現在の例外 baseline
 
-Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらは履歴値であり、以下の現在の承認値とは区別します。
+| Scope | Current exception baselines |
+| --- | ---: |
+| Production modules | 0 |
+| Test modules | 0 |
+
+`tests/test_console_widgets.py` の 52,244 bytes は分割前に承認された過去の baseline 値であり、現在の例外ではありません。
+
+Issue #45 / PR #46 で承認した Phase 3 前の初期 baseline は、`main_window.py` が 2,588 physical LOC / 109,534 bytes、`test_bridge.py` が 76,784 bytes、`test_console_main_window.py` が 135,064 bytes、`test_console_widgets.py` が 60,460 bytes でした。これらは履歴値であり、現在の例外 baseline と区別します。
 
 Phase 3 では、本番 2 モジュールの抽出、Fake の移動、テストの移設を行いました（いずれも純粋移動）。
 
@@ -34,10 +41,6 @@ Phase 4E-4 では、Console timer bootstrap を `timer_bootstrap.py` へ抽出�
 今回、`tests/test_console_main_window.py` を UI/diagnostics・Codex update・thread interaction のテストとして残し、usage、history/SSE/approval、runtime/tunnel lifecycle の各テストを別モジュールへ移しました。共有テスト doubles と helper は `tests/console_main_window_test_support.py` に置いています。4つの test module を合わせた collection は、parameterized case を含めて 131 件です。この分割で旧ファイルの baseline を削除しました。
 
 STEP 2 では、`tests/test_bridge.py` の 91 件を start/resume・permissions、history、notifications、requests の 4 モジュールに分割し、全モジュールを 50,000 bytes 未満にしました。`tests/test_bridge.py` の current baseline は削除しました。
-
-| Path | Metric | Exact baseline | 理由 |
-| --- | --- | ---: | --- |
-| `tests/test_console_widgets.py` | raw bytes | 52,244 | Phase 4-C で context menu テストを移設。50 KB 超。 |
 
 新しく上限超過した production module、未登録の 50,000 bytes 以上の test module、または baseline より増えたファイルは失敗します。別の例外を追加する場合は、checker 内の `POLICY` とこの文書に指定した JSON policy の両方を、レビュー対象の値・理由で一致させます。
 
