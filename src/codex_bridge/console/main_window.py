@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 if TYPE_CHECKING:
     from PySide6.QtCore import QTimer
 
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QSystemTrayIcon,
+    QToolButton,
     QWidget,
 )
 from PySide6.QtWidgets import (
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from ..models import ApprovalDecision
 from .api_client import ApiClient
+from .appearance import AppearanceController, install_appearance
 from .bridge_managed_retry import BridgeManagedRetryCoordinator
 from .bridge_readiness import BridgeReadinessCoordinator
 from .bridge_runtime_observer import BridgeRuntimeObserver
@@ -163,6 +166,10 @@ class MainWindow(QMainWindow):
     status_refresh_button: QPushButton
     status_close_button: QPushButton
     status_dialog: QDialog
+    appearance_button: QToolButton
+    _appearance_actions: dict[str, QAction]
+    _appearance_controller: AppearanceController
+    _appearance_settings: QSettings
     advanced_controls: QWidget
     thread_pane: ThreadListPane
     history_pane: HistoryPane
@@ -189,6 +196,8 @@ class MainWindow(QMainWindow):
         quit_application: Callable[[], None] | None = None,
         codex_uri_opener: Callable[[str], bool] | None = None,
         usage_history_path: Path | None = None,
+        appearance_settings: QSettings | None = None,
+        appearance_system_scheme_getter: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -259,6 +268,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("CodexBridge Console")
         self._build_ui()
+        install_appearance(self, appearance_settings, appearance_system_scheme_getter)
         self._set_initial_size()
         self._build_timers()
         self._thread_interactions = ThreadInteractionController(self)
@@ -532,6 +542,8 @@ class MainWindow(QMainWindow):
         if self._usage_history_window is None:
             self._usage_history_window = UsageHistoryWindow(
                 self._usage_history_path,
+                appearance=self._appearance_controller.theme,
+                settings=self._appearance_settings,
                 parent=self,
             )
         else:

@@ -4,7 +4,6 @@ import csv
 import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import datetime
-from functools import partial
 from math import inf
 from pathlib import Path
 from time import time
@@ -22,6 +21,7 @@ from PySide6.QtCore import QByteArray, QDateTime, QMargins, QSettings, Qt, QTime
 from PySide6.QtGui import (
     QBrush,
     QCloseEvent,
+    QColor,
     QCursor,
     QFont,
     QHideEvent,
@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .appearance import AppearanceTheme, stylesheet_for_theme, system_appearance_theme
 from .usage_history import (
     UsageHistoryEvent,
     UsageHistorySample,
@@ -137,6 +138,7 @@ class UsageHistoryWindow(QMainWindow):
         *,
         now: Callable[[], float] | None = None,
         settings: QSettings | None = None,
+        appearance: AppearanceTheme | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -144,7 +146,10 @@ class UsageHistoryWindow(QMainWindow):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self._database_path = database_path
         self._now = time if now is None else now
-        self._settings = settings or QSettings("CodexBridge", "Console")
+        self._settings = settings if settings is not None else QSettings("CodexBridge", "Console")
+        self._appearance = appearance or system_appearance_theme()
+        self.setPalette(self._appearance.make_palette())
+        self.setStyleSheet(stylesheet_for_theme(self._appearance))
         self._selected_preset = "1 month"
         self._display_samples: list[UsageHistorySample] = []
         self._events: list[UsageHistoryEvent] = []
@@ -158,6 +163,7 @@ class UsageHistoryWindow(QMainWindow):
         self._restore_geometry()
         self._apply_preset("1 month", refresh=False)
         self.refresh()
+        self.apply_appearance(self._appearance)
 
     @property
     def selected_preset(self) -> str:
@@ -191,29 +197,13 @@ class UsageHistoryWindow(QMainWindow):
         self.preset_group.setExclusive(True)
         self.preset_buttons: dict[str, QToolButton] = {}
         preset_labels = tuple(label for label, _days in _PRESETS) + ("Custom",)
-        for index, label in enumerate(preset_labels):
+        for label in preset_labels:
             button = QToolButton(self)
             button.setText(label)
             button.setCheckable(True)
             button.setObjectName(self.preset_object_names[label])
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
             button.setMinimumHeight(30)
-            button.setStyleSheet(
-                "QToolButton { border: 1px solid palette(mid); padding: 4px 12px; }"
-                "QToolButton:checked { background: palette(highlight); "
-                "color: palette(highlighted-text); }"
-                "QToolButton:hover { border-color: palette(highlight); }"
-            )
-            if index == 0:
-                button.setStyleSheet(
-                    button.styleSheet() + "QToolButton { border-radius: 5px 0 0 5px; }"
-                )
-            elif label == "Custom":
-                button.setStyleSheet(
-                    button.styleSheet() + "QToolButton { border-radius: 0 5px 5px 0; }"
-                )
-            else:
-                button.setStyleSheet(button.styleSheet() + "QToolButton { border-left: 0; }")
             self.preset_group.addButton(button)
             self.preset_buttons[label] = button
             button.clicked.connect(
@@ -265,14 +255,6 @@ class UsageHistoryWindow(QMainWindow):
         for key in ("5h remaining", "Weekly remaining", "Reset candidates"):
             card = QFrame(self)
             card.setObjectName("usageHistoryMetricCard")
-            card.setStyleSheet(
-                "QFrame#usageHistoryMetricCard { background: #292a2d; "
-                "border: 1px solid #42464a; border-radius: 6px; }"
-                "QFrame#usageHistoryMetricCard QLabel { background: transparent; "
-                "border: none; }"
-                "QLabel#usageHistoryMetricCaption { color: #aeb4bd; }"
-                "QLabel#usageHistoryMetricValue { color: #f1f3f4; }"
-            )
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(12, 8, 12, 8)
             card_layout.setSpacing(3)
@@ -343,10 +325,6 @@ class UsageHistoryWindow(QMainWindow):
         self.reset_history_list.setObjectName("usageHistoryResetList")
         self.reset_history_list.setMinimumHeight(70)
         self.reset_history_list.setMaximumHeight(132)
-        self.reset_history_list.setStyleSheet(
-            "QListWidget { background: palette(base); border: 1px solid palette(mid); "
-            "border-radius: 4px; padding: 3px; color: palette(text); }"
-        )
         layout.addWidget(self.reset_history_list)
 
         self.setCentralWidget(root)
@@ -404,16 +382,15 @@ class UsageHistoryWindow(QMainWindow):
         return chart, time_axis, percent_axis
 
     def _style_series(self) -> None:
-        palette = self.palette()
-        for series, role in (
-            (self.five_hour_series, QPalette.ColorRole.Link),
-            (self.weekly_series, QPalette.ColorRole.Highlight),
+        for series, color in (
+            (self.five_hour_series, self._appearance.tokens.series_primary),
+            (self.weekly_series, self._appearance.tokens.series_secondary),
         ):
-            pen = QPen(palette.color(role))
+            pen = QPen(color)
             pen.setWidthF(2.4)
             series.setPen(pen)
-        marker_color = palette.color(QPalette.ColorRole.Link)
-        border = QPen(palette.color(QPalette.ColorRole.Window))
+        marker_color = self._appearance.tokens.reset_marker
+        border = QPen(self._appearance.tokens.window)
         border.setWidthF(1.5)
         self.reset_series.setBrush(marker_color)
         self.reset_series.setPen(border)
@@ -425,13 +402,8 @@ class UsageHistoryWindow(QMainWindow):
         for series in (self.five_hour_series, self.weekly_series):
             for marker in self.chart.legend().markers(series):
                 marker.clicked.connect(
-                    partial(
-                        self.toggle_series_visibility,
-                        series,
-                        marker,
-                        QPen(marker.pen()),
-                        QBrush(marker.brush()),
-                        QBrush(marker.labelBrush()),
+                    lambda *_args, selected_series=series, selected_marker=marker: (
+                        self.toggle_series_visibility(selected_series, selected_marker)
                     )
                 )
 
@@ -439,18 +411,21 @@ class UsageHistoryWindow(QMainWindow):
         self,
         series: QLineSeries,
         marker: QLegendMarker,
-        original_pen: QPen,
-        original_brush: QBrush,
-        original_label_brush: QBrush,
         *_args: object,
     ) -> None:
-        visible = not series.isVisible()
-        series.setVisible(visible)
+        series.setVisible(not series.isVisible())
         marker.setVisible(True)
-        pen = QPen(original_pen)
-        brush = QBrush(original_brush)
-        label_brush = QBrush(original_label_brush)
-        if not visible:
+        self._apply_legend_marker_style(series, marker)
+
+    def _apply_legend_marker_style(
+        self,
+        series: QLineSeries,
+        marker: QLegendMarker,
+    ) -> None:
+        pen = QPen(series.pen())
+        brush = QBrush(pen.color())
+        label_brush = QBrush(self._appearance.tokens.text)
+        if not series.isVisible():
             pen_color = pen.color()
             pen_color.setAlphaF(0.45)
             brush_color = brush.color()
@@ -463,6 +438,28 @@ class UsageHistoryWindow(QMainWindow):
         marker.setPen(pen)
         marker.setBrush(brush)
         marker.setLabelBrush(label_brush)
+
+    def apply_appearance(self, appearance: AppearanceTheme) -> None:
+        self._appearance = appearance
+        self.setPalette(appearance.make_palette())
+        self.setStyleSheet(stylesheet_for_theme(appearance))
+        colors = appearance.tokens
+        self.chart.setBackgroundBrush(QBrush(colors.chart_background))
+        self.chart.setPlotAreaBackgroundBrush(QBrush(colors.chart_plot))
+        self.chart.legend().setLabelColor(colors.text)
+        for axis in (self.time_axis, self.percent_axis):
+            axis.setLabelsColor(colors.text)
+            axis.setLinePen(QPen(colors.border))
+            grid_color = QColor(colors.chart_grid)
+            grid_color.setAlphaF(0.28)
+            grid_pen = QPen(grid_color)
+            grid_pen.setStyle(Qt.PenStyle.DotLine)
+            axis.setGridLinePen(grid_pen)
+        self._style_series()
+        for series in (self.five_hour_series, self.weekly_series):
+            for marker in self.chart.legend().markers(series):
+                marker.setVisible(True)
+                self._apply_legend_marker_style(series, marker)
 
     def _on_sample_hover(self, point: object, entered: bool) -> None:
         if not entered or not self._display_samples:

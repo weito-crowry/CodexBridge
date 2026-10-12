@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PySide6.QtCore import QSettings
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -34,3 +35,21 @@ def isolated_usage_history_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
             isolated_default_path_resolver,
         )
     return database_path
+
+
+@pytest.fixture(autouse=True)
+def isolated_qsettings_store(tmp_path: Path):
+    previous_format = QSettings.defaultFormat()
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(
+        QSettings.Format.IniFormat,
+        QSettings.Scope.UserScope,
+        str(tmp_path / "qsettings"),
+    )
+    QSettings.setPath(
+        QSettings.Format.IniFormat,
+        QSettings.Scope.SystemScope,
+        str(tmp_path / "qsettings-system"),
+    )
+    yield
+    QSettings.setDefaultFormat(previous_format)

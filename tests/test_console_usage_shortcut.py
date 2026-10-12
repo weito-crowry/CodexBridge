@@ -120,7 +120,7 @@ def test_usage_status_shortcut_survives_usage_updates_and_failures(tmp_path: Pat
     assert window.usage_status_label.text() == known_text
     assert "5h: 15% left" in known_tooltip
     assert known_weight == QFont.Weight.DemiBold
-    assert known_color == window.usage_status_label.palette().color(QPalette.ColorRole.Link)
+    assert known_color == window._appearance_controller.theme.tokens.warning
 
     window._apply_usage_failure("Bridge unavailable")
     assert window.usage_status_label.text() == f"{known_text} · refresh failed"

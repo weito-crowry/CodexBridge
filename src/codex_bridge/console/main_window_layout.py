@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +51,10 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.codex_update_banner_label = QLabel("")
     window.codex_update_banner_label.setVisible(False)
     window.status_button = QPushButton("Status")
+    window.appearance_button = QToolButton()
+    window.appearance_button.setText("Appearance")
+    window.appearance_button.setObjectName("appearanceButton")
+    window.appearance_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
     window.diagnostics_toggle_button = QPushButton("Diagnostics")
     window.diagnostics_clear_button = QPushButton("Clear")
     window.retry_now_button = QPushButton("Retry now")
@@ -92,11 +97,6 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.usage_history_button.setObjectName("showUsageHistory")
     window.usage_history_button.setFlat(True)
     window.usage_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
-    window.usage_history_button.setStyleSheet(
-        "QPushButton { color: palette(link); text-decoration: underline; "
-        "border: 0; padding: 2px 0; text-align: left; }"
-        "QPushButton:hover { color: palette(highlight); }"
-    )
     window.codex_latest_label = QLabel("Not checked")
     window.codex_update_status_label = QLabel("Not checked")
     window.codex_update_message_label = QLabel("")
@@ -191,6 +191,7 @@ def build_main_window_ui(window: MainWindow) -> None:
     status_bar.addWidget(window.codex_update_banner_label)
     status_bar.addWidget(window.usage_status_label)
     status_bar.addWidget(window.status_button)
+    status_bar.addWidget(window.appearance_button)
 
     window.thread_pane = ThreadListPane()
     window.history_pane = HistoryPane()
@@ -240,26 +241,3 @@ def build_main_window_ui(window: MainWindow) -> None:
     application = QApplication.instance()
     if isinstance(application, QApplication):
         application.setStyle("Fusion")
-    window.setStyleSheet(
-        """
-        QMainWindow, QWidget { background: #202124; color: #e8eaed; }
-        QLabel { color: #d8dbe0; }
-        QLabel#topStatus { padding: 3px 8px; border: 1px solid #3c4043; border-radius: 3px; }
-        QLabel#topStatus[usageShortcut="true"]:hover { background: #2b2d30; }
-        QLabel#topStatus[usageShortcut="true"]:focus { border-color: #8ab4f8; }
-        QLabel#bottomStatus { color: #aeb4bd; padding: 4px 6px; border-top: 1px solid #3c4043; }
-        QLineEdit, QTreeWidget, QTextEdit, QPlainTextEdit {
-            background: #292a2d; color: #f1f3f4; border: 1px solid #4a4d50;
-        }
-        QPushButton {
-            background: #303134; color: #f1f3f4; border: 1px solid #5f6368;
-            padding: 4px 10px;
-        }
-        QPushButton:hover { background: #3c4043; }
-        QFrame#historyCard {
-            background: #292a2d; border: 1px solid #42464a; border-radius: 4px;
-        }
-        QLabel#turnSeparator { color: #7f8791; padding: 4px; }
-        QSplitter::handle { background: #3c4043; }
-        """
-    )

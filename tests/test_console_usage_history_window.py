@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,7 +168,7 @@ def test_close_stops_auto_refresh_timer_and_saves_geometry(tmp_path: Path) -> No
     assert settings.value("console/usageHistory/geometry") == expected_geometry
 
 
-def test_usage_history_summary_cards_use_console_dark_theme_styles(tmp_path: Path) -> None:
+def test_usage_history_summary_cards_use_the_active_appearance_tokens(tmp_path: Path) -> None:
     _application()
     window = UsageHistoryWindow(tmp_path / "usage.sqlite3")
 
@@ -181,31 +180,12 @@ def test_usage_history_summary_cards_use_console_dark_theme_styles(tmp_path: Pat
     assert len(captions) == 3
     assert len(values) == 3
 
-    for card in cards:
-        style = card.styleSheet()
-        assert "palette(alternate-base)" not in style
-        assert "palette(text)" not in style
-        assert "palette(mid)" not in style
-        assert re.search(
-            r"QFrame#usageHistoryMetricCard\s*\{[^}]*background\s*:\s*#292a2d",
-            style,
-            re.IGNORECASE,
-        )
-        assert re.search(
-            r"QFrame#usageHistoryMetricCard\s+QLabel\s*\{[^}]*background\s*:\s*transparent",
-            style,
-            re.IGNORECASE,
-        )
-        assert re.search(
-            r"QLabel#usageHistoryMetricCaption\s*\{[^}]*color\s*:\s*#aeb4bd",
-            style,
-            re.IGNORECASE,
-        )
-        assert re.search(
-            r"QLabel#usageHistoryMetricValue\s*\{[^}]*color\s*:\s*#f1f3f4",
-            style,
-            re.IGNORECASE,
-        )
+    style = window.styleSheet()
+    tokens = window._appearance.tokens
+    assert all(not card.styleSheet() for card in cards)
+    assert f"background-color: {tokens.surface.name()}" in style
+    assert f"QLabel#usageHistoryMetricCaption {{ color: {tokens.muted_text.name()}" in style
+    assert f"QLabel#usageHistoryMetricValue {{ color: {tokens.text.name()}" in style
 
     window.close()
 

@@ -70,12 +70,22 @@ class UsagePresentationController:
             font.setWeight(QFont.Weight.Normal)
         window.usage_status_label.setFont(font)
         palette = window.usage_status_label.palette()
-        role = {
-            "normal": QPalette.ColorRole.Text,
-            "warning": QPalette.ColorRole.Link,
-            "error": QPalette.ColorRole.BrightText,
-        }[level]
-        palette.setColor(QPalette.ColorRole.WindowText, palette.color(role))
+        appearance_controller = getattr(window, "_appearance_controller", None)
+        theme = getattr(appearance_controller, "theme", None)
+        if theme is None:
+            role = {
+                "normal": QPalette.ColorRole.Text,
+                "warning": QPalette.ColorRole.Link,
+                "error": QPalette.ColorRole.BrightText,
+            }[level]
+            status_color = palette.color(role)
+        else:
+            status_color = {
+                "normal": theme.tokens.text,
+                "warning": theme.tokens.warning,
+                "error": theme.tokens.error,
+            }[level]
+        palette.setColor(QPalette.ColorRole.WindowText, status_color)
         window.usage_status_label.setPalette(palette)
 
     def record_usage_history(
