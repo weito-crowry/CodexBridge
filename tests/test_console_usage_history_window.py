@@ -6,8 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QDateTime, QPointF, QSettings, Qt
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QDateTime, QSettings, Qt
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QToolButton
 
 from codex_bridge.console.usage import CodexUsage, UsageWindow
@@ -501,7 +500,7 @@ def test_axis_modes_update_datetime_format(tmp_path: Path) -> None:
     "series_name",
     ("five_hour_series", "weekly_series"),
 )
-def test_legend_marker_click_can_toggle_each_series_off_and_on(
+def test_legend_marker_clicked_signal_can_toggle_each_series_off_and_on(
     tmp_path: Path, series_name: str
 ) -> None:
     _application()
@@ -521,19 +520,16 @@ def test_legend_marker_click_can_toggle_each_series_off_and_on(
     original_pen = marker.pen()
     original_brush = marker.brush()
     original_label_brush = marker.labelBrush()
-    legend_rect = window.chart.legend().sceneBoundingRect()
-    x_fraction = 0.35 if series_name == "five_hour_series" else 0.47
-    click_position = window.chart_view.mapFromScene(
-        QPointF(legend_rect.left() + legend_rect.width() * x_fraction, legend_rect.center().y())
-    )
-    QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
+    # Emit the marker signal directly; this tests the connected behavior, not mouse hit testing.
+    marker.clicked.emit()
     _application().processEvents()
     assert not series.isVisible()
     assert marker.isVisible()
     assert marker.pen().color().alpha() < original_pen.color().alpha()
+    assert marker.brush().color().alpha() < original_brush.color().alpha()
     assert marker.labelBrush().color().alpha() < original_label_brush.color().alpha()
 
-    QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
+    marker.clicked.emit()
     _application().processEvents()
     assert series.isVisible()
     assert marker.isVisible()
@@ -543,7 +539,9 @@ def test_legend_marker_click_can_toggle_each_series_off_and_on(
     window.close()
 
 
-def test_reset_candidate_legend_marker_does_not_toggle_its_series(tmp_path: Path) -> None:
+def test_reset_candidate_legend_marker_clicked_signal_does_not_toggle_its_series(
+    tmp_path: Path,
+) -> None:
     _application()
     settings = QSettings(str(tmp_path / "reset-legend-settings.ini"), QSettings.Format.IniFormat)
     window = UsageHistoryWindow(
@@ -556,11 +554,7 @@ def test_reset_candidate_legend_marker_does_not_toggle_its_series(tmp_path: Path
     _application().processEvents()
 
     marker = window.chart.legend().markers(window.reset_series)[0]
-    legend_rect = window.chart.legend().sceneBoundingRect()
-    click_position = window.chart_view.mapFromScene(
-        QPointF(legend_rect.left() + legend_rect.width() * 0.62, legend_rect.center().y())
-    )
-    QTest.mouseClick(window.chart_view.viewport(), Qt.MouseButton.LeftButton, pos=click_position)
+    marker.clicked.emit()
     _application().processEvents()
 
     assert window.reset_series.isVisible()

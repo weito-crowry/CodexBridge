@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QWidget
 
 from codex_bridge.console import usage_history_window as usage_history_window_module
 from codex_bridge.console.main_window import MainWindow
-from tests.test_console_main_window import (
+from tests.console_main_window_test_support import (
     FakeClient,
     FakeCodexProbe,
     FakeCodexUpdateProbe,
