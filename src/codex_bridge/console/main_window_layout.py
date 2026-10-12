@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .composer_widget import ComposerWidget
 from .usage import (
     format_codex_usage,
     format_codex_usage_detail,
@@ -214,10 +215,19 @@ def build_main_window_ui(window: MainWindow) -> None:
 
     window.thread_pane = ThreadListPane()
     window.history_pane = HistoryPane()
+    composer_widget = ComposerWidget(window._config.allowed_roots)
+    window.composer_widget = composer_widget
+    conversation_pane = QWidget()
+    conversation_pane.setObjectName("conversationPane")
+    conversation_layout = QVBoxLayout(conversation_pane)
+    conversation_layout.setContentsMargins(0, 0, 0, 0)
+    conversation_layout.setSpacing(0)
+    conversation_layout.addWidget(window.history_pane, 1)
+    conversation_layout.addWidget(composer_widget)
     window.activity_pane = ActivityPane()
     window.splitter = QSplitter(Qt.Orientation.Horizontal)
     window.splitter.addWidget(window.thread_pane)
-    window.splitter.addWidget(window.history_pane)
+    window.splitter.addWidget(conversation_pane)
     window.splitter.addWidget(window.activity_pane)
     window.splitter.setStretchFactor(0, 0)
     window.splitter.setStretchFactor(1, 1)

@@ -32,9 +32,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QWidget,
 )
-from PySide6.QtWidgets import (
-    QMessageBox as QMessageBox,
-)
+from PySide6.QtWidgets import QMessageBox as QMessageBox
 
 from ..models import ApprovalDecision
 from .api_client import ApiClient
@@ -54,6 +52,7 @@ from .codex_resolver import (
 )
 from .codex_update_controller import CodexUpdateController
 from .codex_updates import CodexUpdateProbe
+from .composer_controller import create_composer_controller
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
 from .diagnostics_panel import DiagnosticsPanelController
@@ -173,6 +172,7 @@ class MainWindow(QMainWindow):
     advanced_controls: QWidget
     thread_pane: ThreadListPane
     history_pane: HistoryPane
+    composer_widget: QWidget
     activity_pane: ActivityPane
     splitter: QSplitter
     diagnostics_pane: QWidget
@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
             sync_approval_controls=self._sync_approval_controls,
             start_stream=self._client.start_stream,
         )
+        self._composer_controller = create_composer_controller(self, self._client)
         self._connect_runtime()
         self._tray_controller = TrayController(self)
         self._build_tray()
@@ -703,6 +704,7 @@ class MainWindow(QMainWindow):
     def _set_runtime_state(self, state: str, *, label: str | None = None) -> None:
         self._runtime_state = state
         self.runtime_status_label.setText(label or _RUNTIME_LABELS.get(state, f"Runtime: {state}"))
+        self._composer_controller.sync_bridge_ownership()
         self._sync_approval_controls()
         self._update_start_button()
         self._update_bridge_controls()
@@ -1445,6 +1447,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._composer_controller.set_control_available(False)
         self.health_timer.stop()
         self.thread_timer.stop()
         self.selected_status_timer.stop()

@@ -217,6 +217,20 @@ def stylesheet_for_theme(theme: AppearanceTheme) -> str:
         QLabel#activityPendingNotice {{
             color: {_css(colors.warning)}; font-weight: 600;
         }}
+        QWidget#composerRoot {{
+            background-color: {surface}; border-top: 1px solid {border};
+        }}
+        QPlainTextEdit#composerInput {{ border-radius: 6px; padding: 5px; }}
+        QLabel#composerTarget {{ color: {muted}; }}
+        QLabel#composerStatus {{ color: {muted}; }}
+        QLabel#composerStatus[error="true"] {{ color: {error}; }}
+        QPushButton#composerSend {{
+            background-color: {selection}; color: {selection_text}; border-color: {selection};
+        }}
+        QPushButton#composerSend:disabled {{
+            background-color: {alternate}; color: {disabled}; border-color: {border};
+        }}
+        QPushButton#composerStop {{ color: {error}; border-color: {error}; }}
         QPushButton#historyModeButton {{ padding: 3px 8px; }}
         QPushButton#activityVisibilityButton {{ padding: 3px 8px; }}
         QPushButton#conversationDisclosure {{ color: {link}; padding: 2px 4px; }}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from PySide6.QtCore import QObject, QUrl, QUrlQuery, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -44,6 +44,8 @@ class ApiClient(QObject):
     stream_state_changed = Signal(int, str)
     control_succeeded = Signal(str)
     control_failed = Signal(str, str)
+    composer_json_succeeded = Signal(str, object)
+    composer_json_failed = Signal(str, str)
 
     def __init__(
         self,
@@ -62,6 +64,7 @@ class ApiClient(QObject):
         self._control_response_sizes: dict[str, int] = {}
         self._control_response_bodies: dict[str, bytearray] = {}
         self._control_kinds: dict[str, str] = {}
+        self._composer_replies: dict[str, Any] = {}
         self._stream_reply: Any | None = None
         self._stream_generation: int | None = None
         self._stream_parser: SseParser | None = None
@@ -149,6 +152,72 @@ class ApiClient(QObject):
             self.json_succeeded.emit(key, payload)
         finally:
             reply.deleteLater()
+
+    def get_control_json(self, path: str, token: str, *, key: str) -> bool:
+        if key in self._composer_replies:
+            return False
+        try:
+            request = self._request(self._control_url(path))
+            request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
+            reply = self._manager.get(request)
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.composer_json_failed.emit(key, "request_error")
+            return False
+        self._composer_replies[key] = reply
+        reply.finished.connect(lambda key=key, reply=reply: self._finish_composer_json(key, reply))
+        return True
+
+    def post_control_json(
+        self,
+        path: str,
+        payload: Mapping[str, object],
+        token: str,
+        *,
+        key: str,
+    ) -> bool:
+        if key in self._composer_replies:
+            return False
+        try:
+            request = self._request(self._control_url(path))
+            request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
+            request.setRawHeader(b"Content-Type", b"application/json")
+            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            reply = self._manager.post(request, body)
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.composer_json_failed.emit(key, "request_error")
+            return False
+        self._composer_replies[key] = reply
+        reply.finished.connect(lambda key=key, reply=reply: self._finish_composer_json(key, reply))
+        return True
+
+    def _control_url(self, path: str) -> QUrl:
+        if not path.startswith("/ui-api/control/"):
+            raise ValueError("control API path is required")
+        return self._url(path)
+
+    def _finish_composer_json(self, key: str, reply: Any) -> None:
+        if self._composer_replies.get(key) is not reply:
+            return
+        self._composer_replies.pop(key, None)
+        network_reply = cast(QNetworkReply, reply)
+        try:
+            status = self._status(network_reply)
+            if status and not 200 <= status <= 299:
+                category = f"http_{status}" if status in {400, 403, 409, 502, 503} else "http_error"
+                raise ApiClientError(category)
+            if self._has_network_error(network_reply) or status == 0:
+                raise ApiClientError("network_error")
+            try:
+                body = bytes(cast(Any, network_reply.readAll()))
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, TypeError) as exc:
+                raise ApiClientError("invalid_response") from exc
+        except ApiClientError as exc:
+            self.composer_json_failed.emit(key, str(exc))
+        else:
+            self.composer_json_succeeded.emit(key, payload)
+        finally:
+            network_reply.deleteLater()
 
     def post_control_shutdown(self, token: str, *, key: str) -> bool:
         if key in self._control_replies:
@@ -376,4 +445,9 @@ class ApiClient(QObject):
         self._control_response_sizes.clear()
         self._control_response_bodies.clear()
         self._control_kinds.clear()
+        composer_replies = tuple(self._composer_replies.values())
+        self._composer_replies.clear()
+        for reply in composer_replies:
+            reply.abort()
+            reply.deleteLater()
         self.stop_stream()
