@@ -59,6 +59,13 @@ class TimelineEntry:
     completed_at_ms: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _HistoryRenderRow:
+    key: tuple[str, ...]
+    kind: str
+    value: TimelineEntry | str
+
+
 def _safe_text(value: object, limit: int = 16_384) -> str:
     return value[:limit] if isinstance(value, str) else ""
 
@@ -740,6 +747,8 @@ class HistoryPane(QWidget):
         self._programmatic_scroll = False
         self._user_scrolling = False
         self._render_generation = 0
+        self._timeline_rows: list[_HistoryRenderRow] = []
+        self._timeline_row_widgets: dict[tuple[str, ...], QWidget] = {}
         self._timeline_render_signature: tuple[object, ...] | None = None
         self._scroll_restore_state: tuple[int, int, int, bool, bool, bool] | None = None
         self._scroll_restore_stage = 0
@@ -765,6 +774,100 @@ class HistoryPane(QWidget):
                 widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
+        self._timeline_rows.clear()
+        self._timeline_row_widgets.clear()
+
+    def _timeline_row_widget(self, row: _HistoryRenderRow) -> QWidget:
+        if row.kind == "card":
+            assert isinstance(row.value, TimelineEntry)
+            return self._card(row.value)
+        assert isinstance(row.value, str)
+        label = QLabel(row.value)
+        if row.kind == "header":
+            label.setObjectName("turnSeparator")
+        else:
+            label.setObjectName("turnUsageSnapshot")
+            label.setWordWrap(True)
+            snapshot_policy = label.sizePolicy()
+            snapshot_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            label.setSizePolicy(snapshot_policy)
+        return label
+
+    def _can_reconcile_timeline_rows(self, rows: Sequence[_HistoryRenderRow]) -> bool:
+        old_keys = [row.key for row in self._timeline_rows]
+        new_keys = [row.key for row in rows]
+        if len(set(old_keys)) != len(old_keys) or len(set(new_keys)) != len(new_keys):
+            return False
+        old_key_set = set(old_keys)
+        new_key_set = set(new_keys)
+        if any(row.kind == "card" and row.key not in new_key_set for row in self._timeline_rows):
+            return False
+        if old_keys and new_keys and not old_key_set.intersection(new_key_set):
+            return False
+        return [key for key in old_keys if key in new_key_set] == [
+            key for key in new_keys if key in old_key_set
+        ]
+
+    def _render_timeline_rows(self, rows: Sequence[_HistoryRenderRow]) -> None:
+        self._clear_cards()
+        for row in rows:
+            widget = self._timeline_row_widget(row)
+            self._content_layout.addWidget(widget)
+            self._timeline_row_widgets[row.key] = widget
+        self._timeline_rows = list(rows)
+
+    def _layout_index(self, widget: QWidget) -> int | None:
+        for index in range(self._content_layout.count()):
+            item = self._content_layout.itemAt(index)
+            if item is not None and item.widget() is widget:
+                return index
+        return None
+
+    def _discard_timeline_widget(self, widget: QWidget) -> None:
+        widget.hide()
+        widget.setParent(None)
+        widget.deleteLater()
+
+    def _reconcile_timeline_rows(self, rows: Sequence[_HistoryRenderRow]) -> None:
+        old_rows_by_key = {row.key: row for row in self._timeline_rows}
+        new_rows_by_key = {row.key: row for row in rows}
+
+        for row in reversed(self._timeline_rows):
+            if row.key in new_rows_by_key:
+                continue
+            widget = self._timeline_row_widgets.pop(row.key)
+            index = self._layout_index(widget)
+            if index is not None:
+                item = self._content_layout.takeAt(index)
+                del item
+            self._discard_timeline_widget(widget)
+
+        for row in rows:
+            previous = old_rows_by_key.get(row.key)
+            if previous is None or previous.value == row.value:
+                continue
+            widget = self._timeline_row_widgets[row.key]
+            if row.kind in {"header", "usage"}:
+                assert isinstance(widget, QLabel)
+                assert isinstance(row.value, str)
+                widget.setText(row.value)
+                continue
+            index = self._layout_index(widget)
+            assert index is not None
+            item = self._content_layout.takeAt(index)
+            del item
+            self._discard_timeline_widget(widget)
+            replacement = self._timeline_row_widget(row)
+            self._content_layout.insertWidget(index, replacement)
+            self._timeline_row_widgets[row.key] = replacement
+
+        for index, row in enumerate(rows):
+            if row.key in self._timeline_row_widgets:
+                continue
+            widget = self._timeline_row_widget(row)
+            self._content_layout.insertWidget(index, widget)
+            self._timeline_row_widgets[row.key] = widget
+        self._timeline_rows = list(rows)
 
     def set_timeline(
         self,
@@ -786,13 +889,44 @@ class HistoryPane(QWidget):
             snapshot = turn_usage_snapshots.get(turn_id) if turn_usage_snapshots else None
             if snapshot is not None:
                 usage_labels.append((turn_id, format_codex_usage_snapshot(snapshot)))
+        header_texts = dict(turn_headers)
+        usage_texts = dict(usage_labels)
+        render_rows: list[_HistoryRenderRow] = []
+        seen_turn_ids: set[str] = set()
+        seen_item_ids: set[str] = set()
+        previous_turn: str | None = None
+        unique_row_keys = True
+        for entry in render_entries:
+            if entry.turn_id != previous_turn:
+                if entry.turn_id in seen_turn_ids:
+                    unique_row_keys = False
+                else:
+                    seen_turn_ids.add(entry.turn_id)
+                render_rows.append(
+                    _HistoryRenderRow(
+                        ("header", entry.turn_id), "header", header_texts[entry.turn_id]
+                    )
+                )
+                usage_text = usage_texts.get(entry.turn_id)
+                if usage_text is not None:
+                    render_rows.append(
+                        _HistoryRenderRow(("usage", entry.turn_id), "usage", usage_text)
+                    )
+                previous_turn = entry.turn_id
+            if entry.item_id in seen_item_ids:
+                unique_row_keys = False
+            else:
+                seen_item_ids.add(entry.item_id)
+            render_rows.append(
+                _HistoryRenderRow(("card", entry.turn_id, entry.item_id), "card", entry)
+            )
         render_signature = (
             render_entries,
             has_older,
             tuple(turn_headers),
             tuple(usage_labels),
         )
-        if not prepend and self._timeline_render_signature == render_signature:
+        if self._timeline_render_signature == render_signature:
             return
 
         scrollbar = self._scroll.verticalScrollBar()
@@ -803,29 +937,15 @@ class HistoryPane(QWidget):
         generation = self._render_generation
         self._scroll_update_pending = True
         self._has_older = has_older
-        if not prepend:
-            self._update_load_older_visibility()
-
-        self._clear_cards()
-        previous_turn: str | None = None
-        for entry in render_entries:
-            if previous_turn is None or previous_turn != entry.turn_id:
-                turn_status = turn_statuses.get(entry.turn_id) if turn_statuses else None
-                metadata = turn_model_metadata.get(entry.turn_id) if turn_model_metadata else None
-                separator = QLabel(_turn_header(turn_status, metadata))
-                separator.setObjectName("turnSeparator")
-                self._content_layout.addWidget(separator)
-                snapshot = turn_usage_snapshots.get(entry.turn_id) if turn_usage_snapshots else None
-                if snapshot is not None:
-                    snapshot_label = QLabel(format_codex_usage_snapshot(snapshot))
-                    snapshot_label.setObjectName("turnUsageSnapshot")
-                    snapshot_label.setWordWrap(True)
-                    snapshot_policy = snapshot_label.sizePolicy()
-                    snapshot_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
-                    snapshot_label.setSizePolicy(snapshot_policy)
-                    self._content_layout.addWidget(snapshot_label)
-            self._content_layout.addWidget(self._card(entry))
-            previous_turn = entry.turn_id
+        self._update_load_older_visibility()
+        if (
+            unique_row_keys
+            and self._timeline_render_signature is not None
+            and self._can_reconcile_timeline_rows(render_rows)
+        ):
+            self._reconcile_timeline_rows(render_rows)
+        else:
+            self._render_timeline_rows(render_rows)
         self._empty_label.setVisible(not render_entries)
         self._scroll.setVisible(bool(render_entries))
         if not render_entries:

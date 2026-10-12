@@ -601,9 +601,11 @@ def test_history_pane_keeps_cards_and_scroll_for_identical_refreshes() -> None:
     pane.set_timeline(tuple(entries), has_older=True, prepend=True)
     _process_layout(application)
     prepended_cards = pane._content.findChildren(QFrame, "historyCard")
-    assert pane._render_generation == old_generation + 1
-    assert all(current is not old for current, old in zip(prepended_cards, old_cards, strict=True))
+    assert pane._render_generation == old_generation
+    assert all(current is old for current, old in zip(prepended_cards, old_cards, strict=True))
     assert scrollbar.value() == old_value
+    assert not pane._scroll_restore_timer.isActive()
+    assert pane._scroll_restore_state is None
     pane.close()
 
 
