@@ -111,6 +111,7 @@ class ComposerController(QObject):
         widget.new_thread_requested.connect(self._start_new_thread_from_selection)
         widget.cwd_changed.connect(self._change_cwd)
         widget.model_changed.connect(self._change_model)
+        widget.effort_changed.connect(self._change_effort)
         widget.access_changed.connect(self._change_access)
         window.thread_pane.thread_selected.connect(self.select_thread)
         self._connect_api_signals()
@@ -251,6 +252,19 @@ class ComposerController(QObject):
         )
         self._render()
         self._update_controls()
+
+    def _change_effort(self) -> None:
+        if not self._is_new_draft:
+            return
+        options = self._draft_options.get(self._current_draft_key, DraftOptions())
+        model = self._widget.selected_model
+        effort = self._widget.selected_effort
+        supported = self._models.get(model, ("", (), None))[1] if model is not None else ()
+        if effort not in supported:
+            effort = None
+        self._draft_options[self._current_draft_key] = DraftOptions(
+            model=model, effort=effort, access=options.access
+        )
 
     def _change_access(self) -> None:
         if not self._is_new_draft:
@@ -858,6 +872,15 @@ class ComposerController(QObject):
             and status in _TERMINAL_STATES
             and isinstance(turn_id, str)
         ):
+            current_state = self._current_state
+            if (
+                current_state is not None
+                and current_state[0] not in _TERMINAL_STATES
+                and isinstance(current_state[1], str)
+                and current_state[1] != turn_id
+            ):
+                self._update_controls()
+                return
             waiting = self._stop_waiting_for_status
             if waiting is not None and waiting != (thread_id, turn_id):
                 self._update_controls()
@@ -865,7 +888,8 @@ class ComposerController(QObject):
             self._current_state = (str(status), turn_id, False)
             self._stop_target = None
             self._stop_waiting_for_status = None
-            self._awaiting_turns.pop(thread_id, None)
+            if self._awaiting_turns.get(thread_id) == turn_id:
+                self._awaiting_turns.pop(thread_id, None)
             self._set_status("Turnの終了を確認しました")
         elif (
             activity_type in {"approval_requested", "user_input_requested"}

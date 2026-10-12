@@ -71,6 +71,7 @@ class ComposerWidget(QWidget):
     new_thread_requested = Signal()
     cwd_changed = Signal(str)
     model_changed = Signal()
+    effort_changed = Signal()
     access_changed = Signal()
 
     def __init__(self, allowed_roots: Sequence[str] = (), parent: QWidget | None = None) -> None:
@@ -146,6 +147,7 @@ class ComposerWidget(QWidget):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.effort_combo.setMinimumContentsLength(7)
+        self.effort_combo.currentIndexChanged.connect(self._emit_effort_changed)
 
         self.send_button = QPushButton("Send")
         self.send_button.setObjectName("composerSend")
@@ -322,6 +324,10 @@ class ComposerWidget(QWidget):
     def _emit_model_changed(self, _index: int) -> None:
         if not self._rendering:
             self.model_changed.emit()
+
+    def _emit_effort_changed(self, _index: int) -> None:
+        if not self._rendering:
+            self.effort_changed.emit()
 
     def _emit_access_changed(self, _index: int) -> None:
         if not self._rendering:

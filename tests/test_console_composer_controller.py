@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QApplication
 
@@ -95,20 +96,22 @@ def _application() -> QApplication:
     return application if application is not None else QApplication([])
 
 
-def _controller(tmp_path: Path, *, confirm: bool = True):
-    root = str(tmp_path)
+def _controller(
+    tmp_path: Path, *, confirm: bool = True, allowed_roots: tuple[str, ...] | None = None
+):
+    roots = allowed_roots or (str(tmp_path),)
     client = FakeClient()
-    window = FakeWindow((root,), client)
-    widget = ComposerWidget((root,))
+    window = FakeWindow(roots, client)
+    widget = ComposerWidget(roots)
     controller = ComposerController(
         window,
         widget,
         client,
-        allowed_roots=(root,),
+        allowed_roots=roots,
         full_access_confirmation=lambda: confirm,
     )
     controller.set_control_available(True)
-    return controller, window, widget, client, root
+    return controller, window, widget, client, roots[0]
 
 
 def test_new_thread_draft_is_local_and_first_send_uses_confirmed_options(tmp_path: Path) -> None:
@@ -122,10 +125,10 @@ def test_new_thread_draft_is_local_and_first_send_uses_confirmed_options(tmp_pat
                     "model": "model-a",
                     "display_name": "Model A",
                     "reasoning_efforts": [{"id": "low"}, {"id": "high"}],
-                    "default_reasoning_effort": "high",
+                    "default_reasoning_effort": "low",
                 }
             ],
-            "defaults": {"model": "model-a", "reasoning_effort": "high"},
+            "defaults": {"model": "model-a", "reasoning_effort": "low"},
         },
     )
 
@@ -133,6 +136,8 @@ def test_new_thread_draft_is_local_and_first_send_uses_confirmed_options(tmp_pat
     widget.input.setPlainText("最初のメッセージ")
     assert client.post_calls == []
     widget.model_combo.setCurrentIndex(widget.model_combo.findData("model-a"))
+    widget.effort_combo.setCurrentIndex(widget.effort_combo.findData("high"))
+    assert widget.selected_effort == "high"
     widget.access_combo.setCurrentIndex(widget.access_combo.findData("danger-full-access"))
 
     controller.send()
@@ -148,6 +153,116 @@ def test_new_thread_draft_is_local_and_first_send_uses_confirmed_options(tmp_pat
     assert payload["sandbox_mode"] == "danger-full-access"
     assert payload["confirm_full_access"] is True
     assert window.refreshes == 0
+
+
+@pytest.mark.parametrize(
+    ("selected_effort", "expected_effort"),
+    [("low", "low"), (None, None)],
+)
+def test_selected_effort_is_used_in_new_thread_post_payload(
+    tmp_path: Path, selected_effort: str | None, expected_effort: str | None
+) -> None:
+    _application()
+    controller, _window, widget, client, root = _controller(tmp_path)
+    client.succeed(
+        client.get_calls[-1][2],
+        {
+            "models": [
+                {
+                    "model": "model-a",
+                    "reasoning_efforts": [{"id": "low"}, {"id": "high"}],
+                    "default_reasoning_effort": "high",
+                }
+            ],
+            "defaults": {},
+        },
+    )
+    controller.open_new_thread_draft(root)
+    widget.input.setPlainText("new conversation")
+    widget.model_combo.setCurrentIndex(widget.model_combo.findData("model-a"))
+    widget.effort_combo.setCurrentIndex(widget.effort_combo.findData(selected_effort))
+
+    assert widget.selected_effort == expected_effort
+    assert controller.send()
+
+    payload = client.post_calls[-1][1]
+    if expected_effort is None:
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == expected_effort
+
+
+def test_effort_selection_is_kept_per_new_thread_draft(tmp_path: Path) -> None:
+    _application()
+    root_a = str(tmp_path / "a")
+    root_b = str(tmp_path / "b")
+    Path(root_a).mkdir()
+    Path(root_b).mkdir()
+    controller, _window, widget, client, _root = _controller(
+        tmp_path, allowed_roots=(root_a, root_b)
+    )
+    client.succeed(
+        client.get_calls[-1][2],
+        {
+            "models": [
+                {
+                    "model": "model-a",
+                    "reasoning_efforts": [{"id": "low"}, {"id": "high"}],
+                    "default_reasoning_effort": "low",
+                }
+            ],
+            "defaults": {},
+        },
+    )
+    controller.open_new_thread_draft(root_a)
+    widget.model_combo.setCurrentIndex(widget.model_combo.findData("model-a"))
+    widget.effort_combo.setCurrentIndex(widget.effort_combo.findData("high"))
+    widget.input.setPlainText("draft A")
+
+    widget.cwd_combo.setCurrentIndex(widget.cwd_combo.findData(root_b))
+    widget.model_combo.setCurrentIndex(widget.model_combo.findData("model-a"))
+    widget.effort_combo.setCurrentIndex(widget.effort_combo.findData("low"))
+    widget.input.setPlainText("draft B")
+
+    widget.cwd_combo.setCurrentIndex(widget.cwd_combo.findData(root_a))
+    assert widget.selected_effort == "high"
+    assert widget.prompt_text == "draft A"
+    assert controller.send()
+    assert client.post_calls[-1][1]["reasoning_effort"] == "high"
+
+
+def test_model_change_adjusts_effort_to_supported_option_before_post(tmp_path: Path) -> None:
+    _application()
+    controller, _window, widget, client, root = _controller(tmp_path)
+    client.succeed(
+        client.get_calls[-1][2],
+        {
+            "models": [
+                {
+                    "model": "model-a",
+                    "reasoning_efforts": [{"id": "low"}, {"id": "high"}],
+                    "default_reasoning_effort": "low",
+                },
+                {
+                    "model": "model-b",
+                    "reasoning_efforts": [{"id": "low"}],
+                    "default_reasoning_effort": "low",
+                },
+            ],
+            "defaults": {},
+        },
+    )
+    controller.open_new_thread_draft(root)
+    widget.model_combo.setCurrentIndex(widget.model_combo.findData("model-a"))
+    widget.effort_combo.setCurrentIndex(widget.effort_combo.findData("high"))
+    widget.model_combo.setCurrentIndex(widget.model_combo.findData("model-b"))
+    assert widget.selected_effort == "low"
+    widget.input.setPlainText("after model change")
+
+    assert controller.send()
+    payload = client.post_calls[-1][1]
+    assert payload["model"] == "model-b"
+    assert payload["reasoning_effort"] == "low"
 
 
 def test_created_thread_is_selected_only_after_list_contains_it_and_draft_stays_selected(
@@ -314,6 +429,8 @@ def test_stop_uses_status_confirmed_thread_turn_and_waits_for_status_after_succe
     assert widget.stop_button.isEnabled()
     model_labels = [widget.model_combo.itemText(i) for i in range(widget.model_combo.count())]
     assert "actual-model" not in model_labels
+    assert not widget.model_combo.isEnabled()
+    assert not widget.effort_combo.isEnabled()
     assert not widget.send_button.isEnabled()
     assert controller.stop()
     path, payload, _token, key = client.post_calls[-1]
@@ -393,6 +510,106 @@ def test_stop_target_is_cleared_when_selection_changes_and_pending_requests_go_t
     )
     assert "Activity" in widget.status_label.text()
     assert not widget.stop_button.isEnabled()
+
+
+@pytest.mark.parametrize(
+    ("activity_type", "status"),
+    [
+        ("turn_completed", "completed"),
+        ("turn_failed", "failed"),
+        ("turn_interrupted", "interrupted"),
+    ],
+)
+def test_late_turn_a_completion_does_not_replace_running_turn_b(
+    tmp_path: Path, activity_type: str, status: str
+) -> None:
+    _application()
+    controller, window, widget, client, _root = _controller(tmp_path)
+    window.thread_pane.thread_selected.emit("thread-a")
+    generation = window._selection_generation
+
+    client.activity_received.emit(
+        generation,
+        {"thread_id": "thread-a", "type": "turn_started", "turn_id": "turn-a"},
+    )
+    client.activity_received.emit(
+        generation,
+        {
+            "thread_id": "thread-a",
+            "type": "turn_completed",
+            "turn_id": "turn-a",
+            "status": "completed",
+        },
+    )
+    client.activity_received.emit(
+        generation,
+        {"thread_id": "thread-a", "type": "turn_started", "turn_id": "turn-b"},
+    )
+
+    client.activity_received.emit(
+        generation,
+        {
+            "thread_id": "thread-a",
+            "type": activity_type,
+            "turn_id": "turn-a",
+            "status": status,
+        },
+    )
+
+    assert controller._current_state == ("in_progress", "turn-b", False)
+    assert controller._stop_target == ("thread-a", "turn-b")
+    assert not widget.stop_button.isHidden()
+    assert widget.stop_button.isEnabled()
+
+    client.activity_received.emit(
+        generation,
+        {
+            "thread_id": "thread-a",
+            "type": "turn_completed",
+            "turn_id": "turn-b",
+            "status": "completed",
+        },
+    )
+
+    assert controller._current_state == ("completed", "turn-b", False)
+    assert controller._stop_target is None
+    assert widget.stop_button.isHidden()
+    assert "終了を確認" in widget.status_label.text()
+
+
+@pytest.mark.parametrize(
+    ("activity_type", "status"),
+    [
+        ("turn_completed", "completed"),
+        ("turn_failed", "failed"),
+        ("turn_interrupted", "interrupted"),
+    ],
+)
+def test_turn_a_completion_preserves_unresolved_turn_b_record(
+    tmp_path: Path, activity_type: str, status: str
+) -> None:
+    _application()
+    controller, window, _widget, client, _root = _controller(tmp_path)
+    window.thread_pane.thread_selected.emit("thread-a")
+    generation = window._selection_generation
+    client.activity_received.emit(
+        generation,
+        {"thread_id": "thread-a", "type": "turn_started", "turn_id": "turn-a"},
+    )
+    controller._awaiting_turns["thread-a"] = "turn-b"
+
+    client.activity_received.emit(
+        generation,
+        {
+            "thread_id": "thread-a",
+            "type": activity_type,
+            "turn_id": "turn-a",
+            "status": status,
+        },
+    )
+
+    assert controller._current_state == (status, "turn-a", False)
+    assert controller._awaiting_turns["thread-a"] == "turn-b"
 
 
 def test_prompt_validation_rejects_whitespace_and_more_than_32000_characters(

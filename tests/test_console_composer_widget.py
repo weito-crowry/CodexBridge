@@ -5,7 +5,7 @@ from PySide6.QtGui import QInputMethodEvent, QTextCursor, QTextOption
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QVBoxLayout
 
-from codex_bridge.console.composer_widget import ComposerInput
+from codex_bridge.console.composer_widget import ComposerInput, ComposerWidget
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from tests.console_main_window_test_support import FakeClient, _application
@@ -38,6 +38,21 @@ def test_ime_preedit_enter_does_not_send() -> None:
     QTest.keyClick(input_box, Qt.Key.Key_Return)
 
     assert sent == []
+
+
+def test_effort_combo_emits_change_signal() -> None:
+    _application()
+    widget = ComposerWidget()
+    widget.set_draft_mode(True)
+    widget.set_model_options([("Model A", "model-a")], "model-a", available=True)
+    widget.set_effort_options([("Low", "low")], None)
+    changes: list[bool] = []
+    widget.effort_changed.connect(lambda: changes.append(True))
+
+    widget.effort_combo.setCurrentIndex(widget.effort_combo.findData("low"))
+
+    assert widget.selected_effort == "low"
+    assert changes == [True]
 
 
 def test_composer_wraps_long_text_and_remains_outside_history_scroll_area() -> None:
