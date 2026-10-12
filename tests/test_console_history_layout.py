@@ -4,7 +4,15 @@ from math import ceil
 
 import shiboken6
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QPushButton, QTextBrowser, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QTextBrowser,
+    QWidget,
+)
 
 from codex_bridge.console.widgets import HistoryPane, TimelineEntry
 from tests.test_console_widgets import _process_layout
@@ -74,6 +82,65 @@ def test_history_pane_hides_and_detaches_old_cards_before_deferred_delete() -> N
     assert all(not shiboken6.isValid(card) for card in old_cards)
     assert not shiboken6.isValid(old_spinner)
     assert not shiboken6.isValid(old_copy_button)
+    pane.close()
+
+
+def test_user_and_agent_copy_buttons_keep_compact_width_at_all_card_sizes() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entries = (
+        TimelineEntry(
+            "turn",
+            "user",
+            "User",
+            "ユーザーからの非常に長い日本語タイトルが狭い画面でも折り返されます",
+            "質問",
+            None,
+            (),
+        ),
+        TimelineEntry(
+            "turn",
+            "agent",
+            "Agent",
+            "エージェントからの非常に長い日本語タイトルと進行状態",
+            "回答",
+            "in_progress",
+            (),
+        ),
+    )
+    pane.resize(860, 520)
+    pane.show()
+    pane.set_timeline(entries)
+    _process_layout(application)
+
+    for width in (860, 420, 340):
+        pane.resize(width, 520)
+        _process_layout(application)
+        cards = pane._content.findChildren(QFrame, "historyCard")
+        assert len(cards) == 2
+        for card in cards:
+            header_layout = card.layout().itemAt(0).layout()
+            assert header_layout is not None
+            header_label = header_layout.itemAt(0).widget()
+            spinner = card.findChild(QWidget, "historyRunningSpinner")
+            copy_button = card.findChild(QPushButton, "copyMessageButton")
+            assert isinstance(header_label, QLabel)
+            assert spinner is not None
+            assert copy_button is not None
+            diagnostics = (
+                f"width={width} card={card.geometry().getRect()} "
+                f"header={header_label.geometry().getRect()} "
+                f"spinner={spinner.geometry().getRect()} "
+                f"copy={copy_button.geometry().getRect()} "
+                f"size_hint={copy_button.sizeHint().width()}"
+            )
+            assert copy_button.width() <= copy_button.sizeHint().width() + 2, diagnostics
+            assert copy_button.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Fixed
+            assert card.rect().contains(copy_button.geometry()), diagnostics
+            assert not copy_button.geometry().intersects(header_label.geometry()), diagnostics
+            assert not copy_button.geometry().intersects(spinner.geometry()), diagnostics
+
     pane.close()
 
 

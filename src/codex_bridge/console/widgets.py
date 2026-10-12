@@ -740,6 +740,7 @@ class HistoryPane(QWidget):
         self._programmatic_scroll = False
         self._user_scrolling = False
         self._render_generation = 0
+        self._timeline_render_signature: tuple[object, ...] | None = None
         self._scroll_restore_state: tuple[int, int, int, bool, bool, bool] | None = None
         self._scroll_restore_stage = 0
         self._scroll_restore_timer = QTimer(self)
@@ -775,6 +776,25 @@ class HistoryPane(QWidget):
         turn_usage_snapshots: Mapping[str, CodexUsageSnapshot] | None = None,
         prepend: bool = False,
     ) -> None:
+        render_entries = tuple(entries)
+        turn_headers: list[tuple[str, str]] = []
+        usage_labels: list[tuple[str, str]] = []
+        for turn_id in dict.fromkeys(entry.turn_id for entry in render_entries):
+            status = turn_statuses.get(turn_id) if turn_statuses else None
+            metadata = turn_model_metadata.get(turn_id) if turn_model_metadata else None
+            turn_headers.append((turn_id, _turn_header(status, metadata)))
+            snapshot = turn_usage_snapshots.get(turn_id) if turn_usage_snapshots else None
+            if snapshot is not None:
+                usage_labels.append((turn_id, format_codex_usage_snapshot(snapshot)))
+        render_signature = (
+            render_entries,
+            has_older,
+            tuple(turn_headers),
+            tuple(usage_labels),
+        )
+        if not prepend and self._timeline_render_signature == render_signature:
+            return
+
         scrollbar = self._scroll.verticalScrollBar()
         old_value = scrollbar.value()
         old_maximum = scrollbar.maximum()
@@ -788,7 +808,7 @@ class HistoryPane(QWidget):
 
         self._clear_cards()
         previous_turn: str | None = None
-        for entry in entries:
+        for entry in render_entries:
             if previous_turn is None or previous_turn != entry.turn_id:
                 turn_status = turn_statuses.get(entry.turn_id) if turn_statuses else None
                 metadata = turn_model_metadata.get(entry.turn_id) if turn_model_metadata else None
@@ -806,11 +826,12 @@ class HistoryPane(QWidget):
                     self._content_layout.addWidget(snapshot_label)
             self._content_layout.addWidget(self._card(entry))
             previous_turn = entry.turn_id
-        self._empty_label.setVisible(not entries)
-        self._scroll.setVisible(bool(entries))
-        if not entries:
+        self._empty_label.setVisible(not render_entries)
+        self._scroll.setVisible(bool(render_entries))
+        if not render_entries:
             should_follow = True
             self._follow_newest = True
+        self._timeline_render_signature = render_signature
         self._content.updateGeometry()
         self._scroll_restore_state = (
             generation,
@@ -950,7 +971,7 @@ class HistoryPane(QWidget):
         header_policy = header_label.sizePolicy()
         header_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         header_label.setSizePolicy(header_policy)
-        header.addWidget(header_label)
+        header.addWidget(header_label, 1)
         spinner = _HistoryRunningSpinner(card)
         header.addWidget(spinner)
         spinner.setVisible(_item_is_running(entry))
@@ -960,6 +981,9 @@ class HistoryPane(QWidget):
             copy_button.clicked.connect(
                 lambda _checked=False, text=entry.body: copy_to_clipboard(text)
             )
+            copy_policy = copy_button.sizePolicy()
+            copy_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
+            copy_button.setSizePolicy(copy_policy)
             header.addWidget(copy_button)
         layout.addLayout(header)
         timing = QLabel(format_history_timing(entry.started_at_ms, entry.completed_at_ms))
@@ -980,6 +1004,7 @@ class HistoryPane(QWidget):
         self._user_scrolling = False
         self._follow_newest = True
         self._has_older = False
+        self._timeline_render_signature = None
         self._set_programmatic_scroll(0)
         self._clear_cards()
         self._empty_label.setText(text)

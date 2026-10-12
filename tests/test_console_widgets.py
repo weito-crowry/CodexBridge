@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from inspect import signature
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtGui import QTextOption
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -15,11 +17,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from codex_bridge.console import usage as usage_module
 from codex_bridge.console import widgets as widgets_module
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
-from codex_bridge.console.usage import parse_codex_usage
+from codex_bridge.console.usage import CodexUsageSnapshot, parse_codex_usage
 from codex_bridge.console.widgets import (
     ActivityPane,
     HistoryPane,
@@ -38,10 +39,8 @@ from tests.console_main_window_test_support import (
 )
 
 
-def _usage_snapshot() -> object:
-    snapshot_type = getattr(usage_module, "CodexUsageSnapshot", None)
-    assert snapshot_type is not None
-    return snapshot_type(
+def _usage_snapshot() -> CodexUsageSnapshot:
+    return CodexUsageSnapshot(
         parse_codex_usage(
             {
                 "rateLimits": {
@@ -131,6 +130,8 @@ def test_history_pane_adds_copy_action_only_to_user_and_agent_messages(monkeypat
     application = QApplication.instance() or QApplication([])
     assert application is not None
     pane = HistoryPane()
+    pane.resize(640, 420)
+    pane.show()
     pane.set_timeline(
         (
             TimelineEntry("turn", "user", "User", "User", "質問", None, ()),
@@ -145,12 +146,15 @@ def test_history_pane_adds_copy_action_only_to_user_and_agent_messages(monkeypat
     monkeypatch.setattr("codex_bridge.console.widgets.copy_to_clipboard", copied.append)
 
     assert len(buttons) == 2
-    buttons[0].click()
+    _process_layout(application)
+    buttons[0].setFocus()
+    QTest.keyClick(buttons[0], Qt.Key.Key_Space)
     application.processEvents()
     assert copied == ["質問"]
     buttons[1].click()
     application.processEvents()
     assert copied == ["質問", "回答"]
+    pane.close()
 
 
 def test_timeline_renders_safe_work_fields_without_raw_dicts() -> None:
@@ -561,6 +565,205 @@ def test_history_pane_preserves_manual_scroll_position_when_snapshot_is_added() 
 
     assert scrollbar.value() == old_value
     assert scrollbar.value() < scrollbar.maximum()
+
+
+def test_history_pane_keeps_cards_and_scroll_for_identical_refreshes() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entries = _history_entries(0, 24)
+    pane.resize(640, 320)
+    pane.show()
+    pane.set_timeline(list(entries), has_older=True)
+    _process_layout(application)
+
+    scrollbar = pane._scroll.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    _process_layout(application)
+    old_value = scrollbar.value()
+    old_cards = pane._content.findChildren(QFrame, "historyCard")
+    old_generation = pane._render_generation
+    assert len(old_cards) == len(entries)
+
+    for equivalent_entries in (tuple(entries), list(entries)):
+        pane.set_timeline(equivalent_entries, has_older=True)
+        _process_layout(application)
+        current_cards = pane._content.findChildren(QFrame, "historyCard")
+        assert pane._render_generation == old_generation
+        assert len(current_cards) == len(old_cards)
+        assert all(current is old for current, old in zip(current_cards, old_cards, strict=True))
+        assert all(card.parentWidget() is pane._content for card in old_cards)
+        assert scrollbar.value() == old_value
+        assert not pane._scroll_restore_timer.isActive()
+        assert pane._scroll_restore_state is None
+
+    pane.set_timeline(tuple(entries), has_older=True, prepend=True)
+    _process_layout(application)
+    prepended_cards = pane._content.findChildren(QFrame, "historyCard")
+    assert pane._render_generation == old_generation + 1
+    assert all(current is not old for current, old in zip(prepended_cards, old_cards, strict=True))
+    assert scrollbar.value() == old_value
+    pane.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("status", "in_progress"),
+        ("body", "updated answer"),
+        ("details", ("exit 0",)),
+        ("started_at_ms", 1_791_518_400_000),
+        ("completed_at_ms", 1_791_518_401_000),
+    ),
+)
+def test_history_pane_rerenders_when_visible_entry_fields_change(field: str, value: object) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entry = TimelineEntry("turn", "agent", "Agent", "Agent", "original answer", None, ())
+    pane.resize(640, 420)
+    pane.show()
+    pane.set_timeline((entry,))
+    _process_layout(application)
+    old_card = pane._content.findChildren(QFrame, "historyCard")[0]
+
+    pane.set_timeline((replace(entry, **{field: value}),))
+    _process_layout(application)
+    updated_card = pane._content.findChildren(QFrame, "historyCard")[0]
+    assert updated_card is not old_card
+
+    if field == "status":
+        spinner = updated_card.findChild(QWidget, "historyRunningSpinner")
+        assert spinner is not None and spinner.isVisible()
+    elif field == "body":
+        assert any(
+            body.toPlainText() == "updated answer"
+            for body in updated_card.findChildren(QTextBrowser)
+        )
+    elif field == "details":
+        assert any(
+            body.toPlainText() == "exit 0" for body in updated_card.findChildren(QTextBrowser)
+        )
+    else:
+        timing = updated_card.findChild(QLabel, "historyTiming")
+        spinner = updated_card.findChild(QWidget, "historyRunningSpinner")
+        assert timing is not None
+        assert spinner is not None
+        if field == "started_at_ms":
+            assert "Start —" not in timing.text()
+            assert spinner.isVisible()
+        else:
+            assert "End —" not in timing.text()
+            assert not spinner.isVisible()
+    pane.close()
+
+
+def test_history_pane_rerenders_when_turn_display_strings_change_in_place() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entries = (TimelineEntry("turn", "agent", "Agent", "Agent", "answer", None, ()),)
+    statuses = {"turn": "in_progress"}
+    metadata: dict[str, dict[str, object]] = {
+        "turn": {
+            "model_resolution_status": "resolved",
+            "model_candidates": [{"model": "gpt-5", "reasoning_effort": "high"}],
+        }
+    }
+    snapshot = _usage_snapshot()
+    snapshots = {"turn": snapshot}
+    pane.resize(640, 420)
+    pane.show()
+    pane.set_timeline(
+        entries,
+        turn_statuses=statuses,
+        turn_model_metadata=metadata,
+        turn_usage_snapshots=snapshots,
+    )
+    _process_layout(application)
+    header = pane._content.findChild(QLabel, "turnSeparator")
+    assert header is not None
+    assert header.text() == "Turn · in_progress · Model: gpt-5 (high)"
+    initial_snapshot_label = pane._content.findChild(QLabel, "turnUsageSnapshot")
+    assert initial_snapshot_label is not None
+    initial_snapshot_text = initial_snapshot_label.text()
+    generation = pane._render_generation
+
+    statuses["turn"] = "completed"
+    pane.set_timeline(
+        list(entries),
+        turn_statuses=statuses,
+        turn_model_metadata=metadata,
+        turn_usage_snapshots=snapshots,
+    )
+    _process_layout(application)
+    header = pane._content.findChild(QLabel, "turnSeparator")
+    assert header is not None
+    assert header.text() == "Turn · completed · Model: gpt-5 (high)"
+    assert pane._render_generation == generation + 1
+    generation += 1
+
+    candidates = metadata["turn"]["model_candidates"]
+    assert isinstance(candidates, list)
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    candidate["model"] = "gpt-6"
+    pane.set_timeline(
+        tuple(entries),
+        turn_statuses=statuses,
+        turn_model_metadata=metadata,
+        turn_usage_snapshots=snapshots,
+    )
+    _process_layout(application)
+    header = pane._content.findChild(QLabel, "turnSeparator")
+    assert header is not None
+    assert header.text() == "Turn · completed · Model: gpt-6 (high)"
+    assert pane._render_generation == generation + 1
+    generation += 1
+
+    snapshots["turn"] = CodexUsageSnapshot(
+        snapshot.usage,
+        snapshot.captured_at + timedelta(minutes=1),
+    )
+    pane.set_timeline(
+        entries,
+        turn_statuses=statuses,
+        turn_model_metadata=metadata,
+        turn_usage_snapshots=snapshots,
+    )
+    _process_layout(application)
+    snapshot_label = pane._content.findChild(QLabel, "turnUsageSnapshot")
+    assert snapshot_label is not None
+    assert "captured " in snapshot_label.text()
+    assert snapshot_label.text() != initial_snapshot_text
+    assert pane._render_generation == generation + 1
+    pane.close()
+
+
+def test_history_pane_can_render_the_same_timeline_after_empty_state() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = HistoryPane()
+    entries = _history_entries(0, 1)
+    pane.resize(640, 420)
+    pane.show()
+    pane.set_timeline(entries)
+    _process_layout(application)
+    old_card = pane._content.findChildren(QFrame, "historyCard")[0]
+
+    pane.set_empty_state("Select another thread")
+    _process_layout(application)
+    assert pane._content.findChildren(QFrame, "historyCard") == []
+    pane.set_timeline(list(entries))
+    _process_layout(application)
+
+    cards = pane._content.findChildren(QFrame, "historyCard")
+    assert len(cards) == 1
+    assert cards[0] is not old_card
+    assert not pane._empty_label.isVisible()
+    assert pane._scroll.isVisible()
+    pane.close()
 
 
 def test_history_pane_shows_each_message_in_full_without_inner_scroll() -> None:
