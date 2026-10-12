@@ -56,6 +56,36 @@ async def test_start_uses_meaningful_markdown_heading_before_prompt_body(allowed
 
 
 @pytest.mark.asyncio
+async def test_start_prefers_prompt_task_line_over_generic_japanese_headings(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    task_line = "CodexBridge Issue #29 \u306e\u81ea\u52d5\u547d\u540d\u3092\u5b9f\u88c5\u3059\u308b"
+
+    await bridge.start(
+        str(allowed_dir),
+        task_line
+        + "\n\n## \u80cc\u666f\u30fb\u76ee\u7684\nDetails."
+        + "\n## \u4f5c\u696d\u65b9\u6cd5\nSteps.",
+    )
+
+    assert app.calls[1][1]["name"] == task_line
+
+
+@pytest.mark.asyncio
+async def test_start_keeps_meaningful_japanese_heading_preferred(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    meaningful_heading = (
+        "\u4f7f\u7528\u91cf\u5c65\u6b74DB\u306e\u30c6\u30b9\u30c8\u6c5a\u67d3\u3092\u4fee\u6b63"
+    )
+
+    await bridge.start(
+        str(allowed_dir),
+        "Issue details.\n\n## " + meaningful_heading + "\nDetails.",
+    )
+
+    assert app.calls[1][1]["name"] == meaningful_heading
+
+
+@pytest.mark.asyncio
 async def test_start_extracts_quoted_prompt_line_and_ignores_code_fence(allowed_dir) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
 
