@@ -38,6 +38,36 @@ def test_generic_refresh_does_not_reload_usage() -> None:
     window.close()
 
 
+def test_default_usage_history_path_is_isolated_for_fake_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_usage_history_path: Path,
+) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    _set_usage_ready(window)
+    monkeypatch.setattr(main_window_module, "time", lambda: 120.0)
+    window._usage_request_in_flight = True
+    window._usage_request_mode = "manual"
+
+    client.result(
+        "usage",
+        {"rateLimits": {"primary": {"windowDurationMins": 300, "usedPercent": 63}}},
+    )
+
+    assert window._usage_history_path == isolated_usage_history_path
+    assert isolated_usage_history_path.exists()
+    assert [
+        sample.five_hour_remaining
+        for sample in get_usage_samples(
+            0.0,
+            180.0,
+            database_path=isolated_usage_history_path,
+        )
+    ] == [37]
+    window.close()
+
+
 def test_force_usage_does_not_change_mode_of_in_flight_initial_request() -> None:
     _application()
     client = FakeClient()
