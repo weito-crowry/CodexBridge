@@ -28,6 +28,9 @@ class FakeBridge:
         self.start_error: Exception | None = None
         self.capabilities_error: Exception | None = None
         self.status_turn_id: str | None = None
+        self.operation_gate: asyncio.Event | None = None
+        self.operation_entered: dict[str, asyncio.Event] = {}
+        self.operation_error: Exception | None = None
 
     async def model_capabilities(self) -> dict[str, Any]:
         self.calls.append(("model_capabilities", (), {}))
@@ -85,6 +88,7 @@ class FakeBridge:
 
     async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
         self.calls.append(("continue_thread", (thread_id, prompt), {}))
+        await self._wait_for_operation(thread_id)
         return {
             "thread_id": thread_id,
             "turn_id": "continued-turn",
@@ -94,7 +98,17 @@ class FakeBridge:
 
     async def interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         self.calls.append(("interrupt", (thread_id, turn_id), {}))
+        await self._wait_for_operation(thread_id)
         return {"thread_id": thread_id, "turn_id": turn_id, "state": "in_progress"}
+
+    async def _wait_for_operation(self, thread_id: str) -> None:
+        if self.operation_gate is not None:
+            self.operation_entered.setdefault(thread_id, asyncio.Event()).set()
+            await self.operation_gate.wait()
+        if self.operation_error is not None:
+            error = self.operation_error
+            self.operation_error = None
+            raise error
 
 
 def config(tmp_path) -> BridgeConfig:
@@ -148,6 +162,30 @@ def request(
 
 def route(app, path: str):
     return next(route for route in app.routes if getattr(route, "path", None) == path)
+
+
+async def send_continue(app, thread_id: str, request_id: str, prompt: str = "go"):
+    endpoint = route(app, "/ui-api/control/threads/{thread_id}/turns").endpoint
+    return await endpoint(
+        request(
+            f"/ui-api/control/threads/{thread_id}/turns",
+            body=json.dumps({"client_request_id": request_id, "prompt": prompt}).encode(),
+            authorization="Bearer local-control-token",
+            path_params={"thread_id": thread_id},
+        )
+    )
+
+
+async def send_interrupt(app, thread_id: str, turn_id: str, request_id: str):
+    endpoint = route(app, "/ui-api/control/threads/{thread_id}/turns/{turn_id}/interrupt").endpoint
+    return await endpoint(
+        request(
+            f"/ui-api/control/threads/{thread_id}/turns/{turn_id}/interrupt",
+            body=json.dumps({"client_request_id": request_id}).encode(),
+            authorization="Bearer local-control-token",
+            path_params={"thread_id": thread_id, "turn_id": turn_id},
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -572,6 +610,122 @@ async def test_control_continue_checks_thread_state_and_rejects_overrides(tmp_pa
     assert override.status_code == 400
     assert continued.status_code == 200
     assert bridge.calls[-1] == ("continue_thread", ("thread-1", "追加の指示\n次の行"), {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_control_continue_rejects_concurrent_thread_operation_and_releases_slot(
+    tmp_path, outcome: str
+) -> None:
+    bridge = FakeBridge()
+    bridge.cwd = str(tmp_path)
+    bridge.operation_gate = asyncio.Event()
+    if outcome == "failure":
+        bridge.operation_error = BridgeError("private bridge error")
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+
+    first_task = asyncio.create_task(send_continue(app, "thread-1", "request-first-1"))
+    await bridge.operation_entered.setdefault("thread-1", asyncio.Event()).wait()
+    second_task = asyncio.create_task(send_continue(app, "thread-1", "request-second-1"))
+    try:
+        await asyncio.wait_for(asyncio.shield(second_task), timeout=0.5)
+        second_finished_before_release = True
+    except TimeoutError:
+        second_finished_before_release = False
+    dispatches_before_release = sum(call[0] == "continue_thread" for call in bridge.calls)
+
+    if outcome == "cancel":
+        first_task.cancel()
+        first_result = await asyncio.gather(first_task, return_exceptions=True)
+    else:
+        bridge.operation_gate.set()
+        first_result = [await first_task]
+    bridge.operation_gate.set()
+    second_response = await second_task
+    follow_up_response = await send_continue(app, "thread-1", "request-follow-up-1")
+
+    assert second_finished_before_release
+    assert dispatches_before_release == 1
+    assert second_response.status_code == 409
+    if outcome == "cancel":
+        assert isinstance(first_result[0], asyncio.CancelledError)
+    elif outcome == "failure":
+        assert first_result[0].status_code != 200
+    else:
+        assert first_result[0].status_code == 200
+    assert follow_up_response.status_code == 200
+    assert sum(call[0] == "continue_thread" for call in bridge.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_control_continue_and_interrupt_conflict_on_same_thread(tmp_path) -> None:
+    bridge = FakeBridge()
+    bridge.cwd = str(tmp_path)
+    bridge.operation_gate = asyncio.Event()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+
+    continue_task = asyncio.create_task(send_continue(app, "thread-1", "request-cont-1"))
+    await bridge.operation_entered.setdefault("thread-1", asyncio.Event()).wait()
+    bridge.state = {"state": "in_progress", "pending_request": None}
+    interrupt_task = asyncio.create_task(
+        send_interrupt(app, "thread-1", "continued-turn", "request-int-0001")
+    )
+    try:
+        await asyncio.wait_for(asyncio.shield(interrupt_task), timeout=0.5)
+        interrupt_finished_before_release = True
+    except TimeoutError:
+        interrupt_finished_before_release = False
+    bridge.operation_gate.set()
+    continue_response, interrupt_response = await asyncio.gather(continue_task, interrupt_task)
+
+    assert continue_response.status_code == 200
+    assert interrupt_finished_before_release
+    assert interrupt_response.status_code == 409
+    assert not any(call[0] == "interrupt" for call in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_control_operations_on_different_threads_do_not_block_each_other(tmp_path) -> None:
+    bridge = FakeBridge()
+    bridge.cwd = str(tmp_path)
+    bridge.operation_gate = asyncio.Event()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    first_task = asyncio.create_task(send_continue(app, "thread-1", "request-alpha-1"))
+    second_task = asyncio.create_task(send_continue(app, "thread-2", "request-bravo-1"))
+    both_entered = asyncio.gather(
+        bridge.operation_entered.setdefault("thread-1", asyncio.Event()).wait(),
+        bridge.operation_entered.setdefault("thread-2", asyncio.Event()).wait(),
+    )
+    try:
+        await asyncio.wait_for(both_entered, timeout=1)
+        entered_concurrently = True
+    except TimeoutError:
+        entered_concurrently = False
+    bridge.operation_gate.set()
+    responses = await asyncio.gather(first_task, second_task)
+
+    assert entered_concurrently
+    assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
+async def test_control_continue_same_request_id_replay_remains_idempotent(tmp_path) -> None:
+    bridge = FakeBridge()
+    bridge.cwd = str(tmp_path)
+    bridge.operation_gate = asyncio.Event()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+
+    first_task = asyncio.create_task(send_continue(app, "thread-1", "request-replay-1"))
+    await bridge.operation_entered.setdefault("thread-1", asyncio.Event()).wait()
+    replay_task = asyncio.create_task(send_continue(app, "thread-1", "request-replay-1"))
+    await asyncio.sleep(0)
+    replay_waited_for_owner = not replay_task.done()
+    bridge.operation_gate.set()
+    first_response, replay_response = await asyncio.gather(first_task, replay_task)
+
+    assert replay_waited_for_owner
+    assert first_response.status_code == replay_response.status_code == 200
+    assert sum(call[0] == "continue_thread" for call in bridge.calls) == 1
 
 
 @pytest.mark.asyncio

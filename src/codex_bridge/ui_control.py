@@ -235,6 +235,7 @@ class UiControl:
         self._bridge = bridge
         self._path_policy = AllowedPathPolicy(config.allowed_roots)
         self._requests = _IdempotencyRegistry()
+        self._inflight_thread_operations: set[str] = set()
 
     async def capabilities(self) -> dict[str, Any]:
         return await self._bridge.model_capabilities()
@@ -345,11 +346,14 @@ class UiControl:
             raise ValueError("invalid request")
 
         async def action(mark_dispatched: Callable[[], None]) -> dict[str, Any]:
-            await self._validated_thread(thread_id)
-            await self._ensure_inactive(thread_id)
-            mark_dispatched()
-            result = await self._bridge.continue_thread(thread_id, prompt)
-            return _safe_turn_result(result, thread_id)
+            async def execute() -> dict[str, Any]:
+                await self._validated_thread(thread_id)
+                await self._ensure_inactive(thread_id)
+                mark_dispatched()
+                result = await self._bridge.continue_thread(thread_id, prompt)
+                return _safe_turn_result(result, thread_id)
+
+            return await self._run_thread_operation(thread_id, execute)
 
         return await self._requests.execute(
             request_id,
@@ -369,14 +373,17 @@ class UiControl:
             raise ValueError("invalid request")
 
         async def action(mark_dispatched: Callable[[], None]) -> dict[str, Any]:
-            await self._validated_thread(thread_id)
-            await self._ensure_interruptible(thread_id, turn_id)
-            mark_dispatched()
-            result = await self._bridge.interrupt(thread_id, turn_id)
-            safe = _safe_turn_result(result, thread_id)
-            if safe["turn_id"] != turn_id:
-                raise RuntimeError("Bridge returned a mismatched control result")
-            return safe
+            async def execute() -> dict[str, Any]:
+                await self._validated_thread(thread_id)
+                await self._ensure_interruptible(thread_id, turn_id)
+                mark_dispatched()
+                result = await self._bridge.interrupt(thread_id, turn_id)
+                safe = _safe_turn_result(result, thread_id)
+                if safe["turn_id"] != turn_id:
+                    raise RuntimeError("Bridge returned a mismatched control result")
+                return safe
+
+            return await self._run_thread_operation(thread_id, execute)
 
         return await self._requests.execute(
             request_id,
@@ -384,6 +391,17 @@ class UiControl:
             _digest("interrupt:" + thread_id + ":" + turn_id, payload),
             action,
         )
+
+    async def _run_thread_operation(
+        self, thread_id: str, operation: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        if thread_id in self._inflight_thread_operations:
+            raise ControlConflictError("thread already has a control operation in progress")
+        self._inflight_thread_operations.add(thread_id)
+        try:
+            return await operation()
+        finally:
+            self._inflight_thread_operations.discard(thread_id)
 
     async def _validated_thread(self, thread_id: str) -> None:
         result = await self._bridge.threads(thread_id)
