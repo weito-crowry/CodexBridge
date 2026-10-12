@@ -22,6 +22,7 @@ from .jsonrpc import JsonRpcClosedError
 from .models import ApprovalDecision, RequestId
 from .paths import PathPolicyError
 from .thread_titles import normalize_explicit_title
+from .ui_control import ControlConflictError, create_control_routes
 
 
 class UiBridge(Protocol):
@@ -139,6 +140,8 @@ def _authorized_control_request(request: Request, token: str | None) -> bool:
 
 
 def _error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ControlConflictError):
+        return JSONResponse({"error": "request conflict"}, status_code=409)
     if isinstance(exc, PathPolicyError):
         return JSONResponse({"error": "thread not found"}, status_code=404)
     if isinstance(exc, (HistoryValidationError, ValueError)):
@@ -376,6 +379,9 @@ def create_ui_app(
         routes.append(Route("/ui-api/control/shutdown", shutdown, methods=["POST"]))
     if config.control_token is not None:
         routes.append(Route("/ui-api/control/approval", approval, methods=["POST"]))
+        routes.extend(
+            create_control_routes(bridge, config, _authorized_control_request, _error_response)
+        )
     app = Starlette(routes=routes)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     app.state.bridge = bridge

@@ -648,6 +648,8 @@ class Bridge:
                 "config/read", {"includeLayers": False, "cwd": None}
             )
             return normalize_capabilities(pages, config_response)
+        except JsonRpcClosedError:
+            raise
         except Exception:
             raise BridgeError("model capabilities are unavailable") from None
 

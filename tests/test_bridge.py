@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from codex_bridge.bridge import Bridge, BridgeError
-from codex_bridge.jsonrpc import JsonRpcRemoteError
+from codex_bridge.jsonrpc import JsonRpcClosedError, JsonRpcRemoteError
 from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 from codex_bridge.state import StateStore
 from tests.bridge_test_fakes import make_bridge
@@ -316,6 +316,19 @@ async def test_model_capabilities_pagination_cycle_and_empty_catalog_are_safe(al
     }
 
     with pytest.raises(BridgeError, match="model capabilities are unavailable"):
+        await bridge.model_capabilities()
+
+
+@pytest.mark.asyncio
+async def test_model_capabilities_preserves_app_server_disconnect(allowed_dir, monkeypatch) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+
+    async def disconnected(method: str, params: dict[str, object]) -> dict[str, object]:
+        raise JsonRpcClosedError("private transport detail")
+
+    monkeypatch.setattr(app, "request", disconnected)
+
+    with pytest.raises(JsonRpcClosedError):
         await bridge.model_capabilities()
 
 
