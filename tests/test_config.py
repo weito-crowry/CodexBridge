@@ -24,6 +24,101 @@ def test_empty_allowed_roots_fail_closed(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.allowed_roots == ()
 
 
+def test_mcp_events_are_disabled_by_default() -> None:
+    config = BridgeConfig.from_sources(environ={}, config_data={})
+
+    events = getattr(config, "mcp_events", None)
+    assert events is not None, "BridgeConfig must expose MCP Events settings"
+    assert events.enabled is False
+    assert events.default_ttl_seconds == 3600
+    assert events.max_ttl_seconds == 86400
+
+
+def test_mcp_events_environment_overrides_toml_settings(tmp_path) -> None:
+    config = BridgeConfig.from_sources(
+        environ={
+            "CODEX_BRIDGE_MCP_EVENTS_ENABLED": "true",
+            "CODEX_BRIDGE_MCP_EVENTS_DB_PATH": str(tmp_path / "environment.sqlite3"),
+            "CODEX_BRIDGE_MCP_EVENTS_DEFAULT_TTL_SECONDS": "120",
+        },
+        config_data={
+            "mcp_events": {
+                "enabled": False,
+                "db_path": str(tmp_path / "config.sqlite3"),
+                "default_ttl_seconds": 600,
+                "max_ttl_seconds": 80000,
+                "webhook_timeout_seconds": 15,
+                "max_retries": 2,
+            }
+        },
+    )
+
+    assert config.mcp_events.enabled is True
+    assert config.mcp_events.db_path == tmp_path / "environment.sqlite3"
+    assert config.mcp_events.default_ttl_seconds == 120
+    assert config.mcp_events.max_ttl_seconds == 80000
+    assert config.mcp_events.webhook_timeout_seconds == 15
+    assert config.mcp_events.max_retries == 2
+
+
+def test_mcp_events_toml_section_parses(tmp_path) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[mcp_events]\n"
+        "enabled = true\n"
+        f"db_path = '{tmp_path / 'mcp-events.sqlite3'}'\n"
+        "default_ttl_seconds = 300\n"
+        "max_ttl_seconds = 3600\n"
+        "webhook_timeout_seconds = 8\n"
+        "max_retries = 1\n",
+        encoding="utf-8",
+    )
+
+    config = BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+    assert config.mcp_events.enabled is True
+    assert config.mcp_events.db_path == tmp_path / "mcp-events.sqlite3"
+    assert config.mcp_events.default_ttl_seconds == 300
+    assert config.mcp_events.max_ttl_seconds == 3600
+    assert config.mcp_events.webhook_timeout_seconds == 8
+    assert config.mcp_events.max_retries == 1
+
+
+def test_mcp_events_rejects_invalid_ttl_and_retry_settings() -> None:
+    with pytest.raises(ConfigurationError, match="TTL"):
+        BridgeConfig.from_sources(
+            environ={},
+            config_data={"mcp_events": {"default_ttl_seconds": 900, "max_ttl_seconds": 60}},
+        )
+
+    with pytest.raises(ConfigurationError, match="non-negative"):
+        BridgeConfig.from_sources(
+            environ={"CODEX_BRIDGE_MCP_EVENTS_MAX_RETRIES": "-1"}, config_data={}
+        )
+
+    with pytest.raises(ConfigurationError, match="TTL"):
+        BridgeConfig.from_sources(
+            environ={"CODEX_BRIDGE_MCP_EVENTS_MAX_TTL_SECONDS": "86401"}, config_data={}
+        )
+
+    with pytest.raises(ConfigurationError, match="max_retries"):
+        BridgeConfig.from_sources(
+            environ={"CODEX_BRIDGE_MCP_EVENTS_MAX_RETRIES": "4"}, config_data={}
+        )
+
+
+def test_mcp_events_toml_enabled_must_be_boolean(tmp_path) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[mcp_events]\nenabled = 'true'\n", encoding="utf-8")
+
+    with pytest.raises(ConfigFileError, match="must be a boolean"):
+        load_user_config(path=config_path)
+
+
 def test_config_parses_host_origin_and_bounded_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ROOTS", r"C:\work;D:\repo")
     monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_HOSTS", "bridge.example.com, bridge.example.com:*")

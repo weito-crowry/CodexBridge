@@ -24,6 +24,7 @@ from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .execution_targets import ExecutionTargetRouter
 from .logging_utils import log_event
+from .mcp_events import McpEventsAdapter
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
 from .models import ApprovalDecision, ApprovalsReviewer, SandboxMode
@@ -611,6 +612,17 @@ def create_app(
     )
     wire_server.extensions.update(mcp._lowlevel_server.extensions)
 
+    mcp_events: McpEventsAdapter | None = None
+    local_target_id = next(target.id for target in config.targets if target.kind == "local")
+    if config.mcp_events.enabled:
+
+        def event_bridge() -> Bridge | None:
+            runtime = runtime_holder["runtime"]
+            return runtime.bridge if runtime is not None else None
+
+        mcp_events = McpEventsAdapter(config.mcp_events, event_bridge, local_target_id)
+        mcp_events.register(wire_server)
+
     security = _transport_security(config)
     transport_app = wire_server.streamable_http_app(
         streamable_http_path="/mcp",
@@ -634,15 +646,27 @@ def create_app(
                 runtime_started = False
                 try:
                     await router.start()
+                    if mcp_events is not None:
+                        await mcp_events.start()
+                        set_event_publisher = getattr(runtime.bridge, "set_event_publisher", None)
+                        if callable(set_event_publisher):
+                            set_event_publisher(
+                                mcp_events.publish_terminal,
+                                target_id=local_target_id,
+                            )
                     await runtime.start()
                     runtime_started = True
                     await execution_router.start()
                     yield
                 finally:
-                    await execution_router.close()
-                    if runtime_started:
-                        await runtime.shutdown()
-                    await router.shutdown()
+                    try:
+                        if mcp_events is not None:
+                            await mcp_events.stop()
+                    finally:
+                        await execution_router.close()
+                        if runtime_started:
+                            await runtime.shutdown()
+                        await router.shutdown()
                     runtime_holder["runtime"] = None
                     app.state.runtime = None
                     app.state.bridge = None
@@ -660,6 +684,7 @@ def create_app(
     app.state.execution_target_router = execution_router
     app.state.transport_security = security
     app.state.observability = observer
+    app.state.mcp_events = mcp_events
     app.state.runtime = None
     app.state.bridge = None
     return app

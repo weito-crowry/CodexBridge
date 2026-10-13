@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tomllib
 from collections.abc import Mapping
@@ -24,6 +25,14 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "exclude": list,
         "toolsets": list,
         "max_tools": int,
+    },
+    "mcp_events": {
+        "enabled": bool,
+        "db_path": str,
+        "default_ttl_seconds": int,
+        "max_ttl_seconds": int,
+        "webhook_timeout_seconds": int,
+        "max_retries": int,
     },
 }
 _SECRET_TERMS = ("key", "token", "secret", "password", "credential", "pat")
@@ -52,7 +61,8 @@ def default_config_path(
 
 def _secret_setting(section: str, key: str) -> bool:
     lowered = f"{section}.{key}".casefold()
-    return any(term in lowered for term in _SECRET_TERMS)
+    words = set(re.split(r"[^a-z0-9]+", lowered))
+    return any(term in words for term in _SECRET_TERMS)
 
 
 def load_user_config(
@@ -121,6 +131,8 @@ def load_user_config(
                 raise ConfigFileError(f"unsupported CodexBridge configuration key: {section}.{key}")
             if expected is int and (not isinstance(value, int) or isinstance(value, bool)):
                 raise ConfigFileError(f"{section}.{key} must be an integer")
+            if expected is bool and not isinstance(value, bool):
+                raise ConfigFileError(f"{section}.{key} must be a boolean")
             if expected is list:
                 if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                     raise ConfigFileError(f"{section}.{key} must be an array of strings")

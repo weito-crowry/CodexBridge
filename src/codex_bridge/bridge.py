@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol
@@ -363,6 +363,34 @@ class Bridge:
         self._wait_default_seconds = wait_default_seconds
         self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
         self._approval_lock = asyncio.Lock()
+        self._event_publisher: Callable[[str, str, str, str], None] | None = None
+        self._event_target_id: str | None = None
+
+    def set_event_publisher(
+        self,
+        publisher: Callable[[str, str, str, str], None] | None,
+        *,
+        target_id: str | None = None,
+    ) -> None:
+        self._event_publisher = publisher
+        self._event_target_id = target_id if publisher is not None else None
+
+    def _set_terminal(
+        self,
+        thread_id: str,
+        turn_id: str,
+        status: NormalizedState,
+        error: str | None = None,
+    ) -> bool:
+        transitioned = self._state.set_terminal(thread_id, turn_id, status, error)
+        publisher = self._event_publisher
+        target_id = self._event_target_id
+        if transitioned and publisher is not None and target_id is not None:
+            try:
+                publisher(target_id, thread_id, turn_id, status)
+            except Exception as exc:
+                log_event("mcp_events.publish_failed", error_type=exc.__class__.__name__)
+        return transitioned
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:
@@ -529,7 +557,7 @@ class Bridge:
         log_event("turn.start", thread_id=thread_id, turn_id=turn_id)
         status = _native_state(turn.get("status"))
         if status in _TERMINAL_STATES:
-            self._state.set_terminal(thread_id, turn_id, status, _bounded_text(turn.get("error")))
+            self._set_terminal(thread_id, turn_id, status, _bounded_text(turn.get("error")))
             activity_type: ActivityType
             if status == "completed":
                 activity_type = "turn_completed"
@@ -825,7 +853,7 @@ class Bridge:
         lines = error.splitlines()
         error_summary = _bounded_text(lines[0] if lines else error)
         for thread_id, turn_id in self._state.active_turns():
-            self._state.set_terminal(thread_id, turn_id, "failed", error)
+            self._set_terminal(thread_id, turn_id, "failed", error)
             self._record_activity(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -1300,9 +1328,7 @@ class Bridge:
                 and isinstance(turn.get("id"), str)
             ):
                 status = _native_state(turn.get("status"))
-                self._state.set_terminal(
-                    thread_id, turn["id"], status, _bounded_text(turn.get("error"))
-                )
+                self._set_terminal(thread_id, turn["id"], status, _bounded_text(turn.get("error")))
                 activity_types: dict[str, ActivityType] = {
                     "completed": "turn_completed",
                     "failed": "turn_failed",
@@ -1328,7 +1354,7 @@ class Bridge:
                 will_retry = params.get("willRetry")
                 retryable = will_retry is True
                 if not retryable:
-                    self._state.set_terminal(thread_id, turn_id, "failed", error_summary)
+                    self._set_terminal(thread_id, turn_id, "failed", error_summary)
                 self._record_activity(
                     thread_id=thread_id,
                     turn_id=turn_id,

@@ -18,6 +18,7 @@ from codex_bridge.config import (
     ConfigurationError,
     ExecutionTargetConfig,
     GitHubMcpConfig,
+    McpEventsConfig,
 )
 from codex_bridge.paths import PathPolicyError
 from codex_bridge.server import build_runtime, create_app, prepare_config
@@ -613,6 +614,66 @@ async def test_server_uses_low_level_router_for_wire_tools_list(tmp_path) -> Non
 
     native_names = [tool.name for tool in app.state.mcp_server._tool_manager.list_tools()]
     assert [tool.name for tool in result.tools] == native_names
+
+
+def test_mcp_events_disabled_does_not_register_handlers_or_initialize_database(tmp_path) -> None:
+    app = create_app(config(tmp_path), runtime_factory=lambda _: FakeRuntime())
+
+    assert app.state.mcp_events is None
+    assert app.state.mcp_lowlevel_server.get_request_handler("events/list") is None
+    assert app.state.mcp_lowlevel_server.get_request_handler("events/subscribe") is None
+    assert app.state.mcp_lowlevel_server.get_request_handler("events/unsubscribe") is None
+    assert not (tmp_path / "events.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+async def test_mcp_events_discovery_adds_capability_without_replacing_tools(tmp_path) -> None:
+    settings = replace(
+        config(tmp_path),
+        mcp_events=McpEventsConfig(enabled=True, db_path=tmp_path / "events.sqlite3"),
+    )
+    app = create_app(settings, runtime_factory=lambda _: FakeRuntime())
+    wire = app.state.mcp_lowlevel_server
+    event_methods = ("events/list", "events/subscribe", "events/unsubscribe")
+    assert all(wire.get_request_handler(method) is not None for method in event_methods)
+
+    discovery_entry = wire.get_request_handler("server/discover")
+    assert discovery_entry is not None and discovery_entry.handler is not None
+    result = await discovery_entry.handler(
+        SimpleNamespace(protocol_version="2026-07-28"), types.RequestParams()
+    )
+    serialized = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    assert serialized["resultType"] == "complete"
+    assert "2026-07-28" in serialized["supportedVersions"]
+    assert serialized["capabilities"]["events"] == {}
+    assert serialized["capabilities"]["tools"] == {"listChanged": False}
+    assert app.state.mcp_events is not None
+    assert not (tmp_path / "events.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+async def test_mcp_events_lifecycle_initializes_database_and_stops_worker(tmp_path) -> None:
+    settings = replace(
+        config(tmp_path),
+        mcp_events=McpEventsConfig(enabled=True, db_path=tmp_path / "events.sqlite3"),
+    )
+    runtime = FakeRuntime()
+    app = create_app(settings, runtime_factory=lambda _: runtime)
+    native_tools = {tool.name for tool in app.state.mcp_server._tool_manager.list_tools()}
+
+    assert not (tmp_path / "events.sqlite3").exists()
+    async with app.router.lifespan_context(app):
+        events = app.state.mcp_events
+        assert events is not None
+        assert (tmp_path / "events.sqlite3").exists()
+        assert events.worker._task is not None
+        result = await app.state.mcp_router.list_tools(None, None)
+        assert {tool.name for tool in result.tools} == native_tools
+        assert not {"events/list", "events/subscribe", "events/unsubscribe"} & native_tools
+
+    assert events.worker._task is None
+    assert runtime.shutdown_count == 1
 
 
 @pytest.mark.asyncio
