@@ -220,6 +220,10 @@ def stylesheet_for_theme(theme: AppearanceTheme) -> str:
         QWidget#composerRoot {{
             background-color: {surface}; border-top: 1px solid {border};
         }}
+        QFrame#composerAttachmentChip {{
+            background-color: {alternate}; border: 1px solid {border}; border-radius: 4px;
+        }}
+        QLabel#composerAttachmentName {{ color: {text}; }}
         QPlainTextEdit#composerInput {{ border-radius: 6px; padding: 5px; }}
         QLabel#composerTarget {{ color: {muted}; }}
         QLabel#composerStatus {{ color: {muted}; }}

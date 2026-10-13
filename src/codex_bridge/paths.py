@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 
@@ -49,6 +50,28 @@ class AllowedPathPolicy:
             except ValueError:
                 continue
         raise PathPolicyError("cwd is outside CODEX_BRIDGE_ALLOWED_ROOTS")
+
+    def validate_file(self, value: str) -> str:
+        """Return an existing regular file path inside a configured canonical root."""
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            raise PathPolicyError("file path must be absolute")
+        try:
+            canonical = candidate.resolve(strict=True)
+            mode = canonical.stat().st_mode
+        except (OSError, RuntimeError) as exc:
+            raise PathPolicyError("file path cannot be resolved") from exc
+        if not stat.S_ISREG(mode):
+            raise PathPolicyError("path must be a regular file")
+
+        normalized = os.path.normcase(os.fspath(canonical))
+        for root in self._allowed_roots:
+            try:
+                if os.path.commonpath((root, normalized)) == root:
+                    return os.fspath(canonical)
+            except ValueError:
+                continue
+        raise PathPolicyError("file path is outside CODEX_BRIDGE_ALLOWED_ROOTS")
 
     def safe_relative_path(self, path: str) -> str:
         """Return an allowed-root-relative display path without exposing outside paths."""

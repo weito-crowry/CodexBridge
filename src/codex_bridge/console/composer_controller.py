@@ -34,6 +34,7 @@ class SendContext:
     request_id: str
     draft_key: str
     prompt: str
+    attachments: tuple[str, ...]
     thread_id: str | None
     cwd: str | None
     model: str | None
@@ -75,6 +76,7 @@ class ComposerController(QObject):
         self._allowed_roots = tuple(allowed_roots)
         self._confirm_full_access = full_access_confirmation or self._ask_full_access
         self._drafts: dict[str, str] = {"new:unselected": ""}
+        self._draft_attachments: dict[str, tuple[str, ...]] = {"new:unselected": ()}
         self._draft_options: dict[str, DraftOptions] = {}
         self._draft_cwds: dict[str, str | None] = {}
         self._thread_metadata: dict[str, tuple[str | None, str | None, str | None]] = {}
@@ -106,6 +108,8 @@ class ComposerController(QObject):
         self._status_messages: dict[str, tuple[str, bool]] = {}
 
         widget.input.textChanged.connect(self._on_prompt_changed)
+        widget.attachments_changed.connect(self._on_attachments_changed)
+        widget.attachment_notice.connect(self._on_attachment_notice)
         widget.send_requested.connect(self.send)
         widget.stop_requested.connect(self.stop)
         widget.new_thread_requested.connect(self._start_new_thread_from_selection)
@@ -167,6 +171,7 @@ class ComposerController(QObject):
         self._is_new_draft = False
         self._current_draft_key = f"thread:{thread_id}" if thread_id else "new:unselected"
         self._drafts.setdefault(self._current_draft_key, "")
+        self._draft_attachments.setdefault(self._current_draft_key, ())
         self._current_state = None
         self._stop_target = None
         self._stop_waiting_for_status = None
@@ -186,6 +191,7 @@ class ComposerController(QObject):
         self._current_cwd = candidate
         self._current_draft_key = self._new_draft_key(candidate)
         self._drafts.setdefault(self._current_draft_key, "")
+        self._draft_attachments.setdefault(self._current_draft_key, ())
         self._draft_options.setdefault(self._current_draft_key, DraftOptions())
         self._draft_cwds[self._current_draft_key] = candidate
         self._current_state = None
@@ -210,16 +216,25 @@ class ComposerController(QObject):
     def _new_draft_key(cwd: str | None) -> str:
         if cwd is None or not cwd.strip():
             return "new:unselected"
-        canonical = os.path.normcase(os.path.abspath(os.path.normpath(cwd)))
+        canonical = os.path.realpath(os.path.abspath(os.path.normpath(cwd)))
+        canonical = os.path.normcase(canonical)
         return f"new:{canonical}"
 
     def _save_visible_draft(self) -> None:
         if hasattr(self, "_current_draft_key"):
             self._drafts[self._current_draft_key] = self._widget.prompt_text
+            self._draft_attachments[self._current_draft_key] = self._widget.attachments
 
     def _on_prompt_changed(self) -> None:
         self._save_visible_draft()
         self._update_controls()
+
+    def _on_attachments_changed(self, _paths: object) -> None:
+        self._save_visible_draft()
+        self._update_controls()
+
+    def _on_attachment_notice(self, message: str) -> None:
+        self._set_status(message, error=True)
 
     def _change_cwd(self, value: str) -> None:
         if not self._is_new_draft:
@@ -228,6 +243,7 @@ class ComposerController(QObject):
         self._current_cwd = value if value.strip() else None
         self._current_draft_key = self._new_draft_key(self._current_cwd)
         self._drafts.setdefault(self._current_draft_key, "")
+        self._draft_attachments.setdefault(self._current_draft_key, ())
         self._draft_options.setdefault(self._current_draft_key, DraftOptions())
         self._draft_cwds[self._current_draft_key] = self._current_cwd
         self._render()
@@ -350,6 +366,7 @@ class ComposerController(QObject):
     def _render(self) -> None:
         self._widget.set_draft_mode(self._is_new_draft)
         self._widget.set_prompt_text(self._drafts.get(self._current_draft_key, ""))
+        self._widget.set_attachments(self._draft_attachments.get(self._current_draft_key, ()))
         if self._is_new_draft:
             options = self._draft_options.setdefault(self._current_draft_key, DraftOptions())
             self._widget.set_target(self._new_target_text(self._current_cwd))
@@ -473,6 +490,7 @@ class ComposerController(QObject):
             request_id=request_id,
             draft_key=self._current_draft_key,
             prompt=self._widget.prompt_text,
+            attachments=self._draft_attachments.get(self._current_draft_key, ()),
             thread_id=thread_id,
             cwd=self._current_cwd if self._is_new_draft else None,
             model=options.model if self._is_new_draft else None,
@@ -480,6 +498,8 @@ class ComposerController(QObject):
             access=options.access if self._is_new_draft else "inherit",
         )
         payload: dict[str, object] = {"client_request_id": request_id, "prompt": context.prompt}
+        if context.attachments:
+            payload["attachments"] = list(context.attachments)
         if thread_id is None:
             payload["cwd"] = context.cwd or ""
             payload["sandbox_mode"] = context.access
@@ -632,6 +652,10 @@ class ComposerController(QObject):
             self._drafts[context.draft_key] = ""
             if self._current_draft_key == context.draft_key:
                 self._widget.set_prompt_text("")
+        if self._draft_attachments.get(context.draft_key, ()) == context.attachments:
+            self._draft_attachments[context.draft_key] = ()
+            if self._current_draft_key == context.draft_key:
+                self._widget.set_attachments(())
         if context.thread_id is None:
             if self._current_draft_key == context.draft_key and self._is_new_draft:
                 self._pending_create_selection = (thread_id, context.draft_key)
@@ -681,7 +705,9 @@ class ComposerController(QObject):
             text = "送信結果が不明です。Threadsを更新し、履歴とActivityで実行結果を確認してください"
         else:
             text = {
-                "http_400": "APIが送信内容を受け付けませんでした。入力とCWDを確認してください",
+                "http_400": (
+                    "APIが送信内容を受け付けませんでした。入力、添付ファイル、CWDを確認してください"
+                ),
                 "http_403": (
                     "Control APIの認証が拒否されました。Console管理Bridgeを確認してください"
                 ),

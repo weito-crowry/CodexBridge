@@ -55,6 +55,39 @@ async def test_start_returns_native_ids_without_waiting_for_completion(allowed_d
 
 
 @pytest.mark.asyncio
+async def test_start_and_continue_append_local_images_only_to_turn_input(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    image_paths = (str(allowed_dir / "first.png"), str(allowed_dir / "second.jpg"))
+
+    await bridge.start(str(allowed_dir), "inspect", image_paths=image_paths)
+    start_turn = app.calls[-1]
+    assert start_turn[0] == "turn/start"
+    assert start_turn[1]["input"] == [
+        {"type": "text", "text": "inspect"},
+        {"type": "localImage", "path": image_paths[0]},
+        {"type": "localImage", "path": image_paths[1]},
+    ]
+    assert "detail" not in str(start_turn[1]["input"])
+    assert "localImage" not in str(app.calls[0][1])
+
+    app.calls.clear()
+    await bridge.continue_thread("native-thread", "follow up", image_paths=(image_paths[1],))
+
+    assert app.calls == [
+        (
+            "turn/start",
+            {
+                "threadId": "native-thread",
+                "input": [
+                    {"type": "text", "text": "follow up"},
+                    {"type": "localImage", "path": image_paths[1]},
+                ],
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_start_passes_explicit_model_and_effort_only_to_expected_wire_fields(
     allowed_dir,
 ) -> None:

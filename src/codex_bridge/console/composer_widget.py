@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .composer_attachments import ComposerAttachmentBar
+
 
 class ComposerInput(QPlainTextEdit):
     send_requested = Signal()
@@ -73,6 +75,8 @@ class ComposerWidget(QWidget):
     model_changed = Signal()
     effort_changed = Signal()
     access_changed = Signal()
+    attachments_changed = Signal(object)
+    attachment_notice = Signal(str)
 
     def __init__(self, allowed_roots: Sequence[str] = (), parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -120,6 +124,10 @@ class ComposerWidget(QWidget):
 
         self.input = ComposerInput(self)
         self.input.send_requested.connect(self.send_requested.emit)
+        self.attachment_bar = ComposerAttachmentBar(self)
+        self.attachment_bar.attachments_changed.connect(self.attachments_changed.emit)
+        self.attachment_bar.validation_notice.connect(self._on_attachment_notice)
+        self.attachment_add_button = self.attachment_bar.add_button
 
         self.access_combo = QComboBox()
         self.access_combo.setObjectName("composerAccess")
@@ -178,6 +186,7 @@ class ComposerWidget(QWidget):
         layout.addLayout(target_row)
         layout.addWidget(self.cwd_container)
         layout.addWidget(self.input)
+        layout.addWidget(self.attachment_bar)
         layout.addLayout(controls)
         layout.addWidget(self.status_label)
 
@@ -188,6 +197,10 @@ class ComposerWidget(QWidget):
     @property
     def prompt_text(self) -> str:
         return self.input.toPlainText()
+
+    @property
+    def attachments(self) -> tuple[str, ...]:
+        return self.attachment_bar.attachments
 
     @property
     def cwd_value(self) -> str:
@@ -214,6 +227,12 @@ class ComposerWidget(QWidget):
         self.input.blockSignals(True)
         self.input.setPlainText(value)
         self.input.blockSignals(False)
+
+    def set_attachments(self, paths: Sequence[str]) -> None:
+        self.attachment_bar.set_attachments(paths)
+
+    def add_attachments(self, paths: Sequence[str]) -> None:
+        self.attachment_bar.add_paths(paths)
 
     def set_target(self, text: str) -> None:
         self.target_label.setText(text)
@@ -309,6 +328,10 @@ class ComposerWidget(QWidget):
         self.status_label.setProperty("error", error)
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
+
+    def _on_attachment_notice(self, message: str) -> None:
+        self.set_status(message, error=True)
+        self.attachment_notice.emit(message)
 
     def set_send_enabled(self, enabled: bool) -> None:
         self.send_button.setEnabled(enabled)

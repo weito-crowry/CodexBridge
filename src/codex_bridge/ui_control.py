@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -13,6 +13,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from .attachment_policy import (
+    MAX_ATTACHMENTS,
+    AttachmentPolicy,
+    ValidatedAttachment,
+)
 from .config import BridgeConfig
 from .models import SandboxMode
 from .paths import AllowedPathPolicy, PathPolicyError
@@ -42,9 +47,12 @@ class ControlBridge(Protocol):
         reasoning_effort: str | None = None,
         sandbox_mode: SandboxMode | None = None,
         title: str | None = None,
+        image_paths: Sequence[str] = (),
     ) -> dict[str, Any]: ...
 
-    async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]: ...
+    async def continue_thread(
+        self, thread_id: str, prompt: str, *, image_paths: Sequence[str] = ()
+    ) -> dict[str, Any]: ...
 
     async def interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]: ...
 
@@ -199,6 +207,33 @@ def _prompt(payload: Mapping[str, Any]) -> str:
     return value
 
 
+def _attachments(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    if "attachments" not in payload:
+        return ()
+    value = payload["attachments"]
+    if (
+        not isinstance(value, list)
+        or len(value) > MAX_ATTACHMENTS
+        or any(not isinstance(path, str) for path in value)
+    ):
+        raise ValueError("invalid request")
+    return tuple(value)
+
+
+def _attachment_prompt(prompt: str, attachments: Sequence[ValidatedAttachment]) -> str:
+    references = [entry for entry in attachments if entry.kind == "file"]
+    if not references:
+        return prompt
+    paths = "\n".join(
+        "- " + json.dumps(entry.canonical_path, ensure_ascii=False) for entry in references
+    )
+    return f"{prompt}\n\n---\n添付ファイル参照:\n{paths}"
+
+
+def _image_paths(attachments: Sequence[ValidatedAttachment]) -> tuple[str, ...]:
+    return tuple(entry.canonical_path for entry in attachments if entry.kind == "image")
+
+
 def _digest(operation: str, payload: Mapping[str, Any]) -> bytes:
     encoded = json.dumps(
         {"operation": operation, "payload": payload},
@@ -234,6 +269,7 @@ class UiControl:
     def __init__(self, bridge: ControlBridge, config: BridgeConfig) -> None:
         self._bridge = bridge
         self._path_policy = AllowedPathPolicy(config.allowed_roots)
+        self._attachment_policy = AttachmentPolicy(self._path_policy)
         self._requests = _IdempotencyRegistry()
         self._inflight_thread_operations: set[str] = set()
 
@@ -250,12 +286,14 @@ class UiControl:
             "sandbox_mode",
             "confirm_full_access",
             "title",
+            "attachments",
         }
         if set(payload) - allowed or not {"client_request_id", "cwd", "prompt"} <= set(payload):
             raise ValueError("invalid request")
         request_id = _request_id(payload)
         cwd = payload["cwd"]
         prompt = _prompt(payload)
+        raw_attachments = _attachments(payload)
         if not isinstance(cwd, str):
             raise ValueError("invalid request")
         model = payload.get("model")
@@ -283,6 +321,9 @@ class UiControl:
 
         async def action(mark_dispatched: Callable[[], None]) -> dict[str, Any]:
             canonical_cwd = self._path_policy.validate_cwd(cwd)
+            attachments = self._attachment_policy.validate(raw_attachments)
+            turn_prompt = _attachment_prompt(prompt, attachments)
+            image_paths = _image_paths(attachments)
             title = normalize_explicit_title(raw_title) if raw_title is not None else None
             if model is not None:
                 catalog = await self._bridge.model_capabilities()
@@ -307,16 +348,17 @@ class UiControl:
                     ):
                         raise ValueError("invalid request")
             mark_dispatched()
-            result = await self._bridge.start(
-                canonical_cwd,
-                prompt,
-                model=model,
-                reasoning_effort=effort,
-                sandbox_mode=(
+            start_kwargs: dict[str, Any] = {
+                "model": model,
+                "reasoning_effort": effort,
+                "sandbox_mode": (
                     "danger-full-access" if raw_sandbox == "danger-full-access" else None
                 ),
-                title=title,
-            )
+                "title": title,
+            }
+            if image_paths:
+                start_kwargs["image_paths"] = image_paths
+            result = await self._bridge.start(canonical_cwd, turn_prompt, **start_kwargs)
             safe = _safe_turn_result(result)
             title_assignment = result.get("title_assignment")
             if isinstance(title_assignment, Mapping):
@@ -337,11 +379,12 @@ class UiControl:
         )
 
     async def continue_thread(self, thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"client_request_id", "prompt"}
+        allowed = {"client_request_id", "prompt", "attachments"}
         if set(payload) - allowed or not {"client_request_id", "prompt"} <= set(payload):
             raise ValueError("invalid request")
         request_id = _request_id(payload)
         prompt = _prompt(payload)
+        raw_attachments = _attachments(payload)
         if not thread_id:
             raise ValueError("invalid request")
 
@@ -349,8 +392,16 @@ class UiControl:
             async def execute() -> dict[str, Any]:
                 await self._validated_thread(thread_id)
                 await self._ensure_inactive(thread_id)
+                attachments = self._attachment_policy.validate(raw_attachments)
+                turn_prompt = _attachment_prompt(prompt, attachments)
+                image_paths = _image_paths(attachments)
                 mark_dispatched()
-                result = await self._bridge.continue_thread(thread_id, prompt)
+                if image_paths:
+                    result = await self._bridge.continue_thread(
+                        thread_id, turn_prompt, image_paths=image_paths
+                    )
+                else:
+                    result = await self._bridge.continue_thread(thread_id, turn_prompt)
                 return _safe_turn_result(result, thread_id)
 
             return await self._run_thread_operation(thread_id, execute)
@@ -526,6 +577,7 @@ def create_control_routes(
                     "sandbox_mode",
                     "confirm_full_access",
                     "title",
+                    "attachments",
                 },
             )
             return JSONResponse(await control.create_thread(payload))
@@ -536,7 +588,7 @@ def create_control_routes(
         if not authorized(request):
             return JSONResponse({"error": "forbidden"}, status_code=403)
         try:
-            payload = await _json_payload(request, {"client_request_id", "prompt"})
+            payload = await _json_payload(request, {"client_request_id", "prompt", "attachments"})
             result = await control.continue_thread(request.path_params["thread_id"], payload)
             return JSONResponse(result)
         except Exception as exc:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol
@@ -42,6 +42,7 @@ from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unava
 from .setup_capabilities import normalize_capabilities
 from .state import StateStore
 from .thread_titles import derive_thread_title, normalize_explicit_title
+from .turn_input import build_turn_input
 
 
 class AppServerPort(Protocol):
@@ -509,10 +510,11 @@ class Bridge:
         *,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        image_paths: Sequence[str] = (),
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": build_turn_input(prompt, image_paths),
         }
         if model is not None:
             params["model"] = model
@@ -565,6 +567,7 @@ class Bridge:
         sandbox_mode: SandboxMode | None = None,
         approvals_reviewer: ApprovalsReviewer = "auto_review",
         title: str | None = None,
+        image_paths: Sequence[str] = (),
     ) -> dict[str, Any]:
         sandbox_mode = validate_sandbox_mode(sandbox_mode)
         approvals_reviewer = validate_approvals_reviewer(approvals_reviewer)
@@ -613,7 +616,11 @@ class Bridge:
         except (JsonRpcRemoteError, JsonRpcClosedError, OSError, TimeoutError):
             title_failed = True
         snapshot = await self._start_turn(
-            thread_id, prompt, model=model, reasoning_effort=reasoning_effort
+            thread_id,
+            prompt,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            image_paths=image_paths,
         )
         snapshot["title_assignment"] = (
             {"status": "failed"} if title_failed else {"status": "assigned", "name": assigned_title}
@@ -653,7 +660,9 @@ class Bridge:
         except Exception:
             raise BridgeError("model capabilities are unavailable") from None
 
-    async def continue_thread(self, thread_id: str, prompt: str) -> dict[str, Any]:
+    async def continue_thread(
+        self, thread_id: str, prompt: str, *, image_paths: Sequence[str] = ()
+    ) -> dict[str, Any]:
         if not self._state.is_loaded(thread_id):
             metadata = await self._app_server.request(
                 "thread/read", {"threadId": thread_id, "includeTurns": False}
@@ -672,7 +681,7 @@ class Bridge:
             self._state.mark_loaded(thread_id, validated_cwd, resumed_thread)
             self._state.update_thread_metadata(thread_id, response)
             log_event("thread.resume", thread_id=thread_id)
-        return await self._start_turn(thread_id, prompt)
+        return await self._start_turn(thread_id, prompt, image_paths=image_paths)
 
     async def wait(
         self, thread_id: str, turn_id: str, timeout_seconds: float | None = None
