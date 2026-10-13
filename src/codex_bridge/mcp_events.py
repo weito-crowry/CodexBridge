@@ -42,6 +42,12 @@ EVENT_DESCRIPTION = (
 PROTOCOL_VERSION = "2026-07-28"
 FORBIDDEN = -32024
 CALLBACK_ENDPOINT_ERROR = -32015
+_CALLBACK_VERIFICATION_REASONS = frozenset(
+    {"timeout", "callback_unreachable", "invalid_callback", "challenge_failed", "invalid_response"}
+)
+_FORBIDDEN_CATEGORIES = frozenset(
+    {"missing_principal", "remote_target", "thread_unavailable", "turn_unavailable"}
+)
 
 EVENT_INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -250,38 +256,93 @@ class McpEventsAdapter:
         }
 
     async def subscribe(self, context: Any, params: EventsSubscribeParams) -> dict[str, object]:
-        self._require_protocol(context)
-        principal = self._principal_resolver(context)
+        self._log_subscribe("received", state="handler_entered")
+        try:
+            self._require_protocol(context)
+        except MCPError as exc:
+            self._log_subscribe("protocol_checked", state="invalid")
+            self._log_subscribe(
+                "rejected", error_category="protocol_invalid", error_type=exc.__class__.__name__
+            )
+            raise
+        self._log_subscribe("protocol_checked", state="valid")
+        try:
+            principal = self._principal_resolver(context)
+        except Exception as exc:
+            self._log_subscribe(
+                "failed",
+                error_category="principal_resolution_failed",
+                error_type=exc.__class__.__name__,
+            )
+            raise
         if not principal:
-            raise MCPError(code=FORBIDDEN, message="Forbidden")
+            self._log_subscribe("principal_checked", state="missing")
+            self._log_subscribe("rejected", error_category="missing_principal")
+            self._forbidden("missing_principal")
+        self._log_subscribe("principal_checked", state="present_authenticated")
         if not self._ready:
+            self._log_subscribe("rejected", error_category="events_not_ready")
             raise MCPError(code=types.INTERNAL_ERROR, message="MCP Events is unavailable")
         if params.name != EVENT_NAME:
+            self._log_subscribe("rejected", error_category="invalid_arguments")
             raise MCPError(code=types.INVALID_PARAMS, message="Unsupported event name")
         if params.cursor is not None:
+            self._log_subscribe("rejected", error_category="invalid_arguments")
             raise MCPError(
                 code=types.INVALID_PARAMS,
                 message="Cursor replay is not supported for codex.turn.finished",
                 data={"reason": "cursor_replay_unsupported"},
             )
-        arguments = _validate_arguments(params.arguments)
-        await self._validate_local_target(arguments["thread_id"], arguments.get("turn_id"))
+        try:
+            arguments = _validate_arguments(params.arguments)
+        except MCPError as exc:
+            self._log_subscribe(
+                "rejected", error_category="invalid_arguments", error_type=exc.__class__.__name__
+            )
+            raise
+        self._log_subscribe("arguments_checked", state="valid")
+        try:
+            await self._validate_local_target(arguments["thread_id"], arguments.get("turn_id"))
+        except MCPError as exc:
+            category = "target_rejected" if exc.code == FORBIDDEN else "target_validation_failed"
+            self._log_subscribe(
+                "rejected", error_category=category, error_type=exc.__class__.__name__
+            )
+            raise
+        except Exception as exc:
+            self._log_subscribe(
+                "failed",
+                error_category="target_validation_failed",
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        self._log_subscribe("target_checked", state="valid")
         if params.delivery.mode != "webhook":
+            self._log_subscribe("rejected", error_category="invalid_delivery")
             raise MCPError(code=types.INVALID_PARAMS, message="Unsupported delivery mode")
+        self._log_subscribe("delivery_checked", state="webhook")
         try:
             validate_callback_url(params.delivery.url)
         except ValueError as exc:
+            self._log_subscribe(
+                "rejected", error_category="invalid_callback", error_type=exc.__class__.__name__
+            )
             raise MCPError(
                 code=CALLBACK_ENDPOINT_ERROR,
                 message="Callback verification failed",
                 data={"reason": "invalid_callback"},
             ) from exc
+        self._log_subscribe("callback_checked", state="valid")
         try:
             secret_bytes = decode_signing_secret(params.delivery.secret)
         except ValueError as exc:
+            self._log_subscribe(
+                "rejected", error_category="invalid_secret", error_type=exc.__class__.__name__
+            )
             raise MCPError(
                 code=types.INVALID_PARAMS, message="Invalid webhook signing secret"
             ) from exc
+        self._log_subscribe("secret_checked", state="valid")
         canonical_arguments = canonical_json(arguments)
         subscription_id = self.store_subscription_id(
             principal, params.delivery.url, params.name, canonical_arguments
@@ -297,23 +358,53 @@ class McpEventsAdapter:
                 timeout_seconds=self.config.webhook_timeout_seconds,
             )
         except CallbackRequestError as exc:
+            reason = exc.reason if exc.reason in _CALLBACK_VERIFICATION_REASONS else "other"
+            self._log_subscribe(
+                "rejected",
+                error_category="callback_verification_failed",
+                error_type=exc.__class__.__name__,
+                state=reason,
+            )
             raise MCPError(
                 code=CALLBACK_ENDPOINT_ERROR,
                 message="Callback verification failed",
                 data={"reason": exc.reason},
             ) from None
-        granted_ttl_ms = _granted_ttl_ms(params.ttl_ms, self.config)
+        except Exception as exc:
+            self._log_subscribe(
+                "failed",
+                error_category="callback_verification_failed",
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        self._log_subscribe("callback_verified", state="verified")
+        try:
+            granted_ttl_ms = _granted_ttl_ms(params.ttl_ms, self.config)
+        except MCPError as exc:
+            self._log_subscribe(
+                "rejected", error_category="invalid_arguments", error_type=exc.__class__.__name__
+            )
+            raise
         now = self._clock()
         expires_at = now + timedelta(milliseconds=granted_ttl_ms)
-        identifier = self.store.upsert_subscription(
-            principal=principal,
-            event_name=params.name,
-            canonical_arguments=canonical_arguments,
-            callback_url=params.delivery.url,
-            signing_secret=params.delivery.secret,
-            expires_at=expires_at,
-            now=now,
-        )
+        try:
+            identifier = self.store.upsert_subscription(
+                principal=principal,
+                event_name=params.name,
+                canonical_arguments=canonical_arguments,
+                callback_url=params.delivery.url,
+                signing_secret=params.delivery.secret,
+                expires_at=expires_at,
+                now=now,
+            )
+        except Exception as exc:
+            self._log_subscribe(
+                "failed",
+                error_category="subscription_store_failed",
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        self._log_subscribe("persisted", state="stored")
         self.worker.notify()
         return {
             "id": identifier,
@@ -360,7 +451,7 @@ class McpEventsAdapter:
             except Exception as exc:
                 log_event(
                     "mcp_events.target_rejected",
-                    reason="thread_unavailable",
+                    error_category="thread_unavailable",
                     error_type=exc.__class__.__name__,
                 )
                 self._forbidden("thread_unavailable")
@@ -372,7 +463,7 @@ class McpEventsAdapter:
         except Exception as exc:
             log_event(
                 "mcp_events.target_rejected",
-                reason="thread_unavailable",
+                error_category="thread_unavailable",
                 error_type=exc.__class__.__name__,
             )
             self._forbidden("thread_unavailable")
@@ -394,9 +485,14 @@ class McpEventsAdapter:
                 message=f"MCP Events require protocol version {PROTOCOL_VERSION}",
             )
 
-    @staticmethod
-    def _forbidden(reason: str) -> NoReturn:
-        log_event("mcp_events.subscription_forbidden", reason=reason)
+    def _log_subscribe(self, stage: str, **fields: object) -> None:
+        if self.config.enabled:
+            log_event(f"mcp_events.subscribe.{stage}", **fields)
+
+    def _forbidden(self, reason: str) -> NoReturn:
+        if self.config.enabled:
+            category = reason if reason in _FORBIDDEN_CATEGORIES else "target_rejected"
+            log_event("mcp_events.subscription_forbidden", error_category=category)
         raise MCPError(code=FORBIDDEN, message="Forbidden")
 
 

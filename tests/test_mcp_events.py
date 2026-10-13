@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -11,7 +12,12 @@ from pydantic import ValidationError
 
 from codex_bridge.bridge import Bridge
 from codex_bridge.config import McpEventsConfig
-from codex_bridge.event_security import WebhookClient, WebhookResponse, validate_callback_url
+from codex_bridge.event_security import (
+    CallbackRequestError,
+    WebhookClient,
+    WebhookResponse,
+    validate_callback_url,
+)
 from codex_bridge.mcp_events import (
     EVENT_DESCRIPTION,
     EVENT_INPUT_SCHEMA,
@@ -57,9 +63,9 @@ class _CallbackClient(WebhookClient):
         return WebhookResponse(200, {}, json.dumps({"challenge": challenge}).encode())
 
 
-def _adapter(tmp_path, *, principal="owner-a", bridge=None, clock=None):
+def _adapter(tmp_path, *, principal="owner-a", bridge=None, clock=None, enabled=True):
     current = clock or datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
-    config = McpEventsConfig(enabled=True, db_path=tmp_path / "events.sqlite3")
+    config = McpEventsConfig(enabled=enabled, db_path=tmp_path / "events.sqlite3")
     bridge_value = bridge or _Bridge(turns=[{"id": "turn-a"}])
     client = _CallbackClient()
     adapter = McpEventsAdapter(
@@ -112,21 +118,45 @@ async def test_events_list_exposes_one_webhook_event_and_both_schemas(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_subscribe_verifies_callback_persists_and_clamps_ttl(tmp_path) -> None:
+async def test_subscribe_verifies_callback_persists_and_clamps_ttl(tmp_path, caplog) -> None:
     adapter, bridge, client, now = _adapter(tmp_path)
     await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
+    principal = "private-principal-marker"
+    callback_url = "https://receiver.example/private-path?token=private-url-marker"
+    adapter._principal_resolver = lambda _context: principal
+    params = _subscription(ttl=30_000)
+    params.arguments = {"thread_id": "request-body-private-marker", "turn_id": "turn-a"}
+    params.delivery.url = callback_url
+    signing_secret = params.delivery.secret
 
-    result = await adapter.subscribe(_context(), _subscription(ttl=30_000))
+    result = await adapter.subscribe(_context(), params)
 
     assert result["id"].startswith("sub_")
+    assert set(result) == {"id", "refreshBefore", "cursor", "truncated"}
     assert result["refreshBefore"] == "2026-10-13T12:01:00.000000Z"
     assert result["cursor"] is None
     assert result["truncated"] is False
     assert bridge.calls == []
-    assert bridge.turn_calls == [("thread-a", "turn-a")]
+    assert bridge.turn_calls == [("request-body-private-marker", "turn-a")]
     assert len(client.posts) == 1
     secret = adapter.store.subscription_secret(result["id"], now=now)
     assert secret is not None
+    assert "mcp_events.subscribe.received" in caplog.text
+    assert "mcp_events.subscribe.protocol_checked state=valid" in caplog.text
+    assert "mcp_events.subscribe.principal_checked state=present_authenticated" in caplog.text
+    assert "mcp_events.subscribe.arguments_checked state=valid" in caplog.text
+    assert "mcp_events.subscribe.target_checked state=valid" in caplog.text
+    assert "mcp_events.subscribe.delivery_checked state=webhook" in caplog.text
+    assert "mcp_events.subscribe.callback_checked state=valid" in caplog.text
+    assert "mcp_events.subscribe.secret_checked state=valid" in caplog.text
+    assert "mcp_events.subscribe.callback_verified" in caplog.text
+    assert "mcp_events.subscribe.persisted" in caplog.text
+    assert principal not in caplog.text
+    assert callback_url not in caplog.text
+    assert "private-url-marker" not in caplog.text
+    assert signing_secret not in caplog.text
+    assert "request-body-private-marker" not in caplog.text
     await adapter.stop()
 
 
@@ -155,7 +185,7 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("name", "arguments", "mode", "url", "secret", "error_code"),
+    ("name", "arguments", "mode", "url", "secret", "error_code", "error_category"),
     [
         (
             "codex.turn.started",
@@ -164,6 +194,7 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
             "https://receiver.example/callback",
             "valid",
             types.INVALID_PARAMS,
+            "invalid_arguments",
         ),
         (
             EVENT_NAME,
@@ -172,6 +203,7 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
             "https://receiver.example/callback",
             "valid",
             types.INVALID_PARAMS,
+            "invalid_arguments",
         ),
         (
             EVENT_NAME,
@@ -180,6 +212,7 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
             "https://receiver.example/callback",
             "valid",
             types.INVALID_PARAMS,
+            "invalid_arguments",
         ),
         (
             EVENT_NAME,
@@ -188,6 +221,7 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
             "https://receiver.example/callback",
             "valid",
             types.INVALID_PARAMS,
+            "invalid_delivery",
         ),
         (
             EVENT_NAME,
@@ -196,6 +230,7 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
             "http://receiver.example/callback",
             "valid",
             -32015,
+            "invalid_callback",
         ),
         (
             EVENT_NAME,
@@ -204,14 +239,16 @@ async def test_subscribe_caps_requested_ttl_at_configured_maximum(tmp_path) -> N
             "https://receiver.example/callback",
             "invalid",
             types.INVALID_PARAMS,
+            "invalid_secret",
         ),
     ],
 )
 async def test_subscribe_rejects_unsupported_or_malformed_requests(
-    tmp_path, name, arguments, mode, url, secret, error_code
+    tmp_path, name, arguments, mode, url, secret, error_code, error_category, caplog
 ) -> None:
     adapter, _, client, _ = _adapter(tmp_path)
     await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
     secret_value = secret
     if secret == "valid":
         secret_value = "whsec_" + base64.b64encode(bytes(range(32))).decode("ascii")
@@ -228,19 +265,125 @@ async def test_subscribe_rejects_unsupported_or_malformed_requests(
 
     assert exc_info.value.code == error_code
     assert client.posts == []
+    assert f"error_category={error_category}" in caplog.text
     await adapter.stop()
 
 
 @pytest.mark.asyncio
-async def test_anonymous_subscribe_is_forbidden_before_callback_io(tmp_path) -> None:
+async def test_anonymous_subscribe_is_forbidden_before_callback_io(tmp_path, caplog) -> None:
     adapter, _, client, _ = _adapter(tmp_path, principal=None)
     await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
     with pytest.raises(MCPError) as exc_info:
         await adapter.subscribe(_context(), _subscription())
 
     assert exc_info.value.code == -32024
     assert client.posts == []
+    assert "mcp_events.subscribe.rejected" in caplog.text
+    assert "error_category=missing_principal" in caplog.text
+    assert "principal=None" not in caplog.text
     await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_logs_target_rejection_category(tmp_path, caplog) -> None:
+    adapter, _, _, _ = _adapter(tmp_path, bridge=_Bridge(turns=[]))
+    await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
+
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), _subscription())
+
+    assert exc_info.value.code == -32024
+    assert "mcp_events.subscribe.rejected" in caplog.text
+    assert "error_category=target_rejected" in caplog.text
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_logs_invalid_callback_category_without_callback_url(
+    tmp_path, caplog
+) -> None:
+    adapter, _, client, _ = _adapter(tmp_path)
+    await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
+    params = _subscription()
+    params.delivery.url = "http://private-callback-marker.example/path?token=hidden"
+
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), params)
+
+    assert exc_info.value.code == -32015
+    assert client.posts == []
+    assert "error_category=invalid_callback" in caplog.text
+    assert "private-callback-marker" not in caplog.text
+    assert "token=hidden" not in caplog.text
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_logs_callback_challenge_failure_category(
+    tmp_path, caplog, monkeypatch
+) -> None:
+    adapter, _, _, _ = _adapter(tmp_path)
+    await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
+
+    async def fail_verification(**_kwargs) -> None:
+        raise CallbackRequestError("challenge_failed")
+
+    monkeypatch.setattr("codex_bridge.mcp_events.verify_callback", fail_verification)
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), _subscription())
+
+    assert exc_info.value.code == -32015
+    assert "error_category=callback_verification_failed" in caplog.text
+    assert "state=challenge_failed" in caplog.text
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_logs_store_failure_and_propagates_exception(
+    tmp_path, caplog, monkeypatch
+) -> None:
+    adapter, _, _, _ = _adapter(tmp_path)
+    await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
+    failure = sqlite3.OperationalError("private-store-message-marker")
+
+    def fail_store(**_kwargs):
+        raise failure
+
+    monkeypatch.setattr(adapter.store, "upsert_subscription", fail_store)
+    with pytest.raises(sqlite3.OperationalError) as exc_info:
+        await adapter.subscribe(_context(), _subscription())
+
+    assert exc_info.value is failure
+    assert "mcp_events.subscribe.failed" in caplog.text
+    assert "error_category=subscription_store_failed" in caplog.text
+    assert "error_type=OperationalError" in caplog.text
+    assert "private-store-message-marker" not in caplog.text
+    assert "receiver.example" not in caplog.text
+    assert "owner-a" not in caplog.text
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("principal", "expected_code"),
+    [("owner-a", types.INTERNAL_ERROR), (None, -32024)],
+)
+async def test_disabled_events_subscription_emits_no_subscribe_logs(
+    tmp_path, caplog, principal, expected_code
+) -> None:
+    adapter, _, _, _ = _adapter(tmp_path, enabled=False, principal=principal)
+    caplog.set_level("INFO", logger="codex_bridge")
+
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), _subscription())
+
+    assert exc_info.value.code == expected_code
+    assert "mcp_events." not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -374,17 +517,33 @@ async def test_other_principal_cannot_unsubscribe_subscription(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_cursor_and_protocol_version_errors_are_explicit(tmp_path) -> None:
+async def test_cursor_and_protocol_version_errors_are_explicit(tmp_path, caplog) -> None:
     adapter, _, _, _ = _adapter(tmp_path)
     await adapter.start()
+    caplog.set_level("INFO", logger="codex_bridge")
     with pytest.raises(MCPError) as cursor_error:
         await adapter.subscribe(_context(), _subscription(cursor="cursor-1"))
     assert cursor_error.value.code == types.INVALID_PARAMS
+    assert "error_category=invalid_arguments" in caplog.text
 
     with pytest.raises(MCPError) as version_error:
         await adapter.subscribe(_context("2025-11-25"), _subscription())
     assert version_error.value.code == types.INVALID_REQUEST
+    assert "error_category=protocol_invalid" in caplog.text
+    assert "mcp_events.subscribe.protocol_checked state=invalid" in caplog.text
     await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_logs_events_not_ready_without_changing_error(tmp_path, caplog) -> None:
+    adapter, _, _, _ = _adapter(tmp_path)
+    caplog.set_level("INFO", logger="codex_bridge")
+
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), _subscription())
+
+    assert exc_info.value.code == types.INTERNAL_ERROR
+    assert "error_category=events_not_ready" in caplog.text
 
 
 def test_event_params_reject_unknown_delivery_fields() -> None:
