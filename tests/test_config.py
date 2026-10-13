@@ -61,6 +61,59 @@ def test_mcp_events_environment_overrides_toml_settings(tmp_path) -> None:
     assert config.mcp_events.max_retries == 2
 
 
+def test_mcp_events_local_auth_token_is_optional_and_hidden_from_repr() -> None:
+    token = "A" * 32
+    unset = BridgeConfig.from_sources(environ={}, config_data={})
+    configured = BridgeConfig.from_sources(
+        environ={"CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN": token},
+        config_data={},
+    )
+
+    assert unset.mcp_events.local_auth_token is None
+    assert configured.mcp_events.local_auth_token == token
+    assert token not in repr(configured)
+    assert token not in repr(configured.mcp_events)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "",
+        "A" * 31,
+        "A" * 32 + " ",
+        "\t" + "A" * 32,
+        "A" * 16 + "\n" + "A" * 16,
+        "é" * 32,
+        "\x01" * 32,
+    ],
+)
+def test_mcp_events_local_auth_token_rejects_invalid_values_without_echoing_them(
+    token: str,
+) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+        BridgeConfig.from_sources(
+            environ={"CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN": token},
+            config_data={},
+        )
+
+    assert "CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN" in str(exc_info.value)
+    if token:
+        assert token not in str(exc_info.value)
+
+
+def test_mcp_events_local_auth_token_cannot_be_configured_in_toml(tmp_path: Path) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[mcp_events]\nlocal_auth_token = '" + "A" * 32 + "'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigFileError, match="must not be stored"):
+        load_user_config(path=config_path)
+
+
 def test_mcp_events_toml_section_parses(tmp_path) -> None:
     from codex_bridge.config_file import load_user_config
 

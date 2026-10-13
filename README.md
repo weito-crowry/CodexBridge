@@ -257,9 +257,10 @@ not supported. CodexBridge does not synchronize project files between machines.
 | `CODEX_BRIDGE_MCP_EVENTS_MAX_TTL_SECONDS` | `86400` | Maximum subscription lifetime. |
 | `CODEX_BRIDGE_MCP_EVENTS_WEBHOOK_TIMEOUT_SECONDS` | `10` | Callback verification and delivery timeout. |
 | `CODEX_BRIDGE_MCP_EVENTS_MAX_RETRIES` | `3` | Maximum retries after the initial webhook attempt. |
+| `CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN` | unset | Optional local shared key for MCP Events subscriptions; at least 32 printable ASCII characters. |
 
-The config file intentionally does not accept API keys, runtime control tokens, or the GitHub MCP
-PAT.
+The config file intentionally does not accept API keys, runtime control tokens, GitHub MCP PATs, or
+the MCP Events local authentication token.
 
 ### MCP Events webhooks
 
@@ -285,13 +286,14 @@ The default database is `%LOCALAPPDATA%\CodexBridge\mcp_events.sqlite3` on Windo
 `CODEX_BRIDGE_MCP_EVENTS_DB_PATH` or `db_path` under `[mcp_events]` to choose another location.
 
 Creating or removing a subscription requires a verified authenticated principal in the MCP request
-context. The current Secure MCP Tunnel connection forwards MCP requests but does not provide an
-authenticated user identity to CodexBridge. CodexBridge does not implement OAuth, and it does not
-treat tunnel presence, localhost, request headers, or the Console control token as identity. With
-the current deployment path, `events/subscribe` and `events/unsubscribe` return `-32024 Forbidden`
-until a trusted authentication middleware supplies a verified principal. ChatGPT Work event
-subscription and delivery have not been verified end to end. The server continues to support the
-event protocol through injected principals in automated tests.
+context. When Events are enabled and `CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN` is set, CodexBridge
+checks the `X-CodexBridge-Event-Auth` request header with a constant-time comparison and assigns the
+fixed local principal `local-tunnel-owner` only when the values match. Missing or mismatched headers
+remain unauthenticated, so `events/subscribe` and `events/unsubscribe` return `-32024 Forbidden`.
+The shared key is optional and is read only from the environment; it is not accepted in TOML.
+CodexBridge does not implement OAuth or treat tunnel presence, localhost, client metadata, or the
+Console control token as identity. ChatGPT Work event subscription and delivery have not been
+verified end to end.
 
 This first version monitors local targets only. It does not replay events from before subscription,
 invoke a model, or include prompts, reasoning, logs, diffs, file contents, or credentials in event
@@ -312,6 +314,19 @@ $env:CODEX_BRIDGE_ALLOWED_ORIGINS = 'https://your-chat-origin.example.com'
 
 Use only the real host and origin values from your deployment. Do not commit tunnel hostnames,
 tokens, credentials, or identities.
+
+When MCP Events are enabled and the shared key is configured, `tunnel-client` can attach the fixed
+header using `mcp.extra_headers` or `MCP_EXTRA_HEADERS`:
+
+```ini
+MCP_EXTRA_HEADERS=X-CodexBridge-Event-Auth: env:CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN
+```
+
+The Bridge and Tunnel processes must each have the same shared key available in their environments.
+Loading it from a `.env` file in the Bridge process does not automatically pass it to a separately
+started Tunnel process. A client-forwarded header can override the Tunnel's fixed header; the
+request is authenticated only when the resulting header exactly matches the Bridge's shared key.
+CodexBridge does not change the Tunnel profile automatically.
 
 ## Native MCP tools
 

@@ -15,6 +15,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.routing import Mount
 
 from .activity import ActivityStore
@@ -25,6 +26,7 @@ from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .execution_targets import ExecutionTargetRouter
 from .logging_utils import log_event
 from .mcp_events import McpEventsAdapter
+from .mcp_events_auth import LocalMcpEventsAuthenticationBackend
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
 from .models import ApprovalDecision, ApprovalsReviewer, SandboxMode
@@ -673,10 +675,19 @@ def create_app(
         finally:
             observer.server_shutdown()
 
+    middleware = [Middleware(MCPObservabilityMiddleware, observer=observer)]
+    if config.mcp_events.enabled and config.mcp_events.local_auth_token is not None:
+        middleware.append(
+            Middleware(
+                AuthenticationMiddleware,
+                backend=LocalMcpEventsAuthenticationBackend(config.mcp_events.local_auth_token),
+            )
+        )
+
     app = Starlette(
         routes=[Mount("/", app=transport_app)],
         lifespan=lifespan,
-        middleware=[Middleware(MCPObservabilityMiddleware, observer=observer)],
+        middleware=middleware,
     )
     app.state.mcp_server = mcp
     app.state.mcp_lowlevel_server = wire_server

@@ -42,6 +42,7 @@ def validate_allowed_roots(allowed_roots: tuple[str, ...]) -> tuple[str, ...]:
 
 
 _CONTROL_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{32,256}", re.ASCII)
+_MCP_EVENTS_LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"[\x21-\x7e]{32,}", re.ASCII)
 
 
 def _control_token(environ: Mapping[str, str]) -> str | None:
@@ -53,6 +54,23 @@ def _control_token(environ: Mapping[str, str]) -> str | None:
             "CODEX_BRIDGE_CONTROL_TOKEN must be 32-256 ASCII URL-safe characters"
         )
     return raw
+
+
+def _validate_mcp_events_local_auth_token(raw: object) -> str | None:
+    name = "CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN"
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or _MCP_EVENTS_LOCAL_AUTH_TOKEN_PATTERN.fullmatch(raw) is None:
+        raise ConfigurationError(
+            f"{name} must contain at least 32 printable ASCII characters without whitespace"
+        )
+    return raw
+
+
+def _mcp_events_local_auth_token(environ: Mapping[str, str]) -> str | None:
+    return _validate_mcp_events_local_auth_token(
+        environ.get("CODEX_BRIDGE_MCP_EVENTS_LOCAL_AUTH_TOKEN")
+    )
 
 
 def _split(value: str | None, separator: str) -> tuple[str, ...]:
@@ -129,6 +147,10 @@ class McpEventsConfig:
     max_ttl_seconds: int = 86400
     webhook_timeout_seconds: int = 10
     max_retries: int = 3
+    local_auth_token: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        _validate_mcp_events_local_auth_token(self.local_auth_token)
 
 
 def _boolean(value: object, source: str) -> bool:
@@ -586,5 +608,6 @@ class BridgeConfig:
                 max_ttl_seconds=events_max_ttl,
                 webhook_timeout_seconds=events_timeout,
                 max_retries=events_retries,
+                local_auth_token=_mcp_events_local_auth_token(values),
             ),
         )
