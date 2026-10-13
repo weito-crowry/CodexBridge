@@ -334,9 +334,7 @@ def principal_from_request_context(context: object) -> str | None:
     auth = scope.get("auth")
     if user is None or auth is None or getattr(user, "is_authenticated", False) is not True:
         return None
-    principal = getattr(user, "display_name", None)
-    if not isinstance(principal, str) or not principal.strip():
-        principal = getattr(user, "username", None)
+    principal = getattr(user, "identity", None)
     if not isinstance(principal, str) or not principal.strip():
         return None
     return principal.strip()

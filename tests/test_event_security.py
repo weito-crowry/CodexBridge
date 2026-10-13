@@ -222,10 +222,72 @@ def test_principal_resolver_uses_authenticated_request_scope_only() -> None:
         request=SimpleNamespace(
             scope={
                 "auth": object(),
-                "user": SimpleNamespace(is_authenticated=True, display_name="local-owner"),
+                "user": SimpleNamespace(
+                    is_authenticated=True,
+                    identity="user-123",
+                    display_name="local-owner",
+                ),
             }
         )
     )
 
     assert principal_from_request_context(anonymous) is None
-    assert principal_from_request_context(authenticated) == "local-owner"
+    assert principal_from_request_context(authenticated) == "user-123"
+
+
+def test_principal_identity_is_stable_when_display_name_changes() -> None:
+    first = SimpleNamespace(
+        request=SimpleNamespace(
+            scope={
+                "auth": object(),
+                "user": SimpleNamespace(
+                    is_authenticated=True, identity="user-123", display_name="Old name"
+                ),
+            }
+        )
+    )
+    renamed = SimpleNamespace(
+        request=SimpleNamespace(
+            scope={
+                "auth": object(),
+                "user": SimpleNamespace(
+                    is_authenticated=True, identity="user-123", display_name="New name"
+                ),
+            }
+        )
+    )
+
+    assert principal_from_request_context(first) == principal_from_request_context(renamed)
+
+
+def test_principal_identity_distinguishes_users_with_the_same_display_name() -> None:
+    def context(identity: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            request=SimpleNamespace(
+                scope={
+                    "auth": object(),
+                    "user": SimpleNamespace(
+                        is_authenticated=True, identity=identity, display_name="Shared name"
+                    ),
+                }
+            )
+        )
+
+    assert principal_from_request_context(context("user-123")) == "user-123"
+    assert principal_from_request_context(context("user-456")) == "user-456"
+
+
+def test_principal_resolver_does_not_fall_back_to_display_name_or_headers() -> None:
+    context = SimpleNamespace(
+        request=SimpleNamespace(
+            headers={"x-user-id": "forged-user"},
+            scope={
+                "auth": object(),
+                "user": SimpleNamespace(
+                    is_authenticated=True, display_name="Display only", username="local-owner"
+                ),
+            },
+        )
+    )
+
+    assert principal_from_request_context(context) is None
