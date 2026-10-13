@@ -17,6 +17,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Mount
 
@@ -35,6 +36,7 @@ from .git_tools import git_status as run_git_status
 from .lan_auth import McpAuthMiddleware
 from .logging_utils import configure_logging, log_event
 from .mcp_events import McpEventsAdapter
+from .mcp_events_auth import LocalMcpEventsAuthenticationBackend
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
 from .models import ApprovalDecision, ApprovalsReviewer, SandboxMode
@@ -952,10 +954,19 @@ def create_app(
                         "Mcp-Session-Id",
                         "Mcp-Protocol-Version",
                         "Last-Event-ID",
+                        "X-CodexBridge-Event-Auth",
                     ],
                     expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
                 ),
             )
+    if config.mcp_events.enabled and config.mcp_events.local_auth_token is not None:
+        middleware.append(
+            Middleware(
+                AuthenticationMiddleware,
+                backend=LocalMcpEventsAuthenticationBackend(config.mcp_events.local_auth_token),
+            )
+        )
+
     app = Starlette(
         routes=[Mount("/", app=transport_app)],
         lifespan=lifespan,

@@ -142,6 +142,8 @@ def default_config_path(
 
 
 def _secret_setting(section: str, key: str) -> bool:
+    if section == "mcp_events" and key == "db_path":
+        return False
     lowered = f"{section}.{key}".casefold()
     return any(term in lowered for term in _SECRET_TERMS)
 
