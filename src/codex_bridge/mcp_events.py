@@ -3,9 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, NoReturn, Protocol
+from typing import Any, Literal, NoReturn, Protocol, cast
 
 from mcp import MCPError, types
+from mcp.server.context import (
+    CallNext,
+    HandlerResult,
+    ServerMiddleware,
+    ServerRequestContext,
+)
 from mcp.server.lowlevel import Server as LowLevelServer
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
@@ -113,6 +119,8 @@ class EventBridgePort(Protocol):
         self, thread_id: str | None = None, *, include_history: bool = False
     ) -> dict[str, Any]: ...
 
+    async def _event_thread_turn_exists(self, thread_id: str, turn_id: str) -> bool: ...
+
 
 PrincipalResolver = Callable[[object], str | None]
 BridgeGetter = Callable[[], EventBridgePort | None]
@@ -177,15 +185,27 @@ class McpEventsAdapter:
         server.add_request_handler("events/subscribe", EventsSubscribeParams, self.subscribe)
         server.add_request_handler("events/unsubscribe", EventsUnsubscribeParams, self.unsubscribe)
 
+        async def preserve_events_discovery(
+            context: ServerRequestContext[Any, Any], call_next: CallNext
+        ) -> HandlerResult:
+            result = await call_next(context)
+            if context.method != "server/discover" or not isinstance(result, Mapping):
+                return result
+            values = dict(result)
+            raw_capabilities = values.get("capabilities")
+            capabilities = dict(raw_capabilities) if isinstance(raw_capabilities, Mapping) else {}
+            capabilities["events"] = {}
+            values["capabilities"] = capabilities
+            return values
+
+        server.middleware.append(cast(ServerMiddleware[Any], preserve_events_discovery))
+
     async def start(self) -> None:
         if not self.config.enabled:
             return
-        try:
-            self.store.initialize()
-            await self.worker.start()
-            self._ready = True
-        except Exception as exc:
-            log_event("mcp_events.start_failed", error_type=exc.__class__.__name__)
+        self.store.initialize()
+        await self.worker.start()
+        self._ready = True
 
     async def stop(self) -> None:
         try:
@@ -334,8 +354,21 @@ class McpEventsAdapter:
         bridge = self._bridge_getter()
         if bridge is None:
             raise MCPError(code=types.INTERNAL_ERROR, message="CodexBridge is not running")
+        if turn_id is not None:
+            try:
+                turn_exists = await bridge._event_thread_turn_exists(thread_id, turn_id)
+            except Exception as exc:
+                log_event(
+                    "mcp_events.target_rejected",
+                    reason="thread_unavailable",
+                    error_type=exc.__class__.__name__,
+                )
+                self._forbidden("thread_unavailable")
+            if not turn_exists:
+                self._forbidden("turn_unavailable")
+            return
         try:
-            result = await bridge.threads(thread_id, include_history=turn_id is not None)
+            result = await bridge.threads(thread_id, include_history=False)
         except Exception as exc:
             log_event(
                 "mcp_events.target_rejected",
@@ -346,12 +379,6 @@ class McpEventsAdapter:
         thread = result.get("thread") if isinstance(result, Mapping) else None
         if not isinstance(thread, Mapping) or thread.get("id") != thread_id:
             self._forbidden("thread_unavailable")
-        if turn_id is not None:
-            turns = thread.get("turns")
-            if not isinstance(turns, list) or not any(
-                isinstance(turn, Mapping) and turn.get("id") == turn_id for turn in turns
-            ):
-                self._forbidden("turn_unavailable")
 
     @staticmethod
     def store_subscription_id(

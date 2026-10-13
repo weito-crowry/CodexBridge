@@ -936,6 +936,27 @@ class Bridge:
             "backwards_cursor": response.get("backwardsCursor"),
         }
 
+    async def _event_thread_turn_exists(self, thread_id: str, turn_id: str) -> bool:
+        metadata = await self._app_server.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
+        )
+        thread = self._thread_from_response(metadata)
+        validated_cwd = self._validate_thread_metadata(thread, thread_id)
+        self._remember_thread_metadata(thread)
+
+        history = await self._app_server.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        )
+        history_thread = self._thread_from_response(history)
+        if self._validate_thread_metadata(history_thread, thread_id) != validated_cwd:
+            raise BridgeError("thread history returned a mismatched cwd")
+        self._remember_thread_metadata(history_thread)
+
+        turns = history_thread.get("turns")
+        return isinstance(turns, list) and any(
+            isinstance(turn, Mapping) and turn.get("id") == turn_id for turn in turns
+        )
+
     async def rename_thread(
         self,
         thread_id: str,

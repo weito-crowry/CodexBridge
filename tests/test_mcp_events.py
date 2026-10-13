@@ -9,6 +9,7 @@ import pytest
 from mcp import MCPError, types
 from pydantic import ValidationError
 
+from codex_bridge.bridge import Bridge
 from codex_bridge.config import McpEventsConfig
 from codex_bridge.event_security import WebhookClient, WebhookResponse, validate_callback_url
 from codex_bridge.mcp_events import (
@@ -21,16 +22,24 @@ from codex_bridge.mcp_events import (
     EventsUnsubscribeParams,
     McpEventsAdapter,
 )
+from codex_bridge.paths import AllowedPathPolicy
+from codex_bridge.state import StateStore
+from tests.bridge_test_fakes import FakeAppServer
 
 
 class _Bridge:
     def __init__(self, *, turns: list[dict[str, str]] | None = None) -> None:
         self.turns = turns or []
         self.calls: list[tuple[str, bool]] = []
+        self.turn_calls: list[tuple[str, str]] = []
 
     async def threads(self, thread_id=None, *, include_history=False):
         self.calls.append((thread_id, include_history))
         return {"thread": {"id": thread_id, "turns": self.turns}}
+
+    async def _event_thread_turn_exists(self, thread_id: str, turn_id: str) -> bool:
+        self.turn_calls.append((thread_id, turn_id))
+        return any(turn.get("id") == turn_id for turn in self.turns)
 
 
 class _CallbackClient(WebhookClient):
@@ -113,7 +122,8 @@ async def test_subscribe_verifies_callback_persists_and_clamps_ttl(tmp_path) -> 
     assert result["refreshBefore"] == "2026-10-13T12:01:00.000000Z"
     assert result["cursor"] is None
     assert result["truncated"] is False
-    assert bridge.calls == [("thread-a", True)]
+    assert bridge.calls == []
+    assert bridge.turn_calls == [("thread-a", "turn-a")]
     assert len(client.posts) == 1
     secret = adapter.store.subscription_secret(result["id"], now=now)
     assert secret is not None
@@ -247,6 +257,89 @@ async def test_unavailable_thread_turn_and_remote_target_are_forbidden(tmp_path)
         await adapter.subscribe(_context(), remote)
     assert remote_error.value.code == -32024
     assert client.posts == []
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_index", [99, 100])
+async def test_subscribe_accepts_turn_ids_from_the_uncapped_native_history(
+    tmp_path, turn_index: int
+) -> None:
+    app = FakeAppServer()
+    app.thread_cwds["thread-a"] = str(tmp_path)
+    app.thread_histories["thread-a"] = [{"id": f"turn-{index}"} for index in range(101)]
+    bridge = Bridge(app, StateStore(), AllowedPathPolicy((str(tmp_path),)))
+    adapter, _, client, _ = _adapter(tmp_path, bridge=bridge)
+    await adapter.start()
+    params = _subscription()
+    params.arguments = {"thread_id": "thread-a", "turn_id": f"turn-{turn_index}"}
+
+    await adapter.subscribe(_context(), params)
+
+    assert len(client.posts) == 1
+    assert app.calls == [
+        ("thread/read", {"threadId": "thread-a", "includeTurns": False}),
+        ("thread/read", {"threadId": "thread-a", "includeTurns": True}),
+    ]
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_id", ["missing-turn", "turn-from-another-thread"])
+async def test_subscribe_rejects_turn_ids_missing_from_the_requested_thread(
+    tmp_path, turn_id: str
+) -> None:
+    app = FakeAppServer()
+    app.thread_cwds.update({"thread-a": str(tmp_path), "thread-b": str(tmp_path)})
+    app.thread_histories["thread-a"] = [{"id": "turn-a"}]
+    app.thread_histories["thread-b"] = [{"id": "turn-from-another-thread"}]
+    bridge = Bridge(app, StateStore(), AllowedPathPolicy((str(tmp_path),)))
+    adapter, _, client, _ = _adapter(tmp_path, bridge=bridge)
+    await adapter.start()
+    params = _subscription()
+    params.arguments = {"thread_id": "thread-a", "turn_id": turn_id}
+
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), params)
+
+    assert exc_info.value.code == -32024
+    assert client.posts == []
+    assert [call[1]["threadId"] for call in app.calls] == ["thread-a", "thread-a"]
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_rejects_threads_outside_the_allowed_root(tmp_path) -> None:
+    allowed_root = tmp_path / "allowed"
+    outside_root = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside_root.mkdir()
+    app = FakeAppServer()
+    app.thread_cwds["thread-a"] = str(outside_root)
+    bridge = Bridge(app, StateStore(), AllowedPathPolicy((str(allowed_root),)))
+    adapter, _, client, _ = _adapter(tmp_path, bridge=bridge)
+    await adapter.start()
+
+    with pytest.raises(MCPError) as exc_info:
+        await adapter.subscribe(_context(), _subscription())
+
+    assert exc_info.value.code == -32024
+    assert app.calls == [("thread/read", {"threadId": "thread-a", "includeTurns": False})]
+    assert client.posts == []
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_thread_only_subscription_does_not_read_turn_history(tmp_path) -> None:
+    adapter, bridge, _, _ = _adapter(tmp_path)
+    await adapter.start()
+    params = _subscription()
+    params.arguments = {"thread_id": "thread-a"}
+
+    await adapter.subscribe(_context(), params)
+
+    assert bridge.calls == [("thread-a", False)]
+    assert bridge.turn_calls == []
     await adapter.stop()
 
 
