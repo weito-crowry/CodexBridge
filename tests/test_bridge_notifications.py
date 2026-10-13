@@ -29,6 +29,29 @@ async def test_wait_returns_immediately_for_terminal_event(allowed_dir) -> None:
     assert result["state"] == "completed"
 
 
+def test_terminal_event_publisher_receives_only_first_terminal_notification(allowed_dir) -> None:
+    bridge, _, _ = make_bridge(allowed_dir)
+    published: list[tuple[str, str, str, str]] = []
+    bridge.set_event_publisher(
+        lambda target_id, thread_id, turn_id, status: published.append(
+            (target_id, thread_id, turn_id, status)
+        ),
+        target_id="local-machine",
+    )
+    notification = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "native-thread",
+            "turn": {"id": "native-turn", "status": "completed"},
+        },
+    }
+
+    bridge.handle_notification(notification)
+    bridge.handle_notification(notification)
+
+    assert published == [("local-machine", "native-thread", "native-turn", "completed")]
+
+
 @pytest.mark.asyncio
 async def test_wait_wakes_when_matching_turn_completes(allowed_dir) -> None:
     bridge, _, _ = make_bridge(allowed_dir)

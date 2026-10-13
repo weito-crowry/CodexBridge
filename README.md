@@ -186,7 +186,47 @@ the value into TOML. `CODEX_BRIDGE_CONFIG` remains the explicit file locator. Se
 control values stay in the environment, including `CODEX_BRIDGE_GITHUB_PAT` and
 `CODEX_BRIDGE_CONTROL_TOKEN`.
 
-Outside managed mode, precedence remains:
+A fuller example:
+```toml
+[bridge]
+allowed_roots = ["C:\\Users\\you\\Documents\\src"]
+# codex_executable = "C:\\path\\to\\codex.exe"
+
+[console]
+ui_port = 8001
+
+[tunnel]
+# executable = "C:\\path\\to\\tunnel-client.exe"
+profile = "codex-bridge"
+
+[github_mcp]
+enabled = false
+url = "https://api.githubcopilot.com/mcp/x/all"
+prefix = "github_"
+include = ["*"]
+exclude = []
+toolsets = []
+max_tools = 0
+
+[mcp_events]
+enabled = false
+# db_path = "D:\\CodexBridgeData\\mcp_events.sqlite3"
+# default_ttl_seconds = 3600
+# max_ttl_seconds = 86400
+# webhook_timeout_seconds = 10
+# max_retries = 3
+
+[targets.main-pc]
+name = "Main PC"
+kind = "local"
+
+[targets.notebook]
+name = "Notebook PC"
+kind = "remote"
+url = "https://notebook.example.test/mcp"
+```
+
+Outside managed mode, configuration precedence is:
 
 ```text
 explicit CLI option > environment variable > config file > built-in default
@@ -240,6 +280,12 @@ not supported. CodexBridge does not synchronize project files between machines.
 | `CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS` | `0` | Maximum exposed upstream tools; `0` means unlimited. |
 | `CODEX_BRIDGE_GITHUB_PAT` | unset | Dedicated GitHub bearer token; environment-only. |
 | `CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS` | empty | Comma-separated Workflow MCP permissions: `read`, `write`, or `execute`. |
+| `CODEX_BRIDGE_MCP_EVENTS_ENABLED` | `false` | Enable MCP Events webhook subscriptions. |
+| `CODEX_BRIDGE_MCP_EVENTS_DB_PATH` | user data directory | SQLite path for subscriptions and the webhook outbox. |
+| `CODEX_BRIDGE_MCP_EVENTS_DEFAULT_TTL_SECONDS` | `3600` | Subscription lifetime when `ttlMs` is omitted or null. |
+| `CODEX_BRIDGE_MCP_EVENTS_MAX_TTL_SECONDS` | `86400` | Maximum subscription lifetime. |
+| `CODEX_BRIDGE_MCP_EVENTS_WEBHOOK_TIMEOUT_SECONDS` | `10` | Callback verification and delivery timeout. |
+| `CODEX_BRIDGE_MCP_EVENTS_MAX_RETRIES` | `3` | Maximum retries after the initial webhook attempt. |
 
 The config file intentionally does not accept API keys, runtime control tokens, or the GitHub MCP
 PAT.
@@ -288,6 +334,42 @@ bound file and Git access, and the configured inbox bounds writes. Host and Orig
 the HTTP transport boundary. The full MCP token authenticates existing clients; the optional
 ChatPanelPlus token grants only `codex_targets`, `codex_threads`, `codex_status`, and `codex_wait`.
 Keep the endpoint reachable only from clients you trust.
+
+### MCP Events webhooks
+
+MCP Events can notify a webhook when a local Codex turn reaches `completed`, `failed`, or
+`interrupted`. The initial event is `codex.turn.finished`. It contains the configured local target
+ID, native thread and turn IDs, and terminal status. It does not start another Codex turn; ChatGPT
+Work controls any follow-up action. Events are disabled by default. Enable them with
+`[mcp_events] enabled = true` or `CODEX_BRIDGE_MCP_EVENTS_ENABLED=true`. When disabled, CodexBridge
+does not advertise or register Events methods, initialize the Events database, or start its worker.
+
+Subscriptions use `events/list`, `events/subscribe`, and `events/unsubscribe`. A subscription first
+sends a signed verification challenge to its HTTPS callback. CodexBridge accepts public callback
+addresses, pins the validated DNS address for each request, verifies TLS against the URL hostname,
+and does not follow redirects. Deliveries use Standard Webhooks HMAC-SHA256 signatures. Failed
+deliveries are retried up to three times after the initial attempt with 5, 15, and 45 second backoff
+(a valid `Retry-After` is honored for HTTP 429). Delivery is at least once, so receivers should
+deduplicate by `eventId`. Subscriptions default to one hour, have a minimum of one minute, and can
+last at most one day. Cursor replay is not supported.
+
+The default database is `%LOCALAPPDATA%\CodexBridge\mcp_events.sqlite3` on Windows and
+`$XDG_STATE_HOME/CodexBridge/mcp_events.sqlite3` on other platforms (or
+`~/.local/state/CodexBridge/mcp_events.sqlite3` when `XDG_STATE_HOME` is unset). Set
+`CODEX_BRIDGE_MCP_EVENTS_DB_PATH` or `db_path` under `[mcp_events]` to choose another location.
+
+Creating or removing a subscription requires a verified authenticated principal in the MCP request
+context. The current Secure MCP Tunnel connection forwards MCP requests but does not provide an
+authenticated user identity to CodexBridge. CodexBridge does not implement OAuth, and it does not
+treat tunnel presence, localhost, request headers, or the Console control token as identity. With
+the current deployment path, `events/subscribe` and `events/unsubscribe` return `-32024 Forbidden`
+until a trusted authentication middleware supplies a verified principal. ChatGPT Work event
+subscription and delivery have not been verified end to end. The server continues to support the
+event protocol through injected principals in automated tests.
+
+This first version monitors local targets only. It does not replay events from before subscription,
+invoke a model, or include prompts, reasoning, logs, diffs, file contents, or credentials in event
+payloads. Use `codex_status` or `codex_threads` for additional turn information.
 
 ## Connecting through a tunnel
 

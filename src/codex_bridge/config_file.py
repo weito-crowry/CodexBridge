@@ -45,6 +45,14 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "max_tools": int,
     },
     "workflow": {"mcp_permissions": list},
+    "mcp_events": {
+        "enabled": bool,
+        "db_path": str,
+        "default_ttl_seconds": int,
+        "max_ttl_seconds": int,
+        "webhook_timeout_seconds": int,
+        "max_retries": int,
+    },
 }
 WORKFLOW_MCP_PERMISSIONS = frozenset({"read", "write", "execute"})
 _SECRET_TERMS = ("key", "token", "secret", "password", "credential", "pat")

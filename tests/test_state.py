@@ -140,3 +140,11 @@ def test_obsolete_and_structured_approval_policies_are_not_passed_through() -> N
     metadata = store.snapshot("thread", "turn")["thread_metadata"]
     assert metadata["approval_policy"] is None
     assert metadata["approval_policy"] != granular_policy
+
+
+def test_set_terminal_reports_only_the_first_terminal_transition() -> None:
+    store = StateStore()
+    store.ensure_turn("thread", "turn")
+
+    assert store.set_terminal("thread", "turn", "completed") is True
+    assert store.set_terminal("thread", "turn", "completed") is False

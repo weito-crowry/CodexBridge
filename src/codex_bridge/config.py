@@ -4,6 +4,7 @@ import hmac
 import ipaddress
 import os
 import re
+import sys
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -135,6 +136,48 @@ def _positive_float(name: str, default: float, environ: Mapping[str, str]) -> fl
     if value <= 0:
         raise ConfigurationError(f"{name} must be a positive number")
     return value
+
+
+def _event_integer(
+    key: str,
+    default: int,
+    environ: Mapping[str, str],
+    section: Mapping[str, Any],
+    *,
+    allow_zero: bool = False,
+) -> int:
+    env_name = f"CODEX_BRIDGE_MCP_EVENTS_{key.upper()}"
+    raw: object = environ.get(env_name, section.get(key, default))
+    if isinstance(raw, str) and env_name in environ:
+        try:
+            raw = int(raw)
+        except ValueError as exc:
+            raise ConfigurationError(f"{env_name} must be an integer") from exc
+    minimum = 0 if allow_zero else 1
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < minimum:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ConfigurationError(f"{env_name} must be a {qualifier} integer")
+    return raw
+
+
+def _default_events_db_path(environ: Mapping[str, str]) -> Path:
+    if sys.platform.startswith("win"):
+        root = environ.get("LOCALAPPDATA")
+        base = Path(root) if root else Path.home() / "AppData" / "Local"
+    else:
+        root = environ.get("XDG_STATE_HOME")
+        base = Path(root).expanduser() if root else Path.home() / ".local" / "state"
+    return base / "CodexBridge" / "mcp_events.sqlite3"
+
+
+@dataclass(frozen=True, slots=True)
+class McpEventsConfig:
+    enabled: bool = False
+    db_path: Path | None = None
+    default_ttl_seconds: int = 3600
+    max_ttl_seconds: int = 86400
+    webhook_timeout_seconds: int = 10
+    max_retries: int = 3
 
 
 def _boolean(value: object, source: str) -> bool:
@@ -461,6 +504,7 @@ class BridgeConfig:
         default_factory=lambda: (ExecutionTargetConfig("local", "Local PC", "local"),)
     )
     workflow_mcp_permissions: tuple[str, ...] = ()
+    mcp_events: McpEventsConfig = field(default_factory=McpEventsConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "targets", _validate_execution_targets(self.targets))
@@ -530,12 +574,14 @@ class BridgeConfig:
         github_mcp_config = file_config.get("github_mcp", {})
         workflow_config = file_config.get("workflow", {})
         configured_file_put_dir = bridge_config.get("file_put_dir")
+        mcp_events_config = file_config.get("mcp_events", {})
         target_config = file_config.get("targets")
         if (
             not isinstance(bridge_config, Mapping)
             or not isinstance(console_config, Mapping)
             or not isinstance(github_mcp_config, Mapping)
             or not isinstance(workflow_config, Mapping)
+            or not isinstance(mcp_events_config, Mapping)
         ):
             raise ConfigurationError("CodexBridge configuration sections are malformed")
 
@@ -555,6 +601,33 @@ class BridgeConfig:
             float(bridge_config.get("wait_default_seconds", 50.0)),
             values,
         )
+
+        enabled_raw: object = values.get(
+            "CODEX_BRIDGE_MCP_EVENTS_ENABLED", mcp_events_config.get("enabled", False)
+        )
+        enabled = _boolean(enabled_raw, "CODEX_BRIDGE_MCP_EVENTS_ENABLED")
+        db_path_raw: object = values.get(
+            "CODEX_BRIDGE_MCP_EVENTS_DB_PATH", mcp_events_config.get("db_path")
+        )
+        if db_path_raw is None:
+            db_path = _default_events_db_path(values)
+        elif isinstance(db_path_raw, str) and db_path_raw.strip():
+            db_path = Path(db_path_raw.strip()).expanduser()
+        else:
+            raise ConfigurationError("CODEX_BRIDGE_MCP_EVENTS_DB_PATH must be a non-empty path")
+        events_default_ttl = _event_integer("default_ttl_seconds", 3600, values, mcp_events_config)
+        events_max_ttl = _event_integer("max_ttl_seconds", 86400, values, mcp_events_config)
+        events_timeout = _event_integer("webhook_timeout_seconds", 10, values, mcp_events_config)
+        events_retries = _event_integer(
+            "max_retries", 3, values, mcp_events_config, allow_zero=True
+        )
+        if not 60 <= events_default_ttl <= events_max_ttl <= 86_400:
+            raise ConfigurationError(
+                "MCP Events TTL settings must satisfy 60 <= default <= max <= 86400"
+            )
+        if events_retries > 3:
+            raise ConfigurationError("MCP Events max_retries must not exceed 3")
+
         if wait_max > WAIT_HARD_MAX_SECONDS:
             raise ConfigurationError(
                 f"maximum wait must not exceed {WAIT_HARD_MAX_SECONDS:g} seconds"
@@ -668,4 +741,12 @@ class BridgeConfig:
             ),
             workflow_mcp_permissions=workflow_permissions,
             targets=_execution_targets(target_config),
+            mcp_events=McpEventsConfig(
+                enabled=enabled,
+                db_path=db_path,
+                default_ttl_seconds=events_default_ttl,
+                max_ttl_seconds=events_max_ttl,
+                webhook_timeout_seconds=events_timeout,
+                max_retries=events_retries,
+            ),
         )

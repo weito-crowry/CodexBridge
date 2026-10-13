@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -390,6 +390,34 @@ class Bridge:
         self.observations = ThreadObservations(
             state, self._activities, self._turn_outcomes, self._persisted_reader
         )
+        self._event_publisher: Callable[[str, str, str, str], None] | None = None
+        self._event_target_id: str | None = None
+
+    def set_event_publisher(
+        self,
+        publisher: Callable[[str, str, str, str], None] | None,
+        *,
+        target_id: str | None = None,
+    ) -> None:
+        self._event_publisher = publisher
+        self._event_target_id = target_id if publisher is not None else None
+
+    def _set_terminal(
+        self,
+        thread_id: str,
+        turn_id: str,
+        status: NormalizedState,
+        error: str | None = None,
+    ) -> bool:
+        transitioned = self._state.set_terminal(thread_id, turn_id, status, error)
+        publisher = self._event_publisher
+        target_id = self._event_target_id
+        if transitioned and publisher is not None and target_id is not None:
+            try:
+                publisher(target_id, thread_id, turn_id, status)
+            except Exception as exc:
+                log_event("mcp_events.publish_failed", error_type=exc.__class__.__name__)
+        return transitioned
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:
@@ -614,7 +642,7 @@ class Bridge:
         log_event("turn.start", thread_id=thread_id, turn_id=turn_id)
         status = _native_state(turn.get("status"))
         if status in _TERMINAL_STATES:
-            self._state.set_terminal(thread_id, turn_id, status, _bounded_text(turn.get("error")))
+            self._set_terminal(thread_id, turn_id, status, _bounded_text(turn.get("error")))
             activity_type: ActivityType
             if status == "completed":
                 activity_type = "turn_completed"
@@ -925,7 +953,7 @@ class Bridge:
         error_summary = _bounded_text(lines[0] if lines else error)
         for thread_id, turn_id in self._state.active_turns():
             self._turn_outcomes.reasons[(thread_id, turn_id)] = "connection_lost"
-            self._state.set_terminal(thread_id, turn_id, "failed", error)
+            self._set_terminal(thread_id, turn_id, "failed", error)
             self._record_activity(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -1755,7 +1783,7 @@ class Bridge:
                     if auth_category == "auth_check"
                     else _bounded_text(turn_error)
                 )
-                self._state.set_terminal(thread_id, turn["id"], status, error_text)
+                self._set_terminal(thread_id, turn["id"], status, error_text)
                 activity_types: dict[str, ActivityType] = {
                     "completed": "turn_completed",
                     "failed": "turn_failed",
@@ -1789,7 +1817,7 @@ class Bridge:
                 if not retryable:
                     if persist_final_answer:
                         self._record_final_answer_terminal(thread_id, turn_id, "failed")
-                    self._state.set_terminal(thread_id, turn_id, "failed", error_summary)
+                    self._set_terminal(thread_id, turn_id, "failed", error_summary)
                 self._record_activity(
                     thread_id=thread_id,
                     turn_id=turn_id,
