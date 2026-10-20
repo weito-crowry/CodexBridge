@@ -290,9 +290,30 @@ def project_thread_metadata(thread: object) -> dict[str, object] | None:
         value = _safe_int(thread.get(source))
         if value is not None:
             result[target] = value
+    runtime_status = _project_runtime_status(thread.get("status"))
+    if runtime_status is not None:
+        result["runtime_status"] = runtime_status
     if thread.get("historyMode") in {"legacy", "paginated"}:
         result["history_mode"] = thread["historyMode"]
     return result
+
+
+def _project_runtime_status(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    status_type = value.get("type")
+    if status_type in {"notLoaded", "idle", "systemError"}:
+        return {"type": status_type}
+    if status_type != "active":
+        return None
+    active_flags = value.get("activeFlags")
+    if not isinstance(active_flags, list) or any(
+        not isinstance(flag, str) for flag in active_flags
+    ):
+        return None
+    if any(flag not in {"waitingOnApproval", "waitingOnUserInput"} for flag in active_flags):
+        return None
+    return {"type": "active", "active_flags": list(active_flags)}
 
 
 def _project_turn(

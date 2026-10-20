@@ -35,7 +35,45 @@ def test_history_defaults_to_conversation_and_switches_without_changing_timeline
     pane.close()
 
 
-def test_mode_switch_preserves_the_visible_history_anchor() -> None:
+def test_messages_mode_shows_only_user_commentary_and_agent_messages() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    entries = (
+        TimelineEntry("turn-1", "user", "User", "User", "question", None, ()),
+        TimelineEntry("turn-1", "plan", "Plan", "Plan", "internal plan", None, ()),
+        TimelineEntry("turn-1", "commentary", "Commentary", "Commentary", "working", None, ()),
+        TimelineEntry("turn-1", "command", "Command", "Command", "pytest", None, ()),
+        TimelineEntry("turn-1", "agent", "Agent", "Agent", "final answer", None, ()),
+    )
+    pane = HistoryPane()
+    pane.set_timeline(entries)
+    pane.set_mode("Messages")
+
+    assert pane.mode == "Messages"
+    assert pane.messages_mode_button.isChecked()
+    assert tuple(row.value for row in pane._timeline_rows if row.kind == "card") == entries
+    visible_messages = [
+        pane._timeline_row_widgets[("card", "turn-1", entry.item_id)]
+        for entry in entries
+        if not pane._timeline_row_widgets[("card", "turn-1", entry.item_id)].isHidden()
+    ]
+    assert [row.objectName() for row in visible_messages] == [
+        "conversationUser",
+        "conversationCommentary",
+        "conversationAgent",
+    ]
+    assert pane._timeline_row_widgets[("header", "turn-1")].isHidden()
+
+    pane.set_mode("Details")
+    assert all(
+        not pane._timeline_row_widgets[("card", "turn-1", entry.item_id)].isHidden()
+        for entry in entries
+    )
+    pane.close()
+
+
+@pytest.mark.parametrize("mode", ["Details", "Messages"])
+def test_mode_switch_preserves_the_visible_history_anchor(mode: str) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     entries = tuple(
@@ -54,7 +92,7 @@ def test_mode_switch_preserves_the_visible_history_anchor() -> None:
     assert anchor is not None
     key, offset = anchor
 
-    pane.set_mode("Details")
+    pane.set_mode(mode)
     _process_layout(application)
 
     widget = pane._timeline_row_widgets[key]
@@ -63,8 +101,8 @@ def test_mode_switch_preserves_the_visible_history_anchor() -> None:
     pane.close()
 
 
-@pytest.mark.parametrize("mode", ["Conversation", "Details"])
-def test_load_older_prepends_in_order_and_reuses_rows_in_both_modes(mode: str) -> None:
+@pytest.mark.parametrize("mode", ["Conversation", "Details", "Messages"])
+def test_load_older_prepends_in_order_and_reuses_rows_in_all_modes(mode: str) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     current = tuple(
@@ -76,8 +114,8 @@ def test_load_older_prepends_in_order_and_reuses_rows_in_both_modes(mode: str) -
         TimelineEntry("turn-old", "old-agent", "Agent", "Agent", "older answer", None, ()),
     )
     pane = HistoryPane()
-    if mode == "Details":
-        pane.set_mode("Details")
+    if mode != "Conversation":
+        pane.set_mode(mode)
     pane.resize(600, 460)
     pane.show()
     pane.set_timeline(current, has_older=True)
@@ -108,7 +146,8 @@ def test_load_older_prepends_in_order_and_reuses_rows_in_both_modes(mode: str) -
     pane.close()
 
 
-def test_follow_newest_stays_at_bottom_when_conversation_appends() -> None:
+@pytest.mark.parametrize("mode", ["Conversation", "Details", "Messages"])
+def test_follow_newest_stays_at_bottom_when_timeline_appends(mode: str) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     entries = tuple(
@@ -116,6 +155,7 @@ def test_follow_newest_stays_at_bottom_when_conversation_appends() -> None:
         for index in range(16)
     )
     pane = HistoryPane()
+    pane.set_mode(mode)
     pane.resize(560, 440)
     pane.show()
     pane.set_timeline(entries)

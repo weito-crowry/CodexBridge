@@ -66,6 +66,9 @@ class TrayController:
         try:
             window.tray_icon.setContextMenu(menu)
             window.tray_icon.activated.connect(window._on_tray_activated)
+            message_clicked = getattr(window.tray_icon, "messageClicked", None)
+            if message_clicked is not None:
+                message_clicked.connect(window._notification_controller.handle_message_clicked)
             window.tray_icon.show()
         except Exception:
             window.tray_icon = None

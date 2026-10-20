@@ -7,6 +7,7 @@ from codex_bridge.history import (
     project_items_response,
     project_legacy_items_response,
     project_legacy_thread,
+    project_thread_metadata,
     project_turns_response,
 )
 from codex_bridge.paths import AllowedPathPolicy
@@ -14,6 +15,39 @@ from codex_bridge.paths import AllowedPathPolicy
 
 def _policy(tmp_path) -> AllowedPathPolicy:
     return AllowedPathPolicy((str(tmp_path),))
+
+
+def test_project_thread_metadata_exposes_only_known_runtime_status_fields() -> None:
+    active = project_thread_metadata(
+        {
+            "id": "thread-active",
+            "status": {"type": "active", "activeFlags": []},
+            "path": "must not expose",
+        }
+    )
+    waiting = project_thread_metadata(
+        {
+            "id": "thread-waiting",
+            "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+        }
+    )
+    unknown_flag = project_thread_metadata(
+        {"id": "thread-future", "status": {"type": "active", "activeFlags": ["futureFlag"]}}
+    )
+    malformed = project_thread_metadata(
+        {"id": "thread-invalid", "status": {"type": "active", "activeFlags": "unknown"}}
+    )
+
+    assert active == {
+        "id": "thread-active",
+        "runtime_status": {"type": "active", "active_flags": []},
+    }
+    assert waiting == {
+        "id": "thread-waiting",
+        "runtime_status": {"type": "active", "active_flags": ["waitingOnApproval"]},
+    }
+    assert unknown_flag == {"id": "thread-future"}
+    assert malformed == {"id": "thread-invalid"}
 
 
 def test_project_turns_returns_bounded_safe_metadata_and_cursors() -> None:

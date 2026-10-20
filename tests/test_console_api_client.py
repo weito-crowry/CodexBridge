@@ -165,6 +165,42 @@ def test_api_client_streams_safe_activity_and_ignores_stale_reply() -> None:
     assert manager.requests[1].url().toString().endswith("thread_id=thread-b")
 
 
+def test_api_client_global_stream_has_no_thread_query_and_does_not_replace_selected_stream() -> (
+    None
+):
+    _application()
+    selected_reply = FakeReply()
+    global_reply = FakeReply()
+    manager = FakeManager([selected_reply, global_reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    selected_events: list[tuple[int, dict[str, object]]] = []
+    global_events: list[tuple[int, dict[str, object]]] = []
+    client.activity_received.connect(
+        lambda generation, activity: selected_events.append((generation, activity))
+    )
+    client.global_activity_received.connect(
+        lambda generation, activity: global_events.append((generation, activity))
+    )
+
+    client.start_stream("thread-1", 4)
+    client.start_global_stream(8)
+    selected_reply._body = _activity()
+    global_reply._body = _activity().replace(b"activity-1", b"activity-2")
+    selected_reply.readyRead.emit()
+    global_reply.readyRead.emit()
+
+    assert manager.requests[0].url().toString().endswith("/ui-api/events?thread_id=thread-1")
+    assert manager.requests[1].url().toString() == "http://127.0.0.1:8001/ui-api/events"
+    assert selected_events[0][0] == 4
+    assert selected_events[0][1]["activity_id"] == "activity-1"
+    assert global_events[0][0] == 8
+    assert global_events[0][1]["activity_id"] == "activity-2"
+    assert not selected_reply.aborted
+    assert not global_reply.aborted
+    client.abort_all()
+    assert selected_reply.aborted and global_reply.aborted
+
+
 def test_api_client_marks_stream_connected_after_response_headers() -> None:
     _application()
     reply = FakeReply()

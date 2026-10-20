@@ -204,7 +204,9 @@ async def test_agent_delta_and_diff_are_retained(allowed_dir) -> None:
 
 
 @pytest.mark.asyncio
-async def test_item_notifications_are_normalized_without_raw_output_or_diff(allowed_dir) -> None:
+async def test_item_notifications_normalize_output_and_allowlisted_file_changes(
+    allowed_dir,
+) -> None:
     bridge, _, _, activities = make_activity_bridge(allowed_dir)
     file_path = str(allowed_dir / "src" / "changed.py")
     outside_path = str(allowed_dir.parent / "outside-secret.py")
@@ -232,7 +234,7 @@ async def test_item_notifications_are_normalized_without_raw_output_or_diff(allo
                     "commandActions": [],
                     "cwd": str(allowed_dir),
                     "status": "inProgress",
-                    "aggregatedOutput": "secret command output",
+                    "aggregatedOutput": "token: fake-token",
                 },
             },
         }
@@ -252,7 +254,7 @@ async def test_item_notifications_are_normalized_without_raw_output_or_diff(allo
                     "cwd": str(allowed_dir),
                     "status": "completed",
                     "exitCode": 0,
-                    "aggregatedOutput": "secret command output",
+                    "aggregatedOutput": "token: fake-token",
                 },
             },
         }
@@ -301,15 +303,124 @@ async def test_item_notifications_are_normalized_without_raw_output_or_diff(allo
     assert [activity["type"] for activity in recent] == [
         "turn_started",
         "command_started",
+        "command_output",
         "command_completed",
         "file_change_started",
         "file_change_completed",
     ]
-    assert recent[2]["details"] == {"exit_code": 0}
-    assert recent[4]["details"] == {"paths": ["src/changed.py"]}
-    assert "secret command output" not in str(recent)
+    assert recent[1]["details"] == {
+        "cwd": str(allowed_dir),
+        "started_at_ms": 1,
+    }
+    assert recent[2]["summary"] == "token: <redacted>"
+    assert recent[2]["details"] == {
+        "output_source": "completed_item",
+        "output_truncated": False,
+    }
+    assert recent[3]["details"] == {
+        "exit_code": 0,
+        "cwd": str(allowed_dir),
+        "completed_at_ms": 2,
+    }
+    assert recent[5]["details"] == {"paths": ["src/changed.py"]}
+    assert "fake-token" not in str(recent)
     assert "secret-diff" not in str(recent)
     assert "outside-secret.py" not in str(recent)
+
+
+def test_command_output_delta_and_process_metadata_are_exposed_as_activities(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+    command = {
+        "id": "command-item",
+        "type": "commandExecution",
+        "command": "python task.py",
+        "cwd": str(allowed_dir),
+        "processId": "pty-42",
+        "status": "inProgress",
+    }
+
+    bridge.handle_notification(
+        {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "startedAtMs": 10,
+                "item": command,
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "itemId": "command-item",
+                "delta": "Unicode output: 日本語\n",
+            },
+        }
+    )
+    bridge.handle_notification(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "completedAtMs": 27,
+                "item": {
+                    **command,
+                    "status": "completed",
+                    "exitCode": 2,
+                    "durationMs": 17,
+                    "aggregatedOutput": "Unicode output: 日本語\n",
+                },
+            },
+        }
+    )
+
+    recent = activities.get_recent("thread", "turn")
+    started, output, completed = recent[-3:]
+    assert started.type == "command_started"
+    assert started.details == {
+        "cwd": str(allowed_dir),
+        "process_id": "pty-42",
+        "started_at_ms": 10,
+    }
+    assert output.type == "command_output"
+    assert output.item_id == "command-item"
+    assert output.summary == "Unicode output: 日本語\n"
+    assert output.details == {}
+    assert completed.type == "command_completed"
+    assert completed.details == {
+        "exit_code": 2,
+        "cwd": str(allowed_dir),
+        "process_id": "pty-42",
+        "duration_ms": 17,
+        "completed_at_ms": 27,
+    }
+
+
+def test_command_output_delta_is_bounded_and_reports_truncation(allowed_dir) -> None:
+    bridge, _, _, activities = make_activity_bridge(allowed_dir)
+
+    bridge.handle_notification(
+        {
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "itemId": "command-item",
+                "delta": "x" * 2_500,
+            },
+        }
+    )
+
+    output = activities.latest("thread", "turn")
+    assert output is not None
+    assert output.type == "command_output"
+    assert output.summary == "x" * 2_000
+    assert output.details == {"output_truncated": True}
 
 
 @pytest.mark.asyncio
@@ -543,6 +654,9 @@ async def test_approval_and_user_input_lifecycle_are_activities(allowed_dir) -> 
         "user_input_requested",
         "user_input_resolved",
     ]
+    recorded = activities.get_recent("thread", "turn")
+    assert recorded[0].details["request_id"] == "approval-1"
+    assert recorded[2].details["request_id"] == "input-1"
     assert "yes" not in str([activity.to_dict() for activity in activities.get_recent("thread")])
 
 

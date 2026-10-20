@@ -68,6 +68,80 @@ def test_thread_list_marks_active_threads_with_palette_color_and_bold_font() -> 
     assert active.foreground(0).color() != idle.foreground(0).color()
 
 
+def test_thread_list_distinguishes_observed_turn_states_without_promoting_waits_to_running() -> (
+    None
+):
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ThreadListPane()
+
+    pane.set_threads(
+        [
+            {"id": "running", "name": "Running"},
+            {"id": "approval", "name": "Approval"},
+            {"id": "input", "name": "Input"},
+            {"id": "locked", "name": "Locked"},
+            {"id": "stopping", "name": "Stopping"},
+        ],
+        thread_statuses={
+            "running": "in_progress",
+            "approval": "needs_approval",
+            "input": "needs_input",
+            "locked": "locked",
+            "stopping": "stopping",
+        },
+    )
+
+    assert _thread_item(pane, "running").text(0) == "\u25cf Running"
+    assert _thread_item(pane, "approval").text(0) == "\u23f8 Approval"
+    assert _thread_item(pane, "input").text(0) == "\u270e Input"
+    assert _thread_item(pane, "locked").text(0) == "Locked"
+    assert _thread_item(pane, "stopping").text(0) == "Stopping"
+
+
+def test_thread_status_refresh_preserves_selection_groups_expansion_rows_and_scroll(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = str(tmp_path / "first-project")
+    second_cwd = str(tmp_path / "second-project")
+    threads = [
+        *({"id": f"first-{index}", "cwd": first_cwd} for index in range(20)),
+        *({"id": f"second-{index}", "cwd": second_cwd} for index in range(20)),
+    ]
+    pane = ThreadListPane()
+    pane.resize(320, 240)
+    pane.show()
+    pane.set_threads(threads)
+    application.processEvents()
+    pane.list_widget.topLevelItem(0).setExpanded(False)
+    pane.list_widget.setCurrentItem(_thread_item(pane, "second-10"))
+    scroll = pane.list_widget.verticalScrollBar()
+    scroll.setValue(scroll.maximum())
+    previous_scroll = scroll.value()
+    previous_group_labels = [
+        pane.list_widget.topLevelItem(index).text(0)
+        for index in range(pane.list_widget.topLevelItemCount())
+    ]
+
+    pane.set_thread_statuses({"second-10": "needs_approval"})
+    application.processEvents()
+
+    current = pane.list_widget.currentItem()
+    assert current is not None
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "second-10"
+    assert [
+        pane.list_widget.topLevelItem(index).text(0)
+        for index in range(pane.list_widget.topLevelItemCount())
+    ] == previous_group_labels
+    assert not pane.list_widget.topLevelItem(0).isExpanded()
+    assert pane.list_widget.topLevelItem(1).childCount() == 20
+    assert scroll.value() == previous_scroll
+    assert _thread_item(pane, "second-10").text(0) == "\u23f8 New スレッド"
+    pane.close()
+
+
 def test_thread_list_keeps_running_indicator_through_selection_and_state_changes() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None

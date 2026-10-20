@@ -232,6 +232,104 @@ def test_activity_row_uses_only_allowlisted_details() -> None:
     assert "secret" not in row
 
 
+def test_activity_pane_displays_bounded_read_only_command_output_and_process_metadata() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    pane = ActivityPane()
+
+    pane.append_activity(
+        {
+            "activity_id": "started",
+            "type": "command_started",
+            "item_id": "command-1",
+            "summary": "python task.py",
+            "details": {"process_id": "pty-42", "cwd": "C:/workspace"},
+        }
+    )
+    pane.append_activity(
+        {
+            "activity_id": "output-1",
+            "type": "command_output",
+            "item_id": "command-1",
+            "summary": "日本語 output",
+            "details": {},
+        }
+    )
+    pane.append_activity(
+        {
+            "activity_id": "output-2",
+            "type": "command_output",
+            "item_id": "command-1",
+            "summary": "tail",
+            "details": {"output_truncated": True},
+        }
+    )
+    pane.append_activity(
+        {
+            "activity_id": "output-3",
+            "type": "command_output",
+            "item_id": "command-2",
+            "summary": "cached output",
+            "details": {"output_source": "completed_item"},
+        }
+    )
+    pane.append_activity(
+        {
+            "activity_id": "output-3",
+            "type": "command_output",
+            "item_id": "command-2",
+            "summary": "duplicate",
+            "details": {},
+        }
+    )
+
+    output = pane.command_output_text.toPlainText()
+    assert pane.command_output_text.isReadOnly()
+    assert (
+        "[Command command-1 · App Server process id: pty-42 · cwd: C:/workspace] python task.py"
+        in output
+    )
+    assert "日本語 output" in output
+    assert "tail" in output
+    assert "Output delta truncated" in output
+    assert "Final output recovered from the completed App Server item" in output
+    assert output.count("cached output") == 1
+    assert pane.activity_list.count() == 1
+
+    pane.append_activity(
+        {
+            "activity_id": "started-empty",
+            "type": "command_started",
+            "item_id": "command-empty",
+            "summary": "quiet command",
+            "details": {},
+        }
+    )
+    pane.append_activity(
+        {
+            "activity_id": "completed-empty",
+            "type": "command_completed",
+            "item_id": "command-empty",
+            "status": "failed",
+            "summary": "quiet command",
+            "details": {"exit_code": 9},
+        }
+    )
+    assert "No command output was observed" in pane.command_output_text.toPlainText()
+    assert "[failed · exit 9]" in pane.command_output_text.toPlainText()
+
+    pane.append_activity(
+        {
+            "activity_id": "output-large",
+            "type": "command_output",
+            "item_id": "command-3",
+            "summary": "x" * 2000,
+            "details": {},
+        }
+    )
+    assert len(pane.command_output_text.toPlainText()) <= 256_000
+
+
 def test_activity_rows_distinguish_commentary_from_final_agent_message() -> None:
     commentary = activity_row(
         {"type": "agent_commentary", "status": "completed", "summary": "progress update"}

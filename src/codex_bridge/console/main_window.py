@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 if TYPE_CHECKING:
     from PySide6.QtCore import QTimer
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -67,6 +68,7 @@ from .history_stream import (
 )
 from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
 from .main_window_layout import build_main_window_ui
+from .notification_controller import NotificationController, NotificationSettingsDialog
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .runtime_ui import RuntimeUiPresenter
@@ -98,6 +100,33 @@ from .widgets import (
 )
 
 _EXIT_TIMEOUT_SECONDS = 12.0
+
+
+def _runtime_thread_status_observation(thread: Mapping[str, object]) -> tuple[bool, str | None]:
+    status = thread.get("runtime_status")
+    if not isinstance(status, Mapping):
+        return False, None
+    status_type = status.get("type")
+    if not isinstance(status_type, str):
+        return False, None
+    if status_type in {"notLoaded", "idle", "systemError"}:
+        return True, None
+    if status_type != "active":
+        return False, None
+    active_flags = status.get("active_flags")
+    if not isinstance(active_flags, list) or any(
+        not isinstance(flag, str) for flag in active_flags
+    ):
+        return False, None
+    if not active_flags:
+        return True, "in_progress"
+    if active_flags == ["waitingOnApproval"]:
+        return True, "needs_approval"
+    if active_flags == ["waitingOnUserInput"]:
+        return True, "needs_input"
+    return True, "waiting"
+
+
 _RUNTIME_LABELS = {
     "unavailable": "Runtime: unavailable",
     "external": "Runtime: external",
@@ -166,6 +195,7 @@ class MainWindow(QMainWindow):
     status_close_button: QPushButton
     status_dialog: QDialog
     appearance_button: QToolButton
+    notification_settings_button: QToolButton
     _appearance_actions: dict[str, QAction]
     _appearance_controller: AppearanceController
     _appearance_settings: QSettings
@@ -240,6 +270,7 @@ class MainWindow(QMainWindow):
         self._selected_thread_id: str | None = None
         self._history_timeline = HistoryTimelineState()
         self._active_thread_ids: set[str] = set()
+        self._thread_turn_statuses: dict[str, str] = {}
         self._runtime_state = "unavailable"
         self._usage_presentation = UsagePresentationController(self)
         self._usage_snapshot_store = UsageSnapshotStore(self)
@@ -268,7 +299,23 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("CodexBridge Console")
         self._build_ui()
+        self.thread_pane.set_thread_statuses(self._thread_turn_statuses)
         install_appearance(self, appearance_settings, appearance_system_scheme_getter)
+        self._notification_controller = NotificationController(
+            self._appearance_settings,
+            show_message=self._show_notification,
+            is_window_active=self.isActiveWindow,
+            activate_thread=self._activate_notification_thread,
+            play_sound=self._play_notification_sound,
+        )
+        self._global_stream_generation = 1
+        self._global_stream_retries = 0
+        self._global_stream_retry_initial_ms = 1_000
+        self._global_stream_retry_max_ms = 30_000
+        self._global_stream_retry_timer = QTimer(self)
+        self._global_stream_retry_timer.setSingleShot(True)
+        self._global_stream_retry_timer.setInterval(1500)
+        self._global_stream_retry_timer.timeout.connect(self._retry_global_stream)
         self._set_initial_size()
         self._build_timers()
         self._thread_interactions = ThreadInteractionController(self)
@@ -330,6 +377,7 @@ class MainWindow(QMainWindow):
             sync_approval_controls=self._sync_approval_controls,
             start_stream=self._client.start_stream,
         )
+        self._start_global_stream()
         self._composer_controller = create_composer_controller(self, self._client)
         self._connect_runtime()
         self._tray_controller = TrayController(self)
@@ -496,6 +544,12 @@ class MainWindow(QMainWindow):
         self._client.json_failed.connect(self._apply_json_error)
         self._client.activity_received.connect(self._apply_activity)
         self._client.stream_state_changed.connect(self._apply_stream_state)
+        global_activity_signal = getattr(self._client, "global_activity_received", None)
+        if global_activity_signal is not None:
+            global_activity_signal.connect(self._apply_global_activity)
+        global_state_signal = getattr(self._client, "global_stream_state_changed", None)
+        if global_state_signal is not None:
+            global_state_signal.connect(self._apply_global_stream_state)
         self._client.control_succeeded.connect(self._apply_control_success)
         self._client.control_failed.connect(self._apply_control_failure)
         self.activity_pane.approval_decision_requested.connect(self._resolve_approval)
@@ -524,6 +578,7 @@ class MainWindow(QMainWindow):
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
         self.status_button.clicked.connect(self._show_status)
+        self.notification_settings_button.clicked.connect(self._show_notification_settings)
         self.usage_status_label.activated.connect(self._create_or_show_usage_history_window)
         self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
         self.status_refresh_button.clicked.connect(self._refresh_status)
@@ -538,6 +593,77 @@ class MainWindow(QMainWindow):
         self.status_dialog.show()
         self.status_dialog.raise_()
         self.status_dialog.activateWindow()
+
+    def _show_notification_settings(self) -> None:
+        dialog = NotificationSettingsDialog(self._appearance_settings, self)
+        dialog.exec()
+
+    def _show_notification(self, title: str, body: str) -> None:
+        if self.tray_icon is None:
+            return
+        show_message = getattr(self.tray_icon, "showMessage", None)
+        if callable(show_message):
+            show_message(title, body, QSystemTrayIcon.MessageIcon.Information, 5000)
+
+    @staticmethod
+    def _play_notification_sound() -> None:
+        if sys.platform != "win32":
+            QApplication.beep()
+
+    def _activate_notification_thread(self, thread_id: str) -> None:
+        if self._closing:
+            return
+        self._show_console()
+        self.select_thread(thread_id)
+
+    def _start_global_stream(self) -> None:
+        start = getattr(self._client, "start_global_stream", None)
+        if callable(start) and not self._closing:
+            start(self._global_stream_generation)
+
+    def _apply_global_activity(self, generation: int, payload: object) -> None:
+        if self._closing or generation != self._global_stream_generation:
+            return
+        self._update_thread_status_from_activity(payload)
+        self._notification_controller.handle_activity(payload)
+
+    def _update_thread_status_from_activity(self, payload: object) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        thread_id = payload.get("thread_id")
+        activity_type = payload.get("type")
+        status = payload.get("status")
+        if not isinstance(thread_id, str) or not isinstance(activity_type, str):
+            return
+        if activity_type == "approval_requested" and status == "requested":
+            self._update_thread_activity(thread_id, "needs_approval")
+        elif activity_type == "user_input_requested" and status == "requested":
+            self._update_thread_activity(thread_id, "needs_input")
+        elif activity_type == "turn_started" and status in ACTIVE_TURN_STATES:
+            self._update_thread_activity(thread_id, status)
+        elif activity_type in {"turn_completed", "turn_failed", "turn_interrupted", "error"} and (
+            status in TERMINAL_TURN_STATES
+        ):
+            self._update_thread_activity(thread_id, status)
+
+    def _apply_global_stream_state(self, generation: int, state: str) -> None:
+        if generation != self._global_stream_generation:
+            return
+        if state == "connected":
+            self._global_stream_retries = 0
+            self._global_stream_retry_timer.stop()
+        elif state == "disconnected" and not self._closing:
+            delay_ms = min(
+                self._global_stream_retry_initial_ms * (2**self._global_stream_retries),
+                self._global_stream_retry_max_ms,
+            )
+            self._global_stream_retry_timer.start(delay_ms)
+
+    def _retry_global_stream(self) -> None:
+        if self._closing:
+            return
+        self._global_stream_retries += 1
+        self._start_global_stream()
 
     def _create_or_show_usage_history_window(self) -> None:
         if self._usage_history_window is None:
@@ -1261,9 +1387,35 @@ class MainWindow(QMainWindow):
         if key == "threads":
             if isinstance(payload, Mapping) and isinstance(payload.get("threads"), list):
                 threads = [thread for thread in payload["threads"] if isinstance(thread, Mapping)]
+                thread_ids = {
+                    thread_id
+                    for thread in threads
+                    if isinstance((thread_id := thread.get("id")), str)
+                }
+                statuses = {
+                    thread_id: state
+                    for thread_id, state in self._thread_turn_statuses.items()
+                    if thread_id in thread_ids
+                }
+                for thread in threads:
+                    thread_id = thread.get("id")
+                    if not isinstance(thread_id, str):
+                        continue
+                    observed, state = _runtime_thread_status_observation(thread)
+                    if observed:
+                        if state is None:
+                            statuses.pop(thread_id, None)
+                        else:
+                            statuses[thread_id] = state
+                self._thread_turn_statuses = statuses
+                self._active_thread_ids = {
+                    thread_id
+                    for thread_id, state in statuses.items()
+                    if state in ACTIVE_TURN_STATES
+                }
                 self.thread_pane.set_threads(
                     threads,
-                    active_thread_ids=self._active_thread_ids,
+                    thread_statuses=self._thread_turn_statuses,
                     project_names=read_local_project_names(),
                 )
                 if not threads:
@@ -1283,9 +1435,16 @@ class MainWindow(QMainWindow):
         if suffix == "turns":
             has_active_turn = self._history_timeline.apply_turns(payload, live_refresh=live_refresh)
             if has_active_turn is not None:
-                if has_active_turn:
-                    if self._selected_thread_id is not None:
-                        self._set_thread_active(self._selected_thread_id, True)
+                if self._selected_thread_id is not None:
+                    active_states = [
+                        state
+                        for state in self._turn_statuses.values()
+                        if state in ACTIVE_TURN_STATES
+                    ]
+                    if active_states:
+                        self._update_thread_activity(self._selected_thread_id, active_states[-1])
+                    else:
+                        self._update_thread_activity(self._selected_thread_id, "completed")
                 self._render_timeline()
             self._finish_selected_history_request(key)
             return
@@ -1320,13 +1479,15 @@ class MainWindow(QMainWindow):
             self._active_thread_ids.add(thread_id)
         else:
             self._active_thread_ids.discard(thread_id)
-        self.thread_pane.set_active_thread_ids(self._active_thread_ids)
 
     def _update_thread_activity(self, thread_id: str, state: str) -> None:
         if state in ACTIVE_TURN_STATES:
-            self._set_thread_active(thread_id, True)
-        elif state in TERMINAL_TURN_STATES or state == "not_loaded":
-            self._set_thread_active(thread_id, False)
+            self._thread_turn_statuses[thread_id] = state
+            self._active_thread_ids.add(thread_id)
+        else:
+            self._thread_turn_statuses.pop(thread_id, None)
+            self._active_thread_ids.discard(thread_id)
+        self.thread_pane.set_thread_statuses(self._thread_turn_statuses)
 
     def load_older(self) -> None:
         if self._selected_thread_id is None or self._next_cursor is None:
@@ -1400,6 +1561,18 @@ class MainWindow(QMainWindow):
 
     def _apply_activity(self, generation: int, payload: object) -> None:
         self._history_stream.apply_activity(generation, payload)
+        if (
+            self._closing
+            or generation != self._selection_generation
+            or not isinstance(payload, Mapping)
+            or payload.get("thread_id") != self._selected_thread_id
+        ):
+            return
+        thread_id = payload.get("thread_id")
+        if not isinstance(thread_id, str):
+            return
+        self._notification_controller.handle_activity(payload)
+        self._update_thread_status_from_activity(payload)
 
     def _sync_approval_controls(self) -> None:
         self.activity_pane.set_control_available(
@@ -1447,6 +1620,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._global_stream_retry_timer.stop()
         self._composer_controller.set_control_available(False)
         self.health_timer.stop()
         self.thread_timer.stop()
