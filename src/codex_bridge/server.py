@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from importlib.resources import files as package_files
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
@@ -23,6 +24,10 @@ from .bridge import Bridge, BridgeError
 from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .execution_targets import ExecutionTargetRouter
+from .file_put import file_put as put_file
+from .file_tools import FileTools
+from .git_tools import git_diff as run_git_diff
+from .git_tools import git_status as run_git_status
 from .logging_utils import log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
@@ -141,6 +146,68 @@ def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | Non
     )
 
 
+def _probe_output(value: str | bytes | None, *, limit: int = 4096) -> tuple[str, bool]:
+    if value is None:
+        return "", False
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    return text[:limit], len(text) > limit
+
+
+async def _run_fixed_command_probe() -> dict[str, Any]:
+    command = ["git", "--version"]
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_truncated = _probe_output(exc.stdout)
+        stderr, stderr_truncated = _probe_output(exc.stderr)
+        return {
+            "command": command,
+            "returncode": None,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "timed_out": True,
+            "elapsed_seconds": round(loop.time() - started_at, 3),
+            "codex_invoked": False,
+        }
+    except OSError:
+        return {
+            "command": command,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "Unable to start the fixed Git version probe.",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "timed_out": False,
+            "elapsed_seconds": round(loop.time() - started_at, 3),
+            "codex_invoked": False,
+        }
+
+    stdout, stdout_truncated = _probe_output(result.stdout)
+    stderr, stderr_truncated = _probe_output(result.stderr)
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "timed_out": False,
+        "elapsed_seconds": round(loop.time() - started_at, 3),
+        "codex_invoked": False,
+    }
+
+
 async def _run_tool(operation: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
     try:
         return await operation()
@@ -149,6 +216,13 @@ async def _run_tool(operation: Callable[[], Awaitable[dict[str, Any]]]) -> dict[
         raise ToolError(message) from None
     except BridgeError as exc:
         raise ToolError(str(exc)) from None
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+
+
+async def _run_sync_tool(operation: Callable[[], dict[str, object]]) -> dict[str, object]:
+    try:
+        return await asyncio.to_thread(operation)
     except ValueError as exc:
         raise ToolError(str(exc)) from None
 
@@ -265,11 +339,76 @@ def create_app(
         instructions=MCP_SERVER_INSTRUCTIONS,
         extensions=[apps],
     )
+    files = FileTools(config.allowed_roots)
+
+    @mcp.tool()
+    async def git_status(repo_path: str) -> dict[str, object]:
+        """Read branch and staged, unstaged, and untracked status in an allowed repository."""
+        return await _run_sync_tool(
+            lambda: run_git_status(repo_path, allowed_roots=config.allowed_roots)
+        )
+
+    @mcp.tool()
+    async def git_diff(
+        repo_path: str, staged: bool = False, path: str | None = None
+    ) -> dict[str, object]:
+        """Read a bounded tracked-file Git diff without including untracked file contents."""
+        return await _run_sync_tool(
+            lambda: run_git_diff(
+                repo_path,
+                staged=staged,
+                path=path,
+                allowed_roots=config.allowed_roots,
+            )
+        )
+
+    @mcp.tool()
+    async def file_put(filename: str, content: str) -> dict[str, object]:
+        """Write one new UTF-8 file into the explicitly configured inbox."""
+        return await _run_sync_tool(
+            lambda: put_file(
+                filename,
+                content,
+                inbox_dir=config.file_put_dir,
+                allowed_roots=config.allowed_roots,
+            )
+        )
 
     @mcp.tool()
     async def codex_targets() -> dict[str, Any]:
         """List configured execution machines and their current availability."""
         return await execution_router.target_list()
+
+    @mcp.tool()
+    async def command_execute_probe() -> dict[str, Any]:
+        """Run the fixed, read-only `git --version` probe without invoking Codex."""
+        return await _run_fixed_command_probe()
+
+    @mcp.tool()
+    async def file_read(
+        path: str, start_line: int | None = None, max_lines: int | None = None
+    ) -> dict[str, object]:
+        """Read bounded UTF-8 text from a file inside configured allowed roots."""
+        return await _run_sync_tool(
+            lambda: files.file_read(path, start_line=start_line, max_lines=max_lines)
+        )
+
+    @mcp.tool()
+    async def directory_list(path: str) -> dict[str, object]:
+        """List a bounded set of immediate children inside configured allowed roots."""
+        return await _run_sync_tool(lambda: files.directory_list(path))
+
+    @mcp.tool()
+    async def file_search(
+        root: str,
+        query: str,
+        mode: Literal["name", "content"],
+        max_results: int | None = None,
+    ) -> dict[str, object]:
+        """Search bounded allowed-root paths by name or UTF-8 text content."""
+        return await _run_sync_tool(
+            lambda: files.file_search(root, query, mode, max_results=max_results)
+        )
 
     @mcp.tool()
     async def mcp_tasks_probe(ctx: Context) -> dict[str, Any]:

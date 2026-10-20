@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from .config_file import ConfigFileError, load_user_config
+from .file_put import validate_file_put_inbox
 
 
 class ConfigurationError(ValueError):
@@ -392,6 +393,7 @@ class BridgeConfig:
     wait_max_seconds: float
     shutdown_grace_seconds: float
     control_token: str | None = None
+    file_put_dir: str | None = None
     codex_executable_source: str = "default"
     github_mcp: GitHubMcpConfig = field(default_factory=GitHubMcpConfig)
     targets: tuple[ExecutionTargetConfig, ...] = field(
@@ -400,6 +402,16 @@ class BridgeConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "targets", _validate_execution_targets(self.targets))
+        if self.file_put_dir is not None:
+            if not isinstance(self.file_put_dir, str) or not self.file_put_dir:
+                raise ConfigurationError("file put inbox must be a configured absolute directory")
+            try:
+                canonical_inbox = validate_file_put_inbox(self.file_put_dir, self.allowed_roots)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "file put inbox must be an existing directory inside allowed roots"
+                ) from exc
+            object.__setattr__(self, "file_put_dir", canonical_inbox)
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
@@ -420,6 +432,7 @@ class BridgeConfig:
         bridge_config = file_config.get("bridge", {})
         console_config = file_config.get("console", {})
         github_mcp_config = file_config.get("github_mcp", {})
+        configured_file_put_dir = bridge_config.get("file_put_dir")
         target_config = file_config.get("targets")
         if (
             not isinstance(bridge_config, Mapping)
@@ -487,6 +500,15 @@ class BridgeConfig:
             raw_roots = bridge_config.get("allowed_roots", ())
             allowed_roots = tuple(raw_roots) if isinstance(raw_roots, list) else ()
 
+        if "CODEX_BRIDGE_FILE_PUT_DIR" in values:
+            file_put_dir = values["CODEX_BRIDGE_FILE_PUT_DIR"].strip() or None
+        elif configured_file_put_dir is None:
+            file_put_dir = None
+        elif isinstance(configured_file_put_dir, str):
+            file_put_dir = configured_file_put_dir.strip() or None
+        else:
+            raise ConfigurationError("bridge.file_put_dir must be a string")
+
         return cls(
             host=values.get("CODEX_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=port,
@@ -501,6 +523,7 @@ class BridgeConfig:
                 "CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS", 3.0, values
             ),
             control_token=_control_token(values),
+            file_put_dir=file_put_dir,
             codex_executable_source=executable_source,
             github_mcp=GitHubMcpConfig.from_sources(
                 environ=values,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,7 @@ from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from starlette.datastructures import Headers
 
+import codex_bridge.server as server_module
 from codex_bridge.config import (
     BridgeConfig,
     ConfigurationError,
@@ -156,6 +158,7 @@ def test_prepare_config_keeps_cli_codex_before_process_environment(tmp_path, mon
         explicit_allowed_roots=(str(tmp_path),),
         explicit_codex_executable=str(cli_executable),
         environ={},
+        config_data={},
     )
 
     prepared = prepare_config(settings)
@@ -163,7 +166,7 @@ def test_prepare_config_keeps_cli_codex_before_process_environment(tmp_path, mon
     assert prepared.codex_executable == str(cli_executable)
 
 
-def test_server_registers_thirteen_native_tools_plus_local_probe_tools(tmp_path) -> None:
+def test_server_registers_nineteen_native_tools_plus_local_probe_tools(tmp_path) -> None:
     runtime = FakeRuntime()
     app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
 
@@ -175,9 +178,10 @@ def test_server_registers_thirteen_native_tools_plus_local_probe_tools(tmp_path)
         "mcp_long_wait_progress_probe",
         "mcp_progress_token_probe",
         "mcp_request_headers_probe",
+        "command_execute_probe",
     }
-    assert len(probe_names) == 5
-    assert len(names - probe_names) == 13
+    assert len(probe_names) == 6
+    assert len(names - probe_names) == 19
     assert names - probe_names == {
         "codex_targets",
         "codex_start",
@@ -192,6 +196,12 @@ def test_server_registers_thirteen_native_tools_plus_local_probe_tools(tmp_path)
         "codex_setup",
         "codex_setup_capabilities",
         "codex_setup_confirm",
+        "file_read",
+        "directory_list",
+        "file_search",
+        "git_status",
+        "git_diff",
+        "file_put",
     }
 
 
@@ -228,6 +238,94 @@ async def test_mcp_tasks_probe_reports_capability_advertisements_without_startin
     assert advertised["tasks_extension_advertised"] is True
     assert advertised["legacy_tasks_capability_advertised"] is True
     assert advertised["client_capabilities"]["extensions"] == {"io.modelcontextprotocol/tasks": {}}
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_command_execute_probe_runs_only_fixed_bounded_command_without_codex(
+    tmp_path, monkeypatch
+) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "command_execute_probe"
+    )
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args[0], 0, "git version 2.50.0\n", "")
+
+    monkeypatch.setattr(server_module.subprocess, "run", fake_run)
+
+    result = await tool.fn()
+
+    assert calls == [
+        (
+            (["git", "--version"],),
+            {"capture_output": True, "text": True, "timeout": 5, "check": False},
+        )
+    ]
+    assert result["command"] == ["git", "--version"]
+    assert result["returncode"] == 0
+    assert result["stdout"] == "git version 2.50.0\n"
+    assert result["stderr"] == ""
+    assert result["timed_out"] is False
+    assert result["codex_invoked"] is False
+    assert 0 <= result["elapsed_seconds"] <= 5
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_command_execute_probe_reports_nonzero_and_caps_output(tmp_path, monkeypatch) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "command_execute_probe"
+    )
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(args[0], 7, "x" * 10000, "failed")
+
+    monkeypatch.setattr(server_module.subprocess, "run", fake_run)
+
+    result = await tool.fn()
+
+    assert result["returncode"] == 7
+    assert len(result["stdout"]) <= 4096
+    assert result["stdout_truncated"] is True
+    assert result["stderr"] == "failed"
+    assert result["timed_out"] is False
+    assert runtime.bridge.start_count == 0
+
+
+@pytest.mark.asyncio
+async def test_command_execute_probe_reports_timeout_without_codex(tmp_path, monkeypatch) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "command_execute_probe"
+    )
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        raise subprocess.TimeoutExpired(args[0], timeout=5, output="started", stderr="")
+
+    monkeypatch.setattr(server_module.subprocess, "run", fake_run)
+
+    result = await tool.fn()
+
+    assert result["returncode"] is None
+    assert result["stdout"] == "started"
+    assert result["timed_out"] is True
+    assert result["codex_invoked"] is False
     assert runtime.bridge.start_count == 0
 
 
@@ -613,6 +711,64 @@ async def test_server_uses_low_level_router_for_wire_tools_list(tmp_path) -> Non
 
     native_names = [tool.name for tool in app.state.mcp_server._tool_manager.list_tools()]
     assert [tool.name for tool in result.tools] == native_names
+
+
+@pytest.mark.asyncio
+async def test_wire_server_lists_file_tools_and_calls_fixed_probe(tmp_path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    readable_file = tmp_path / "hello.txt"
+    readable_file.write_bytes("日本語 file read\n".encode())
+    runtime = FakeRuntime()
+    settings = replace(config(tmp_path), file_put_dir=str(inbox))
+    app = create_app(settings, runtime_factory=lambda _: runtime)
+    lowlevel = app.state.mcp_lowlevel_server
+    initialization = lowlevel.create_initialization_options()
+
+    async with app.router.lifespan_context(app):
+        client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream(0)
+        server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream(0)
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                lowlevel.run,
+                client_to_server_receive,
+                server_to_client_send,
+                initialization,
+            )
+            async with ClientSession(server_to_client_receive, client_to_server_send) as client:
+                await client.initialize()
+                listed = await client.list_tools()
+                names = {tool.name for tool in listed.tools}
+                assert {
+                    "file_read",
+                    "directory_list",
+                    "file_search",
+                    "git_status",
+                    "git_diff",
+                    "file_put",
+                    "command_execute_probe",
+                } <= names
+
+                read_result = await client.call_tool("file_read", {"path": str(readable_file)})
+                assert read_result.is_error is False
+                assert read_result.structured_content["text"] == "日本語 file read\n"
+
+                put_result = await client.call_tool(
+                    "file_put", {"filename": "転送.txt", "content": "UTF-8 inbox\n"}
+                )
+                assert put_result.is_error is False
+                assert put_result.structured_content["ok"] is True
+                assert (inbox / "転送.txt").read_text(encoding="utf-8") == "UTF-8 inbox\n"
+
+                result = await client.call_tool("command_execute_probe", {})
+
+                assert result.is_error is False
+                assert result.structured_content["returncode"] == 0
+                assert result.structured_content["stdout"].startswith("git version ")
+                assert result.structured_content["codex_invoked"] is False
+            task_group.cancel_scope.cancel()
+
+    assert runtime.bridge.start_count == 0
 
 
 @pytest.mark.asyncio
