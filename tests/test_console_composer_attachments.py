@@ -230,3 +230,26 @@ def test_attachment_failure_and_unknown_result_keep_draft_without_retry(tmp_path
     assert widget.attachments == (str(path.resolve()),)
     assert len(client.post_calls) == 2
     assert not widget.send_button.isEnabled()
+
+
+def test_out_of_root_attachment_failure_shows_specific_guidance_and_keeps_draft(
+    tmp_path: Path,
+) -> None:
+    _application()
+    path = tmp_path / "outside.txt"
+    path.write_text("data", encoding="utf-8")
+    controller, window, widget, client, _root = _controller(
+        tmp_path, allowed_roots=(str(tmp_path / "allowed"),)
+    )
+    window.thread_pane.thread_selected.emit("thread-a")
+    widget.input.setPlainText("keep this")
+    widget.add_attachments([str(path)])
+
+    assert controller.send()
+    key = client.post_calls[-1][3]
+    client.fail(key, "attachment_outside_allowed_root")
+
+    assert widget.prompt_text == "keep this"
+    assert widget.attachments == (str(path.resolve()),)
+    assert "許可されたフォルダー内" in widget.status_label.text()
+    assert "outside.txt" not in widget.status_label.text()

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QTextOption
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QResizeEvent, QTextOption
 from PySide6.QtWidgets import (
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -155,6 +157,9 @@ class ComposerWidget(QWidget):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.effort_combo.setMinimumContentsLength(7)
+        for combo in (self.access_combo, self.model_combo, self.effort_combo):
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.effort_combo.currentIndexChanged.connect(self._emit_effort_changed)
 
         self.send_button = QPushButton("Send")
@@ -167,13 +172,13 @@ class ComposerWidget(QWidget):
         self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self.stop_requested.emit)
 
-        controls = QHBoxLayout()
-        controls.addWidget(self.access_combo)
-        controls.addWidget(self.model_combo)
-        controls.addWidget(self.effort_combo)
-        controls.addStretch(1)
-        controls.addWidget(self.stop_button)
-        controls.addWidget(self.send_button)
+        self.controls_container = QWidget(self)
+        self.controls_grid = QGridLayout(self.controls_container)
+        self.controls_grid.setContentsMargins(0, 0, 0, 0)
+        self.controls_grid.setHorizontalSpacing(6)
+        self.controls_grid.setVerticalSpacing(6)
+        self._compact_controls: bool | None = None
+        self._set_controls_compact(False)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("composerStatus")
@@ -181,14 +186,45 @@ class ComposerWidget(QWidget):
         self.status_label.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
         layout.addLayout(target_row)
         layout.addWidget(self.cwd_container)
         layout.addWidget(self.input)
         layout.addWidget(self.attachment_bar)
-        layout.addLayout(controls)
+        layout.addWidget(self.controls_container)
         layout.addWidget(self.status_label)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._set_controls_compact(event.size().width() < 600)
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
+
+    def _set_controls_compact(self, compact: bool) -> None:
+        if compact == self._compact_controls:
+            return
+        self._compact_controls = compact
+        while self.controls_grid.count():
+            self.controls_grid.takeAt(0)
+        for column in (1, 2, 3):
+            self.controls_grid.setColumnStretch(column, 0)
+        if compact:
+            self.controls_grid.addWidget(self.access_combo, 0, 0, 1, 2)
+            self.controls_grid.addWidget(self.model_combo, 1, 0, 1, 2)
+            self.controls_grid.addWidget(self.effort_combo, 2, 0, 1, 2)
+            button_row = 3
+        else:
+            self.controls_grid.addWidget(self.access_combo, 0, 0)
+            self.controls_grid.addWidget(self.model_combo, 0, 1)
+            self.controls_grid.addWidget(self.effort_combo, 0, 2)
+            self.controls_grid.setColumnStretch(3, 1)
+            button_row = 0
+        self.controls_grid.addWidget(self.stop_button, button_row, 3 if not compact else 0)
+        self.controls_grid.addWidget(self.send_button, button_row, 4 if not compact else 1)
 
     @property
     def is_new_draft(self) -> bool:
