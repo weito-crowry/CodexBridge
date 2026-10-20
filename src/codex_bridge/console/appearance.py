@@ -248,7 +248,7 @@ def stylesheet_for_theme(theme: AppearanceTheme) -> str:
             text-align: left;
         }}
         QPushButton#showUsageHistory:hover {{ color: {selection}; }}
-        QToolButton#appearanceButton {{ padding: 3px 7px; }}
+        QToolButton#settingsButton {{ padding: 3px 7px; }}
         QLabel#usageHistoryMetricCaption {{ color: {muted}; }}
         QLabel#usageHistoryMetricValue {{ color: {text}; }}
         QLabel#usageHistoryUpdated, QLabel#usageHistoryState {{ color: {muted}; }}

@@ -79,7 +79,13 @@ def test_system_mode_uses_os_scheme_and_invalid_preference_is_not_rewritten(
     assert window._appearance_actions["System"].isChecked()
     assert settings.value("appearance/mode") == "unexpected"
     assert window.appearance_button.menu() is not None
-    assert [action.text() for action in window.appearance_button.menu().actions()] == [
+    appearance_action = next(
+        action
+        for action in window.appearance_button.menu().actions()
+        if action.text() == "Appearance"
+    )
+    assert appearance_action.menu() is not None
+    assert [action.text() for action in appearance_action.menu().actions()] == [
         "System",
         "Light",
         "Dark",

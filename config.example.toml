@@ -1,0 +1,57 @@
+# Copy this file to config.toml in a source checkout, or to a user-local path
+# and set CODEX_BRIDGE_CONFIG to that path. Replace example values first.
+
+[bridge]
+host = "127.0.0.1"
+port = 8000
+allowed_roots = ["C:\\path\\to\\allowed"]
+# allowed_hosts = ["127.0.0.1", "localhost"]
+# allowed_origins = ["http://127.0.0.1:8000"]
+# codex_executable = "C:\\path\\to\\codex.exe"
+# wait_default_seconds = 10.0
+# wait_max_seconds = 55.0
+# shutdown_grace_seconds = 2.0
+# file_put_dir = "C:\\path\\to\\allowed\\inbox"
+
+[console]
+ui_port = 8001
+# attachment_staging_directory = "C:\\path\\to\\allowed\\attachments"
+
+[tunnel]
+config_version = 1
+# executable = "C:\\path\\to\\tunnel-client.exe"
+# profile_dir = "C:\\path\\to\\generated-profiles"
+
+[tunnel.control_plane]
+base_url = "https://control.example.test"
+tunnel_id = "replace-with-tunnel-id"
+api_key = "env:TUNNEL_API_KEY"
+
+[tunnel.health]
+listen_addr = "127.0.0.1:8080"
+
+[tunnel.admin_ui]
+open_browser = false
+
+[tunnel.log]
+level = "info"
+format = "text"
+
+# Add the actual MCP server URL required by your Tunnel deployment.
+# [[tunnel.mcp.server_urls]]
+# channel = "mcp"
+# url = "https://bridge.example.test/mcp"
+
+[github_mcp]
+enabled = false
+url = "https://api.githubcopilot.com/mcp/x/all"
+prefix = "github_"
+include = ["*"]
+exclude = []
+toolsets = []
+max_tools = 0
+
+# An explicit target table must include exactly one local target.
+# [targets.local]
+# name = "Local PC"
+# kind = "local"

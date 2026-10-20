@@ -15,6 +15,9 @@ class FakeEnvironment:
     def insert(self, key: str, value: str) -> None:
         self.values[key] = value
 
+    def remove(self, key: str) -> None:
+        self.values.pop(key, None)
+
 
 class FakeProcess:
     def __init__(self, outcome: object = (True, 4321)) -> None:
@@ -106,6 +109,47 @@ def test_launcher_uses_python_module_and_only_authorized_environment_overrides(m
     assert token not in str(process.stdout_file)
     assert token not in str(process.stderr_file)
     assert "PYINSTALLER_RESET_ENVIRONMENT" not in process.environment.values
+
+
+def test_managed_config_child_loads_toml_without_environment_overrides() -> None:
+    _application()
+    process = FakeProcess()
+    environment = FakeEnvironment(
+        {
+            "CODEX_BRIDGE_CONFIG": "C:/old/config.toml",
+            "CODEX_BRIDGE_HOST": "0.0.0.0",
+            "CODEX_BRIDGE_PORT": "9000",
+            "CODEX_BRIDGE_ALLOWED_ROOTS": "C:/old-root",
+            "CODEX_BRIDGE_UI_PORT": "9001",
+            "CODEX_BRIDGE_GITHUB_PAT": "keep-secret-environment-value",
+        }
+    )
+    launcher = BridgeRuntimeLauncher(
+        process_factory=lambda: process,
+        environment_factory=lambda: environment,
+    )
+
+    launcher.launch(
+        codex_executable="C:/Codex/codex.exe",
+        ui_port=8456,
+        control_token="A" * 32,
+        allowed_roots=("C:/repo",),
+        managed_config_path="C:/repo/config.toml",
+    )
+
+    assert environment.values["CODEX_BRIDGE_CONFIG"] == "C:/repo/config.toml"
+    assert environment.values["CODEX_BRIDGE_GITHUB_PAT"] == "keep-secret-environment-value"
+    assert environment.values["CODEX_BRIDGE_CONTROL_TOKEN"] == "A" * 32
+    assert not any(
+        key in environment.values
+        for key in (
+            "CODEX_BRIDGE_HOST",
+            "CODEX_BRIDGE_PORT",
+            "CODEX_BRIDGE_ALLOWED_ROOTS",
+            "CODEX_BRIDGE_UI_PORT",
+            "CODEX_BRIDGE_CODEX_EXECUTABLE",
+        )
+    )
 
 
 def test_frozen_launcher_uses_internal_runtime_mode_and_reset_environment(monkeypatch) -> None:

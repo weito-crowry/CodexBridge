@@ -208,3 +208,80 @@ def test_invalid_tunnel_profiles_are_rejected(value) -> None:
 @pytest.mark.parametrize("value", ["a", "codex-bridge", "a_b.c-1", "x" * 64])
 def test_bounded_tunnel_profiles_are_accepted(value: str) -> None:
     assert parse_tunnel_profile(value) == value
+
+
+def test_repository_managed_console_settings_reject_legacy_environment_conflicts(
+    tmp_path, monkeypatch
+) -> None:
+    from codex_bridge import config_file
+
+    package = tmp_path / "src" / "codex_bridge"
+    package.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    monkeypatch.setattr(config_file, "__file__", str(package / "config_file.py"))
+    (tmp_path / "config.toml").write_text("[console]\nui_port = 8125\n", encoding="utf-8")
+
+    with pytest.raises(ConsoleConfigurationError, match="conflicts"):
+        ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_UI_PORT": "8126"})
+
+
+def test_console_config_exposes_selected_config_source_and_tunnel_profile_directory(
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "custom.toml"
+    config_path.write_text(
+        '[tunnel]\nprofile = "work"\nprofile_dir = "C:/Users/test/.tunnel/profiles"\n',
+        encoding="utf-8",
+    )
+
+    config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+
+    assert config.config_path == str(config_path)
+    assert config.config_mode == "explicit"
+    assert config.tunnel_profile == "work"
+    assert config.tunnel_profile_dir == "C:/Users/test/.tunnel/profiles"
+    assert config.tunnel_profile_file == str(
+        Path("C:/Users/test/.tunnel/profiles") / "tunnel-profile.yaml"
+    )
+
+
+def test_console_config_exposes_tunnel_profile_mapping(tmp_path) -> None:
+    config_path = tmp_path / "profile.toml"
+    config_path.write_text(
+        '[tunnel]\nprofile_dir = "C:/tunnel/profiles"\n'
+        '[tunnel.control_plane]\nbase_url = "https://control.example.test"\n'
+        'tunnel_id = "bridge-main"\napi_key = "env:TUNNEL_API_KEY"\n',
+        encoding="utf-8",
+    )
+
+    config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+
+    assert config.tunnel_profile_settings["control_plane"]["tunnel_id"] == "bridge-main"
+
+
+def test_explicit_config_uses_ignored_runtime_profile_file_by_default(tmp_path) -> None:
+    config_path = tmp_path / "custom.toml"
+    config_path.write_text('[tunnel]\nprofile = "main"\n', encoding="utf-8")
+
+    config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+
+    assert config.tunnel_profile_file == str(tmp_path / ".runtime" / "tunnel-profile.yaml")
+
+
+def test_console_config_retains_explicit_overrides_for_reload(tmp_path) -> None:
+    config = ConsoleConfig.from_sources(
+        explicit_port=8129,
+        explicit_allowed_roots=("C:/work",),
+        explicit_codex_executable="codex-local",
+        explicit_tunnel_executable="tunnel-client",
+        explicit_tunnel_profile="work-profile",
+        environ=_isolated_environ(tmp_path),
+    )
+
+    assert config.explicit_overrides == {
+        "explicit_port": 8129,
+        "explicit_allowed_roots": ("C:/work",),
+        "explicit_codex_executable": "codex-local",
+        "explicit_tunnel_executable": "tunnel-client",
+        "explicit_tunnel_profile": "work-profile",
+    }

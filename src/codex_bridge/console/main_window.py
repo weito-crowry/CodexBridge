@@ -4,6 +4,7 @@ import os
 import sys
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QMessageBox as QMessageBox
 
 from ..models import ApprovalDecision
+from ..tunnel_profile import TunnelProfileError, generate_tunnel_profile
 from .api_client import ApiClient
 from .appearance import AppearanceController, install_appearance
 from .bridge_managed_retry import BridgeManagedRetryCoordinator
@@ -55,7 +57,7 @@ from .codex_resolver import (
 from .codex_update_controller import CodexUpdateController
 from .codex_updates import CodexUpdateProbe
 from .composer_controller import create_composer_controller
-from .config import ConsoleConfig
+from .config import ConsoleConfig, ConsoleConfigurationError
 from .diagnostics import DiagnosticsReader
 from .diagnostics_panel import DiagnosticsPanelController
 from .history_requests import (
@@ -196,6 +198,11 @@ class MainWindow(QMainWindow):
     status_close_button: QPushButton
     status_dialog: QDialog
     appearance_button: QToolButton
+    settings_button: QToolButton
+    settings_menu: QMenu
+    _appearance_menu: QMenu
+    _settings_actions: dict[str, QAction]
+    _apply_pending_settings_action: QAction
     notification_settings_button: QToolButton
     _appearance_actions: dict[str, QAction]
     _appearance_controller: AppearanceController
@@ -232,6 +239,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self._config = config
+        self._pending_config: ConsoleConfig | None = None
+        self._restart_after_settings_apply = False
         self._usage_history_path = (
             default_usage_history_path() if usage_history_path is None else usage_history_path
         )
@@ -247,6 +256,7 @@ class MainWindow(QMainWindow):
         self._diagnostics_reader = (
             diagnostics_reader if diagnostics_reader is not None else DiagnosticsReader()
         )
+        self._tunnel_resolution_error: str | None = None
         self._tunnel = (
             tunnel_supervisor if tunnel_supervisor is not None else self._new_tunnel_supervisor()
         )
@@ -295,13 +305,13 @@ class MainWindow(QMainWindow):
         self._exit_shutdown_pending = False
         self._exit_deadline = 0.0
         self._sigint_requested = False
-        self._tunnel_resolution_error: str | None = None
         self._tunnel_state = getattr(self._tunnel, "state", "unavailable")
 
         self.setWindowTitle("CodexBridge Console")
         self._build_ui()
         self.thread_pane.set_thread_statuses(self._thread_turn_statuses)
         install_appearance(self, appearance_settings, appearance_system_scheme_getter)
+        self._install_settings_menu()
         self._notification_controller = NotificationController(
             self._appearance_settings,
             show_message=self._show_notification,
@@ -500,9 +510,31 @@ class MainWindow(QMainWindow):
             candidates = ()
             self._tunnel_resolution_error = str(exc)
         executable = candidates[0].path if candidates else None
+        profile_file: str | None = None
+        profile_settings = self._config.tunnel_profile_settings
+        has_managed_tunnel_profile = any(key != "config_version" for key in profile_settings)
+        if (
+            executable is not None
+            and self._config.tunnel_profile_file is not None
+            and has_managed_tunnel_profile
+        ):
+            configured_profile_path = Path(self._config.tunnel_profile_file)
+            try:
+                generated = generate_tunnel_profile(
+                    profile_settings,
+                    profile_dir=configured_profile_path.parent,
+                    profile_name=configured_profile_path.stem,
+                    client_executable=executable,
+                )
+            except TunnelProfileError as exc:
+                self._tunnel_resolution_error = str(exc)
+                executable = None
+            else:
+                profile_file = os.fspath(generated.path)
         return TunnelSupervisor(
             executable=executable,
             profile=self._config.tunnel_profile,
+            profile_file=profile_file,
             resolution_source=candidates[0].source if candidates else "unavailable",
             validate_version=True,
             parent=self,
@@ -601,6 +633,137 @@ class MainWindow(QMainWindow):
     def _show_notification_settings(self) -> None:
         dialog = NotificationSettingsDialog(self._appearance_settings, self)
         dialog.exec()
+
+    def _install_settings_menu(self) -> None:
+        appearance_menu = self.appearance_button.menu()
+        self._appearance_menu = appearance_menu or QMenu(self.settings_button)
+        menu = QMenu(self.settings_button)
+        self._settings_actions = {
+            "Open settings file": menu.addAction("Open settings file", self._open_settings_file),
+            "Reload settings": menu.addAction("Reload settings", self._reload_configuration),
+            "Open settings folder": menu.addAction(
+                "Open settings folder", self._open_settings_folder
+            ),
+        }
+        menu.addSeparator()
+        appearance_menu_item = menu.addMenu("Appearance")
+        appearance_menu_item.addActions(self._appearance_menu.actions())
+        menu.addSeparator()
+        self._apply_pending_settings_action = menu.addAction(
+            "Restart Console to apply pending settings…",
+            self._apply_pending_configuration,
+        )
+        self._apply_pending_settings_action.setEnabled(False)
+        self.settings_button.setMenu(menu)
+        self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.settings_menu = menu
+
+    def _active_config_path(self) -> Path | None:
+        path = self._config.config_path
+        if not path:
+            return None
+        return Path(path).expanduser()
+
+    def _open_settings_file(self) -> None:
+        path = self._active_config_path()
+        if path is None:
+            QMessageBox.warning(self, "Settings", "The active configuration file is unavailable.")
+            return
+        try:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(os.fspath(path)))
+        except Exception:
+            opened = False
+        if not opened:
+            QMessageBox.warning(self, "Settings", "Could not open the active configuration file.")
+
+    def _open_settings_folder(self) -> None:
+        path = self._active_config_path()
+        if path is None:
+            QMessageBox.warning(self, "Settings", "The active configuration folder is unavailable.")
+            return
+        try:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(os.fspath(path.parent)))
+        except Exception:
+            opened = False
+        if not opened:
+            QMessageBox.warning(self, "Settings", "Could not open the active configuration folder.")
+
+    def _settings_change_names(self, candidate: ConsoleConfig) -> tuple[str, ...]:
+        display_names = {
+            "allowed_roots": "Allowed roots",
+            "attachment_staging_directory": "Attachment staging directory",
+            "codex_executable": "Codex executable",
+            "config_mode": "Configuration source mode",
+            "config_path": "Configuration source path",
+            "port": "Console UI port",
+            "tunnel_executable": "Tunnel executable",
+            "tunnel_profile": "Tunnel profile",
+            "tunnel_profile_dir": "Tunnel profile directory",
+            "tunnel_profile_file": "Generated Tunnel profile path",
+            "tunnel_profile_settings": "Tunnel connection settings",
+        }
+        changed: list[str] = []
+        for item in dataclass_fields(self._config):
+            if item.name == "explicit_overrides":
+                continue
+            if getattr(self._config, item.name) != getattr(candidate, item.name):
+                changed.append(display_names.get(item.name, item.name.replace("_", " ").title()))
+        return tuple(changed)
+
+    def _reload_configuration(self) -> None:
+        explicit_overrides = cast(dict[str, Any], dict(self._config.explicit_overrides))
+        try:
+            candidate = ConsoleConfig.from_sources(**explicit_overrides)
+        except ConsoleConfigurationError as exc:
+            QMessageBox.warning(self, "Settings", str(exc))
+            self.bottom_status_label.setText(
+                "Settings reload failed; current settings remain active"
+            )
+            return
+
+        changed = self._settings_change_names(candidate)
+        self._pending_config = candidate if changed else None
+        self._apply_pending_settings_action.setEnabled(bool(changed))
+        if changed:
+            changed_text = ", ".join(changed)
+            self.config_status_label.setText(
+                f"Config: {candidate.config_mode} · {len(changed)} pending restart"
+            )
+            self.config_status_label.setToolTip(
+                f"Validated pending changes: {changed_text}. Restart Console to apply."
+            )
+            message = (
+                f"Settings reloaded and validated. Pending changes: {changed_text}. "
+                "Restart Console to apply them. Bridge and Tunnel were not restarted."
+            )
+            self.bottom_status_label.setText("Settings reloaded; restart required to apply changes")
+        else:
+            self.config_status_label.setText(
+                f"Config: {candidate.config_mode} · roots {candidate.roots_count}"
+            )
+            self.config_status_label.setToolTip(
+                candidate.roots_error or "Allowed roots are ready; settings are current"
+            )
+            message = "Settings reloaded and validated. No restart is required."
+            self.bottom_status_label.setText("Settings reloaded")
+        QMessageBox.information(self, "Settings reloaded", message)
+
+    def _apply_pending_configuration(self) -> None:
+        if self._pending_config is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Restart Console to apply settings",
+            "This closes Console and stops its managed Bridge and Tunnel so the validated "
+            "settings can load. Active Codex work may be interrupted. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._restart_after_settings_apply = True
+        self.bottom_status_label.setText("Applying settings and restarting Console…")
+        self._begin_exit()
 
     def _show_notification(self, title: str, body: str) -> None:
         if self.tray_icon is None:
@@ -1020,12 +1183,21 @@ class MainWindow(QMainWindow):
         self._launch_in_progress = True
         self._set_runtime_state("launching")
         try:
-            result = self._launcher.launch(
-                codex_executable=codex_executable,
-                ui_port=self._config.port,
-                control_token=control_token,
-                allowed_roots=self._config.allowed_roots,
-            )
+            if self._config.config_mode == "managed" and self._config.config_path is not None:
+                result = self._launcher.launch(
+                    codex_executable=codex_executable,
+                    ui_port=self._config.port,
+                    control_token=control_token,
+                    allowed_roots=self._config.allowed_roots,
+                    managed_config_path=self._config.config_path,
+                )
+            else:
+                result = self._launcher.launch(
+                    codex_executable=codex_executable,
+                    ui_port=self._config.port,
+                    control_token=control_token,
+                    allowed_roots=self._config.allowed_roots,
+                )
         except Exception:
             self._launch_in_progress = False
             self._control_token = None
@@ -1720,4 +1892,19 @@ class MainWindow(QMainWindow):
                     delete_later()
             except Exception:
                 pass
+        if self._restart_after_settings_apply:
+            try:
+                result = QProcess.startDetached(sys.argv[0], list(sys.argv[1:]))
+                restarted = (
+                    bool(result[0]) if isinstance(result, tuple) and result else bool(result)
+                )
+            except Exception:
+                restarted = False
+            self._restart_after_settings_apply = False
+            if not restarted:
+                QMessageBox.warning(
+                    self,
+                    "Settings",
+                    "Console could not restart. Launch it again to apply the validated settings.",
+                )
         self._quit_application()

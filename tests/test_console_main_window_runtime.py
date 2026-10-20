@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
+from codex_bridge.console.tunnel_resolver import TunnelCandidate
+from codex_bridge.tunnel_profile import TunnelProfileError, TunnelProfileResult
 from tests.console_main_window_test_support import (
     FakeClient,
     FakeCodexProbe,
@@ -78,6 +81,147 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     assert window.runtime_state == "launching"
     assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
     assert not window.start_bridge_button.isEnabled()
+    window.close()
+
+
+def test_managed_config_path_is_passed_to_bridge_launcher() -> None:
+    _application()
+    config = ConsoleConfig(
+        allowed_roots=_config().allowed_roots,
+        config_path="C:/repo/config.toml",
+        config_mode="managed",
+    )
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    window = MainWindow(
+        config,
+        api_client=client,
+        codex_probe=probe,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
+
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    assert launcher.managed_config_paths == ["C:/repo/config.toml"]
+    window.close()
+
+
+def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch) -> None:
+    _application()
+    config_path = tmp_path / "config.toml"
+    profile_path = tmp_path / ".runtime" / "tunnel-profile.yaml"
+    profile_settings = {
+        "config_version": 1,
+        "control_plane": {
+            "base_url": "https://control.example.test",
+            "tunnel_id": "example-id",
+            "api_key": "env:TUNNEL_API_KEY",
+        },
+    }
+    config = ConsoleConfig(
+        allowed_roots=_config().allowed_roots,
+        config_path=str(config_path),
+        config_mode="explicit",
+        tunnel_executable="C:/tools/tunnel-client.exe",
+        tunnel_executable_source="explicit",
+        tunnel_profile_file=str(profile_path),
+        tunnel_profile_settings=profile_settings,
+    )
+    generator_calls = []
+    supervisor_options = []
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def generate(profile, **kwargs):
+        generator_calls.append((profile, kwargs))
+        return TunnelProfileResult(profile_path, "tunnel-profile")
+
+    def create_supervisor(**kwargs):
+        supervisor_options.append(kwargs)
+        return StableTunnel()
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", generate)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", create_supervisor)
+    window = MainWindow(
+        config,
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    assert generator_calls == [
+        (
+            profile_settings,
+            {
+                "profile_dir": profile_path.parent,
+                "profile_name": "tunnel-profile",
+                "client_executable": "C:/tools/tunnel-client.exe",
+            },
+        )
+    ]
+    assert supervisor_options[0]["profile_file"] == str(profile_path)
+    assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
+    window.close()
+
+
+def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    _application()
+    profile_settings = {
+        "config_version": 1,
+        "control_plane": {
+            "base_url": "https://control.example.test",
+            "tunnel_id": "example-id",
+            "api_key": "env:TUNNEL_API_KEY",
+        },
+    }
+    config = ConsoleConfig(
+        allowed_roots=_config().allowed_roots,
+        config_path=str(tmp_path / "config.toml"),
+        config_mode="explicit",
+        tunnel_executable="C:/tools/tunnel-client.exe",
+        tunnel_executable_source="explicit",
+        tunnel_profile_file=str(tmp_path / ".runtime" / "tunnel-profile.yaml"),
+        tunnel_profile_settings=profile_settings,
+    )
+    supervisor_options = []
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def reject_profile(*_args, **_kwargs):
+        raise TunnelProfileError("Tunnel client rejected the staged profile")
+
+    def create_supervisor(**kwargs):
+        supervisor_options.append(kwargs)
+        return StableTunnel()
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", reject_profile)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", create_supervisor)
+    window = MainWindow(
+        config,
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    assert supervisor_options[0]["executable"] is None
+    assert supervisor_options[0]["profile_file"] is None
+    assert window._tunnel_resolution_error == "Tunnel client rejected the staged profile"
     window.close()
 
 

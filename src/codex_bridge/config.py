@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
-from .config_file import ConfigFileError, load_user_config
+from .config_file import ConfigFileError, active_config_source, load_user_config
 from .file_put import validate_file_put_inbox
 
 
@@ -61,13 +61,53 @@ def _split(value: str | None, separator: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(separator) if part.strip())
 
 
-def _config(environ: Mapping[str, str], config_data: Mapping[str, Any] | None) -> Mapping[str, Any]:
+def _config(
+    environ: Mapping[str, str],
+    config_data: Mapping[str, Any] | None,
+    *,
+    path: Path | None = None,
+) -> Mapping[str, Any]:
     if config_data is not None:
         return config_data
     try:
-        return load_user_config(environ)
+        return load_user_config(environ, path=path)
     except ConfigFileError as exc:
         raise ConfigurationError(str(exc)) from exc
+
+
+_MANAGED_ENV_KEYS: dict[str, tuple[str, str]] = {
+    "CODEX_BRIDGE_HOST": ("bridge", "host"),
+    "CODEX_BRIDGE_PORT": ("bridge", "port"),
+    "CODEX_BRIDGE_ALLOWED_ROOTS": ("bridge", "allowed_roots"),
+    "CODEX_BRIDGE_ALLOWED_HOSTS": ("bridge", "allowed_hosts"),
+    "CODEX_BRIDGE_ALLOWED_ORIGINS": ("bridge", "allowed_origins"),
+    "CODEX_BRIDGE_CODEX_EXECUTABLE": ("bridge", "codex_executable"),
+    "CODEX_BRIDGE_WAIT_DEFAULT_SECONDS": ("bridge", "wait_default_seconds"),
+    "CODEX_BRIDGE_WAIT_MAX_SECONDS": ("bridge", "wait_max_seconds"),
+    "CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS": ("bridge", "shutdown_grace_seconds"),
+    "CODEX_BRIDGE_FILE_PUT_DIR": ("bridge", "file_put_dir"),
+    "CODEX_BRIDGE_UI_PORT": ("console", "ui_port"),
+    "CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY": ("console", "attachment_staging_directory"),
+    "CODEX_BRIDGE_TUNNEL_EXECUTABLE": ("tunnel", "executable"),
+    "CODEX_BRIDGE_TUNNEL_PROFILE": ("tunnel", "profile"),
+    "CODEX_BRIDGE_TUNNEL_PROFILE_DIR": ("tunnel", "profile_dir"),
+    "CODEX_BRIDGE_GITHUB_MCP_ENABLED": ("github_mcp", "enabled"),
+    "CODEX_BRIDGE_GITHUB_MCP_URL": ("github_mcp", "url"),
+    "CODEX_BRIDGE_GITHUB_MCP_PREFIX": ("github_mcp", "prefix"),
+    "CODEX_BRIDGE_GITHUB_MCP_INCLUDE": ("github_mcp", "include"),
+    "CODEX_BRIDGE_GITHUB_MCP_EXCLUDE": ("github_mcp", "exclude"),
+    "CODEX_BRIDGE_GITHUB_MCP_TOOLSETS": ("github_mcp", "toolsets"),
+    "CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS": ("github_mcp", "max_tools"),
+}
+MANAGED_CONFIG_ENVIRONMENT_KEYS = tuple(_MANAGED_ENV_KEYS)
+
+
+def _reject_managed_environment_conflicts(environ: Mapping[str, str]) -> None:
+    for variable, (section, key) in _MANAGED_ENV_KEYS.items():
+        if variable in environ:
+            raise ConfigurationError(
+                f"{variable} conflicts with managed TOML configuration ({section}.{key})"
+            )
 
 
 def _port(value: object, source: str) -> int:
@@ -428,7 +468,15 @@ class BridgeConfig:
         config_data: Mapping[str, Any] | None = None,
     ) -> BridgeConfig:
         values = os.environ if environ is None else environ
-        file_config = _config(values, config_data)
+        source = None
+        if config_data is None:
+            try:
+                source = active_config_source(values)
+            except ConfigFileError as exc:
+                raise ConfigurationError(str(exc)) from exc
+        file_config = _config(values, config_data, path=None if source is None else source.path)
+        if source is not None and source.mode == "managed":
+            _reject_managed_environment_conflicts(values)
         bridge_config = file_config.get("bridge", {})
         console_config = file_config.get("console", {})
         github_mcp_config = file_config.get("github_mcp", {})
@@ -441,8 +489,16 @@ class BridgeConfig:
         ):
             raise ConfigurationError("CodexBridge configuration sections are malformed")
 
-        wait_max = _positive_float("CODEX_BRIDGE_WAIT_MAX_SECONDS", WAIT_HARD_MAX_SECONDS, values)
-        wait_default = _positive_float("CODEX_BRIDGE_WAIT_DEFAULT_SECONDS", 50.0, values)
+        wait_max = _positive_float(
+            "CODEX_BRIDGE_WAIT_MAX_SECONDS",
+            float(bridge_config.get("wait_max_seconds", WAIT_HARD_MAX_SECONDS)),
+            values,
+        )
+        wait_default = _positive_float(
+            "CODEX_BRIDGE_WAIT_DEFAULT_SECONDS",
+            float(bridge_config.get("wait_default_seconds", 50.0)),
+            values,
+        )
         if wait_max > WAIT_HARD_MAX_SECONDS:
             raise ConfigurationError(
                 f"maximum wait must not exceed {WAIT_HARD_MAX_SECONDS:g} seconds"
@@ -452,11 +508,19 @@ class BridgeConfig:
                 "default wait cannot exceed the configured default wait maximum"
             )
 
-        port_raw = values.get("CODEX_BRIDGE_PORT", "8000")
-        try:
-            port = int(port_raw)
-        except ValueError as exc:
-            raise ConfigurationError("CODEX_BRIDGE_PORT must be an integer") from exc
+        if "CODEX_BRIDGE_PORT" in values:
+            port_raw: object = values["CODEX_BRIDGE_PORT"]
+        else:
+            port_raw = bridge_config.get("port", 8000)
+        if isinstance(port_raw, int) and not isinstance(port_raw, bool):
+            port = port_raw
+        elif isinstance(port_raw, str):
+            try:
+                port = int(port_raw)
+            except ValueError as exc:
+                raise ConfigurationError("CODEX_BRIDGE_PORT must be an integer") from exc
+        else:
+            raise ConfigurationError("CODEX_BRIDGE_PORT must be an integer")
         if not 1 <= port <= 65535:
             raise ConfigurationError("CODEX_BRIDGE_PORT must be between 1 and 65535")
 
@@ -510,12 +574,21 @@ class BridgeConfig:
             raise ConfigurationError("bridge.file_put_dir must be a string")
 
         return cls(
-            host=values.get("CODEX_BRIDGE_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            host=values.get("CODEX_BRIDGE_HOST", bridge_config.get("host", "127.0.0.1")).strip()
+            or "127.0.0.1",
             port=port,
             ui_port=ui_port,
             allowed_roots=allowed_roots,
-            allowed_hosts=_split(values.get("CODEX_BRIDGE_ALLOWED_HOSTS"), ","),
-            allowed_origins=_split(values.get("CODEX_BRIDGE_ALLOWED_ORIGINS"), ","),
+            allowed_hosts=(
+                _split(values["CODEX_BRIDGE_ALLOWED_HOSTS"], ",")
+                if "CODEX_BRIDGE_ALLOWED_HOSTS" in values
+                else tuple(bridge_config.get("allowed_hosts", ()))
+            ),
+            allowed_origins=(
+                _split(values["CODEX_BRIDGE_ALLOWED_ORIGINS"], ",")
+                if "CODEX_BRIDGE_ALLOWED_ORIGINS" in values
+                else tuple(bridge_config.get("allowed_origins", ()))
+            ),
             codex_executable=executable,
             wait_default_seconds=wait_default,
             wait_max_seconds=wait_max,
