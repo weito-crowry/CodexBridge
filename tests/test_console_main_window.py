@@ -715,6 +715,91 @@ def test_open_in_codex_app_uses_right_clicked_thread_id_and_preserves_selection(
     window.close()
 
 
+def test_project_parent_actions_open_folder_terminal_and_only_create_an_unsent_draft(
+    tmp_path, monkeypatch
+) -> None:
+    _application()
+    cwd = tmp_path / "日本語 project with spaces"
+    cwd.mkdir()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result(
+        "threads",
+        {"threads": [{"id": "thread-a", "name": "A", "cwd": str(cwd)}]},
+    )
+    window.select_thread("thread-a")
+    window.composer_widget.set_prompt_text("unsent existing draft")
+    selected_draft_key = window._composer_controller._current_draft_key
+    initial_requests = list(client.requests)
+    parent = window.thread_pane.list_widget.topLevelItem(0)
+    assert parent is not None
+    menu = window.thread_pane._context_menu_for_item(parent)
+    assert menu is not None
+
+    menu.actions()[0].trigger()
+
+    assert window._composer_controller._is_new_draft
+    assert window._composer_controller._current_thread_id is None
+    assert window._composer_controller._current_cwd == str(cwd)
+    assert window.composer_widget.prompt_text == ""
+    assert window._composer_controller._drafts[selected_draft_key] == "unsent existing draft"
+    assert client.requests == initial_requests
+    assert client.json_posts == []
+
+    opened: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()) or True,
+    )
+    menu.actions()[2].trigger()
+    assert len(opened) == 1
+    assert os.path.normcase(os.path.normpath(opened[0])) == os.path.normcase(
+        os.path.normpath(str(cwd))
+    )
+
+    detached: list[tuple[str, list[str], str]] = []
+
+    def _start_detached(program: str, arguments: list[str], working_directory: str):
+        detached.append((program, arguments, working_directory))
+        return True, 1234
+
+    monkeypatch.setattr(main_window_module.QProcess, "startDetached", _start_detached)
+    menu.actions()[4].trigger()
+    assert detached[0][2] == str(cwd)
+    if main_window_module.sys.platform == "win32":
+        assert detached[0] == ("wt.exe", ["-d", str(cwd)], str(cwd))
+    else:
+        assert detached[0][2] == str(cwd)
+    assert client.requests == initial_requests
+    window.close()
+
+
+def test_project_folder_launch_failures_are_reported(tmp_path, monkeypatch) -> None:
+    _application()
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    window = MainWindow(_config(), api_client=FakeClient(), tray_available=False)
+    window.thread_pane.set_threads([{"id": "thread-a", "cwd": str(cwd)}])
+    parent = window.thread_pane.list_widget.topLevelItem(0)
+    assert parent is not None
+    menu = window.thread_pane._context_menu_for_item(parent)
+    assert menu is not None
+
+    monkeypatch.setattr(main_window_module.QDesktopServices, "openUrl", lambda _url: False)
+    menu.actions()[2].trigger()
+    assert "Could not open project folder" in window.bottom_status_label.text()
+
+    monkeypatch.setattr(
+        main_window_module.QProcess,
+        "startDetached",
+        lambda *_args: (False, 0),
+    )
+    menu.actions()[4].trigger()
+    assert "Could not open a terminal" in window.bottom_status_label.text()
+    window.close()
+
+
 def test_copy_thread_content_fetches_all_pages_in_order_without_changing_selection(
     monkeypatch,
 ) -> None:

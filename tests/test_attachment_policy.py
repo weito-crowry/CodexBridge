@@ -54,6 +54,23 @@ def test_empty_attachment_list_is_valid(tmp_path: Path) -> None:
     assert _policy(tmp_path).validate([]) == ()
 
 
+def test_backend_policy_accepts_staged_copy_and_rejects_it_after_disappearance(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / ".codexbridge-staging"
+    staging.mkdir()
+    staged = staging / "report.txt"
+    staged.write_text("copied contents", encoding="utf-8")
+
+    validated = _policy(tmp_path).validate([str(staged)])
+
+    assert validated[0].canonical_path == str(staged.resolve())
+    staged.unlink()
+    with pytest.raises(AttachmentPolicyError) as error:
+        _policy(tmp_path).validate([str(staged)])
+    assert error.value.category == "attachment_missing_or_unavailable"
+
+
 @pytest.mark.parametrize("path_kind", ["relative", "missing", "directory", "outside"])
 def test_rejects_invalid_or_out_of_root_paths(tmp_path: Path, path_kind: str) -> None:
     root = tmp_path / "allowed"

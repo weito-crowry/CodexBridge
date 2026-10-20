@@ -17,6 +17,53 @@ def _policy(tmp_path) -> AllowedPathPolicy:
     return AllowedPathPolicy((str(tmp_path),))
 
 
+def test_project_items_preserves_only_existing_local_images_inside_allowed_roots(tmp_path) -> None:
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    local_image = allowed_root / "image.png"
+    local_image.write_bytes(b"image bytes")
+    outside_image = tmp_path / "outside.png"
+    outside_image.write_bytes(b"outside image bytes")
+    missing_image = allowed_root / "missing.png"
+    malformed_image = str(allowed_root / "invalid\x00image.png")
+
+    result = project_items_response(
+        "thread",
+        None,
+        {
+            "data": [
+                {
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "user-1",
+                        "type": "userMessage",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {"type": "localImage", "path": str(local_image)},
+                            {"type": "localImage", "path": str(missing_image)},
+                            {"type": "localImage", "path": str(outside_image)},
+                            {"type": "localImage", "path": malformed_image},
+                            {"type": "image", "url": "https://private.invalid/image"},
+                        ],
+                    },
+                }
+            ]
+        },
+        policy=_policy(allowed_root),
+    )
+
+    projected = result["items"][0]
+    assert projected["turn_id"] == "turn-1"
+    assert projected["item"] == {
+        "id": "user-1",
+        "type": "userMessage",
+        "text": "hello\n[image]\n[image]\n[image]\n[image]\n[image]",
+        "images": [str(local_image.resolve())],
+    }
+    assert str(outside_image) not in str(result)
+    assert "private.invalid" not in str(result)
+
+
 def test_project_thread_metadata_exposes_only_known_runtime_status_fields() -> None:
     active = project_thread_metadata(
         {

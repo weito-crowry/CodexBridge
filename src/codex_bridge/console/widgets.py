@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 from .activity_pane import ActivityPane as ActivityPane
 from .activity_pane import activity_row as activity_row
 from .bulk_thread_naming import build_thread_list_header, loaded_untitled_thread_rows
-from .conversation_widgets import build_conversation_row
+from .conversation_widgets import build_conversation_row, build_image_attachment_row
 from .project_names import normalize_cwd
 from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
 
@@ -59,6 +59,7 @@ class TimelineEntry:
     details: tuple[str, ...]
     started_at_ms: int | None = None
     completed_at_ms: int | None = None
+    images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +71,21 @@ class _HistoryRenderRow:
 
 def _safe_text(value: object, limit: int = 16_384) -> str:
     return value[:limit] if isinstance(value, str) else ""
+
+
+def _safe_local_image_paths(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    paths: list[str] = []
+    for path in value[:8]:
+        if (
+            isinstance(path, str)
+            and len(path) <= 4_096
+            and QDir.isAbsolutePath(path)
+            and path not in paths
+        ):
+            paths.append(path)
+    return tuple(paths)
 
 
 def _safe_status(value: object) -> str | None:
@@ -207,7 +223,14 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
     status = _safe_status(item.get("status"))
     if item_type == "userMessage":
         return TimelineEntry(
-            turn_id, item_id, "User", "User", _safe_text(item.get("text")), None, ()
+            turn_id,
+            item_id,
+            "User",
+            "User",
+            _safe_text(item.get("text")),
+            None,
+            (),
+            images=_safe_local_image_paths(item.get("images")),
         )
     if item_type == "agentMessage":
         if item.get("phase") == "commentary":
@@ -357,7 +380,11 @@ class ThreadListPane(QWidget):
     thread_rename_requested = Signal(str)
     thread_open_requested = Signal(str)
     thread_copy_requested = Signal(str)
+    new_thread_for_folder_requested = Signal(str)
+    folder_explorer_requested = Signal(str)
+    folder_terminal_requested = Signal(str)
     _GROUP_KEY_ROLE = Qt.ItemDataRole.UserRole + 1
+    _GROUP_CWD_ROLE = Qt.ItemDataRole.UserRole + 2
     _OTHER_GROUP_KEY = "\x00other"
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -491,6 +518,7 @@ class ThreadListPane(QWidget):
                 parent.setData(0, self._GROUP_KEY_ROLE, state_key)
                 if group_cwd is not None:
                     parent.setToolTip(0, group_cwd)
+                    parent.setData(0, self._GROUP_CWD_ROLE, group_cwd)
                 self.list_widget.addTopLevelItem(parent)
 
                 for thread in matching_threads:
@@ -629,6 +657,9 @@ class ThreadListPane(QWidget):
     def _context_menu_for_item(self, item: QTreeWidgetItem) -> QMenu | None:
         thread_id = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(thread_id, str):
+            cwd = item.data(0, self._GROUP_CWD_ROLE)
+            if isinstance(cwd, str) and cwd.strip():
+                return self._project_context_menu(cwd)
             return None
         menu = QMenu(self)
 
@@ -662,6 +693,31 @@ class ThreadListPane(QWidget):
         )
         open_cwd_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self._open_cwd(thread_id)
+        )
+        return menu
+
+    def _project_context_menu(self, cwd: str) -> QMenu:
+        menu = QMenu(self)
+        openable = self._openable_cwd(cwd) is not None
+
+        new_thread_action = menu.addAction("新規スレッドを開始...")
+        new_thread_action.setEnabled(openable)
+        new_thread_action.triggered.connect(
+            lambda _checked=False, cwd=cwd: self.new_thread_for_folder_requested.emit(cwd)
+        )
+        menu.addSeparator()
+
+        explorer_action = menu.addAction("エクスプローラーで開く")
+        explorer_action.setEnabled(openable)
+        explorer_action.triggered.connect(
+            lambda _checked=False, cwd=cwd: self.folder_explorer_requested.emit(cwd)
+        )
+        copy_path_action = menu.addAction("フォルダパスをコピー")
+        copy_path_action.triggered.connect(lambda _checked=False, cwd=cwd: self._copy_text(cwd))
+        terminal_action = menu.addAction("ターミナルで開く")
+        terminal_action.setEnabled(openable)
+        terminal_action.triggered.connect(
+            lambda _checked=False, cwd=cwd: self.folder_terminal_requested.emit(cwd)
         )
         return menu
 
@@ -1329,6 +1385,11 @@ class HistoryPane(QWidget):
         layout.addWidget(timing)
         if entry.body:
             layout.addWidget(_HistoryBody(entry.body))
+        image_row = build_image_attachment_row(entry.images, card)
+        if image_row is not None:
+            image_row.setProperty("turnId", entry.turn_id)
+            image_row.setProperty("itemId", entry.item_id)
+            layout.addWidget(image_row)
         if entry.details:
             layout.addWidget(_HistoryBody(" · ".join(entry.details)))
         return card

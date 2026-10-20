@@ -38,6 +38,78 @@ def test_add_button_selects_multiple_files_and_remove_keeps_file(
     assert second.exists()
 
 
+def test_explicit_external_selection_is_copied_into_persistent_allowed_root_staging(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    external = tmp_path / "Desktop" / "日本語 report.txt"
+    external.parent.mkdir()
+    external.write_bytes(b"source bytes")
+    widget = ComposerWidget([str(allowed)])
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *_args, **_kwargs: ([str(external)], ""),
+    )
+
+    widget.attachment_add_button.click()
+
+    staged = Path(widget.attachments[0])
+    assert staged == allowed / ".codexbridge-staging" / external.name
+    assert staged.read_bytes() == b"source bytes"
+    assert external.read_bytes() == b"source bytes"
+    assert str(staged) in " ".join(notices)
+    widget.set_attachments(())
+    assert staged.exists()
+
+
+def test_external_staging_preserves_collisions_and_handles_source_disappearance(
+    tmp_path: Path,
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    staging = allowed / ".codexbridge-staging"
+    staging.mkdir()
+    existing = staging / "report.txt"
+    existing.write_text("keep existing", encoding="utf-8")
+    external = tmp_path / "report.txt"
+    external.write_text("new contents", encoding="utf-8")
+    widget = ComposerWidget([str(allowed)])
+
+    widget.add_attachments([str(external)])
+
+    staged = Path(widget.attachments[0])
+    assert staged.name == "report (1).txt"
+    assert staged.read_text(encoding="utf-8") == "new contents"
+    assert existing.read_text(encoding="utf-8") == "keep existing"
+
+    missing = tmp_path / "disappeared.txt"
+    widget.add_attachments([str(missing)])
+    assert all("disappeared" not in path for path in widget.attachments)
+
+
+def test_external_selection_uses_configured_staging_directory(
+    tmp_path: Path,
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    custom_staging = allowed / "managed" / "attachments"
+    external = tmp_path / "external.txt"
+    external.write_text("data", encoding="utf-8")
+    widget = ComposerWidget([str(allowed)], attachment_staging_directory=str(custom_staging))
+
+    widget.add_attachments([str(external)])
+
+    assert widget.attachments == (str(custom_staging / external.name),)
+    assert Path(widget.attachments[0]).read_text(encoding="utf-8") == "data"
+
+
 def test_file_selection_rejects_missing_directories_duplicates_and_extra_files(
     tmp_path: Path,
 ) -> None:
@@ -238,9 +310,9 @@ def test_out_of_root_attachment_failure_shows_specific_guidance_and_keeps_draft(
     _application()
     path = tmp_path / "outside.txt"
     path.write_text("data", encoding="utf-8")
-    controller, window, widget, client, _root = _controller(
-        tmp_path, allowed_roots=(str(tmp_path / "allowed"),)
-    )
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    controller, window, widget, client, _root = _controller(tmp_path, allowed_roots=(str(allowed),))
     window.thread_pane.thread_selected.emit("thread-a")
     widget.input.setPlainText("keep this")
     widget.add_attachments([str(path)])
@@ -250,6 +322,6 @@ def test_out_of_root_attachment_failure_shows_specific_guidance_and_keeps_draft(
     client.fail(key, "attachment_outside_allowed_root")
 
     assert widget.prompt_text == "keep this"
-    assert widget.attachments == (str(path.resolve()),)
+    assert widget.attachments == (str(allowed / ".codexbridge-staging" / path.name),)
     assert "許可されたフォルダー内" in widget.status_label.text()
     assert "outside.txt" not in widget.status_label.text()

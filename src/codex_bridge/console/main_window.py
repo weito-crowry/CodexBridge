@@ -12,10 +12,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 if TYPE_CHECKING:
     from PySide6.QtCore import QTimer
 
-from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtCore import QProcess, QSettings, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QDesktopServices,
     QIcon,
 )
 from PySide6.QtWidgets import (
@@ -558,6 +559,9 @@ class MainWindow(QMainWindow):
         self.thread_pane.thread_rename_requested.connect(self._rename_thread)
         self.thread_pane.thread_open_requested.connect(self._open_thread_in_codex)
         self.thread_pane.thread_copy_requested.connect(self._copy_thread_content)
+        self.thread_pane.new_thread_for_folder_requested.connect(self._new_thread_for_folder)
+        self.thread_pane.folder_explorer_requested.connect(self._open_project_folder)
+        self.thread_pane.folder_terminal_requested.connect(self._open_project_terminal)
         self.history_pane.older_requested.connect(self.load_older)
 
     def _connect_runtime(self) -> None:
@@ -1252,6 +1256,51 @@ class MainWindow(QMainWindow):
 
     def _copy_thread_content(self, thread_id: str) -> None:
         self._thread_interactions._copy_thread_content(thread_id)
+
+    def _validated_project_folder(self, cwd: str) -> str | None:
+        folder = self.thread_pane._openable_cwd(cwd)
+        if folder is None:
+            self.bottom_status_label.setText("Project folder is no longer available")
+        return folder
+
+    def _new_thread_for_folder(self, cwd: str) -> None:
+        folder = self._validated_project_folder(cwd)
+        if folder is not None:
+            self._composer_controller.open_new_thread_draft(folder)
+
+    def _open_project_folder(self, cwd: str) -> None:
+        folder = self._validated_project_folder(cwd)
+        if folder is None:
+            return
+        try:
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        except Exception:
+            opened = False
+        if not opened:
+            self.bottom_status_label.setText("Could not open project folder in Explorer")
+
+    def _open_project_terminal(self, cwd: str) -> None:
+        folder = self._validated_project_folder(cwd)
+        if folder is None:
+            return
+        if sys.platform == "win32":
+            commands: tuple[tuple[str, list[str]], ...] = (
+                ("wt.exe", ["-d", folder]),
+                ("cmd.exe", []),
+            )
+        elif sys.platform == "darwin":
+            commands = (("open", ["-a", "Terminal"]),)
+        else:
+            commands = (("x-terminal-emulator", []),)
+        for program, arguments in commands:
+            try:
+                result = QProcess.startDetached(program, arguments, folder)
+            except Exception:
+                continue
+            started = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
+            if started:
+                return
+        self.bottom_status_label.setText("Could not open a terminal in the project folder")
 
     def _request_thread_copy_page(
         self, key: str, thread_id: str, cursor: str | None = None

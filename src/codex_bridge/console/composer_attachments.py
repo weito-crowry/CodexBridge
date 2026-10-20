@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -124,13 +126,21 @@ class ComposerAttachmentBar(QWidget):
     attachments_changed = Signal(object)
     validation_notice = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        allowed_roots: Sequence[str] = (),
+        staging_directory: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("composerAttachmentBar")
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._attachments: tuple[str, ...] = ()
         self._chips: list[_AttachmentChip] = []
+        self._allowed_roots = tuple(allowed_roots)
+        self._staging_directory = staging_directory
 
         self.add_button = QPushButton("+")
         self.add_button.setObjectName("composerAttachmentAdd")
@@ -169,6 +179,7 @@ class ComposerAttachmentBar(QWidget):
         existing = list(self._attachments)
         seen = {os.path.normcase(path) for path in existing}
         invalid = duplicate = overflow = False
+        staged: list[str] = []
         for raw_path in paths:
             if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
                 invalid = True
@@ -182,6 +193,16 @@ class ComposerAttachmentBar(QWidget):
                 invalid = True
                 continue
             canonical = os.fspath(candidate)
+            if len(existing) >= _MAX_ATTACHMENTS:
+                overflow = True
+                continue
+            if self._allowed_roots and not self._is_under_allowed_root(canonical):
+                try:
+                    canonical = self._stage_external_file(candidate)
+                    staged.append(canonical)
+                except (OSError, RuntimeError, ValueError):
+                    invalid = True
+                    continue
             normalized = os.path.normcase(canonical)
             if normalized in seen:
                 duplicate = True
@@ -206,6 +227,73 @@ class ComposerAttachmentBar(QWidget):
             if overflow:
                 messages.append("添付は最大8件です")
             self.validation_notice.emit("。".join(messages))
+        if staged:
+            self.validation_notice.emit(
+                "許可されたフォルダーへコピーしました: " + "、".join(staged)
+            )
+
+    def _is_under_allowed_root(self, path: str) -> bool:
+        normalized = os.path.normcase(path)
+        for value in self._allowed_roots:
+            try:
+                root = os.path.normcase(os.fspath(Path(value).resolve(strict=True)))
+                if os.path.commonpath((root, normalized)) == root:
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _stage_external_file(self, source: Path) -> str:
+        roots = tuple(Path(value).resolve(strict=True) for value in self._allowed_roots)
+        if not roots or any(not root.is_dir() for root in roots):
+            raise ValueError("allowed root is unavailable")
+        staging = (
+            Path(self._staging_directory)
+            if self._staging_directory is not None
+            else roots[0] / ".codexbridge-staging"
+        )
+        prospective = os.path.normcase(os.fspath(staging.resolve(strict=False)))
+        allowed = False
+        for root in roots:
+            canonical_root = os.path.normcase(os.fspath(root))
+            try:
+                if os.path.commonpath((canonical_root, prospective)) == canonical_root:
+                    allowed = True
+                    break
+            except ValueError:
+                continue
+        if not allowed:
+            raise ValueError("staging directory is outside allowed roots")
+        staging.mkdir(parents=True, exist_ok=True)
+        canonical_staging = staging.resolve(strict=True)
+        canonical_target = os.path.normcase(os.fspath(canonical_staging))
+        if not any(
+            os.path.commonpath((os.path.normcase(os.fspath(root)), canonical_target))
+            == os.path.normcase(os.fspath(root))
+            for root in roots
+        ):
+            raise ValueError("staging directory escaped the allowed root")
+
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".incoming-", dir=canonical_staging)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as destination, source.open("rb") as origin:
+                shutil.copyfileobj(origin, destination, length=1024 * 1024)
+                destination.flush()
+                os.fsync(destination.fileno())
+            stem = source.stem
+            suffix = source.suffix
+            index = 0
+            while True:
+                name = source.name if index == 0 else f"{stem} ({index}){suffix}"
+                target = canonical_staging / name
+                try:
+                    os.link(temporary, target)
+                    return os.fspath(target.resolve(strict=True))
+                except FileExistsError:
+                    index += 1
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _open_file_dialog(self) -> None:
         remaining = _MAX_ATTACHMENTS - len(self._attachments)

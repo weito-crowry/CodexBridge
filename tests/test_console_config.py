@@ -7,6 +7,7 @@ import pytest
 from codex_bridge.console.config import (
     ConsoleConfig,
     ConsoleConfigurationError,
+    parse_attachment_staging_directory,
     parse_tunnel_profile,
     parse_ui_port,
 )
@@ -113,6 +114,67 @@ def test_console_reads_user_config_and_reports_effective_roots(tmp_path, monkeyp
     assert config.tunnel_profile == "configured"
     assert config.roots_ready
     assert config.roots_count == 1
+
+
+def test_console_reads_validated_attachment_staging_directory(tmp_path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    staging = root / "managed" / "incoming"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[bridge]\nallowed_roots = ["{root.as_posix()}"]\n'
+        f'[console]\nattachment_staging_directory = "{staging.as_posix()}"\n',
+        encoding="utf-8",
+    )
+
+    config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+
+    assert config.attachment_staging_directory == str(staging.resolve())
+
+
+def test_attachment_staging_directory_environment_overrides_config(tmp_path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    configured = root / "configured"
+    from_environment = root / "environment"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[bridge]\nallowed_roots = ["{root.as_posix()}"]\n'
+        f'[console]\nattachment_staging_directory = "{configured.as_posix()}"\n',
+        encoding="utf-8",
+    )
+
+    config = ConsoleConfig.from_sources(
+        environ={
+            "CODEX_BRIDGE_CONFIG": str(config_path),
+            "CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY": str(from_environment),
+        }
+    )
+
+    assert config.attachment_staging_directory == str(from_environment.resolve())
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["relative/path", "", "../outside", "C:/outside"],
+)
+def test_attachment_staging_directory_rejects_paths_outside_allowed_roots(
+    tmp_path, value: str
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+
+    with pytest.raises(ConsoleConfigurationError):
+        parse_attachment_staging_directory(value, (str(root),))
+
+
+def test_attachment_staging_directory_must_be_inside_an_existing_allowed_root(tmp_path) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    outside = tmp_path / "outside" / "staging"
+
+    with pytest.raises(ConsoleConfigurationError, match="inside bridge.allowed_roots"):
+        parse_attachment_staging_directory(str(outside), (str(root),))
 
 
 def test_console_environment_overrides_config_and_cli_overrides_environment(tmp_path) -> None:

@@ -132,11 +132,18 @@ allowed_roots = ["C:\\Users\\you\\Documents\\src"]
 
 [console]
 ui_port = 8001
+# Optional; defaults to the first allowed root's .codexbridge-staging directory.
+attachment_staging_directory = "C:\\Users\\you\\Documents\\src\\.codexbridge-staging"
 
 [targets.local]
 name = "Local PC"
 kind = "local"
 ```
+
+Set `console.attachment_staging_directory` (or
+`CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY`) to choose where explicitly selected files outside
+`allowed_roots` are copied. The directory must be inside an existing allowed root. Staged files
+remain there so sent history can continue to reference them.
 
 Start the Console:
 
