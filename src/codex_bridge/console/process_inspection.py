@@ -19,6 +19,9 @@ _MAX_SCANNED_PROCESSES = 5_000
 _MAX_ROOT_CANDIDATES = 100
 # Windows descendant trees can exceed one second while remaining bounded in the worker.
 _MAX_SCAN_SECONDS = 4.0
+_CODEX_POWERSHELL_UTF8_SETUP = (
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}"
+)
 _COMMAND_LINE_LIMIT = 8_000
 _COMMAND_ARGUMENT_LIMIT = 256
 _COMMAND_ARGUMENTS_TOTAL_LIMIT = 16_000
@@ -647,21 +650,58 @@ def _command_matches(summary: str, process: ProcessView) -> bool:
         if not token_matches:
             return False
         expected_body = _summary_command_body(remainder)
-        actual_body = _argv_command_payload(arguments[1:])
+        actual_payload = _argv_command_payload(arguments[1:])
+        actual_body = actual_payload
         if actual_body is None:
             actual_body = _argv_command_body(arguments[1:])
         return (
             expected_body is not None
             and actual_body is not None
-            and _normalize_command(expected_body) == _normalize_command(actual_body)
+            and _command_payload_matches(
+                expected_body,
+                actual_body,
+                executable_name,
+                allow_codex_utf8_setup=actual_payload is not None,
+            )
         )
 
     if executable_name not in {"pwsh.exe", "powershell.exe", "cmd.exe"}:
         return False
     actual_script = _argv_command_payload(arguments[1:])
-    return actual_script is not None and _normalize_command(summary) == _normalize_command(
-        actual_script
+    return actual_script is not None and _command_payload_matches(
+        summary, actual_script, executable_name, allow_codex_utf8_setup=True
     )
+
+
+def _command_payload_matches(
+    expected: str,
+    actual: str,
+    executable_name: str,
+    *,
+    allow_codex_utf8_setup: bool,
+) -> bool:
+    normalized_expected = _normalize_command(expected)
+    if normalized_expected == _normalize_command(actual):
+        return True
+    if not allow_codex_utf8_setup or executable_name not in {"pwsh.exe", "powershell.exe"}:
+        return False
+    actual_without_setup = _remove_codex_powershell_utf8_setup(actual)
+    return actual_without_setup is not None and normalized_expected == _normalize_command(
+        actual_without_setup
+    )
+
+
+def _remove_codex_powershell_utf8_setup(actual_payload: str) -> str | None:
+    if not actual_payload.startswith(_CODEX_POWERSHELL_UTF8_SETUP):
+        return None
+    suffix = actual_payload[len(_CODEX_POWERSHELL_UTF8_SETUP) :]
+    if suffix.startswith("\r\n"):
+        payload = suffix[2:]
+    elif suffix.startswith("\n"):
+        payload = suffix[1:]
+    else:
+        return None
+    return payload if payload and not payload[0].isspace() else None
 
 
 def _may_be_command_shell(summary: str, process_name: str | None) -> bool:

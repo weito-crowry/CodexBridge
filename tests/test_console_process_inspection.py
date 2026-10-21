@@ -539,6 +539,16 @@ def test_incomplete_scan_preserves_previously_verified_root_evidence() -> None:
 _POWERSHELL_SCRIPT = "1..12 | ForEach-Object { $_ }"
 _POWERSHELL_SUMMARY = f"pwsh.exe -NoProfile -Command '{_POWERSHELL_SCRIPT}'"
 _POWERSHELL_EXE = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+_CODEX_POWERSHELL_UTF8_SETUP = (
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}"
+)
+_LIVE_POWERSHELL_SCRIPT = (
+    'Write-Output ("WINDOWS_ACTUAL_PID={0}" -f $PID)\n'
+    "1..60 | ForEach-Object { Write-Output "
+    '("PROCESS_PID_VERIFIED_STEP_{0} {1:HH:mm:ss}" -f $_, (Get-Date)); '
+    "Start-Sleep -Seconds 5 }\n"
+    'Write-Output "PID_VERIFIED_CHECK_DONE"'
+)
 
 
 def _anchored_processes(
@@ -608,6 +618,12 @@ def _anchored_processes(
     return _Psutil(processes, listed)
 
 
+def _set_shell_command_line(psutil: _Psutil, pid: int, payload: str) -> None:
+    process = psutil.processes[pid]
+    assert isinstance(process, _Process)
+    process.cmdline_value = [_POWERSHELL_EXE, "-Command", payload]
+
+
 def test_matches_exact_powershell_command_beneath_actual_app_server_os_pid() -> None:
     psutil = _anchored_processes(include_intermediate_parent=True)
 
@@ -632,6 +648,138 @@ def test_matches_exact_powershell_command_beneath_actual_app_server_os_pid() -> 
     assert _POWERSHELL_SCRIPT in command.root.command_line
     assert 11385 not in psutil.process_calls
     assert dict(result.evidence.roots)[command.command.key].pid == 197728
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_matches_live_powershell_command_after_exact_codex_utf8_setup(
+    newline: str,
+) -> None:
+    psutil = _anchored_processes()
+    summary = f"\"{_POWERSHELL_EXE}\" -Command '{_LIVE_POWERSHELL_SCRIPT}'"
+    _set_shell_command_line(
+        psutil,
+        197728,
+        _CODEX_POWERSHELL_UTF8_SETUP + newline + _LIVE_POWERSHELL_SCRIPT,
+    )
+
+    result = inspect_command_processes(
+        (_command("174644", summary=summary),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Running"
+    assert result.commands[0].root is not None
+    assert result.commands[0].root.pid == 197728
+    assert 174644 not in psutil.process_calls
+
+
+def test_summary_containing_exact_utf8_setup_matches_without_stripping() -> None:
+    psutil = _anchored_processes()
+    full_script = _CODEX_POWERSHELL_UTF8_SETUP + "\n" + _LIVE_POWERSHELL_SCRIPT
+    summary = f"\"{_POWERSHELL_EXE}\" -Command '{full_script}'"
+    _set_shell_command_line(psutil, 197728, full_script)
+
+    result = inspect_command_processes(
+        (_command("174644", summary=summary),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Running"
+    assert result.commands[0].root is not None
+    assert result.commands[0].root.pid == 197728
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "try { [Console]::OutputEncoding=[System.Text.Encoding]::Unicode } catch {}\n"
+        + _LIVE_POWERSHELL_SCRIPT,
+        "Write-Output 'unrelated'\n"
+        + _CODEX_POWERSHELL_UTF8_SETUP
+        + "\n"
+        + _LIVE_POWERSHELL_SCRIPT,
+        _CODEX_POWERSHELL_UTF8_SETUP + "\n" + _LIVE_POWERSHELL_SCRIPT + "\nWrite-Output 'trailing'",
+        _CODEX_POWERSHELL_UTF8_SETUP + ";" + _LIVE_POWERSHELL_SCRIPT,
+        _CODEX_POWERSHELL_UTF8_SETUP + "\n \n" + _LIVE_POWERSHELL_SCRIPT,
+        _LIVE_POWERSHELL_SCRIPT
+        + "\n"
+        + _CODEX_POWERSHELL_UTF8_SETUP
+        + "\n"
+        + _LIVE_POWERSHELL_SCRIPT,
+    ],
+    ids=[
+        "modified-setup",
+        "unrelated-prefix",
+        "trailing-payload",
+        "semicolon-separator",
+        "whitespace-only-line",
+        "setup-not-first",
+    ],
+)
+def test_does_not_match_nearby_but_nonidentical_powershell_prefixes(payload: str) -> None:
+    psutil = _anchored_processes(child_script=payload)
+    summary = f"\"{_POWERSHELL_EXE}\" -Command '{_LIVE_POWERSHELL_SCRIPT}'"
+    _set_shell_command_line(psutil, 197728, payload)
+
+    result = inspect_command_processes(
+        (_command("174644", summary=summary),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: no matching Codex child"
+    assert result.commands[0].root is None
+
+
+def test_duplicate_exact_wrapper_matches_remain_ambiguous() -> None:
+    psutil = _anchored_processes(second_matching_child=True)
+    payload = _CODEX_POWERSHELL_UTF8_SETUP + "\n" + _LIVE_POWERSHELL_SCRIPT
+    _set_shell_command_line(psutil, 197728, payload)
+    _set_shell_command_line(psutil, 197729, payload)
+    summary = f"\"{_POWERSHELL_EXE}\" -Command '{_LIVE_POWERSHELL_SCRIPT}'"
+
+    result = inspect_command_processes(
+        (_command("174644", summary=summary),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: ambiguous matching Codex children"
+    assert result.commands[0].root is None
+
+
+def test_exact_utf8_setup_does_not_match_an_unrelated_executable() -> None:
+    psutil = _anchored_processes()
+    _set_shell_command_line(
+        psutil,
+        197728,
+        _CODEX_POWERSHELL_UTF8_SETUP + "\n" + _LIVE_POWERSHELL_SCRIPT,
+    )
+    candidate = psutil.processes[197728]
+    assert isinstance(candidate, _Process)
+    candidate.exe_value = "C:\\OtherPowerShell\\pwsh.exe"
+    summary = f"\"{_POWERSHELL_EXE}\" -Command '{_LIVE_POWERSHELL_SCRIPT}'"
+
+    result = inspect_command_processes(
+        (_command("174644", summary=summary),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: no matching Codex child"
+    assert result.commands[0].root is None
 
 
 def test_missing_matching_child_is_unverified_and_not_reported_exited() -> None:
