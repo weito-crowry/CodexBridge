@@ -18,7 +18,6 @@ _MAX_TRACKED_CHILDREN = 100
 _MAX_SCANNED_PROCESSES = 5_000
 _MAX_ROOT_CANDIDATES = 100
 _MAX_SCAN_SECONDS = 1.0
-_PROCESS_ITER_ATTRIBUTES = ["pid", "ppid", "create_time", "name"]
 _COMMAND_LINE_LIMIT = 8_000
 _COMMAND_ARGUMENT_LIMIT = 256
 _COMMAND_ARGUMENTS_TOTAL_LIMIT = 16_000
@@ -67,6 +66,13 @@ class ProcessView:
     state: str
     executable: str | None = None
     arguments: tuple[str, ...] | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ProcessScan:
+    processes: dict[int, tuple[ProcessIdentity, int, ProcessView]]
+    complete: bool
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,14 +137,14 @@ def inspect_command_processes(
     except errors.access_denied:
         return InspectionResult(
             _empty_states(command_list, "Unverified: App Server anchor access denied"),
-            ProcessEvidence(app_server_os_pid=anchor_pid),
+            _evidence_for_anchor(evidence, anchor_pid),
         )
     except errors.all:
         anchor_create_time = None
     if anchor_create_time is None:
         return InspectionResult(
             _empty_states(command_list, "Unverified: App Server anchor unavailable"),
-            ProcessEvidence(app_server_os_pid=anchor_pid),
+            _evidence_for_anchor(evidence, anchor_pid),
         )
 
     anchor_identity = ProcessIdentity(anchor_pid, anchor_create_time)
@@ -189,15 +195,24 @@ def inspect_command_processes(
             root_active[command.key] = prior
         states[command.key] = CommandProcessState(command, state, view, ())
 
-    scan = _scan_processes(runtime_psutil, errors, cancelled)
-    descendants = _descendants(anchor_identity, scan, now)
+    scan = _scan_processes(anchor_process, errors, cancelled)
+    descendants = _descendants(anchor_identity, scan.processes, now) if scan.complete else {}
+    anchor_revalidation_denied = False
     try:
         after_scan_time = _number(runtime_psutil.Process(anchor_pid).create_time())
+    except errors.access_denied:
+        after_scan_time = None
+        anchor_revalidation_denied = True
     except errors.all:
         after_scan_time = None
-    if after_scan_time is None or not _same_identity(
-        anchor_identity, ProcessIdentity(anchor_pid, after_scan_time)
-    ):
+    if anchor_revalidation_denied or after_scan_time is None:
+        scan = ProcessScan(
+            scan.processes,
+            False,
+            "access denied" if anchor_revalidation_denied else "anchor unavailable",
+        )
+        descendants = {}
+    elif not _same_identity(anchor_identity, ProcessIdentity(anchor_pid, after_scan_time)):
         return InspectionResult(
             _empty_states(command_list, "Unverified: App Server anchor changed during inspection"),
             ProcessEvidence(app_server_os_pid=anchor_pid),
@@ -210,6 +225,9 @@ def inspect_command_processes(
     inspected_candidates = 0
     for command in command_list:
         if _is_cancelled(cancelled) or command.key in states:
+            continue
+        if not scan.complete:
+            unverified_reasons[command.key] = _scan_unverified_reason(scan)
             continue
         if command.started_at_seconds is None:
             unverified_reasons[command.key] = "Unverified: command start timestamp unavailable"
@@ -235,7 +253,7 @@ def inspect_command_processes(
             ):
                 time_mismatch = True
                 continue
-            scanned_process = scan.get(identity.pid)
+            scanned_process = scan.processes.get(identity.pid)
             scanned_name = scanned_process[2].name if scanned_process is not None else None
             if not _may_be_command_shell(command.summary, scanned_name):
                 continue
@@ -309,7 +327,7 @@ def inspect_command_processes(
             if active:
                 child_active.setdefault(command.key, set()).add(identity)
 
-    if root_active or any(child_active.values()):
+    if scan.complete and (root_active or any(child_active.values())):
         command_by_key = {command.key: command for command in command_list}
         for key, identity in tuple(root_active.items()):
             state, view, active = _read_identity(runtime_psutil, identity, errors)
@@ -319,7 +337,7 @@ def inspect_command_processes(
                 root_active.pop(key, None)
         _discover_children(
             command_list,
-            scan,
+            scan.processes,
             runtime_psutil,
             errors,
             roots,
@@ -359,6 +377,12 @@ def _empty_states(
     commands: Sequence[CommandDescriptor], message: str
 ) -> tuple[CommandProcessState, ...]:
     return tuple(CommandProcessState(command, message, None, ()) for command in commands)
+
+
+def _evidence_for_anchor(evidence: ProcessEvidence, anchor_pid: int) -> ProcessEvidence:
+    if evidence.app_server_os_pid == anchor_pid:
+        return evidence
+    return ProcessEvidence(app_server_os_pid=anchor_pid)
 
 
 def _number(value: object) -> float | None:
@@ -491,37 +515,64 @@ def _identity_view(identity: ProcessIdentity, state: str) -> ProcessView:
     return ProcessView(identity.pid, identity.create_time, None, None, None, None, state)
 
 
-def _scan_processes(
-    psutil_module: object, errors: Any, cancelled: Event | None
-) -> dict[int, tuple[ProcessIdentity, int | None, ProcessView]]:
-    result: dict[int, tuple[ProcessIdentity, int | None, ProcessView]] = {}
+def _scan_processes(anchor_process: object, errors: Any, cancelled: Event | None) -> ProcessScan:
+    result: dict[int, tuple[ProcessIdentity, int, ProcessView]] = {}
     started = time.monotonic()
+    if _is_cancelled(cancelled):
+        return ProcessScan(result, False, "incomplete")
     try:
-        runtime_psutil: Any = psutil_module
-        iterator = runtime_psutil.process_iter(attrs=_PROCESS_ITER_ATTRIBUTES)
-        for index, process in enumerate(iterator):
-            if index >= _MAX_SCANNED_PROCESSES or time.monotonic() - started >= _MAX_SCAN_SECONDS:
-                break
-            if _is_cancelled(cancelled):
-                break
-            info = getattr(process, "info", None)
-            if not isinstance(info, Mapping):
-                continue
-            pid = _positive_integer(info.get("pid"))
-            create_time = _number(info.get("create_time"))
-            if pid is None or create_time is None:
-                continue
-            ppid = _positive_integer(info.get("ppid"))
-            name = _string_or_none(info.get("name"))
-            identity = ProcessIdentity(pid, create_time)
-            result[pid] = (
-                identity,
-                ppid,
-                ProcessView(pid, create_time, name, None, ppid, None, "Unknown"),
-            )
-    except errors.all:
-        pass
-    return result
+        runtime_process: Any = anchor_process
+        descendants = runtime_process.children(recursive=True)
+        if time.monotonic() - started >= _MAX_SCAN_SECONDS:
+            return ProcessScan(result, False, "incomplete")
+        iterator = iter(descendants)
+    except errors.access_denied:
+        return ProcessScan(result, False, "access denied")
+    except Exception:
+        return ProcessScan(result, False, "incomplete")
+
+    while True:
+        if _is_cancelled(cancelled):
+            return ProcessScan(result, False, "incomplete")
+        if time.monotonic() - started >= _MAX_SCAN_SECONDS:
+            return ProcessScan(result, False, "incomplete")
+        try:
+            process = next(iterator)
+        except StopIteration:
+            return ProcessScan(result, True)
+        except errors.access_denied:
+            return ProcessScan(result, False, "access denied")
+        except Exception:
+            return ProcessScan(result, False, "incomplete")
+
+        if len(result) >= _MAX_SCANNED_PROCESSES:
+            return ProcessScan(result, False, "incomplete")
+        try:
+            runtime_process = process
+            pid = _positive_integer(runtime_process.pid)
+            create_time = _number(runtime_process.create_time())
+            ppid = _positive_integer(runtime_process.ppid())
+            name = _string_or_none(runtime_process.name())
+        except errors.access_denied:
+            return ProcessScan(result, False, "access denied")
+        except Exception:
+            return ProcessScan(result, False, "incomplete")
+        if pid is None or create_time is None or ppid is None:
+            return ProcessScan(result, False, "incomplete")
+        identity = ProcessIdentity(pid, create_time)
+        result[pid] = (
+            identity,
+            ppid,
+            ProcessView(pid, create_time, name, None, ppid, None, "Unknown"),
+        )
+
+
+def _scan_unverified_reason(scan: ProcessScan) -> str:
+    if scan.reason == "access denied":
+        return "Unverified: process enumeration access denied"
+    if scan.reason == "anchor unavailable":
+        return "Unverified: App Server anchor unavailable"
+    return "Unverified: process enumeration incomplete"
 
 
 def _descendants(

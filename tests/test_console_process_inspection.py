@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
+from codex_bridge.console import process_inspection
 from codex_bridge.console.process_inspection import (
     CommandDescriptor,
     CommandKey,
@@ -35,6 +37,8 @@ class _Process:
     cmdline_value: list[str] | None = None
     status_value: str = "sleeping"
     running: bool = True
+    children_error: Exception | None = None
+    _owner: _Psutil | None = None
 
     def __post_init__(self) -> None:
         if self.cmdline_value is None:
@@ -69,6 +73,32 @@ class _Process:
     def is_running(self) -> bool:
         return self.running
 
+    def children(self, recursive: bool = False) -> list[_Process]:
+        if self._owner is not None:
+            self._owner.children_calls.append((self.pid, recursive))
+        if self.children_error is not None:
+            raise self.children_error
+        if self._owner is None:
+            return []
+        direct = [process for process in self._owner.listed if process.ppid_value == self.pid]
+        if not recursive:
+            return direct
+        descendants: list[_Process] = []
+        frontier = direct
+        visited = {self.pid}
+        while frontier:
+            next_frontier: list[_Process] = []
+            for process in frontier:
+                if process.pid in visited:
+                    continue
+                visited.add(process.pid)
+                descendants.append(process)
+                next_frontier.extend(
+                    child for child in self._owner.listed if child.ppid_value == process.pid
+                )
+            frontier = next_frontier
+        return descendants
+
 
 class _ProcessWithoutCreateTime(_Process):
     def create_time(self) -> None:
@@ -84,6 +114,8 @@ class _Psutil:
         self,
         processes: dict[int, _Process | Exception],
         listed: list[_Process] | None = None,
+        *,
+        forbid_process_iter: bool = False,
     ) -> None:
         self.processes = processes
         self.listed = (
@@ -94,6 +126,10 @@ class _Psutil:
         self.iter_calls = 0
         self.iter_attributes: list[str] = []
         self.process_calls: list[int] = []
+        self.children_calls: list[tuple[int, bool]] = []
+        self.forbid_process_iter = forbid_process_iter
+        for process in self.listed:
+            process._owner = self
 
     def Process(self, pid: int) -> _Process:
         self.process_calls.append(pid)
@@ -107,6 +143,8 @@ class _Psutil:
     def process_iter(self, attrs: list[str]) -> list[_Process]:
         self.iter_calls += 1
         self.iter_attributes = attrs
+        if self.forbid_process_iter:
+            raise AssertionError("global process_iter must not be used")
         return self.listed
 
 
@@ -163,8 +201,8 @@ def test_verifies_command_descendant_and_keeps_witnessed_children_after_shell_ex
     assert first.commands[0].root.command_line is not None
     assert _POWERSHELL_SCRIPT in first.commands[0].root.command_line
     assert [process.pid for process in first.commands[0].children] == [200, 201]
-    assert psutil.iter_calls == 1
-    assert psutil.iter_attributes == ["pid", "ppid", "create_time", "name"]
+    assert psutil.iter_calls == 0
+    assert psutil.children_calls == [(220132, True)]
 
     residual = _Psutil(
         {
@@ -265,6 +303,237 @@ def test_numeric_app_server_id_is_not_used_as_a_windows_pid() -> None:
     assert result.commands[0].root_status == "Unverified: App Server anchor unavailable"
     assert result.commands[0].root is None
     assert psutil.process_calls == []
+
+
+def test_matches_dogfood_command_from_rooted_three_level_descendant_tree() -> None:
+    anchor = _Process(
+        217648,
+        200_000.0,
+        ppid_value=1,
+        name_value="cmd.exe",
+        exe_value="C:\\Windows\\System32\\cmd.exe",
+    )
+    node = _Process(
+        222124,
+        200_100.0,
+        ppid_value=217648,
+        name_value="node.exe",
+        exe_value="C:\\Program Files\\nodejs\\node.exe",
+    )
+    codex = _Process(
+        221256,
+        200_200.0,
+        ppid_value=222124,
+        name_value="codex.exe",
+        exe_value="C:\\Program Files\\Codex\\codex.exe",
+    )
+    shell = _Process(
+        200676,
+        200_700.0,
+        ppid_value=221256,
+        name_value="pwsh.exe",
+        exe_value=_POWERSHELL_EXE,
+        cmdline_value=[_POWERSHELL_EXE, "-NoProfile", "-Command", _POWERSHELL_SCRIPT],
+    )
+    unrelated_opaque_pid = _Process(
+        91919,
+        200_700.0,
+        ppid_value=1,
+        name_value="pwsh.exe",
+        exe_value=_POWERSHELL_EXE,
+        cmdline_value=[_POWERSHELL_EXE, "-NoProfile", "-Command", _POWERSHELL_SCRIPT],
+    )
+    psutil = _Psutil(
+        {process.pid: process for process in (anchor, node, codex, shell, unrelated_opaque_pid)},
+        [anchor, node, codex, shell, unrelated_opaque_pid],
+        forbid_process_iter=True,
+    )
+
+    result = inspect_command_processes(
+        (_command("91919", start=200_700.0, summary=_POWERSHELL_SUMMARY),),
+        ProcessEvidence(app_server_os_pid=217648),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=200_701.0,
+    )
+
+    command = result.commands[0]
+    assert command.root_status == "Running"
+    assert command.root is not None and command.root.pid == 200676
+    assert psutil.iter_calls == 0
+    assert psutil.children_calls == [(217648, True)]
+    assert 91919 not in psutil.process_calls
+
+
+def test_access_denied_rooted_enumeration_is_explicitly_incomplete() -> None:
+    anchor = _Process(220132, 990.0, name_value="codex.exe", children_error=AccessDenied())
+    candidate = _Process(
+        197728,
+        999.5,
+        ppid_value=220132,
+        name_value="pwsh.exe",
+        exe_value=_POWERSHELL_EXE,
+        cmdline_value=[_POWERSHELL_EXE, "-NoProfile", "-Command", _POWERSHELL_SCRIPT],
+    )
+    psutil = _Psutil({220132: anchor, 197728: candidate}, [anchor, candidate])
+
+    result = inspect_command_processes(
+        (_command("11385", summary=_POWERSHELL_SUMMARY),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == ("Unverified: process enumeration access denied")
+    assert result.commands[0].root is None
+    assert psutil.iter_calls == 0
+
+
+def test_disappeared_anchor_during_enumeration_preserves_verified_command_evidence() -> None:
+    command = _command("pty-42", summary=_POWERSHELL_SUMMARY)
+    first = inspect_command_processes(
+        (command,),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=_anchored_processes(),
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+    source = _anchored_processes()
+
+    class GoneAfterScan(_Psutil):
+        anchor_queries = 0
+
+        def Process(self, pid: int) -> _Process:
+            if pid == 220132:
+                self.anchor_queries += 1
+                if self.anchor_queries == 2:
+                    raise NoSuchProcess(pid)
+            return super().Process(pid)
+
+    psutil = GoneAfterScan(source.processes, source.listed)
+
+    result = inspect_command_processes(
+        (command,),
+        first.evidence,
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_005.0,
+    )
+
+    assert result.commands[0].root_status == "Running"
+    assert result.commands[0].root is not None
+    assert result.commands[0].root.pid == 197728
+    assert result.evidence.roots == first.evidence.roots
+    assert result.evidence.app_server_identity == first.evidence.app_server_identity
+
+
+def test_missing_anchor_child_list_is_incomplete_not_no_matching_child() -> None:
+    anchor = _Process(220132, 990.0, name_value="codex.exe", children_error=NoSuchProcess())
+    candidate = _Process(
+        197728,
+        999.5,
+        ppid_value=220132,
+        name_value="pwsh.exe",
+        exe_value=_POWERSHELL_EXE,
+        cmdline_value=[_POWERSHELL_EXE, "-NoProfile", "-Command", _POWERSHELL_SCRIPT],
+    )
+    psutil = _Psutil({220132: anchor, 197728: candidate}, [anchor, candidate])
+
+    result = inspect_command_processes(
+        (_command("pty-42", summary=_POWERSHELL_SUMMARY),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: process enumeration incomplete"
+    assert result.commands[0].root is None
+
+
+def test_truncated_rooted_enumeration_cannot_claim_unique_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = _Process(220132, 990.0, name_value="cmd.exe")
+    node = _Process(222124, 991.0, ppid_value=220132, name_value="node.exe")
+    shell = _Process(
+        197728,
+        999.5,
+        ppid_value=222124,
+        name_value="pwsh.exe",
+        exe_value=_POWERSHELL_EXE,
+        cmdline_value=[_POWERSHELL_EXE, "-NoProfile", "-Command", _POWERSHELL_SCRIPT],
+    )
+    psutil = _Psutil({220132: anchor, 222124: node, 197728: shell}, [anchor, node, shell])
+    monkeypatch.setattr(process_inspection, "_MAX_SCANNED_PROCESSES", 1)
+
+    result = inspect_command_processes(
+        (_command("pty-42", summary=_POWERSHELL_SUMMARY),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: process enumeration incomplete"
+    assert result.commands[0].root is None
+    assert not result.evidence.roots
+    assert psutil.iter_calls == 0
+
+
+def test_slow_rooted_enumeration_is_incomplete_not_a_negative_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    psutil = _anchored_processes()
+    clock_values = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(
+        process_inspection,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock_values)),
+    )
+
+    result = inspect_command_processes(
+        (_command("pty-42", summary=_POWERSHELL_SUMMARY),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: process enumeration incomplete"
+    assert result.commands[0].root is None
+    assert not result.evidence.roots
+    assert psutil.iter_calls == 0
+
+
+def test_incomplete_scan_preserves_previously_verified_root_evidence() -> None:
+    command = _command("pty-42", summary=_POWERSHELL_SUMMARY)
+    first = inspect_command_processes(
+        (command,),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=_anchored_processes(),
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+    inaccessible = _anchored_processes()
+    anchor = inaccessible.processes[220132]
+    assert isinstance(anchor, _Process)
+    anchor.children_error = AccessDenied()
+
+    result = inspect_command_processes(
+        (command,),
+        first.evidence,
+        psutil_module=inaccessible,
+        platform_name="win32",
+        observed_at=1_005.0,
+    )
+
+    assert result.commands[0].root_status == "Running"
+    assert result.commands[0].root is not None
+    assert result.commands[0].root.pid == 197728
+    assert result.evidence.roots == first.evidence.roots
+    assert inaccessible.iter_calls == 0
 
 
 _POWERSHELL_SCRIPT = "1..12 | ForEach-Object { $_ }"
@@ -745,7 +1014,8 @@ def test_rejects_reused_root_pid_and_never_links_children_through_reused_child_p
     )
 
     assert [process.state for process in second.commands[0].children] == ["PID reused"]
-    assert child_reused.iter_calls == 1
+    assert child_reused.iter_calls == 0
+    assert child_reused.children_calls == [(220132, True)]
 
 
 def test_other_platform_is_explicitly_unsupported_without_inspecting_processes() -> None:
@@ -835,4 +1105,5 @@ def test_related_process_tracking_is_bounded_to_one_hundred_children() -> None:
     )
 
     assert len(result.commands[0].children) == 100
-    assert psutil.iter_calls == 1
+    assert psutil.iter_calls == 0
+    assert psutil.children_calls == [(220132, True)]
