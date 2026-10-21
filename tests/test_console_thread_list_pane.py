@@ -307,6 +307,92 @@ def test_running_aggregate_refresh_preserves_project_expansion_selection_and_scr
     pane.close()
 
 
+def test_running_project_collapse_survives_status_refresh_and_other_project_changes(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = str(tmp_path / "first-project")
+    second_cwd = str(tmp_path / "second-project")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "first-a", "cwd": first_cwd},
+            {"id": "first-b", "cwd": first_cwd},
+            {"id": "second-a", "cwd": second_cwd},
+            {"id": "second-b", "cwd": second_cwd},
+        ],
+        thread_statuses={
+            "first-a": "in_progress",
+            "first-b": "in_progress",
+            "second-a": "in_progress",
+            "second-b": "in_progress",
+        },
+    )
+    running_section = pane.list_widget.topLevelItem(0)
+    first_running = running_section.child(0)
+    second_running = running_section.child(1)
+    assert running_section.text(0) == "現在処理中"
+    assert first_running.isExpanded()
+    assert second_running.isExpanded()
+
+    first_running.setExpanded(False)
+    pane.set_thread_statuses(
+        {
+            "first-a": "in_progress",
+            "first-b": "in_progress",
+            "second-a": "in_progress",
+            "second-b": "needs_input",
+        }
+    )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    assert running_section.isExpanded()
+    assert not running_section.child(0).isExpanded()
+    assert running_section.child(1).isExpanded()
+
+
+def test_running_and_regular_project_expansion_states_are_independent(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "project")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "first", "cwd": cwd},
+            {"id": "second", "cwd": cwd},
+        ],
+        thread_statuses={"first": "in_progress", "second": "in_progress"},
+    )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    running_project = running_section.child(0)
+    regular_project = pane.list_widget.topLevelItem(1)
+    running_project.setExpanded(False)
+    assert regular_project.isExpanded()
+    regular_project.setExpanded(False)
+    assert not running_project.isExpanded()
+
+    pane.set_thread_statuses({"first": "in_progress", "second": "needs_input"})
+
+    running_section = pane.list_widget.topLevelItem(0)
+    running_project = running_section.child(0)
+    regular_project = pane.list_widget.topLevelItem(1)
+    assert running_section.isExpanded()
+    assert not running_project.isExpanded()
+    assert not regular_project.isExpanded()
+
+    running_section.setExpanded(False)
+    regular_project.setExpanded(True)
+    assert not running_project.isExpanded()
+    pane.set_thread_statuses({"first": "in_progress", "second": "in_progress"})
+    running_section = pane.list_widget.topLevelItem(0)
+    assert not running_section.isExpanded()
+    running_section.setExpanded(True)
+    assert not running_section.child(0).isExpanded()
+    assert pane.list_widget.topLevelItem(1).isExpanded()
+
+
 def test_thread_list_refresh_preserves_selected_thread_id() -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None

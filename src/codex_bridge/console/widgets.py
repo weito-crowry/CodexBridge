@@ -387,6 +387,7 @@ class ThreadListPane(QWidget):
     _GROUP_CWD_ROLE = Qt.ItemDataRole.UserRole + 2
     _RUNNING_SECTION_ROLE = Qt.ItemDataRole.UserRole + 3
     _RUNNING_PROJECT_ROLE = Qt.ItemDataRole.UserRole + 4
+    _RUNNING_PROJECT_KEY_ROLE = Qt.ItemDataRole.UserRole + 5
     _OTHER_GROUP_KEY = "\x00other"
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -397,6 +398,7 @@ class ThreadListPane(QWidget):
         self._has_thread_statuses = False
         self._project_names: dict[str, str] = {}
         self._collapsed_group_keys: set[str] = set()
+        self._collapsed_running_group_keys: set[str] = set()
         self._selected_thread_id: str | None = None
         self._running_section_expanded = True
         self._rendering = False
@@ -532,12 +534,13 @@ class ThreadListPane(QWidget):
             ) -> None:
                 nonlocal selected_item, fallback_selected_item
                 group_cwd = group_cwds[group_key]
+                state_key = group_key if group_key is not None else self._OTHER_GROUP_KEY
                 parent = QTreeWidgetItem([project_label(group_key, group_cwd)])
                 parent.setData(0, Qt.ItemDataRole.UserRole, None)
                 if running:
                     parent.setData(0, self._RUNNING_PROJECT_ROLE, True)
+                    parent.setData(0, self._RUNNING_PROJECT_KEY_ROLE, state_key)
                 else:
-                    state_key = group_key if group_key is not None else self._OTHER_GROUP_KEY
                     parent.setData(0, self._GROUP_KEY_ROLE, state_key)
                     if group_cwd is not None:
                         parent.setToolTip(0, group_cwd)
@@ -575,9 +578,10 @@ class ThreadListPane(QWidget):
                             selected_item = item
 
                 if running:
-                    parent.setExpanded(True)
+                    parent.setExpanded(
+                        bool(query) or state_key not in self._collapsed_running_group_keys
+                    )
                 else:
-                    state_key = group_key if group_key is not None else self._OTHER_GROUP_KEY
                     parent.setExpanded(bool(query) or state_key not in self._collapsed_group_keys)
 
             running_groups: dict[str | None, list[dict[str, object]]] = {}
@@ -639,6 +643,15 @@ class ThreadListPane(QWidget):
         if item.data(0, self._RUNNING_SECTION_ROLE):
             self._running_section_expanded = False
             return
+        if item.data(0, self._RUNNING_PROJECT_ROLE):
+            group_key = item.data(0, self._RUNNING_PROJECT_KEY_ROLE)
+            if not isinstance(group_key, str):
+                return
+            if self.filter_edit.text():
+                item.setExpanded(True)
+                return
+            self._collapsed_running_group_keys.add(group_key)
+            return
         group_key = item.data(0, self._GROUP_KEY_ROLE)
         if not isinstance(group_key, str):
             return
@@ -652,6 +665,11 @@ class ThreadListPane(QWidget):
             return
         if item.data(0, self._RUNNING_SECTION_ROLE):
             self._running_section_expanded = True
+            return
+        if item.data(0, self._RUNNING_PROJECT_ROLE):
+            group_key = item.data(0, self._RUNNING_PROJECT_KEY_ROLE)
+            if isinstance(group_key, str):
+                self._collapsed_running_group_keys.discard(group_key)
             return
         group_key = item.data(0, self._GROUP_KEY_ROLE)
         if isinstance(group_key, str):
