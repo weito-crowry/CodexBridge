@@ -143,7 +143,11 @@ kind = "local"
 Set `console.attachment_staging_directory` (or
 `CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY`) to choose where explicitly selected files outside
 `allowed_roots` are copied. The directory must be inside an existing allowed root. Staged files
-remain there so sent history can continue to reference them.
+remain there indefinitely so sent history can continue to reference them; CodexBridge does not
+automatically remove staged files. To reclaim space, open the configured staging directory (or
+the default `.codexbridge-staging` folder under the first allowed root) in Explorer and manually
+delete only files that are no longer needed by sent history. Deleting a staged file that history
+still references can make its attachment unavailable. The original selected file is not changed.
 
 Start the Console:
 

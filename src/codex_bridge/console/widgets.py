@@ -385,6 +385,9 @@ class ThreadListPane(QWidget):
     folder_terminal_requested = Signal(str)
     _GROUP_KEY_ROLE = Qt.ItemDataRole.UserRole + 1
     _GROUP_CWD_ROLE = Qt.ItemDataRole.UserRole + 2
+    _RUNNING_SECTION_ROLE = Qt.ItemDataRole.UserRole + 3
+    _RUNNING_PROJECT_ROLE = Qt.ItemDataRole.UserRole + 4
+    _RUNNING_PROJECT_KEY_ROLE = Qt.ItemDataRole.UserRole + 5
     _OTHER_GROUP_KEY = "\x00other"
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -395,7 +398,9 @@ class ThreadListPane(QWidget):
         self._has_thread_statuses = False
         self._project_names: dict[str, str] = {}
         self._collapsed_group_keys: set[str] = set()
+        self._collapsed_running_group_keys: set[str] = set()
         self._selected_thread_id: str | None = None
+        self._running_section_expanded = True
         self._rendering = False
         title = QLabel("Threads")
         self.refresh_button = QPushButton("Refresh")
@@ -462,6 +467,7 @@ class ThreadListPane(QWidget):
         query = self.filter_edit.text().casefold()
         scroll_value = self.list_widget.verticalScrollBar().value()
         current_item = self.list_widget.currentItem()
+        selected_in_running_section = self._is_running_section_item(current_item)
         if current_item is not None:
             self._remember_selected_thread(current_item, None)
         selected_thread_id = self._selected_thread_id
@@ -483,8 +489,9 @@ class ThreadListPane(QWidget):
         try:
             self.list_widget.clear()
             selected_item: QTreeWidgetItem | None = None
-            for group_key, group_threads in groups.items():
-                group_cwd = group_cwds[group_key]
+            fallback_selected_item: QTreeWidgetItem | None = None
+
+            def project_label(group_key: str | None, group_cwd: str | None) -> str:
                 friendly_name = (
                     self._project_names.get(group_key) if group_key is not None else None
                 )
@@ -493,33 +500,55 @@ class ThreadListPane(QWidget):
                     if group_cwd is not None
                     else "Other"
                 )
-                label = basename
                 if isinstance(friendly_name, str) and friendly_name.strip():
                     friendly_name = friendly_name.strip()
                     if friendly_name.casefold() == basename.casefold():
-                        label = friendly_name
-                    else:
-                        label = f"{friendly_name} — {basename}"
+                        return friendly_name
+                    return f"{friendly_name} — {basename}"
+                return basename
 
-                matching_threads: list[dict[str, object]] = []
-                for thread in group_threads:
-                    searchable = " ".join(
-                        str(thread.get(key, "")) for key in ("id", "name", "preview", "cwd")
-                    )
-                    if query and query not in f"{searchable} {label}".casefold():
-                        continue
-                    matching_threads.append(thread)
-                if not matching_threads:
-                    continue
+            def matching_group_threads(
+                group_key: str | None, group_threads: list[dict[str, object]]
+            ) -> list[dict[str, object]]:
+                label = project_label(group_key, group_cwds[group_key])
+                return [
+                    thread
+                    for thread in group_threads
+                    if not query
+                    or query
+                    in (
+                        " ".join(
+                            str(thread.get(key, "")) for key in ("id", "name", "preview", "cwd")
+                        )
+                        + " "
+                        + label
+                    ).casefold()
+                ]
 
-                parent = QTreeWidgetItem([label])
-                parent.setData(0, Qt.ItemDataRole.UserRole, None)
+            def append_group(
+                destination: QTreeWidgetItem | None,
+                group_key: str | None,
+                matching_threads: list[dict[str, object]],
+                *,
+                running: bool,
+            ) -> None:
+                nonlocal selected_item, fallback_selected_item
+                group_cwd = group_cwds[group_key]
                 state_key = group_key if group_key is not None else self._OTHER_GROUP_KEY
-                parent.setData(0, self._GROUP_KEY_ROLE, state_key)
-                if group_cwd is not None:
-                    parent.setToolTip(0, group_cwd)
-                    parent.setData(0, self._GROUP_CWD_ROLE, group_cwd)
-                self.list_widget.addTopLevelItem(parent)
+                parent = QTreeWidgetItem([project_label(group_key, group_cwd)])
+                parent.setData(0, Qt.ItemDataRole.UserRole, None)
+                if running:
+                    parent.setData(0, self._RUNNING_PROJECT_ROLE, True)
+                    parent.setData(0, self._RUNNING_PROJECT_KEY_ROLE, state_key)
+                else:
+                    parent.setData(0, self._GROUP_KEY_ROLE, state_key)
+                    if group_cwd is not None:
+                        parent.setToolTip(0, group_cwd)
+                        parent.setData(0, self._GROUP_CWD_ROLE, group_cwd)
+                if destination is None:
+                    self.list_widget.addTopLevelItem(parent)
+                else:
+                    destination.addChild(parent)
 
                 for thread in matching_threads:
                     thread_id = thread.get("id")
@@ -543,10 +572,54 @@ class ThreadListPane(QWidget):
                         )
                     parent.addChild(item)
                     if thread_id == selected_thread_id:
-                        selected_item = item
+                        if fallback_selected_item is None:
+                            fallback_selected_item = item
+                        if running == selected_in_running_section:
+                            selected_item = item
 
-                collapsed = state_key in self._collapsed_group_keys
-                parent.setExpanded(bool(query) or not collapsed)
+                if running:
+                    parent.setExpanded(
+                        bool(query) or state_key not in self._collapsed_running_group_keys
+                    )
+                else:
+                    parent.setExpanded(bool(query) or state_key not in self._collapsed_group_keys)
+
+            running_groups: dict[str | None, list[dict[str, object]]] = {}
+            for group_key, group_threads in groups.items():
+                running_threads = [
+                    thread
+                    for thread in group_threads
+                    if isinstance(thread.get("id"), str)
+                    and self._thread_statuses.get(str(thread.get("id"))) == "in_progress"
+                ]
+                if running_threads:
+                    running_groups[group_key] = running_threads
+
+            matching_running_groups = [
+                (group_key, matching_group_threads(group_key, group_threads))
+                for group_key, group_threads in running_groups.items()
+            ]
+            matching_running_groups = [
+                (group_key, matching_threads)
+                for group_key, matching_threads in matching_running_groups
+                if matching_threads
+            ]
+            if matching_running_groups:
+                running_section = QTreeWidgetItem(["現在処理中"])
+                running_section.setData(0, Qt.ItemDataRole.UserRole, None)
+                running_section.setData(0, self._RUNNING_SECTION_ROLE, True)
+                self.list_widget.addTopLevelItem(running_section)
+                running_section.setExpanded(bool(query) or self._running_section_expanded)
+                for group_key, matching_threads in matching_running_groups:
+                    append_group(running_section, group_key, matching_threads, running=True)
+
+            for group_key, group_threads in groups.items():
+                matching_threads = matching_group_threads(group_key, group_threads)
+                if not matching_threads:
+                    continue
+                append_group(None, group_key, matching_threads, running=False)
+            if selected_item is None:
+                selected_item = fallback_selected_item
             if selected_item is not None:
                 self.list_widget.setCurrentItem(selected_item)
             self.list_widget.verticalScrollBar().setValue(scroll_value)
@@ -567,6 +640,18 @@ class ThreadListPane(QWidget):
     def _group_collapsed(self, item: QTreeWidgetItem) -> None:
         if self._rendering:
             return
+        if item.data(0, self._RUNNING_SECTION_ROLE):
+            self._running_section_expanded = False
+            return
+        if item.data(0, self._RUNNING_PROJECT_ROLE):
+            group_key = item.data(0, self._RUNNING_PROJECT_KEY_ROLE)
+            if not isinstance(group_key, str):
+                return
+            if self.filter_edit.text():
+                item.setExpanded(True)
+                return
+            self._collapsed_running_group_keys.add(group_key)
+            return
         group_key = item.data(0, self._GROUP_KEY_ROLE)
         if not isinstance(group_key, str):
             return
@@ -577,6 +662,14 @@ class ThreadListPane(QWidget):
 
     def _group_expanded(self, item: QTreeWidgetItem) -> None:
         if self._rendering or self.filter_edit.text():
+            return
+        if item.data(0, self._RUNNING_SECTION_ROLE):
+            self._running_section_expanded = True
+            return
+        if item.data(0, self._RUNNING_PROJECT_ROLE):
+            group_key = item.data(0, self._RUNNING_PROJECT_KEY_ROLE)
+            if isinstance(group_key, str):
+                self._collapsed_running_group_keys.discard(group_key)
             return
         group_key = item.data(0, self._GROUP_KEY_ROLE)
         if isinstance(group_key, str):
@@ -655,6 +748,8 @@ class ThreadListPane(QWidget):
             return
 
     def _context_menu_for_item(self, item: QTreeWidgetItem) -> QMenu | None:
+        if item.data(0, self._RUNNING_SECTION_ROLE) or item.data(0, self._RUNNING_PROJECT_ROLE):
+            return None
         thread_id = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(thread_id, str):
             cwd = item.data(0, self._GROUP_CWD_ROLE)
@@ -695,6 +790,15 @@ class ThreadListPane(QWidget):
             lambda _checked=False, thread_id=thread_id: self._open_cwd(thread_id)
         )
         return menu
+
+    @classmethod
+    def _is_running_section_item(cls, item: QTreeWidgetItem | None) -> bool:
+        current = item
+        while current is not None:
+            if current.data(0, cls._RUNNING_SECTION_ROLE):
+                return True
+            current = current.parent()
+        return False
 
     def _project_context_menu(self, cwd: str) -> QMenu:
         menu = QMenu(self)

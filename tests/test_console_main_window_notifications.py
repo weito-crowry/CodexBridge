@@ -102,7 +102,7 @@ def test_global_live_notifications_deduplicate_and_retries_back_off_until_connec
     settings.clear()
 
 
-def test_notification_click_selects_target_thread_and_settings_button_persists(
+def test_notification_click_shows_console_without_routing_to_latest_thread_and_settings_persists(
     tmp_path: Path,
 ) -> None:
     _application()
@@ -110,20 +110,25 @@ def test_notification_click_selects_target_thread_and_settings_button_persists(
     tray = FakeTray()
     settings = QSettings(str(tmp_path / "console.ini"), QSettings.Format.IniFormat)
     window = _window(client, settings=settings, tray=tray)
-    activity = {
-        "activity_id": "activity-b",
-        "timestamp": "2026-10-21T00:00:00Z",
-        "thread_id": "thread-b",
-        "turn_id": "turn-b",
-        "type": "user_input_requested",
-        "status": "requested",
-        "summary": "Question pending",
-        "details": {"request_id": "request-b"},
-    }
-    client.global_activity(window._global_stream_generation, activity)
+    window.select_thread("selected-thread")
+    for thread_id, request_id in (("thread-a", "request-a"), ("thread-b", "request-b")):
+        client.global_activity(
+            window._global_stream_generation,
+            {
+                "activity_id": f"activity-{thread_id}",
+                "timestamp": "2026-10-21T00:00:00Z",
+                "thread_id": thread_id,
+                "turn_id": f"turn-{thread_id}",
+                "type": "user_input_requested",
+                "status": "requested",
+                "summary": "Question pending",
+                "details": {"request_id": request_id},
+            },
+        )
     tray.messageClicked.emit()
-    assert window._selected_thread_id == "thread-b"
+    assert window._selected_thread_id == "selected-thread"
     assert window.isVisible()
+    assert len(tray.messages) == 2
     assert not client.approval_requests
 
     def accept_settings_dialog() -> None:
@@ -175,6 +180,9 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
     )
 
     assert window._thread_turn_statuses["thread-b"] == "in_progress"
+    running_section = window.thread_pane.list_widget.topLevelItem(0)
+    assert running_section.text(0) == "現在処理中"
+    assert running_section.child(0).child(0).data(0, Qt.ItemDataRole.UserRole) == "thread-b"
     thread_b = next(
         child
         for group_index in range(window.thread_pane.list_widget.topLevelItemCount())
@@ -200,6 +208,7 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
     )
 
     assert "thread-b" not in window._thread_turn_statuses
+    assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "Other"
     completed_thread_b = next(
         child
         for group_index in range(window.thread_pane.list_widget.topLevelItemCount())
@@ -209,4 +218,42 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
         if child.data(0, Qt.ItemDataRole.UserRole) == "thread-b"
     )
     assert completed_thread_b.text(0) == "B"
+    window.close()
+
+
+def test_failed_and_interrupted_turns_leave_the_running_aggregate() -> None:
+    _application()
+    client = FakeClient()
+    window = _window(client)
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    generation = window._global_stream_generation
+
+    for terminal_type, terminal_status in (
+        ("turn_failed", "failed"),
+        ("turn_interrupted", "interrupted"),
+    ):
+        client.global_activity(
+            generation,
+            {
+                "thread_id": "thread-a",
+                "turn_id": f"turn-{terminal_status}",
+                "type": "turn_started",
+                "status": "in_progress",
+                "details": {},
+            },
+        )
+        assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "現在処理中"
+        client.global_activity(
+            generation,
+            {
+                "thread_id": "thread-a",
+                "turn_id": f"turn-{terminal_status}",
+                "type": terminal_type,
+                "status": terminal_status,
+                "details": {},
+            },
+        )
+        assert terminal_type not in window._thread_turn_statuses.values()
+        assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "Other"
+
     window.close()

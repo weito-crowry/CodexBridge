@@ -11,11 +11,17 @@ from codex_bridge.console.widgets import ThreadListPane
 
 
 def _thread_items(pane: ThreadListPane) -> list[QTreeWidgetItem]:
-    return [
-        pane.list_widget.topLevelItem(group_index).child(child_index)
-        for group_index in range(pane.list_widget.topLevelItemCount())
-        for child_index in range(pane.list_widget.topLevelItem(group_index).childCount())
-    ]
+    result: list[QTreeWidgetItem] = []
+
+    def visit(item: QTreeWidgetItem) -> None:
+        if isinstance(item.data(0, Qt.ItemDataRole.UserRole), str):
+            result.append(item)
+        for child_index in range(item.childCount()):
+            visit(item.child(child_index))
+
+    for index in range(pane.list_widget.topLevelItemCount()):
+        visit(pane.list_widget.topLevelItem(index))
+    return result
 
 
 def _thread_item(pane: ThreadListPane, thread_id: str) -> QTreeWidgetItem:
@@ -160,13 +166,231 @@ def test_thread_list_keeps_running_indicator_through_selection_and_state_changes
     assert selected is not None
     assert selected.text(0) == "\u25cf Active"
     assert selected.data(0, Qt.ItemDataRole.UserRole) == "active"
-
     pane.set_active_thread_ids(set())
 
     selected = pane.list_widget.currentItem()
     assert selected is not None
     assert selected.text(0) == "Active"
     assert selected.data(0, Qt.ItemDataRole.UserRole) == "active"
+
+
+def test_running_threads_are_aggregated_by_project_and_remain_in_project_lists(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = str(tmp_path / "first-project")
+    second_cwd = str(tmp_path / "second-project")
+    threads = [
+        {"id": "first-a", "name": "First A", "cwd": first_cwd},
+        {"id": "first-b", "name": "First B", "cwd": first_cwd},
+        {"id": "second", "name": "Second", "cwd": second_cwd},
+        {"id": "approval", "name": "Approval", "cwd": first_cwd},
+        {"id": "input", "name": "Input", "cwd": second_cwd},
+        {"id": "locked", "name": "Locked", "cwd": second_cwd},
+        {"id": "stopped", "name": "Stopped", "cwd": second_cwd},
+        {"id": "paused", "name": "Paused", "cwd": second_cwd},
+    ]
+    pane = ThreadListPane()
+    pane.set_threads(
+        threads,
+        thread_statuses={
+            "first-a": "in_progress",
+            "first-b": "in_progress",
+            "second": "in_progress",
+            "approval": "needs_approval",
+            "input": "needs_input",
+            "locked": "locked",
+            "stopped": "stopped",
+            "paused": "paused",
+        },
+    )
+
+    running = pane.list_widget.topLevelItem(0)
+    assert running.text(0) == "現在処理中"
+    assert [running.child(index).text(0) for index in range(running.childCount())] == [
+        "first-project",
+        "second-project",
+    ]
+    first_running = running.child(0)
+    second_running = running.child(1)
+    assert [
+        first_running.child(index).data(0, Qt.ItemDataRole.UserRole)
+        for index in range(first_running.childCount())
+    ] == ["first-a", "first-b"]
+    assert second_running.child(0).data(0, Qt.ItemDataRole.UserRole) == "second"
+    assert {item.data(0, Qt.ItemDataRole.UserRole) for item in _thread_items(pane)} == {
+        "first-a",
+        "first-b",
+        "second",
+        "approval",
+        "input",
+        "locked",
+        "stopped",
+        "paused",
+    }
+    assert (
+        sum(item.data(0, Qt.ItemDataRole.UserRole) == "first-a" for item in _thread_items(pane))
+        == 2
+    )
+
+
+def test_running_copy_selection_is_preserved_and_terminal_state_removes_only_aggregate_copy(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "project")
+    pane = ThreadListPane()
+    threads = [{"id": "running", "name": "Running", "cwd": cwd}]
+    pane.set_threads(threads, thread_statuses={"running": "in_progress"})
+    running_section = pane.list_widget.topLevelItem(0)
+    running_item = running_section.child(0).child(0)
+    project_item = pane.list_widget.topLevelItem(1).child(0)
+    selected: list[str] = []
+    pane.thread_selected.connect(selected.append)
+
+    pane.list_widget.setCurrentItem(running_item)
+    pane.list_widget.itemClicked.emit(running_item, 0)
+    assert selected == ["running"]
+    assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "running"
+    assert pane.list_widget.currentItem().parent().parent().text(0) == "現在処理中"
+
+    pane.list_widget.setCurrentItem(project_item)
+    pane.list_widget.itemClicked.emit(project_item, 0)
+    assert selected == ["running", "running"]
+    pane.set_thread_statuses({"running": "in_progress"})
+    current = pane.list_widget.currentItem()
+    assert current is not None
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "running"
+    assert current.parent().text(0) == "project"
+
+    pane.list_widget.setCurrentItem(pane.list_widget.topLevelItem(0).child(0).child(0))
+    pane.set_thread_statuses({"running": "failed"})
+    assert pane.list_widget.topLevelItemCount() == 1
+    remaining = pane.list_widget.topLevelItem(0).child(0)
+    assert remaining.data(0, Qt.ItemDataRole.UserRole) == "running"
+    assert pane.list_widget.currentItem() is remaining
+
+
+def test_running_aggregate_refresh_preserves_project_expansion_selection_and_scroll(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = str(tmp_path / "first-project")
+    second_cwd = str(tmp_path / "second-project")
+    threads = [
+        *({"id": f"first-{index}", "cwd": first_cwd} for index in range(20)),
+        *({"id": f"second-{index}", "cwd": second_cwd} for index in range(20)),
+    ]
+    pane = ThreadListPane()
+    pane.resize(320, 240)
+    pane.show()
+    pane.set_threads(threads)
+    application.processEvents()
+    pane.list_widget.topLevelItem(0).setExpanded(False)
+    pane.list_widget.setCurrentItem(_thread_item(pane, "second-10"))
+    scroll = pane.list_widget.verticalScrollBar()
+    scroll.setValue(scroll.maximum())
+    previous_scroll = scroll.value()
+
+    pane.set_thread_statuses({"second-10": "in_progress"})
+    application.processEvents()
+
+    current = pane.list_widget.currentItem()
+    assert current is not None
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "second-10"
+    assert current.parent().text(0) == "second-project"
+    assert not pane.list_widget.topLevelItem(1).isExpanded()
+    assert scroll.value() == previous_scroll
+    pane.close()
+
+
+def test_running_project_collapse_survives_status_refresh_and_other_project_changes(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = str(tmp_path / "first-project")
+    second_cwd = str(tmp_path / "second-project")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "first-a", "cwd": first_cwd},
+            {"id": "first-b", "cwd": first_cwd},
+            {"id": "second-a", "cwd": second_cwd},
+            {"id": "second-b", "cwd": second_cwd},
+        ],
+        thread_statuses={
+            "first-a": "in_progress",
+            "first-b": "in_progress",
+            "second-a": "in_progress",
+            "second-b": "in_progress",
+        },
+    )
+    running_section = pane.list_widget.topLevelItem(0)
+    first_running = running_section.child(0)
+    second_running = running_section.child(1)
+    assert running_section.text(0) == "現在処理中"
+    assert first_running.isExpanded()
+    assert second_running.isExpanded()
+
+    first_running.setExpanded(False)
+    pane.set_thread_statuses(
+        {
+            "first-a": "in_progress",
+            "first-b": "in_progress",
+            "second-a": "in_progress",
+            "second-b": "needs_input",
+        }
+    )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    assert running_section.isExpanded()
+    assert not running_section.child(0).isExpanded()
+    assert running_section.child(1).isExpanded()
+
+
+def test_running_and_regular_project_expansion_states_are_independent(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "project")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "first", "cwd": cwd},
+            {"id": "second", "cwd": cwd},
+        ],
+        thread_statuses={"first": "in_progress", "second": "in_progress"},
+    )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    running_project = running_section.child(0)
+    regular_project = pane.list_widget.topLevelItem(1)
+    running_project.setExpanded(False)
+    assert regular_project.isExpanded()
+    regular_project.setExpanded(False)
+    assert not running_project.isExpanded()
+
+    pane.set_thread_statuses({"first": "in_progress", "second": "needs_input"})
+
+    running_section = pane.list_widget.topLevelItem(0)
+    running_project = running_section.child(0)
+    regular_project = pane.list_widget.topLevelItem(1)
+    assert running_section.isExpanded()
+    assert not running_project.isExpanded()
+    assert not regular_project.isExpanded()
+
+    running_section.setExpanded(False)
+    regular_project.setExpanded(True)
+    assert not running_project.isExpanded()
+    pane.set_thread_statuses({"first": "in_progress", "second": "in_progress"})
+    running_section = pane.list_widget.topLevelItem(0)
+    assert not running_section.isExpanded()
+    running_section.setExpanded(True)
+    assert not running_section.child(0).isExpanded()
+    assert pane.list_widget.topLevelItem(1).isExpanded()
 
 
 def test_thread_list_refresh_preserves_selected_thread_id() -> None:

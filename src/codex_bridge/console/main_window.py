@@ -316,7 +316,7 @@ class MainWindow(QMainWindow):
             self._appearance_settings,
             show_message=self._show_notification,
             is_window_active=self.isActiveWindow,
-            activate_thread=self._activate_notification_thread,
+            activate_console=self._show_console,
             play_sound=self._play_notification_sound,
         )
         self._global_stream_generation = 1
@@ -776,12 +776,6 @@ class MainWindow(QMainWindow):
     def _play_notification_sound() -> None:
         if sys.platform != "win32":
             QApplication.beep()
-
-    def _activate_notification_thread(self, thread_id: str) -> None:
-        if self._closing:
-            return
-        self._show_console()
-        self.select_thread(thread_id)
 
     def _start_global_stream(self) -> None:
         start = getattr(self._client, "start_global_stream", None)

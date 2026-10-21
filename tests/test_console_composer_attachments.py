@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QFileDialog, QToolButton
 
+from codex_bridge.console import composer_attachments
 from codex_bridge.console.appearance import stylesheet_for_theme, theme_for_scheme
 from codex_bridge.console.composer_controller import ComposerController
 from codex_bridge.console.composer_widget import ComposerWidget
@@ -108,6 +109,106 @@ def test_external_selection_uses_configured_staging_directory(
 
     assert widget.attachments == (str(custom_staging / external.name),)
     assert Path(widget.attachments[0]).read_text(encoding="utf-8") == "data"
+
+
+def test_external_staging_rejects_image_over_limit_before_creating_staging(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    external = tmp_path / "large.png"
+    external.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_IMAGE_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+    widget.input.setPlainText("keep draft")
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+
+    widget.add_attachments([str(external)])
+
+    assert widget.attachments == ()
+    assert widget.prompt_text == "keep draft"
+    assert "20 MiB" in widget.status_label.text()
+    assert notices and "20 MiB" in notices[-1]
+    assert not (allowed / ".codexbridge-staging").exists()
+    assert external.read_bytes() == b"1234"
+
+
+def test_external_staging_rejects_other_file_over_limit_before_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    external = tmp_path / "large.txt"
+    external.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+
+    widget.add_attachments([str(external)])
+
+    assert widget.attachments == ()
+    assert "50 MiB" in widget.status_label.text()
+    assert not (allowed / ".codexbridge-staging").exists()
+    assert external.read_bytes() == b"1234"
+
+
+def test_external_staging_enforces_aggregate_attachment_size(tmp_path: Path, monkeypatch) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    existing = allowed / "existing.txt"
+    existing.write_bytes(b"12345")
+    external = tmp_path / "external.txt"
+    external.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_TOTAL_BYTES", 8)
+    widget = ComposerWidget([str(allowed)])
+    widget.add_attachments([str(existing)])
+
+    widget.add_attachments([str(external)])
+
+    assert widget.attachments == (str(existing.resolve()),)
+    assert "100 MiB" in widget.status_label.text()
+    assert not (allowed / ".codexbridge-staging").exists()
+    assert existing.read_bytes() == b"12345"
+    assert external.read_bytes() == b"1234"
+
+
+def test_external_staging_aborts_and_removes_temporary_copy_when_source_grows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    external = tmp_path / "growing.txt"
+    external.write_bytes(b"abcd")
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 5)
+    monkeypatch.setattr(composer_attachments, "MAX_TOTAL_BYTES", 20)
+    original_open = Path.open
+    grew = False
+
+    def grow_before_copy(path: Path, *args, **kwargs):
+        nonlocal grew
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == external and mode == "rb" and not grew:
+            with original_open(path, "ab") as source:
+                source.write(b"ef")
+            grew = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", grow_before_copy)
+    widget = ComposerWidget([str(allowed)])
+    widget.input.setPlainText("keep draft")
+
+    widget.add_attachments([str(external)])
+
+    staging = allowed / ".codexbridge-staging"
+    assert widget.attachments == ()
+    assert widget.prompt_text == "keep draft"
+    assert "50 MiB" in widget.status_label.text()
+    assert list(staging.iterdir()) == []
+    assert external.read_bytes() == b"abcdef"
 
 
 def test_file_selection_rejects_missing_directories_duplicates_and_extra_files(

@@ -33,6 +33,26 @@ def test_project_parent_has_folder_menu_and_empty_placeholder_has_no_menu(tmp_pa
     assert pane._context_menu_for_item(placeholder) is None
 
 
+def test_running_section_parent_is_not_treated_as_project_context_menu(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path / "project")
+    pane = ThreadListPane()
+    pane.set_threads(
+        [{"id": "running", "cwd": cwd}],
+        thread_statuses={"running": "in_progress"},
+    )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    running_project = running_section.child(0)
+    existing_project = pane.list_widget.topLevelItem(1)
+
+    assert running_section.text(0) == "現在処理中"
+    assert pane._context_menu_for_item(running_section) is None
+    assert pane._context_menu_for_item(running_project) is None
+    assert pane._context_menu_for_item(existing_project) is not None
+
+
 def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(
     tmp_path, monkeypatch
 ) -> None:

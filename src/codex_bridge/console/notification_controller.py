@@ -60,16 +60,15 @@ class NotificationController:
         *,
         show_message: Callable[[str, str], None],
         is_window_active: Callable[[], bool],
-        activate_thread: Callable[[str], None],
+        activate_console: Callable[[], None],
         play_sound: Callable[[], None],
     ) -> None:
         self._settings = settings
         self._show_message = show_message
         self._is_window_active = is_window_active
-        self._activate_thread = activate_thread
+        self._activate_console = activate_console
         self._play_sound = play_sound
         self._seen: OrderedDict[tuple[object, ...], None] = OrderedDict()
-        self._last_clicked_thread_id: str | None = None
 
     def _remember(self, key: tuple[object, ...]) -> bool:
         if key in self._seen:
@@ -80,10 +79,9 @@ class NotificationController:
             self._seen.popitem(last=False)
         return True
 
-    def _notify(self, key: tuple[object, ...], thread_id: str, title: str, body: str) -> bool:
+    def _notify(self, key: tuple[object, ...], title: str, body: str) -> bool:
         if not self._remember(key):
             return False
-        self._last_clicked_thread_id = thread_id
         try:
             self._show_message(title, body)
         except Exception:
@@ -123,9 +121,9 @@ class NotificationController:
             }[activity_type]
             if status != expected_status:
                 return False
-            mode = self._settings.value("notifications/completion_mode", "inactive")
+            mode = self._settings.value("notifications/completion_mode", "always")
             if mode not in _COMPLETION_MODES:
-                mode = "inactive"
+                mode = "always"
             if mode == "off" or (mode == "inactive" and self._is_window_active()):
                 return False
             title = {
@@ -133,7 +131,7 @@ class NotificationController:
                 "turn_failed": "Turn failed",
                 "turn_interrupted": "Turn interrupted",
             }[activity_type]
-            return self._notify(("turn", thread_id, turn_id, activity_type), thread_id, title, body)
+            return self._notify(("turn", thread_id, turn_id, activity_type), title, body)
 
         request_types = {
             "approval_requested": ("notifications/approval_enabled", "Approval required"),
@@ -148,16 +146,10 @@ class NotificationController:
         request_id = details.get("request_id")
         if isinstance(request_id, bool) or not isinstance(request_id, (int, str)):
             return False
-        return self._notify(
-            ("request", activity_type, thread_id, turn_id, request_id), thread_id, title, body
-        )
+        return self._notify(("request", activity_type, thread_id, turn_id, request_id), title, body)
 
     def handle_message_clicked(self) -> bool:
-        thread_id = self._last_clicked_thread_id
-        if thread_id is None:
-            return False
-        self._last_clicked_thread_id = None
-        self._activate_thread(thread_id)
+        self._activate_console()
         return True
 
 
@@ -187,9 +179,9 @@ class NotificationSettingsDialog(QDialog):
                 "The extra beep is separate from any sound played by native notifications."
             )
 
-        stored_mode = settings.value("notifications/completion_mode", "inactive")
+        stored_mode = settings.value("notifications/completion_mode", "always")
         index = self.completion_mode.findData(stored_mode)
-        self.completion_mode.setCurrentIndex(index if index >= 0 else 1)
+        self.completion_mode.setCurrentIndex(index if index >= 0 else 0)
         self.approval_enabled.setChecked(
             _setting_bool(settings, "notifications/approval_enabled", True)
         )
@@ -217,7 +209,7 @@ class NotificationSettingsDialog(QDialog):
     def accept(self) -> None:
         mode = self.completion_mode.currentData()
         if mode not in _COMPLETION_MODES:
-            mode = "inactive"
+            mode = "always"
         self._settings.setValue("notifications/completion_mode", mode)
         self._settings.setValue("notifications/approval_enabled", self.approval_enabled.isChecked())
         self._settings.setValue(

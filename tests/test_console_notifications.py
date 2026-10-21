@@ -39,7 +39,7 @@ def _activity(
     }
 
 
-def test_completion_notifications_follow_mode_and_route_click_to_thread() -> None:
+def test_completion_notifications_follow_mode_and_click_shows_console() -> None:
     settings = FakeSettings({"notifications/completion_mode": "inactive"})
     active = True
     messages: list[tuple[str, str]] = []
@@ -49,7 +49,7 @@ def test_completion_notifications_follow_mode_and_route_click_to_thread() -> Non
         settings,
         show_message=lambda title, body: messages.append((title, body)),
         is_window_active=lambda: active,
-        activate_thread=opened.append,
+        activate_console=lambda: opened.append("console"),
         play_sound=lambda: sounds.append(True),
     )
 
@@ -61,7 +61,7 @@ def test_completion_notifications_follow_mode_and_route_click_to_thread() -> Non
     assert messages[-1][0] == "Turn failed"
 
     assert controller.handle_message_clicked()
-    assert opened == ["thread-1"]
+    assert opened == ["console"]
     assert sounds == []
 
 
@@ -79,7 +79,7 @@ def test_request_notifications_are_independently_configurable_and_deduplicated()
         settings,
         show_message=lambda title, body: messages.append((title, body)),
         is_window_active=lambda: True,
-        activate_thread=lambda _thread_id: None,
+        activate_console=lambda: None,
         play_sound=lambda: sounds.append(True),
     )
     approval = _activity(
@@ -112,7 +112,7 @@ def test_completion_off_mode_and_unknown_events_are_ignored() -> None:
         settings,
         show_message=lambda title, body: messages.append((title, body)),
         is_window_active=lambda: False,
-        activate_thread=lambda _thread_id: None,
+        activate_console=lambda: None,
         play_sound=lambda: None,
     )
 
@@ -128,7 +128,7 @@ def test_interrupted_turn_has_its_own_completion_notification() -> None:
         settings,
         show_message=lambda title, body: messages.append((title, body)),
         is_window_active=lambda: True,
-        activate_thread=lambda _thread_id: None,
+        activate_console=lambda: None,
         play_sound=lambda: None,
     )
 
@@ -144,7 +144,7 @@ def test_request_deduplication_uses_request_id_within_thread_and_turn() -> None:
         FakeSettings(),
         show_message=lambda title, body: messages.append((title, body)),
         is_window_active=lambda: True,
-        activate_thread=lambda _thread_id: None,
+        activate_console=lambda: None,
         play_sound=lambda: None,
     )
 
@@ -163,6 +163,44 @@ def test_request_deduplication_uses_request_id_within_thread_and_turn() -> None:
     assert not controller.handle_activity(first)
     assert controller.handle_activity(second)
     assert len(messages) == 2
+
+
+def test_consecutive_notifications_from_different_threads_only_activate_console() -> None:
+    messages: list[tuple[str, str]] = []
+    activated: list[str] = []
+    controller = NotificationController(
+        FakeSettings(),
+        show_message=lambda title, body: messages.append((title, body)),
+        is_window_active=lambda: True,
+        activate_console=lambda: activated.append("console"),
+        play_sound=lambda: None,
+    )
+
+    assert controller.handle_activity(
+        _activity("turn_completed", thread_id="thread-a", turn_id="turn-a")
+    )
+    assert controller.handle_activity(
+        _activity("turn_failed", thread_id="thread-b", turn_id="turn-b", status="failed")
+    )
+    assert messages == [("Turn completed", "summary"), ("Turn failed", "summary")]
+
+    assert controller.handle_message_clicked()
+    assert activated == ["console"]
+
+
+def test_missing_completion_mode_defaults_to_always_without_changing_settings() -> None:
+    settings = FakeSettings({"notifications/approval_enabled": False})
+    controller = NotificationController(
+        settings,
+        show_message=lambda _title, _body: None,
+        is_window_active=lambda: True,
+        activate_console=lambda: None,
+        play_sound=lambda: None,
+    )
+
+    assert controller.handle_activity(_activity("turn_completed"))
+    assert "notifications/completion_mode" not in settings.values
+    assert settings.values["notifications/approval_enabled"] is False
 
 
 def test_notification_settings_dialog_loads_and_persists_preferences(tmp_path: Path) -> None:
@@ -189,3 +227,21 @@ def test_notification_settings_dialog_loads_and_persists_preferences(tmp_path: P
     assert settings.value("notifications/approval_enabled", type=bool)
     assert not settings.value("notifications/user_input_enabled", type=bool)
     assert settings.value("notifications/sound_enabled", type=bool) is (sys.platform != "win32")
+
+
+def test_notification_settings_default_to_always_and_preserve_saved_mode(tmp_path: Path) -> None:
+    _application()
+    settings = QSettings(str(tmp_path / "notification-default.ini"), QSettings.Format.IniFormat)
+    settings.setFallbacksEnabled(False)
+    dialog = NotificationSettingsDialog(settings)
+
+    assert dialog.completion_mode.currentData() == "always"
+    assert settings.value("notifications/completion_mode") is None
+    dialog.reject()
+    assert settings.value("notifications/completion_mode") is None
+
+    settings.setValue("notifications/completion_mode", "off")
+    saved_dialog = NotificationSettingsDialog(settings)
+    assert saved_dialog.completion_mode.currentData() == "off"
+    saved_dialog.reject()
+    assert settings.value("notifications/completion_mode") == "off"
