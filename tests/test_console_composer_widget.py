@@ -3,12 +3,28 @@ from __future__ import annotations
 from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtGui import QInputMethodEvent, QTextCursor, QTextOption
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QVBoxLayout
+from PySide6.QtWidgets import QComboBox, QStyle, QStyleOptionComboBox, QVBoxLayout
 
 from codex_bridge.console.composer_widget import ComposerInput, ComposerWidget
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
 from tests.console_main_window_test_support import FakeClient, _application
+
+
+def _visible_combo_text_width(combo: QComboBox) -> int:
+    option = QStyleOptionComboBox()
+    option.initFrom(combo)
+    option.rect = combo.rect()
+    option.currentText = combo.currentText()
+    option.editable = combo.isEditable()
+    option.frame = combo.hasFrame()
+    edit_field = combo.style().subControlRect(
+        QStyle.ComplexControl.CC_ComboBox,
+        option,
+        QStyle.SubControl.SC_ComboBoxEditField,
+        combo,
+    )
+    return edit_field.width()
 
 
 def test_enter_sends_once_and_shift_enter_inserts_a_new_line() -> None:
@@ -96,8 +112,12 @@ def test_footer_values_remain_fully_visible_at_ordinary_and_narrow_widths() -> N
             combos = (widget.access_combo, widget.model_combo, widget.effort_combo)
             for combo in combos:
                 text_width = combo.fontMetrics().horizontalAdvance(combo.currentText())
-                assert text_width <= combo.contentsRect().width(), (
+                assert text_width <= _visible_combo_text_width(combo), (
                     f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
+                )
+            if width == 760:
+                assert widget.model_combo.width() > max(
+                    widget.access_combo.width(), widget.effort_combo.width()
                 )
             for left, right in zip(combos, combos[1:], strict=False):
                 assert not left.geometry().intersects(right.geometry())
@@ -106,6 +126,90 @@ def test_footer_values_remain_fully_visible_at_ordinary_and_narrow_widths() -> N
                 assert control.geometry().right() < control.parentWidget().width(), (
                     f"{control.objectName()} extends beyond the composer at width {width}"
                 )
+    finally:
+        widget.close()
+
+
+def test_readonly_footer_metadata_updates_remain_visible_during_resize() -> None:
+    app = _application()
+    widget = ComposerWidget()
+    emitted: list[str] = []
+    widget.access_changed.connect(lambda: emitted.append("access"))
+    widget.model_changed.connect(lambda: emitted.append("model"))
+    widget.effort_changed.connect(lambda: emitted.append("effort"))
+    widget.set_stop_state(visible=True, enabled=True)
+    widget.set_send_enabled(True)
+    model_hint_widths: list[int] = []
+
+    try:
+        for model in ("gpt-6.1-sol", "gpt-6-luna", "gpt-6.1-sol"):
+            widget.set_readonly_metadata(
+                model,
+                "extra high",
+                "danger-full-access",
+                model_tooltip=f"history model: {model}",
+                effort_tooltip=f"history effort: {model}",
+            )
+            for width in (760, 620, 600, 599, 420, 320, 260):
+                widget.resize(width, 400)
+                widget.show()
+                app.processEvents()
+
+                combos = (widget.access_combo, widget.model_combo, widget.effort_combo)
+                assert tuple(combo.currentText() for combo in combos) == (
+                    "Access: Full Access",
+                    f"Model: {model}",
+                    "Effort: extra high",
+                )
+                for combo in combos:
+                    text_width = combo.fontMetrics().horizontalAdvance(combo.currentText())
+                    assert text_width <= _visible_combo_text_width(combo), (
+                        f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
+                    )
+                    assert not combo.isEnabled()
+                assert widget.model_combo.toolTip() == f"history model: {model}"
+                assert widget.effort_combo.toolTip() == f"history effort: {model}"
+                assert widget.stop_button.isVisible() and widget.stop_button.isEnabled()
+                assert widget.send_button.isVisible() and widget.send_button.isEnabled()
+                if width == 760:
+                    model_hint_widths.append(widget.model_combo.sizeHint().width())
+
+                controls = (*combos, widget.stop_button, widget.send_button)
+                for control in controls:
+                    assert widget.controls_container.rect().contains(control.geometry()), (
+                        f"{control.objectName()} extends outside the controls at width {width}"
+                    )
+                for index, left in enumerate(controls):
+                    for right in controls[index + 1 :]:
+                        assert not left.geometry().intersects(right.geometry()), (
+                            f"{left.objectName()} overlaps {right.objectName()} at width {width}"
+                        )
+        assert model_hint_widths[0] > model_hint_widths[1]
+        assert model_hint_widths[2] == model_hint_widths[0]
+        assert emitted == []
+    finally:
+        widget.close()
+
+
+def test_model_selection_can_move_from_long_to_short_and_back() -> None:
+    app = _application()
+    widget = ComposerWidget()
+    widget.set_draft_mode(True)
+    widget.set_model_options(
+        [("gpt-6.1-sol", "gpt-6.1-sol"), ("gpt-6-luna", "gpt-6-luna")],
+        "gpt-6.1-sol",
+        available=True,
+    )
+
+    try:
+        widget.resize(760, 260)
+        widget.show()
+        app.processEvents()
+        assert widget.selected_model == "gpt-6.1-sol"
+        widget.model_combo.setCurrentIndex(widget.model_combo.findData("gpt-6-luna"))
+        assert widget.selected_model == "gpt-6-luna"
+        widget.model_combo.setCurrentIndex(widget.model_combo.findData("gpt-6.1-sol"))
+        assert widget.selected_model == "gpt-6.1-sol"
     finally:
         widget.close()
 
