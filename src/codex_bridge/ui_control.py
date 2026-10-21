@@ -14,8 +14,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .attachment_policy import (
-    MAX_ATTACHMENTS,
     AttachmentPolicy,
+    AttachmentPolicyError,
     ValidatedAttachment,
 )
 from .config import BridgeConfig
@@ -211,12 +211,8 @@ def _attachments(payload: Mapping[str, Any]) -> tuple[str, ...]:
     if "attachments" not in payload:
         return ()
     value = payload["attachments"]
-    if (
-        not isinstance(value, list)
-        or len(value) > MAX_ATTACHMENTS
-        or any(not isinstance(path, str) for path in value)
-    ):
-        raise ValueError("invalid request")
+    if not isinstance(value, list) or any(not isinstance(path, str) for path in value):
+        raise AttachmentPolicyError("invalid attachments", category="malformed_attachment_list")
     return tuple(value)
 
 

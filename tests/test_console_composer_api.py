@@ -140,6 +140,66 @@ def test_control_json_reports_safe_failure_categories(
     assert "sensitive" not in failures[0][1]
 
 
+def test_control_json_extracts_only_allowed_composer_validation_categories() -> None:
+    _application()
+    reply = FakeReply(
+        b'{"error":"invalid_attachment","category":"attachment_outside_allowed_root",'
+        b'"message":"/private/path"}',
+        status=400,
+    )
+    client = ApiClient("http://127.0.0.1:8001", manager=FakeManager([reply]))
+    failures: list[tuple[str, str]] = []
+    client.composer_json_failed.connect(lambda key, error: failures.append((key, error)))
+
+    assert client.post_control_json(
+        "/ui-api/control/threads",
+        {"client_request_id": "request-1234", "cwd": "/private", "prompt": "go"},
+        "control-secret",
+        key="composer:send:request-1234",
+    )
+    reply.finished.emit()
+
+    assert failures == [("composer:send:request-1234", "attachment_outside_allowed_root")]
+    assert "/private" not in failures[0][1]
+
+
+def test_control_json_ignores_unknown_validation_category() -> None:
+    _application()
+    reply = FakeReply(b'{"category":"raw_exception_text","message":"do not show me"}', status=400)
+    client = ApiClient("http://127.0.0.1:8001", manager=FakeManager([reply]))
+    failures: list[tuple[str, str]] = []
+    client.composer_json_failed.connect(lambda key, error: failures.append((key, error)))
+
+    assert client.post_control_json(
+        "/ui-api/control/threads",
+        {"client_request_id": "request-1234", "cwd": "/private", "prompt": "go"},
+        "control-secret",
+        key="composer:send:request-1234",
+    )
+    reply.finished.emit()
+
+    assert failures == [("composer:send:request-1234", "http_400")]
+    assert "raw_exception_text" not in failures[0][1]
+
+
+def test_control_json_ignores_non_string_validation_category() -> None:
+    _application()
+    reply = FakeReply(b'{"category":[]} ', status=400)
+    client = ApiClient("http://127.0.0.1:8001", manager=FakeManager([reply]))
+    failures: list[tuple[str, str]] = []
+    client.composer_json_failed.connect(lambda key, error: failures.append((key, error)))
+
+    assert client.post_control_json(
+        "/ui-api/control/threads",
+        {"client_request_id": "request-1234", "cwd": "/private", "prompt": "go"},
+        "control-secret",
+        key="composer:send:request-1234",
+    )
+    reply.finished.emit()
+
+    assert failures == [("composer:send:request-1234", "http_400")]
+
+
 def test_abort_all_cancels_composer_requests_without_crossing_control_signals() -> None:
     _application()
     reply = FakeReply(b'{"models":[]}')

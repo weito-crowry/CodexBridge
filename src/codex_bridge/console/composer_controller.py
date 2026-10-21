@@ -699,12 +699,34 @@ class ComposerController(QObject):
         self._update_controls()
 
     def _handle_send_failure(self, context: SendContext, category: str) -> None:
-        uncertain = category not in {"http_400", "http_403", "request_error"}
+        validation_messages = {
+            "malformed_attachment_list": "添付ファイルの選択を確認して、もう一度お試しください",
+            "too_many_attachments": "添付ファイルを8個以内にしてください",
+            "attachment_not_absolute": "許可されたフォルダーからファイルを選び直してください",
+            "attachment_missing_or_unavailable": "存在するファイルを選び直してください",
+            "attachment_not_regular_file": "フォルダーではなくファイルを選んでください",
+            "attachment_outside_allowed_root": "許可されたフォルダー内のファイルを選んでください",
+            "duplicate_attachment": "添付ファイルの重複を削除してください",
+            "attachment_too_large": "サイズの小さいファイルを選んでください",
+            "invalid_image_signature": "有効なPNGまたはJPEG画像を選んでください",
+            "total_attachment_size_exceeded": "添付を減らすか、小さいファイルを選んでください",
+            "cwd_not_absolute": "絶対パスの作業フォルダーを選んでください",
+            "cwd_parent_traversal": "親フォルダーへの移動を含まない作業フォルダーを選んでください",
+            "cwd_missing_or_unavailable": "存在する作業フォルダーを選んでください",
+            "cwd_not_directory": "ファイルではなく作業フォルダーを選んでください",
+            "cwd_outside_allowed_root": "許可されたフォルダー内の作業フォルダーを選んでください",
+        }
+        uncertain = category not in {
+            "http_400",
+            "http_403",
+            "request_error",
+            *validation_messages,
+        }
         if uncertain:
             self._unknown_sends[context.draft_key] = context
             text = "送信結果が不明です。Threadsを更新し、履歴とActivityで実行結果を確認してください"
         else:
-            text = {
+            text = validation_messages.get(category) or {
                 "http_400": (
                     "APIが送信内容を受け付けませんでした。入力、添付ファイル、CWDを確認してください"
                 ),

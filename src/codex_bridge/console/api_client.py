@@ -12,6 +12,25 @@ from .sse import SseParser, SseProtocolError, parse_activity_event
 
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024
 _APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
+_COMPOSER_VALIDATION_CATEGORIES = frozenset(
+    {
+        "malformed_attachment_list",
+        "too_many_attachments",
+        "attachment_not_absolute",
+        "attachment_missing_or_unavailable",
+        "attachment_not_regular_file",
+        "attachment_outside_allowed_root",
+        "duplicate_attachment",
+        "attachment_too_large",
+        "invalid_image_signature",
+        "total_attachment_size_exceeded",
+        "cwd_not_absolute",
+        "cwd_parent_traversal",
+        "cwd_missing_or_unavailable",
+        "cwd_not_directory",
+        "cwd_outside_allowed_root",
+    }
+)
 
 
 class ApiClientError(RuntimeError):
@@ -203,6 +222,20 @@ class ApiClient(QObject):
         try:
             status = self._status(network_reply)
             if status and not 200 <= status <= 299:
+                body = bytes(cast(Any, network_reply.readAll()))
+                if len(body) <= _MAX_CONTROL_RESPONSE_BYTES:
+                    try:
+                        payload = json.loads(body.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        payload = None
+                    validation_category = (
+                        payload.get("category") if isinstance(payload, dict) else None
+                    )
+                    if (
+                        isinstance(validation_category, str)
+                        and validation_category in _COMPOSER_VALIDATION_CATEGORIES
+                    ):
+                        raise ApiClientError(validation_category)
                 category = f"http_{status}" if status in {400, 403, 409, 502, 503} else "http_error"
                 raise ApiClientError(category)
             if self._has_network_error(network_reply) or status == 0:

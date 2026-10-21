@@ -198,6 +198,77 @@ async def test_out_of_root_attachment_is_400_before_bridge_dispatch(tmp_path: Pa
 
     assert response.status_code == 400
     assert "outside.txt" not in response.body.decode()
+    assert json.loads(response.body) == {
+        "error": "invalid_attachment",
+        "category": "attachment_outside_allowed_root",
+        "message": "Choose a file inside an allowed folder.",
+    }
+    assert not any(call[0] == "start" for call in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_missing_attachment_has_structured_actionable_error(tmp_path: Path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _create_request(
+        app,
+        {
+            "client_request_id": "request-attach-missing-1",
+            "cwd": str(tmp_path),
+            "prompt": "go",
+            "attachments": [str(tmp_path / "gone.txt")],
+        },
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {
+        "error": "invalid_attachment",
+        "category": "attachment_missing_or_unavailable",
+        "message": "Choose an existing regular file and try again.",
+    }
+    assert not any(call[0] == "start" for call in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_invalid_cwd_has_safe_category_without_changing_status(tmp_path: Path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _create_request(
+        app,
+        {
+            "client_request_id": "request-cwd-invalid-1",
+            "cwd": str(tmp_path / "missing"),
+            "prompt": "go",
+        },
+    )
+
+    assert response.status_code == 404
+    assert json.loads(response.body) == {
+        "error": "invalid_cwd",
+        "category": "cwd_missing_or_unavailable",
+        "message": "Choose an existing working folder.",
+    }
+    assert str(tmp_path) not in response.body.decode()
+    assert not any(call[0] == "start" for call in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_too_many_attachments_has_specific_structured_error(tmp_path: Path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), config(tmp_path))
+    response = await _create_request(
+        app,
+        {
+            "client_request_id": "request-attach-count-1",
+            "cwd": str(tmp_path),
+            "prompt": "go",
+            "attachments": [str(tmp_path / f"{index}.txt") for index in range(9)],
+        },
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["category"] == "too_many_attachments"
+    assert "9.txt" not in response.body.decode()
     assert not any(call[0] == "start" for call in bridge.calls)
 
 

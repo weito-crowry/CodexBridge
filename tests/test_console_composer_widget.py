@@ -55,6 +55,38 @@ def test_effort_combo_emits_change_signal() -> None:
     assert changes == [True]
 
 
+def test_footer_values_remain_fully_visible_at_ordinary_and_narrow_widths() -> None:
+    app = _application()
+    widget = ComposerWidget()
+    widget.set_draft_mode(True)
+    widget.set_model_options([("gpt-6.1-sol", "gpt-6.1-sol")], "gpt-6.1-sol", available=True)
+    widget.set_effort_options([("extra high", "extra high")], "extra high")
+    widget.set_access("danger-full-access")
+
+    try:
+        for width in (760, 420, 320, 260):
+            widget.resize(width, 260)
+            widget.show()
+            app.processEvents()
+            assert widget.width() == width
+            assert widget._compact_controls is (width < 600)
+            combos = (widget.access_combo, widget.model_combo, widget.effort_combo)
+            for combo in combos:
+                text_width = combo.fontMetrics().horizontalAdvance(combo.currentText())
+                assert text_width <= combo.contentsRect().width(), (
+                    f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
+                )
+            for left, right in zip(combos, combos[1:], strict=False):
+                assert not left.geometry().intersects(right.geometry())
+            assert widget.controls_container.geometry().right() < widget.width()
+            for control in (*combos, widget.send_button):
+                assert control.geometry().right() < control.parentWidget().width(), (
+                    f"{control.objectName()} extends beyond the composer at width {width}"
+                )
+    finally:
+        widget.close()
+
+
 def test_composer_wraps_long_text_and_remains_outside_history_scroll_area() -> None:
     _application()
     window = MainWindow(ConsoleConfig(), api_client=FakeClient(), tray_available=False)

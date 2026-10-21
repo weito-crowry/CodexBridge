@@ -69,8 +69,17 @@ def test_rejects_invalid_or_out_of_root_paths(tmp_path: Path, path_kind: str) ->
         "outside": str(outside),
     }
 
-    with pytest.raises(AttachmentPolicyError):
+    with pytest.raises(AttachmentPolicyError) as error:
         _policy(root).validate([values[path_kind]])
+    assert (
+        error.value.category
+        == {
+            "relative": "attachment_not_absolute",
+            "missing": "attachment_missing_or_unavailable",
+            "directory": "attachment_not_regular_file",
+            "outside": "attachment_outside_allowed_root",
+        }[path_kind]
+    )
 
 
 @pytest.mark.parametrize(
@@ -83,8 +92,9 @@ def test_rejects_image_extension_and_header_mismatch(
     path = tmp_path / name
     path.write_bytes(header)
 
-    with pytest.raises(AttachmentPolicyError):
+    with pytest.raises(AttachmentPolicyError) as error:
         _policy(tmp_path).validate([str(path)])
+    assert error.value.category == "invalid_image_signature"
 
 
 def test_rejects_files_larger_than_type_limit(tmp_path: Path, monkeypatch) -> None:
@@ -92,8 +102,9 @@ def test_rejects_files_larger_than_type_limit(tmp_path: Path, monkeypatch) -> No
     path.write_bytes(b"12345")
     monkeypatch.setattr("codex_bridge.attachment_policy.MAX_OTHER_FILE_BYTES", 4)
 
-    with pytest.raises(AttachmentPolicyError):
+    with pytest.raises(AttachmentPolicyError) as error:
         _policy(tmp_path).validate([str(path)])
+    assert error.value.category == "attachment_too_large"
 
 
 def test_rejects_images_larger_than_image_limit(tmp_path: Path, monkeypatch) -> None:
@@ -111,8 +122,9 @@ def test_rejects_combined_size_limit(tmp_path: Path, monkeypatch) -> None:
         path.write_bytes(b"12345")
     monkeypatch.setattr("codex_bridge.attachment_policy.MAX_TOTAL_BYTES", 9)
 
-    with pytest.raises(AttachmentPolicyError):
+    with pytest.raises(AttachmentPolicyError) as error:
         _policy(tmp_path).validate([str(path) for path in files])
+    assert error.value.category == "total_attachment_size_exceeded"
 
 
 def test_rejects_more_than_eight_attachments(tmp_path: Path) -> None:
@@ -122,8 +134,9 @@ def test_rejects_more_than_eight_attachments(tmp_path: Path) -> None:
         path.write_bytes(b"x")
         paths.append(str(path))
 
-    with pytest.raises(AttachmentPolicyError):
+    with pytest.raises(AttachmentPolicyError) as error:
         _policy(tmp_path).validate(paths)
+    assert error.value.category == "too_many_attachments"
 
 
 def test_rejects_duplicate_canonical_paths(tmp_path: Path) -> None:
@@ -135,8 +148,9 @@ def test_rejects_duplicate_canonical_paths(tmp_path: Path) -> None:
     except OSError as exc:
         pytest.skip(f"file symlink unavailable: {exc}")
 
-    with pytest.raises(AttachmentPolicyError):
+    with pytest.raises(AttachmentPolicyError) as error:
         _policy(tmp_path).validate([str(original), str(alias)])
+    assert error.value.category == "duplicate_attachment"
 
 
 def test_rejects_symlink_escape_and_allows_symlink_resolving_inside_root(

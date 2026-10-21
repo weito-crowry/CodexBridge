@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .activity import ActivityStore
+from .attachment_policy import AttachmentPolicyError
 from .bridge import ApprovalConflictError, Bridge, BridgeError
 from .config import BridgeConfig
 from .history import HistoryValidationError, project_thread_metadata, validate_cursor
@@ -142,7 +143,45 @@ def _authorized_control_request(request: Request, token: str | None) -> bool:
 def _error_response(exc: Exception) -> JSONResponse:
     if isinstance(exc, ControlConflictError):
         return JSONResponse({"error": "request conflict"}, status_code=409)
+    if isinstance(exc, AttachmentPolicyError):
+        messages = {
+            "malformed_attachment_list": "Review the attachment selection and try again.",
+            "too_many_attachments": "Remove attachments so no more than 8 files are selected.",
+            "attachment_not_absolute": "Choose the file again from an allowed folder.",
+            "attachment_missing_or_unavailable": "Choose an existing regular file and try again.",
+            "attachment_not_regular_file": "Choose a regular file instead of a folder.",
+            "attachment_outside_allowed_root": "Choose a file inside an allowed folder.",
+            "duplicate_attachment": "Remove duplicate files from the attachment list.",
+            "attachment_too_large": "Choose a smaller file.",
+            "invalid_image_signature": "Choose a valid PNG or JPEG image.",
+            "total_attachment_size_exceeded": "Choose fewer or smaller files.",
+        }
+        category = exc.category if exc.category in messages else "invalid_attachments"
+        return JSONResponse(
+            {
+                "error": "invalid_attachment",
+                "category": category,
+                "message": messages.get(category, "Review the attachments and try again."),
+            },
+            status_code=400,
+        )
     if isinstance(exc, PathPolicyError):
+        cwd_messages = {
+            "cwd_not_absolute": "Choose an absolute working folder.",
+            "cwd_parent_traversal": "Choose a working folder without parent-folder traversal.",
+            "cwd_missing_or_unavailable": "Choose an existing working folder.",
+            "cwd_not_directory": "Choose an existing working folder, not a file.",
+            "cwd_outside_allowed_root": "Choose a working folder inside an allowed folder.",
+        }
+        if exc.category in cwd_messages:
+            return JSONResponse(
+                {
+                    "error": "invalid_cwd",
+                    "category": exc.category,
+                    "message": cwd_messages[exc.category],
+                },
+                status_code=404,
+            )
         return JSONResponse({"error": "thread not found"}, status_code=404)
     if isinstance(exc, (HistoryValidationError, ValueError)):
         return JSONResponse({"error": "invalid request"}, status_code=400)

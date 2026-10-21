@@ -8,8 +8,9 @@ from codex_bridge.paths import AllowedPathPolicy, PathPolicyError
 
 
 def test_relative_cwd_is_rejected(tmp_path: os.PathLike[str]) -> None:
-    with pytest.raises(PathPolicyError):
+    with pytest.raises(PathPolicyError) as error:
         AllowedPathPolicy((os.fspath(tmp_path),)).validate_cwd(".")
+    assert error.value.category == "cwd_not_absolute"
 
 
 def test_sibling_prefix_is_rejected(tmp_path: os.PathLike[str]) -> None:
@@ -18,8 +19,9 @@ def test_sibling_prefix_is_rejected(tmp_path: os.PathLike[str]) -> None:
     allowed.mkdir()
     sibling.mkdir()
 
-    with pytest.raises(PathPolicyError):
+    with pytest.raises(PathPolicyError) as error:
         AllowedPathPolicy((os.fspath(allowed),)).validate_cwd(os.fspath(sibling))
+    assert error.value.category == "cwd_outside_allowed_root"
 
 
 def test_cwd_is_returned_as_canonical_path(tmp_path: os.PathLike[str]) -> None:
