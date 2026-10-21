@@ -27,7 +27,7 @@ New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 
 Push-Location $repoRoot
 try {
-    & uv run pyinstaller --noconfirm --clean --distpath $distRoot --workpath $buildRoot $specPath
+    & uv run --extra console --extra package pyinstaller --noconfirm --clean --distpath $distRoot --workpath $buildRoot $specPath
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE."
     }
