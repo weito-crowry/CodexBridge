@@ -23,6 +23,13 @@ from tests.console_main_window_test_support import (
 )
 
 
+def _entry(model: str, effort: str) -> dict[str, object]:
+    return {
+        "model_candidates": [{"model": model, "reasoning_effort": effort}],
+        "model_resolution_status": "resolved",
+    }
+
+
 def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     _application()
     client = FakeClient()
@@ -815,6 +822,216 @@ def test_history_header_includes_turn_model_metadata() -> None:
     headers = {label.text() for label in window.history_pane._content.findChildren(QLabel)}
     assert "Turn · Model: gpt-5 (high)" in headers
     assert "Agent · Model: gpt-5 · Reasoning: high" not in headers
+    window.close()
+
+
+@pytest.mark.parametrize("status_first", [True, False])
+def test_unloaded_thread_composer_uses_loaded_history_in_either_arrival_order(
+    status_first: bool,
+) -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.thread_pane.thread_selected.emit("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    items_key = next(key for key, _, _ in client.requests if key.endswith(":items"))
+    request_count = len(client.requests)
+    status = {
+        "thread_id": "thread-a",
+        "state": "not_loaded",
+        "thread_metadata": None,
+        "recent_activities": [],
+    }
+    items = {
+        "items": [{"turn_id": "turn-1", "item": _item("agent-1", "agentMessage", text="answer")}],
+        "turn_model_metadata": {
+            "turn-1": {
+                "model_candidates": [{"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}],
+                "model_resolution_status": "resolved",
+            }
+        },
+    }
+
+    if status_first:
+        client.result(status_key, status)
+        client.result(items_key, items)
+    else:
+        client.result(items_key, items)
+        client.result(status_key, status)
+
+    widget = window.composer_widget
+    assert widget.model_combo.itemText(0) == "Model: gpt-5.6-sol"
+    assert widget.effort_combo.itemText(0) == "Effort: xhigh"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    assert "読み込んだ履歴" in widget.model_combo.toolTip()
+    assert "turn-1" in widget.effort_combo.toolTip()
+    assert len(client.requests) == request_count
+    assert client.json_posts == []
+    assert client.control_requests == []
+    window.close()
+
+
+def test_status_failure_does_not_enable_history_fallback_until_not_loaded_is_known() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.thread_pane.thread_selected.emit("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    items_key = next(key for key, _, _ in client.requests if key.endswith(":items"))
+    client.failure(status_key, "status unavailable")
+    client.result(
+        items_key,
+        {
+            "items": [{"turn_id": "turn-1", "item": _item("agent-1", "agentMessage", text="A")}],
+            "turn_model_metadata": {"turn-1": _entry("history-model", "high")},
+        },
+    )
+
+    widget = window.composer_widget
+    assert widget.model_combo.itemText(0) == "Model: Unknown"
+    assert widget.effort_combo.itemText(0) == "Effort: Unknown"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    assert widget.model_combo.toolTip() == ""
+
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+    assert widget.model_combo.itemText(0) == "Model: history-model"
+    window.close()
+
+
+def test_unavailable_history_page_keeps_unloaded_thread_metadata_unknown() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.thread_pane.thread_selected.emit("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    items_key = next(key for key, _, _ in client.requests if key.endswith(":items"))
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+    client.failure(items_key, "history unavailable")
+
+    widget = window.composer_widget
+    assert widget.model_combo.itemText(0) == "Model: Unknown"
+    assert widget.effort_combo.itemText(0) == "Effort: Unknown"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    window.close()
+
+
+def test_loaded_status_overrides_history_then_unloaded_status_restores_history_summary() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.thread_pane.thread_selected.emit("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    items_key = next(key for key, _, _ in client.requests if key.endswith(":items"))
+    client.result(
+        items_key,
+        {
+            "items": [
+                {"turn_id": "turn-1", "item": _item("agent-1", "agentMessage", text="answer")}
+            ],
+            "turn_model_metadata": {"turn-1": _entry("history-model", "high")},
+        },
+    )
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+    widget = window.composer_widget
+    assert widget.model_combo.itemText(0) == "Model: history-model"
+
+    client.result(
+        status_key,
+        {
+            "thread_id": "thread-a",
+            "state": "completed",
+            "thread_metadata": {
+                "model": "current-model",
+                "reasoning_effort": "low",
+                "sandbox_mode": "workspace-write",
+            },
+        },
+    )
+
+    assert widget.model_combo.itemText(0) == "Model: current-model"
+    assert widget.effort_combo.itemText(0) == "Effort: low"
+    assert widget.access_combo.itemText(0) == "Access: workspace-write"
+    assert widget.model_combo.toolTip() == ""
+    assert widget.effort_combo.toolTip() == ""
+
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+    assert widget.model_combo.itemText(0) == "Model: history-model"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    window.close()
+
+
+def test_history_metadata_is_cleared_for_each_selection_generation() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.thread_pane.thread_selected.emit("thread-a")
+    client.result(
+        "selection:1:status",
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+    client.result(
+        "selection:1:items",
+        {
+            "items": [{"turn_id": "a-turn", "item": _item("a-item", "agentMessage", text="A")}],
+            "turn_model_metadata": {"a-turn": _entry("model-a", "high")},
+        },
+    )
+    widget = window.composer_widget
+    assert widget.model_combo.itemText(0) == "Model: model-a"
+
+    window.thread_pane.thread_selected.emit("thread-b")
+    assert widget.model_combo.itemText(0) == "Model: Unknown"
+    assert widget.model_combo.toolTip() == ""
+    client.result(
+        "selection:1:items",
+        {
+            "items": [{"turn_id": "stale", "item": _item("stale", "agentMessage", text="stale")}],
+            "turn_model_metadata": {"stale": _entry("stale-model", "xhigh")},
+        },
+    )
+    client.result(
+        "selection:2:status",
+        {"thread_id": "thread-b", "state": "not_loaded", "thread_metadata": None},
+    )
+    assert widget.model_combo.itemText(0) == "Model: Unknown"
+
+    client.result(
+        "selection:2:items",
+        {
+            "items": [{"turn_id": "b-turn", "item": _item("b-item", "agentMessage", text="B")}],
+            "turn_model_metadata": {"b-turn": _entry("model-b", "low")},
+        },
+    )
+    assert widget.model_combo.itemText(0) == "Model: model-b"
+    client.result(
+        "selection:1:status",
+        {
+            "thread_id": "thread-a",
+            "state": "completed",
+            "thread_metadata": {
+                "model": "late-model-a",
+                "reasoning_effort": "xhigh",
+                "sandbox_mode": "danger-full-access",
+            },
+        },
+    )
+    assert widget.model_combo.itemText(0) == "Model: model-b"
+
+    window.thread_pane.thread_selected.emit("thread-a")
+    assert widget.model_combo.itemText(0) == "Model: Unknown"
+    assert widget.model_combo.toolTip() == ""
     window.close()
 
 

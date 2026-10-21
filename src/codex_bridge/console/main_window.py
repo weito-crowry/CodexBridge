@@ -1677,6 +1677,19 @@ class MainWindow(QMainWindow):
     def _apply_items(self, payload: object, *, prepend: bool, live_refresh: bool = False) -> None:
         if self._history_timeline.apply_items(payload, prepend=prepend, live_refresh=live_refresh):
             self._render_timeline(prepend=prepend)
+            thread_id = self._selected_thread_id
+            generation = self._selection_generation
+            if thread_id is not None:
+                self._composer_controller.apply_history_model_metadata(
+                    thread_id,
+                    generation,
+                    tuple(
+                        entry.turn_id
+                        for entry in self._history_timeline.entries
+                        if isinstance(entry.turn_id, str)
+                    ),
+                    self._history_timeline.turn_model_metadata,
+                )
 
     def _render_timeline(self, *, prepend: bool = False) -> None:
         self._history_timeline.render(

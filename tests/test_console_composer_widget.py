@@ -55,6 +55,29 @@ def test_effort_combo_emits_change_signal() -> None:
     assert changes == [True]
 
 
+def test_readonly_metadata_tooltips_are_replaced_and_cleared() -> None:
+    _application()
+    widget = ComposerWidget()
+
+    widget.set_readonly_metadata(
+        "Multiple",
+        "Multiple",
+        None,
+        model_tooltip="history model source",
+        effort_tooltip="history effort source",
+    )
+
+    assert widget.model_combo.itemText(0) == "Model: Multiple"
+    assert widget.effort_combo.itemText(0) == "Effort: Multiple"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    assert widget.model_combo.toolTip() == "history model source"
+    assert widget.effort_combo.toolTip() == "history effort source"
+
+    widget.set_readonly_metadata("current-model", "high", "workspace-write")
+    assert widget.model_combo.toolTip() == ""
+    assert widget.effort_combo.toolTip() == ""
+
+
 def test_footer_values_remain_fully_visible_at_ordinary_and_narrow_widths() -> None:
     app = _application()
     widget = ComposerWidget()

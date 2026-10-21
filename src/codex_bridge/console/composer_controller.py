@@ -11,6 +11,7 @@ from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtWidgets import QMessageBox, QTreeWidget, QTreeWidgetItem
 
 from .composer_widget import ComposerWidget
+from .history_metadata import HistoryModelSummary, summarize_turn_model_metadata
 
 if TYPE_CHECKING:
     from .api_client import ApiClient
@@ -57,6 +58,16 @@ class StatusRequestContext:
     confirms_stop: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ThreadMetadataSnapshot:
+    thread_id: str
+    selection_generation: int
+    state: str | None
+    model: str | None
+    effort: str | None
+    sandbox_mode: str | None
+
+
 class ComposerController(QObject):
     """Owns per-thread drafts and the authenticated Composer operations."""
 
@@ -79,8 +90,10 @@ class ComposerController(QObject):
         self._draft_attachments: dict[str, tuple[str, ...]] = {"new:unselected": ()}
         self._draft_options: dict[str, DraftOptions] = {}
         self._draft_cwds: dict[str, str | None] = {}
-        self._thread_metadata: dict[str, tuple[str | None, str | None, str | None]] = {}
         self._thread_states: dict[str, tuple[str | None, str | None, bool]] = {}
+        self._active_thread_metadata: ThreadMetadataSnapshot | None = None
+        self._metadata_selection: tuple[str, int] | None = None
+        self._history_model_summary: HistoryModelSummary | None = None
         self._unknown_sends: dict[str, SendContext] = {}
         self._awaiting_turns: dict[str, str] = {}
         self._current_draft_key = "new:unselected"
@@ -167,6 +180,14 @@ class ComposerController(QObject):
         self._pending_create_selection = None
         self._pending_create_notice_shown = False
         self._current_thread_id = thread_id
+        generation = getattr(self._window, "_selection_generation", None)
+        self._metadata_selection = (
+            (thread_id, generation)
+            if isinstance(thread_id, str) and isinstance(generation, int)
+            else None
+        )
+        self._active_thread_metadata = None
+        self._history_model_summary = None
         self._current_cwd = None
         self._is_new_draft = False
         self._current_draft_key = f"thread:{thread_id}" if thread_id else "new:unselected"
@@ -179,6 +200,34 @@ class ComposerController(QObject):
             self._thread_states.pop(thread_id, None)
         self._render()
         self._update_controls()
+
+    def apply_history_model_metadata(
+        self,
+        thread_id: str,
+        selection_generation: int,
+        turn_ids: Sequence[str],
+        turn_model_metadata: Mapping[str, object],
+    ) -> None:
+        if not self._is_current_metadata_selection(thread_id, selection_generation):
+            return
+        self._history_model_summary = summarize_turn_model_metadata(turn_ids, turn_model_metadata)
+        status = self._active_thread_metadata
+        if (
+            status is not None
+            and status.thread_id == thread_id
+            and status.selection_generation == selection_generation
+            and status.state == "not_loaded"
+        ):
+            self._render()
+
+    def _is_current_metadata_selection(self, thread_id: str, generation: int) -> bool:
+        return (
+            not self._is_new_draft
+            and self._current_thread_id == thread_id
+            and self._metadata_selection == (thread_id, generation)
+            and getattr(self._window, "_selected_thread_id", None) == thread_id
+            and getattr(self._window, "_selection_generation", None) == generation
+        )
 
     def open_new_thread_draft(self, cwd: str | None) -> None:
         """Open a local draft; no API request is made until the first Send."""
@@ -392,8 +441,32 @@ class ComposerController(QObject):
                 self._widget.set_readonly_metadata(None, None, None)
             else:
                 self._widget.set_target(self._existing_target_text(thread_id, thread))
-                model, effort, sandbox = self._thread_metadata.get(thread_id, (None, None, None))
-                self._widget.set_readonly_metadata(model, effort, sandbox)
+                snapshot = self._active_thread_metadata
+                if (
+                    snapshot is not None
+                    and snapshot.thread_id == thread_id
+                    and self._metadata_selection == (thread_id, snapshot.selection_generation)
+                    and self._is_current_metadata_selection(
+                        thread_id, snapshot.selection_generation
+                    )
+                ):
+                    if snapshot.state == "not_loaded":
+                        summary = self._history_model_summary
+                        self._widget.set_readonly_metadata(
+                            summary.model if summary is not None else None,
+                            summary.effort if summary is not None else None,
+                            None,
+                            model_tooltip=(summary.model_tooltip if summary is not None else None),
+                            effort_tooltip=(
+                                summary.effort_tooltip if summary is not None else None
+                            ),
+                        )
+                    else:
+                        self._widget.set_readonly_metadata(
+                            snapshot.model, snapshot.effort, snapshot.sandbox_mode
+                        )
+                else:
+                    self._widget.set_readonly_metadata(None, None, None)
         message, is_error = self._status_messages.get(self._current_draft_key, ("", False))
         if not message and not self._control_available:
             message = "Console管理Bridgeに接続するとSend／Stopを利用できます"
@@ -848,8 +921,21 @@ class ComposerController(QObject):
         sandbox = (
             metadata.get("sandbox_mode") if isinstance(metadata.get("sandbox_mode"), str) else None
         )
-        self._thread_metadata[thread_id] = (model, effort, sandbox)
         state = payload.get("state") if isinstance(payload.get("state"), str) else None
+        generation = getattr(self._window, "_selection_generation", None)
+        if (
+            current_selection
+            and isinstance(generation, int)
+            and self._is_current_metadata_selection(thread_id, generation)
+        ):
+            self._active_thread_metadata = ThreadMetadataSnapshot(
+                thread_id,
+                generation,
+                state,
+                model,
+                effort,
+                sandbox,
+            )
         turn_id = payload.get("turn_id") if isinstance(payload.get("turn_id"), str) else None
         pending = payload.get("pending_request") is not None
         self._thread_states[thread_id] = (state, turn_id, pending)

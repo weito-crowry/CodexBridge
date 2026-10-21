@@ -315,6 +315,7 @@ class ComposerWidget(QWidget):
         self, models: Sequence[tuple[str, str]], selected: str | None, *, available: bool
     ) -> None:
         self._rendering = True
+        self.model_combo.setToolTip("")
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         self.model_combo.addItem(
@@ -330,6 +331,7 @@ class ComposerWidget(QWidget):
 
     def set_effort_options(self, efforts: Sequence[tuple[str, str]], selected: str | None) -> None:
         self._rendering = True
+        self.effort_combo.setToolTip("")
         self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
         self.effort_combo.addItem("Effort: Default", None)
@@ -359,13 +361,21 @@ class ComposerWidget(QWidget):
         self._rendering = False
 
     def set_readonly_metadata(
-        self, model: str | None, effort: str | None, sandbox_mode: str | None
+        self,
+        model: str | None,
+        effort: str | None,
+        sandbox_mode: str | None,
+        *,
+        model_tooltip: str | None = None,
+        effort_tooltip: str | None = None,
     ) -> None:
         self.set_draft_mode(False)
         self.set_model_options([], None, available=False)
         self.model_combo.setItemText(0, f"Model: {model or 'Unknown'}")
+        self.model_combo.setToolTip(model_tooltip or "")
         self.effort_combo.clear()
         self.effort_combo.addItem(f"Effort: {effort or 'Unknown'}", None)
+        self.effort_combo.setToolTip(effort_tooltip or "")
         self.effort_combo.setEnabled(False)
         self.set_access(sandbox_mode or "Unknown")
 
