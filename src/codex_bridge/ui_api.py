@@ -27,6 +27,9 @@ from .ui_control import ControlConflictError, create_control_routes
 
 
 class UiBridge(Protocol):
+    @property
+    def app_server_os_pid(self) -> int | None: ...
+
     async def approve(
         self, request_id: RequestId, decision: ApprovalDecision
     ) -> dict[str, Any]: ...
@@ -323,6 +326,7 @@ def create_ui_app(
                 turn_id=request.query_params.get("turn_id") or None,
                 activity_limit=_parse_activity_limit(request),
             )
+            result["app_server_os_pid"] = bridge.app_server_os_pid
             return JSONResponse(result)
         except Exception as exc:
             return _error_response(exc)

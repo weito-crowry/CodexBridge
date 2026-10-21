@@ -29,6 +29,25 @@ async def test_app_server_sends_initialize_then_initialized() -> None:
 
 
 @pytest.mark.asyncio
+async def test_app_server_exposes_only_a_live_managed_process_os_pid() -> None:
+    factory = FakeProcessFactory()
+    client = AppServerClient("codex", process_factory=factory)
+
+    assert getattr(client, "os_pid", "missing") is None
+    factory.process.pid = 220132
+    await client.start()
+
+    assert getattr(client, "os_pid", None) == 220132
+    for invalid_pid in (True, 0, 4_294_967_296, "220132"):
+        factory.process.pid = invalid_pid
+        assert getattr(client, "os_pid", "missing") is None
+    factory.process.pid = 220132
+    factory.process.returncode = 0
+    assert getattr(client, "os_pid", "missing") is None
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_app_server_routes_server_request_to_callback() -> None:
     factory = FakeProcessFactory()
     requests: list[dict[str, object]] = []

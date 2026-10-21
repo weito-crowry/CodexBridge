@@ -1458,6 +1458,14 @@ class Bridge:
             "recent_activities": [],
         }
 
+    @property
+    def app_server_os_pid(self) -> int | None:
+        """Return the OS PID of this host's live managed App Server, if available."""
+        pid = getattr(self._app_server, "os_pid", None)
+        if isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 4_294_967_296:
+            return pid
+        return None
+
     async def status(
         self, thread_id: str, turn_id: str | None = None, activity_limit: int = 20
     ) -> dict[str, Any]:

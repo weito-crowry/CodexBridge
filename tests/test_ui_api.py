@@ -20,6 +20,7 @@ from codex_bridge.ui_api import create_ui_app
 class FakeBridge:
     def __init__(self) -> None:
         self.app_server_ready = True
+        self.app_server_os_pid = 220132
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.approval_error: Exception | None = None
 
@@ -220,6 +221,12 @@ async def test_ui_api_get_endpoints_delegate_to_read_only_bridge(tmp_path) -> No
     assert (await _json_response(turns))["history_mode"] == "paginated"
     assert (await _json_response(items))["thread_id"] == "thread-1"
     assert (await _json_response(thread_status))["state"] == "completed"
+    assert (await _json_response(thread_status))["app_server_os_pid"] == 220132
+    assert bridge.calls[-1] == (
+        "status",
+        ("thread-1",),
+        {"turn_id": "turn-1", "activity_limit": 2},
+    )
     assert [call[0] for call in bridge.calls] == [
         "threads",
         "threads",

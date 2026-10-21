@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .process_monitor import ProcessMonitorWidget
+
 _EFFECTIVE_SANDBOX_MODES = {
     "danger-full-access",
     "external-sandbox",
@@ -71,7 +73,12 @@ class ActivityPane(QWidget):
     approval_decision_requested = Signal(object, str)
     pending_state_changed = Signal(bool, str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        process_monitor: ProcessMonitorWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.state_label = QLabel("not_loaded")
         self.state_label.setWordWrap(True)
@@ -166,6 +173,7 @@ class ActivityPane(QWidget):
         self.command_output_text.setPlaceholderText(
             "No command output deltas observed. Output may be unavailable or not yet produced."
         )
+        self.process_monitor = process_monitor or ProcessMonitorWidget()
         self._command_output_item_id: str | None = None
         self._activity_ids: set[str] = set()
         self._command_output_activity_ids: set[str] = set()
@@ -176,6 +184,7 @@ class ActivityPane(QWidget):
         layout.addWidget(self._state_section)
         layout.addWidget(self._activity_header)
         layout.addWidget(self.activity_list, 1)
+        layout.addWidget(self.process_monitor)
         layout.addWidget(self.command_output_header)
         layout.addWidget(self.command_output_text, 1)
 
@@ -234,6 +243,7 @@ class ActivityPane(QWidget):
             self._sync_approval_controls()
         self._state_section.show()
         if reset:
+            self.process_monitor.reset()
             self.activity_list.clear()
             self.command_output_text.clear()
             self._command_output_item_id = None
@@ -242,6 +252,7 @@ class ActivityPane(QWidget):
             self._command_output_activity_order.clear()
             self._command_output_items.clear()
             self._command_output_item_order.clear()
+        self.process_monitor.set_app_server_os_pid(snapshot.get("app_server_os_pid"))
         self.merge_activities(snapshot.get("recent_activities"))
         self._set_pending_request_state(pending_label)
 
@@ -367,6 +378,8 @@ class ActivityPane(QWidget):
         activity_type = activity.get("type")
         if activity_type in {"command_started", "command_output", "command_completed"}:
             self._append_command_activity(activity)
+        if activity_type in {"command_started", "command_completed"}:
+            self.process_monitor.append_activity(activity)
         if activity_type == "command_output":
             self._command_output_activity_ids.add(activity_id)
             self._command_output_activity_order.append(activity_id)
@@ -388,7 +401,10 @@ class ActivityPane(QWidget):
 
     def _append_command_activity(self, activity: Mapping[str, object]) -> None:
         activity_type = activity.get("type")
-        item_id = _safe_text(activity.get("item_id"), 512) or "unknown"
+        raw_item_id = activity.get("item_id")
+        has_item_id = isinstance(raw_item_id, str) and bool(raw_item_id.strip())
+        item_id = _safe_text(raw_item_id, 512) or "unknown"
+        association_id = item_id if has_item_id else "\x00unattributed-output"
         summary = _safe_text(activity.get("summary"), 2_000)
         details = activity.get("details")
         if not isinstance(details, Mapping):
@@ -398,7 +414,7 @@ class ActivityPane(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         current_text = self.command_output_text.toPlainText()
         if activity_type == "command_started":
-            self._command_output_item_id = item_id
+            self._command_output_item_id = association_id
             process_id = _safe_text(details.get("process_id"), 512)
             cwd = _safe_text(details.get("cwd"), 4_096)
             metadata = "".join(
@@ -411,15 +427,18 @@ class ActivityPane(QWidget):
                 cursor, f"{separator}[Command {item_id}{metadata}] {summary}\n"
             )
         elif activity_type == "command_output":
-            if self._command_output_item_id != item_id:
+            if self._command_output_item_id != association_id:
                 separator = "\n" if current_text and not current_text.endswith("\n") else ""
-                cursor = self._insert_bounded_command_output(
-                    cursor, f"{separator}[Output for command {item_id}]\n"
+                label = (
+                    f"[Output for command {item_id}]"
+                    if has_item_id
+                    else ("[Unattributed command output (missing item id)]")
                 )
-                self._command_output_item_id = item_id
-            if item_id not in self._command_output_items:
-                self._command_output_items.add(item_id)
-                self._command_output_item_order.append(item_id)
+                cursor = self._insert_bounded_command_output(cursor, f"{separator}{label}\n")
+                self._command_output_item_id = association_id
+            if association_id not in self._command_output_items:
+                self._command_output_items.add(association_id)
+                self._command_output_item_order.append(association_id)
                 while len(self._command_output_item_order) > 500:
                     self._command_output_items.discard(self._command_output_item_order.popleft())
             if details.get("output_source") == "completed_item":
@@ -432,12 +451,12 @@ class ActivityPane(QWidget):
                 )
             cursor = self._insert_bounded_command_output(cursor, summary)
         elif activity_type == "command_completed":
-            if self._command_output_item_id != item_id:
+            if self._command_output_item_id != association_id:
                 separator = "\n" if current_text and not current_text.endswith("\n") else ""
                 cursor = self._insert_bounded_command_output(
                     cursor, f"{separator}[Command {item_id}] {summary}\n"
                 )
-            if item_id not in self._command_output_items:
+            if association_id not in self._command_output_items:
                 cursor = self._insert_bounded_command_output(
                     cursor,
                     "[No command output was observed; the command may have produced none "
@@ -484,6 +503,7 @@ class ActivityPane(QWidget):
         self._pending_header.hide()
         self.pending_label.hide()
         self._state_section.hide()
+        self.process_monitor.reset()
         self.activity_list.clear()
         self.command_output_text.clear()
         self._command_output_item_id = None
@@ -498,6 +518,7 @@ class ActivityPane(QWidget):
         self._state_section.show()
 
     def set_error(self, text: str) -> None:
+        self.process_monitor.set_app_server_os_pid(None)
         self.state_label.setText(text)
         self._set_effective_access_unavailable("Unavailable")
         self.pending_label.clear()
