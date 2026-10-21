@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QFileDialog, QToolButton
 
@@ -152,6 +153,194 @@ def test_external_staging_rejects_other_file_over_limit_before_copy(
     assert "50 MiB" in widget.status_label.text()
     assert not (allowed / ".codexbridge-staging").exists()
     assert external.read_bytes() == b"1234"
+
+
+def test_allowed_root_selection_rejects_oversized_file_and_keeps_existing_draft(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    existing = allowed / "existing.txt"
+    existing.write_bytes(b"yes")
+    oversized = allowed / "oversized.txt"
+    oversized.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+    widget.input.setPlainText("keep this draft")
+    widget.add_attachments([str(existing)])
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+
+    widget.add_attachments([str(oversized)])
+
+    assert widget.attachments == (str(existing.resolve()),)
+    assert widget.prompt_text == "keep this draft"
+    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
+    assert notices[-1] == "その他の添付は50 MiB以下にしてください"
+
+
+def test_external_oversized_file_is_rejected_before_staging(tmp_path: Path, monkeypatch) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    external = tmp_path / "oversized.txt"
+    external.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+
+    widget.add_attachments([str(external)])
+
+    assert widget.attachments == ()
+    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
+    assert notices[-1] == "その他の添付は50 MiB以下にしてください"
+    assert not (allowed / ".codexbridge-staging").exists()
+    assert external.read_bytes() == b"1234"
+
+
+def test_external_copy_success_does_not_hide_another_candidate_size_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    valid = external / "valid.txt"
+    valid.write_bytes(b"123")
+    oversized = external / "oversized.txt"
+    oversized.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+
+    widget.add_attachments([str(valid), str(oversized)])
+
+    staging = allowed / ".codexbridge-staging"
+    assert len(widget.attachments) == 1
+    assert Path(widget.attachments[0]).name == valid.name
+    assert (staging / valid.name).read_bytes() == b"123"
+    assert not (staging / oversized.name).exists()
+    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
+
+
+@pytest.mark.parametrize("suffix", [".png", ".jpg", ".jpeg"])
+@pytest.mark.parametrize("external", [False, True], ids=["allowed-root", "outside-root"])
+def test_image_size_limit_is_inclusive_in_both_locations(
+    tmp_path: Path, monkeypatch, suffix: str, external: bool
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    parent = tmp_path / "outside" if external else allowed
+    parent.mkdir(exist_ok=True)
+    accepted = parent / f"accepted{suffix}"
+    rejected = parent / f"rejected{suffix}"
+    accepted.write_bytes(b"123")
+    rejected.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_IMAGE_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+
+    widget.add_attachments([str(accepted)])
+    widget.add_attachments([str(rejected)])
+
+    assert len(widget.attachments) == 1
+    assert Path(widget.attachments[0]).name == accepted.name
+    assert widget.status_label.text() == "画像添付は20 MiB以下にしてください"
+    assert notices[-1] == "画像添付は20 MiB以下にしてください"
+    if external:
+        assert not (allowed / ".codexbridge-staging" / rejected.name).exists()
+
+
+@pytest.mark.parametrize("external", [False, True], ids=["allowed-root", "outside-root"])
+def test_other_file_size_limit_is_inclusive_in_both_locations(
+    tmp_path: Path, monkeypatch, external: bool
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    parent = tmp_path / "outside" if external else allowed
+    parent.mkdir(exist_ok=True)
+    accepted = parent / "accepted.txt"
+    rejected = parent / "rejected.txt"
+    accepted.write_bytes(b"123")
+    rejected.write_bytes(b"1234")
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 3)
+    widget = ComposerWidget([str(allowed)])
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+
+    widget.add_attachments([str(accepted)])
+    widget.add_attachments([str(rejected)])
+
+    assert len(widget.attachments) == 1
+    assert Path(widget.attachments[0]).name == accepted.name
+    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
+    assert notices[-1] == "その他の添付は50 MiB以下にしてください"
+    if external:
+        assert not (allowed / ".codexbridge-staging" / rejected.name).exists()
+
+
+@pytest.mark.parametrize("has_existing", [False, True], ids=["same-batch", "existing-chip"])
+def test_aggregate_size_limit_includes_existing_and_same_batch_candidates(
+    tmp_path: Path, monkeypatch, has_existing: bool
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 20)
+    monkeypatch.setattr(composer_attachments, "MAX_TOTAL_BYTES", 8)
+    widget = ComposerWidget([str(allowed)])
+    widget.input.setPlainText("preserve draft")
+    expected: list[str] = []
+    three = allowed / "three.txt"
+    five = allowed / "five.txt"
+    one = allowed / "one.txt"
+    three.write_bytes(b"123")
+    five.write_bytes(b"12345")
+    one.write_bytes(b"1")
+    if has_existing:
+        existing = allowed / "existing.txt"
+        existing.write_bytes(b"12345")
+        widget.add_attachments([str(existing)])
+        expected.append(str(existing.resolve()))
+        widget.add_attachments([str(three), str(one)])
+        expected.append(str(three.resolve()))
+    else:
+        widget.add_attachments([str(three), str(five), str(one)])
+        expected.extend([str(three.resolve()), str(five.resolve())])
+
+    assert widget.attachments == tuple(expected)
+    assert widget.prompt_text == "preserve draft"
+    assert widget.status_label.text() == "添付ファイルの合計は100 MiB以下にしてください"
+
+
+def test_allowed_root_batch_keeps_valid_candidate_when_later_file_exceeds_total(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _application()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(composer_attachments, "MAX_OTHER_FILE_BYTES", 20)
+    monkeypatch.setattr(composer_attachments, "MAX_TOTAL_BYTES", 4)
+    valid = allowed / "valid.txt"
+    valid.write_bytes(b"123")
+    oversized_total = allowed / "over.txt"
+    oversized_total.write_bytes(b"12")
+    widget = ComposerWidget([str(allowed)])
+    widget.input.setPlainText("draft stays")
+    notices: list[str] = []
+    widget.attachment_notice.connect(notices.append)
+
+    widget.add_attachments([str(valid), str(oversized_total)])
+
+    assert widget.attachments == (str(valid.resolve()),)
+    assert widget.prompt_text == "draft stays"
+    assert widget.status_label.text() == "添付ファイルの合計は100 MiB以下にしてください"
+    assert notices[-1] == "添付ファイルの合計は100 MiB以下にしてください"
 
 
 def test_external_staging_enforces_aggregate_attachment_size(tmp_path: Path, monkeypatch) -> None:
