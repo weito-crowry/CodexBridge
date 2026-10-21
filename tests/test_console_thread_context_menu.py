@@ -18,13 +18,15 @@ def _thread_item(pane: ThreadListPane, thread_id: str) -> QTreeWidgetItem:
     return next(item for item in items if item.data(0, Qt.ItemDataRole.UserRole) == thread_id)
 
 
-def test_parent_and_empty_placeholder_have_no_thread_context_menu(tmp_path) -> None:
+def test_project_parent_has_folder_menu_and_empty_placeholder_has_no_menu(tmp_path) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     pane = ThreadListPane()
     pane.set_threads([{"id": "a", "cwd": str(tmp_path)}])
 
-    assert pane._context_menu_for_item(pane.list_widget.topLevelItem(0)) is None
+    parent = pane.list_widget.topLevelItem(0)
+    assert parent is not None
+    assert pane._context_menu_for_item(parent) is not None
     pane.set_empty_state("No threads found.")
     placeholder = pane.list_widget.topLevelItem(0)
     assert not placeholder.flags() & Qt.ItemFlag.ItemIsSelectable
@@ -139,3 +141,74 @@ def test_thread_context_menu_copies_cached_nonexistent_cwd_but_disables_open(
     assert len(copied) == 1
     assert f"CWD: {missing_cwd}" in copied[0]
     assert not menu.actions()[-1].isEnabled()
+
+
+def test_project_parent_context_menu_uses_group_path_and_keeps_action_order(
+    tmp_path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = tmp_path / "日本語 project with spaces"
+    cwd.mkdir()
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "a", "cwd": str(cwd)},
+            {"id": "b", "cwd": str(cwd)},
+        ]
+    )
+    parent = pane.list_widget.topLevelItem(0)
+    assert parent is not None
+
+    menu = pane._context_menu_for_item(parent)
+
+    assert menu is not None
+    assert [action.text() for action in menu.actions()] == [
+        "新規スレッドを開始...",
+        "",
+        "エクスプローラーで開く",
+        "フォルダパスをコピー",
+        "ターミナルで開く",
+    ]
+    new_drafts: list[str] = []
+    explorer_paths: list[str] = []
+    terminal_paths: list[str] = []
+    copied_paths: list[str] = []
+    pane.new_thread_for_folder_requested.connect(new_drafts.append)
+    pane.folder_explorer_requested.connect(explorer_paths.append)
+    pane.folder_terminal_requested.connect(terminal_paths.append)
+    monkeypatch.setattr(pane, "_copy_text", copied_paths.append)
+
+    menu.actions()[0].trigger()
+    menu.actions()[2].trigger()
+    menu.actions()[3].trigger()
+    menu.actions()[4].trigger()
+
+    assert new_drafts == [str(cwd)]
+    assert explorer_paths == [str(cwd)]
+    assert copied_paths == [str(cwd)]
+    assert terminal_paths == [str(cwd)]
+
+
+def test_project_parent_context_menu_disables_open_actions_for_missing_folder(
+    tmp_path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    missing_cwd = str(tmp_path / "not-created")
+    pane = ThreadListPane()
+    pane.set_threads([{"id": "a", "cwd": missing_cwd}])
+    parent = pane.list_widget.topLevelItem(0)
+    assert parent is not None
+
+    menu = pane._context_menu_for_item(parent)
+
+    assert menu is not None
+    assert menu.actions()[0].isEnabled() is False
+    assert menu.actions()[2].isEnabled() is False
+    assert menu.actions()[3].isEnabled()
+    assert menu.actions()[4].isEnabled() is False
+    copied: list[str] = []
+    monkeypatch.setattr(pane, "_copy_text", copied.append)
+    menu.actions()[3].trigger()
+    assert copied == [missing_cwd]

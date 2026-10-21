@@ -3,10 +3,19 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from math import ceil
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QSize, Qt, QUrl
-from PySide6.QtGui import QResizeEvent, QTextCursor, QTextDocument, QTextOption
+from PySide6.QtGui import (
+    QDesktopServices,
+    QImageReader,
+    QPixmap,
+    QResizeEvent,
+    QTextCursor,
+    QTextDocument,
+    QTextOption,
+)
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -14,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +48,10 @@ _MESSAGE_OBJECT_NAMES = {
     "Commentary": "conversationCommentary",
     "Plan": "conversationPlan",
 }
+_MAX_IMAGE_ATTACHMENTS = 8
+_MAX_IMAGE_PREVIEW_BYTES = 128 * 1024 * 1024
+_MAX_IMAGE_PREVIEW_PIXELS = 40_000_000
+_IMAGE_PREVIEW_SIZE = QSize(320, 200)
 
 
 class ConversationTextBody(QTextBrowser):
@@ -137,6 +151,80 @@ def _metadata_text(entry: TimelineEntry, timing: str | None) -> str:
     return " · ".join(parts)
 
 
+def _open_local_image(path: str) -> None:
+    try:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    except Exception:
+        return
+
+
+def build_image_attachment_row(paths: tuple[str, ...], parent: QWidget) -> QWidget | None:
+    existing_paths: list[Path] = []
+    for raw_path in paths[:_MAX_IMAGE_ATTACHMENTS]:
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            continue
+        try:
+            if candidate.is_file():
+                existing_paths.append(candidate)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    if not existing_paths:
+        return None
+
+    row = QWidget(parent)
+    row.setObjectName("conversationImageAttachments")
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 2, 0, 2)
+    layout.setSpacing(8)
+    for image_path in existing_paths:
+        attachment = QWidget(row)
+        attachment_layout = QVBoxLayout(attachment)
+        attachment_layout.setContentsMargins(0, 0, 0, 0)
+        attachment_layout.setSpacing(2)
+        try:
+            file_size = image_path.stat().st_size
+            if file_size <= _MAX_IMAGE_PREVIEW_BYTES:
+                reader = QImageReader(str(image_path))
+                reader.setAutoTransform(True)
+                image_size = reader.size()
+                if (
+                    image_size.isValid()
+                    and image_size.width() > 0
+                    and image_size.height() > 0
+                    and image_size.width() * image_size.height() <= _MAX_IMAGE_PREVIEW_PIXELS
+                ):
+                    reader.setScaledSize(
+                        image_size.scaled(_IMAGE_PREVIEW_SIZE, Qt.AspectRatioMode.KeepAspectRatio)
+                    )
+                    image = reader.read()
+                    if not image.isNull():
+                        preview = QLabel(attachment)
+                        preview.setObjectName("conversationImagePreview")
+                        preview.setAccessibleName(f"Image preview: {image_path.name[:160]}")
+                        preview.setAlignment(
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                        )
+                        preview.setPixmap(QPixmap.fromImage(image))
+                        attachment_layout.addWidget(preview)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+        open_button = QToolButton(attachment)
+        open_button.setObjectName("conversationImageOpenButton")
+        file_name = image_path.name[:160] or "Open image"
+        open_button.setText(file_name)
+        open_button.setAccessibleName(f"Open image: {file_name}")
+        open_button.setToolTip("Open local image file")
+        open_button.clicked.connect(
+            lambda _checked=False, path=str(image_path): _open_local_image(path)
+        )
+        attachment_layout.addWidget(open_button)
+        layout.addWidget(attachment, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+    layout.addStretch(1)
+    return row
+
+
 def build_conversation_row(
     entry: TimelineEntry,
     *,
@@ -170,6 +258,11 @@ def build_conversation_row(
         layout.addLayout(header)
         if entry.body:
             layout.addWidget(ConversationTextBody(entry.body, markdown=True, parent=frame))
+        image_row = build_image_attachment_row(entry.images, frame)
+        if image_row is not None:
+            image_row.setProperty("turnId", entry.turn_id)
+            image_row.setProperty("itemId", entry.item_id)
+            layout.addWidget(image_row)
         metadata = _metadata_text(entry, timing)
         if metadata:
             metadata_label = QLabel(metadata)

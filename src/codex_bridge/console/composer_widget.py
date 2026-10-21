@@ -80,7 +80,13 @@ class ComposerWidget(QWidget):
     attachments_changed = Signal(object)
     attachment_notice = Signal(str)
 
-    def __init__(self, allowed_roots: Sequence[str] = (), parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        allowed_roots: Sequence[str] = (),
+        parent: QWidget | None = None,
+        *,
+        attachment_staging_directory: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("composerRoot")
         self.setMinimumWidth(0)
@@ -126,7 +132,11 @@ class ComposerWidget(QWidget):
 
         self.input = ComposerInput(self)
         self.input.send_requested.connect(self.send_requested.emit)
-        self.attachment_bar = ComposerAttachmentBar(self)
+        self.attachment_bar = ComposerAttachmentBar(
+            self,
+            allowed_roots=self._allowed_roots,
+            staging_directory=attachment_staging_directory,
+        )
         self.attachment_bar.attachments_changed.connect(self.attachments_changed.emit)
         self.attachment_bar.validation_notice.connect(self._on_attachment_notice)
         self.attachment_add_button = self.attachment_bar.add_button

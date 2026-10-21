@@ -14,7 +14,7 @@ class ConfigFileError(ValueError):
 
 _SCHEMA: dict[str, dict[str, type[object]]] = {
     "bridge": {"allowed_roots": list, "codex_executable": str},
-    "console": {"ui_port": int},
+    "console": {"ui_port": int, "attachment_staging_directory": str},
     "tunnel": {"executable": str, "profile": str},
     "github_mcp": {
         "enabled": bool,

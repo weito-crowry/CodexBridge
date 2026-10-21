@@ -220,7 +220,10 @@ def build_main_window_ui(window: MainWindow) -> None:
 
     window.thread_pane = ThreadListPane()
     window.history_pane = HistoryPane()
-    composer_widget = ComposerWidget(window._config.allowed_roots)
+    composer_widget = ComposerWidget(
+        window._config.allowed_roots,
+        attachment_staging_directory=window._config.attachment_staging_directory,
+    )
     window.composer_widget = composer_widget
     conversation_pane = QWidget()
     conversation_pane.setObjectName("conversationPane")

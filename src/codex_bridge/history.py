@@ -50,6 +50,8 @@ _KNOWN_ITEMS = {
 }
 _IMAGE_INPUT_TYPES = {"image", "localImage", "audio", "localAudio"}
 _SAFE_PHASES = {"commentary", "final_answer"}
+_MAX_USER_IMAGE_PATHS = 8
+_MAX_IMAGE_PATH_CHARS = 4_096
 
 
 def validate_history_query(limit: object, sort_direction: object) -> tuple[int, str]:
@@ -107,12 +109,15 @@ def _safe_item_id(item: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _project_user_message(item: Mapping[str, Any]) -> dict[str, object] | None:
+def _project_user_message(
+    item: Mapping[str, Any], policy: AllowedPathPolicy
+) -> dict[str, object] | None:
     item_id = _safe_item_id(item)
     content = item.get("content")
     if item_id is None or not isinstance(content, list):
         return None
     parts: list[str] = []
+    images: list[str] = []
     for entry in content[:100]:
         if not isinstance(entry, Mapping):
             continue
@@ -123,7 +128,27 @@ def _project_user_message(item: Mapping[str, Any]) -> dict[str, object] | None:
                 parts.append(text)
         elif entry_type in _IMAGE_INPUT_TYPES:
             parts.append("[image]")
-    return {"id": item_id, "type": "userMessage", "text": _bounded_text("\n".join(parts)) or ""}
+            path = entry.get("path")
+            if (
+                entry_type == "localImage"
+                and isinstance(path, str)
+                and len(path) <= _MAX_IMAGE_PATH_CHARS
+                and len(images) < _MAX_USER_IMAGE_PATHS
+            ):
+                try:
+                    canonical_path = policy.validate_file(path)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if canonical_path not in images:
+                    images.append(canonical_path)
+    projected: dict[str, object] = {
+        "id": item_id,
+        "type": "userMessage",
+        "text": _bounded_text("\n".join(parts)) or "",
+    }
+    if images:
+        projected["images"] = images
+    return projected
 
 
 def _project_item(item: object, policy: AllowedPathPolicy) -> dict[str, object] | None:
@@ -134,7 +159,7 @@ def _project_item(item: object, policy: AllowedPathPolicy) -> dict[str, object] 
         return None
     item_id = _safe_item_id(item)
     if item_type == "userMessage":
-        return _project_user_message(item)
+        return _project_user_message(item, policy)
     if item_type == "agentMessage":
         text = _bounded_text(item.get("text"))
         if item_id is None or text is None:

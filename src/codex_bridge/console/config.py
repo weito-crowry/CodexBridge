@@ -4,6 +4,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import ConfigurationError, validate_allowed_roots
 from ..config_file import ConfigFileError, load_user_config
@@ -43,6 +44,29 @@ def parse_tunnel_profile(value: object, *, source: str = "Tunnel profile") -> st
     return value
 
 
+def parse_attachment_staging_directory(value: object, allowed_roots: tuple[str, ...]) -> str:
+    source = "console.attachment_staging_directory"
+    if not isinstance(value, str) or not value.strip() or not Path(value).is_absolute():
+        raise ConsoleConfigurationError(f"{source} must be an absolute path")
+    candidate = Path(value)
+    if ".." in candidate.parts:
+        raise ConsoleConfigurationError(f"{source} must not contain parent traversal")
+    try:
+        canonical = candidate.resolve(strict=False)
+        roots = tuple(Path(root).resolve(strict=True) for root in allowed_roots)
+    except (OSError, RuntimeError) as exc:
+        raise ConsoleConfigurationError(f"{source} cannot be resolved") from exc
+    for root in roots:
+        try:
+            if os.path.commonpath(
+                (os.path.normcase(os.fspath(root)), os.path.normcase(os.fspath(canonical)))
+            ) == os.path.normcase(os.fspath(root)):
+                return os.fspath(canonical)
+        except ValueError:
+            continue
+    raise ConsoleConfigurationError(f"{source} must be inside bridge.allowed_roots")
+
+
 @dataclass(frozen=True, slots=True)
 class ConsoleConfig:
     """Small console-only configuration; the host is intentionally fixed."""
@@ -52,6 +76,7 @@ class ConsoleConfig:
     tunnel_executable: str | None = None
     tunnel_profile: str = "codex-bridge"
     allowed_roots: tuple[str, ...] = ()
+    attachment_staging_directory: str | None = None
     codex_executable: str | None = None
     codex_executable_source: str = "default"
     tunnel_executable_source: str = "default"
@@ -61,6 +86,10 @@ class ConsoleConfig:
             raise ConsoleConfigurationError("console host is fixed to 127.0.0.1")
         parse_ui_port(self.port)
         parse_tunnel_profile(self.tunnel_profile)
+        if self.attachment_staging_directory is not None:
+            parse_attachment_staging_directory(
+                self.attachment_staging_directory, self.allowed_roots
+            )
 
     @property
     def base_url(self) -> str:
@@ -91,6 +120,7 @@ class ConsoleConfig:
         explicit_codex_executable: str | None = None,
         explicit_tunnel_executable: str | None = None,
         explicit_tunnel_profile: str | None = None,
+        explicit_attachment_staging_directory: str | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> ConsoleConfig:
         values = os.environ if environ is None else environ
@@ -128,6 +158,18 @@ class ConsoleConfig:
         else:
             raw_roots = bridge_config.get("allowed_roots", ())
             allowed_roots = tuple(raw_roots) if isinstance(raw_roots, list) else ()
+
+        if explicit_attachment_staging_directory is not None:
+            staging_value: object = explicit_attachment_staging_directory
+        elif "CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY" in values:
+            staging_value = values["CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY"]
+        else:
+            staging_value = console_config.get("attachment_staging_directory")
+        staging_directory = (
+            parse_attachment_staging_directory(staging_value, allowed_roots)
+            if staging_value is not None
+            else None
+        )
 
         if explicit_codex_executable is not None:
             codex_executable = explicit_codex_executable
@@ -172,6 +214,7 @@ class ConsoleConfig:
             tunnel_executable=tunnel_executable,
             tunnel_profile=parse_tunnel_profile(profile, source="CODEX_BRIDGE_TUNNEL_PROFILE"),
             allowed_roots=allowed_roots,
+            attachment_staging_directory=staging_directory,
             codex_executable=codex_executable,
             codex_executable_source=codex_source,
             tunnel_executable_source=tunnel_source,
