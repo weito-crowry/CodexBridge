@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 import tempfile
 from collections.abc import Sequence
@@ -23,8 +22,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..attachment_policy import MAX_IMAGE_FILE_BYTES, MAX_OTHER_FILE_BYTES, MAX_TOTAL_BYTES
+
 _MAX_ATTACHMENTS = 8
 _CHIP_LABEL_WIDTH = 180
+_COPY_CHUNK_BYTES = 1024 * 1024
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
 
 
 class _FlowLayout(QLayout):
@@ -180,6 +183,14 @@ class ComposerAttachmentBar(QWidget):
         seen = {os.path.normcase(path) for path in existing}
         invalid = duplicate = overflow = False
         staged: list[str] = []
+        stage_errors: list[str] = []
+        staged_sources: set[str] = set()
+        total_size = 0
+        for path in existing:
+            try:
+                total_size += Path(path).stat().st_size
+            except OSError:
+                continue
         for raw_path in paths:
             if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
                 invalid = True
@@ -197,11 +208,19 @@ class ComposerAttachmentBar(QWidget):
                 overflow = True
                 continue
             if self._allowed_roots and not self._is_under_allowed_root(canonical):
+                source_key = os.path.normcase(canonical)
+                if source_key in staged_sources:
+                    duplicate = True
+                    continue
+                staged_sources.add(source_key)
                 try:
-                    canonical = self._stage_external_file(candidate)
+                    canonical = self._stage_external_file(
+                        candidate, existing_total_bytes=total_size
+                    )
                     staged.append(canonical)
-                except (OSError, RuntimeError, ValueError):
+                except (OSError, RuntimeError, ValueError) as exc:
                     invalid = True
+                    stage_errors.append(f"添付ファイルをステージングできません: {exc}")
                     continue
             normalized = os.path.normcase(canonical)
             if normalized in seen:
@@ -212,6 +231,10 @@ class ComposerAttachmentBar(QWidget):
                 continue
             seen.add(normalized)
             existing.append(canonical)
+            try:
+                total_size += Path(canonical).stat().st_size
+            except OSError:
+                total_size += candidate.stat().st_size
 
         updated = tuple(existing)
         if updated != self._attachments:
@@ -221,7 +244,10 @@ class ComposerAttachmentBar(QWidget):
         if invalid or duplicate or overflow:
             messages = []
             if invalid:
-                messages.append("存在しないファイルまたはフォルダは添付できません")
+                if stage_errors:
+                    messages.extend(stage_errors)
+                else:
+                    messages.append("存在しないファイルまたはフォルダは添付できません")
             if duplicate:
                 messages.append("同じファイルは重複して添付できません")
             if overflow:
@@ -243,7 +269,26 @@ class ComposerAttachmentBar(QWidget):
                 continue
         return False
 
-    def _stage_external_file(self, source: Path) -> str:
+    def _stage_external_file(self, source: Path, *, existing_total_bytes: int = 0) -> str:
+        image = source.suffix.casefold() in _IMAGE_SUFFIXES
+        file_limit = MAX_IMAGE_FILE_BYTES if image else MAX_OTHER_FILE_BYTES
+        file_limit_message = (
+            "画像添付は20 MiB以下にしてください"
+            if image
+            else "その他の添付は50 MiB以下にしてください"
+        )
+        source_size = source.stat().st_size
+        if source_size > file_limit:
+            raise ValueError(file_limit_message)
+        total_limit = MAX_TOTAL_BYTES - existing_total_bytes
+        if total_limit < 0 or source_size > total_limit:
+            raise ValueError("添付ファイルの合計は100 MiB以下にしてください")
+        copy_limit = min(file_limit, total_limit)
+        over_limit_message = (
+            file_limit_message
+            if file_limit <= total_limit
+            else "添付ファイルの合計は100 MiB以下にしてください"
+        )
         roots = tuple(Path(value).resolve(strict=True) for value in self._allowed_roots)
         if not roots or any(not root.is_dir() for root in roots):
             raise ValueError("allowed root is unavailable")
@@ -278,7 +323,16 @@ class ComposerAttachmentBar(QWidget):
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as destination, source.open("rb") as origin:
-                shutil.copyfileobj(origin, destination, length=1024 * 1024)
+                copied = 0
+                while True:
+                    remaining = copy_limit - copied
+                    chunk = origin.read(min(_COPY_CHUNK_BYTES, remaining + 1))
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining:
+                        raise ValueError(over_limit_message)
+                    destination.write(chunk)
+                    copied += len(chunk)
                 destination.flush()
                 os.fsync(destination.fileno())
             stem = source.stem

@@ -18,10 +18,20 @@ def _application() -> QCoreApplication:
     return _APP
 
 
+class FakeComposerController:
+    def __init__(self) -> None:
+        self.control_availability: list[bool] = []
+
+    def set_control_available(self, available: bool) -> None:
+        self.control_availability.append(available)
+
+
 class FakeMainWindow(QObject):
     def __init__(self) -> None:
         super().__init__()
         self.timeout_calls: list[str] = []
+        self._global_stream_retry_timer = QTimer(self)
+        self._composer_controller = FakeComposerController()
         callback_names = (
             "_request_health",
             "_request_threads",
@@ -99,6 +109,7 @@ def test_main_window_wrapper_passes_current_exit_timeout_to_timer_and_deadline(
     window._codex_probe = type("CodexProbe", (), {"abort": lambda self: None})()
     window._tunnel = type("Tunnel", (), {"close": lambda self, *, on_finished: None})()
     window._on_exit_tunnel_stopped = lambda: None
+    window._global_stream_retry_timer.start(30_000)
     monkeypatch.setattr(main_window_module, "_EXIT_TIMEOUT_SECONDS", 8.25)
     monkeypatch.setattr(main_window_module, "monotonic", lambda: 100.0)
 
@@ -107,6 +118,8 @@ def test_main_window_wrapper_passes_current_exit_timeout_to_timer_and_deadline(
     assert window.exit_timer.interval() == 8_250
     main_window_module.MainWindow._begin_exit(cast(Any, window))
     assert window._exit_deadline == 108.25
+    assert not window._global_stream_retry_timer.isActive()
+    assert window._composer_controller.control_availability == [False]
 
     for timer_name, _interval, _single_shot, _active, _callback_name in TIMER_SPECS:
         getattr(window, timer_name).stop()
