@@ -61,6 +61,8 @@ class ApiClient(QObject):
     json_failed = Signal(str, str)
     activity_received = Signal(int, object)
     stream_state_changed = Signal(int, str)
+    global_activity_received = Signal(int, object)
+    global_stream_state_changed = Signal(int, str)
     control_succeeded = Signal(str)
     control_failed = Signal(str, str)
     composer_json_succeeded = Signal(str, object)
@@ -88,6 +90,10 @@ class ApiClient(QObject):
         self._stream_generation: int | None = None
         self._stream_parser: SseParser | None = None
         self._stream_connected = False
+        self._global_stream_reply: Any | None = None
+        self._global_stream_generation: int | None = None
+        self._global_stream_parser: SseParser | None = None
+        self._global_stream_connected = False
 
     def _url(self, path: str, query: Mapping[str, object] | None = None) -> QUrl:
         if not path.startswith("/") or "://" in path:
@@ -393,6 +399,84 @@ class ApiClient(QObject):
         )
         self.stream_state_changed.emit(generation, "reconnecting")
 
+    def start_global_stream(self, generation: int) -> None:
+        """Subscribe to live activity for all threads without requesting history replay."""
+        self.stop_global_stream()
+        self._global_stream_generation = generation
+        self._global_stream_parser = SseParser()
+        self._global_stream_connected = False
+        reply = self._manager.get(self._request(self._url("/ui-api/events")))
+        self._global_stream_reply = reply
+        meta_data_changed = getattr(reply, "metaDataChanged", None)
+        if meta_data_changed is not None:
+            meta_data_changed.connect(
+                lambda generation=generation, reply=reply: self._mark_global_stream_connected(
+                    generation, reply
+                )
+            )
+        reply.readyRead.connect(
+            lambda generation=generation, reply=reply: self._consume_global_stream(
+                generation, reply
+            )
+        )
+        reply.finished.connect(
+            lambda generation=generation, reply=reply: self._finish_global_stream(generation, reply)
+        )
+        self.global_stream_state_changed.emit(generation, "reconnecting")
+
+    def _mark_global_stream_connected(self, generation: int, reply: Any) -> None:
+        if self._active_global_stream(generation, reply) and not self._global_stream_connected:
+            self._global_stream_connected = True
+            self.global_stream_state_changed.emit(generation, "connected")
+
+    def _active_global_stream(self, generation: int, reply: Any) -> bool:
+        return self._global_stream_generation == generation and self._global_stream_reply is reply
+
+    def _consume_global_stream(self, generation: int, reply: Any) -> None:
+        if not self._active_global_stream(generation, reply) or self._global_stream_parser is None:
+            return
+        try:
+            events = self._global_stream_parser.feed(bytes(reply.readAll()))
+        except SseProtocolError:
+            self._close_global_stream(generation, reply)
+            return
+        self._mark_global_stream_connected(generation, reply)
+        for event in events:
+            activity = parse_activity_event(event)
+            if activity is not None and self._active_global_stream(generation, reply):
+                self.global_activity_received.emit(generation, activity)
+
+    def _finish_global_stream(self, generation: int, reply: Any) -> None:
+        if not self._active_global_stream(generation, reply):
+            return
+        parser = self._global_stream_parser
+        if not self._has_network_error(reply) and self._status(reply) in range(200, 300):
+            try:
+                events = parser.finish() if parser is not None else ()
+            except SseProtocolError:
+                events = ()
+            for event in events:
+                activity = parse_activity_event(event)
+                if activity is not None:
+                    self.global_activity_received.emit(generation, activity)
+        self._global_stream_reply = None
+        self._global_stream_generation = None
+        self._global_stream_parser = None
+        self._global_stream_connected = False
+        reply.deleteLater()
+        self.global_stream_state_changed.emit(generation, "disconnected")
+
+    def _close_global_stream(self, generation: int, reply: Any) -> None:
+        if not self._active_global_stream(generation, reply):
+            return
+        self._global_stream_reply = None
+        self._global_stream_generation = None
+        self._global_stream_parser = None
+        self._global_stream_connected = False
+        reply.abort()
+        reply.deleteLater()
+        self.global_stream_state_changed.emit(generation, "disconnected")
+
     def _mark_stream_connected(self, generation: int, reply: Any) -> None:
         if self._active_stream(generation, reply) and not self._stream_connected:
             self._stream_connected = True
@@ -466,6 +550,19 @@ class ApiClient(QObject):
         if generation is not None:
             self.stream_state_changed.emit(generation, "idle")
 
+    def stop_global_stream(self) -> None:
+        if self._global_stream_reply is None:
+            return
+        reply, generation = self._global_stream_reply, self._global_stream_generation
+        self._global_stream_reply = None
+        self._global_stream_generation = None
+        self._global_stream_parser = None
+        self._global_stream_connected = False
+        reply.abort()
+        reply.deleteLater()
+        if generation is not None:
+            self.global_stream_state_changed.emit(generation, "idle")
+
     def abort_all(self) -> None:
         for reply in tuple(self._json_replies.values()):
             reply.abort()
@@ -484,3 +581,4 @@ class ApiClient(QObject):
             reply.abort()
             reply.deleteLater()
         self.stop_stream()
+        self.stop_global_stream()

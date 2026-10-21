@@ -16,6 +16,7 @@ ActivityType = Literal[
     "turn_interrupted",
     "command_started",
     "command_completed",
+    "command_output",
     "file_change_started",
     "file_change_completed",
     "agent_commentary",

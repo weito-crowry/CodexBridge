@@ -103,6 +103,63 @@ def test_activity_parser_requires_safe_fields_and_ignores_unknown_fields() -> No
     }
 
 
+def test_activity_parser_allows_bounded_command_monitor_metadata() -> None:
+    payload = json.loads(_payload())
+    payload["type"] = "command_output"
+    payload["summary"] = "日本語 output"
+    payload["details"] = {
+        "cwd": "C:/workspace",
+        "process_id": "pty-42",
+        "duration_ms": 25,
+        "started_at_ms": 1_791_101_948_000,
+        "completed_at_ms": 1_791_101_948_025,
+        "output_truncated": True,
+        "output_source": "completed_item",
+        "raw": "not allowed",
+    }
+
+    activity = parse_activity_event(
+        SseEvent(event="activity", event_id=None, data=json.dumps(payload, ensure_ascii=False))
+    )
+
+    assert activity is not None
+    assert activity["details"] == {
+        "cwd": "C:/workspace",
+        "process_id": "pty-42",
+        "duration_ms": 25,
+        "started_at_ms": 1_791_101_948_000,
+        "completed_at_ms": 1_791_101_948_025,
+        "output_truncated": True,
+        "output_source": "completed_item",
+    }
+
+
+def test_activity_parser_keeps_bounded_notification_request_id() -> None:
+    payload = json.loads(_payload())
+    payload["type"] = "approval_requested"
+    payload["status"] = "requested"
+    payload["details"] = {"request_id": "request-1", "unknown": "ignored"}
+
+    activity = parse_activity_event(
+        SseEvent(event="activity", event_id=None, data=json.dumps(payload))
+    )
+
+    assert activity is not None
+    assert activity["details"] == {"request_id": "request-1"}
+
+
+def test_activity_parser_rejects_malformed_notification_request_id() -> None:
+    payload = json.loads(_payload())
+    payload["details"] = {"request_id": {"nested": "unexpected"}}
+
+    activity = parse_activity_event(
+        SseEvent(event="activity", event_id=None, data=json.dumps(payload))
+    )
+
+    assert activity is not None
+    assert activity["details"] == {}
+
+
 def test_activity_parser_rejects_missing_required_key_even_when_null_is_allowed() -> None:
     payload = json.loads(_payload())
     del payload["turn_id"]

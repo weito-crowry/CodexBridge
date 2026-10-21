@@ -35,10 +35,13 @@ class FakeClient:
         self.json_failed = Signal()
         self.activity_received = Signal()
         self.stream_state_changed = Signal()
+        self.global_activity_received = Signal()
+        self.global_stream_state_changed = Signal()
         self.control_succeeded = Signal()
         self.control_failed = Signal()
         self.requests: list[tuple[str, str, dict[str, object] | None]] = []
         self.streams: list[tuple[str, int]] = []
+        self.global_streams: list[int] = []
         self.aborted_groups: list[str] = []
         self.stopped_streams = 0
         self.aborted_all = False
@@ -62,6 +65,12 @@ class FakeClient:
 
     def stop_stream(self) -> None:
         self.stopped_streams += 1
+
+    def start_global_stream(self, generation: int) -> None:
+        self.global_streams.append(generation)
+
+    def stop_global_stream(self) -> None:
+        pass
 
     def abort_all(self) -> None:
         self.aborted_all = True
@@ -90,6 +99,9 @@ class FakeClient:
 
     def activity(self, generation: int, payload: dict[str, object]) -> None:
         self.activity_received.emit(generation, payload)
+
+    def global_activity(self, generation: int, payload: dict[str, object]) -> None:
+        self.global_activity_received.emit(generation, payload)
 
 
 class FakeDiagnosticsReader:

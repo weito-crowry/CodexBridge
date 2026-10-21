@@ -424,11 +424,40 @@ class Bridge:
         return paths
 
     def _record_item_activity(
-        self, method: str, thread_id: str, turn_id: str, item: dict[str, Any]
+        self,
+        method: str,
+        thread_id: str,
+        turn_id: str,
+        item: dict[str, Any],
+        *,
+        timestamp_ms: int | None = None,
     ) -> None:
         item_id = item.get("id") if isinstance(item.get("id"), str) else None
         item_type = item.get("type")
         if item_type == "commandExecution":
+            if method == "item/completed" and item_id is not None:
+                aggregated_output = item.get("aggregatedOutput")
+                has_output_delta = any(
+                    activity.type == "command_output" and activity.item_id == item_id
+                    for activity in self._activities.get_recent(thread_id, turn_id, limit=500)
+                )
+                if (
+                    isinstance(aggregated_output, str)
+                    and aggregated_output
+                    and not has_output_delta
+                ):
+                    self._record_activity(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        type="command_output",
+                        status="completed",
+                        summary=aggregated_output,
+                        details={
+                            "output_source": "completed_item",
+                            "output_truncated": len(aggregated_output) > 2_000,
+                        },
+                    )
             activity_type: ActivityType = (
                 "command_started" if method == "item/started" else "command_completed"
             )
@@ -436,6 +465,21 @@ class Bridge:
             exit_code = item.get("exitCode")
             if isinstance(exit_code, int) and not isinstance(exit_code, bool):
                 details["exit_code"] = exit_code
+            cwd = item.get("cwd")
+            if isinstance(cwd, str):
+                try:
+                    details["cwd"] = self._path_policy.validate_cwd(cwd)
+                except ValueError:
+                    details["cwd"] = "<path omitted>"
+            process_id = item.get("processId")
+            if isinstance(process_id, str):
+                details["process_id"] = process_id
+            duration_ms = item.get("durationMs")
+            if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
+                details["duration_ms"] = duration_ms
+            if timestamp_ms is not None:
+                timestamp_key = "started_at_ms" if method == "item/started" else "completed_at_ms"
+                details[timestamp_key] = timestamp_ms
             command = item.get("command")
             summary = command if isinstance(command, str) else "Command execution"
             self._record_activity(
@@ -1145,6 +1189,7 @@ class Bridge:
                 type="approval_requested",
                 status="requested",
                 summary=activity_summary,
+                details={"request_id": request_id},
             )
             log_event(
                 "approval.request",
@@ -1185,6 +1230,7 @@ class Bridge:
                 type="user_input_requested",
                 status="requested",
                 summary=_bounded_text(question_summary),
+                details={"request_id": request_id},
             )
             log_event(
                 "user_input.request",
@@ -1244,6 +1290,27 @@ class Bridge:
             ):
                 self._state.update_diff(thread_id, turn_id, params["diff"])
             return
+        if method == "item/commandExecution/outputDelta":
+            item_id = params.get("itemId")
+            delta = params.get("delta")
+            if (
+                isinstance(thread_id, str)
+                and isinstance(turn_id, str)
+                and isinstance(item_id, str)
+                and isinstance(delta, str)
+                and delta
+            ):
+                self._state.ensure_turn(thread_id, turn_id)
+                self._record_activity(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    type="command_output",
+                    status="in_progress",
+                    summary=delta,
+                    details={"output_truncated": True} if len(delta) > 2_000 else None,
+                )
+            return
         if method == "turn/started":
             turn = params.get("turn")
             if (
@@ -1281,7 +1348,9 @@ class Bridge:
                                 self._item_lifecycle.observe_completed(
                                     thread_id, turn_id, item_id, timestamp
                                 )
-                        self._record_item_activity(method, thread_id, turn_id, item)
+                        self._record_item_activity(
+                            method, thread_id, turn_id, item, timestamp_ms=timestamp
+                        )
                         self._activities.publish_transient(
                             thread_id=thread_id,
                             turn_id=turn_id,

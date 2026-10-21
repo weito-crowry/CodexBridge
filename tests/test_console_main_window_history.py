@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -39,6 +40,162 @@ def test_main_window_requests_snapshot_and_applies_connected_status() -> None:
     assert "connected" in window.bridge_status_label.text().casefold()
     assert "ready" in window.app_server_status_label.text().casefold()
     assert client.streams == [("thread-a", 1)]
+    window.close()
+
+
+def test_selected_thread_turn_status_snapshots_keep_running_and_waiting_distinct() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+
+    def thread_item():
+        return next(
+            item
+            for group_index in range(window.thread_pane.list_widget.topLevelItemCount())
+            for group in [window.thread_pane.list_widget.topLevelItem(group_index)]
+            for child_index in range(group.childCount())
+            for item in [group.child(child_index)]
+            if item.data(0, Qt.ItemDataRole.UserRole) == "thread-a"
+        )
+
+    for state, expected_prefix in (
+        ("in_progress", "\u25cf "),
+        ("needs_approval", "\u23f8 "),
+        ("needs_input", "\u270e "),
+        ("needs_user_input", "\u270e "),
+    ):
+        client.result(
+            status_key,
+            {"thread_id": "thread-a", "state": state, "recent_activities": []},
+        )
+        assert window._thread_turn_statuses["thread-a"] == state
+        assert thread_item().text(0).startswith(expected_prefix)
+
+    for state in ("locked", "stopping", "completed"):
+        client.result(
+            status_key,
+            {"thread_id": "thread-a", "state": state, "recent_activities": []},
+        )
+        assert "thread-a" not in window._thread_turn_statuses
+        assert thread_item().text(0) == "A"
+    window.close()
+
+
+def test_thread_list_runtime_flags_show_waiting_without_calling_it_running() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result(
+        "threads",
+        {
+            "threads": [
+                {
+                    "id": "running",
+                    "name": "Running",
+                    "runtime_status": {"type": "active", "active_flags": []},
+                },
+                {
+                    "id": "approval",
+                    "name": "Approval",
+                    "runtime_status": {
+                        "type": "active",
+                        "active_flags": ["waitingOnApproval"],
+                    },
+                },
+                {
+                    "id": "input",
+                    "name": "Input",
+                    "runtime_status": {
+                        "type": "active",
+                        "active_flags": ["waitingOnUserInput"],
+                    },
+                },
+                {"id": "idle", "name": "Idle", "runtime_status": {"type": "idle"}},
+                {"id": "invalid", "name": "Invalid", "runtime_status": {"type": "active"}},
+            ]
+        },
+    )
+
+    def thread_item(thread_id: str):
+        return next(
+            item
+            for group_index in range(window.thread_pane.list_widget.topLevelItemCount())
+            for group in [window.thread_pane.list_widget.topLevelItem(group_index)]
+            for child_index in range(group.childCount())
+            for item in [group.child(child_index)]
+            if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
+        )
+
+    assert thread_item("running").text(0) == "\u25cf Running"
+    assert thread_item("approval").text(0) == "\u23f8 Approval"
+    assert thread_item("input").text(0) == "\u270e Input"
+    assert thread_item("idle").text(0) == "Idle"
+    assert thread_item("invalid").text(0) == "Invalid"
+    assert window.thread_pane.thread_count == 5
+    window.close()
+
+
+def test_non_turn_activity_does_not_replace_observed_turn_status() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "needs_approval", "recent_activities": []},
+    )
+    activity = {
+        "activity_id": "command-started",
+        "thread_id": "thread-a",
+        "turn_id": "turn-a",
+        "type": "command_started",
+        "status": "in_progress",
+        "summary": "Command started",
+        "details": {},
+    }
+
+    client.activity(window._selection_generation, activity)
+
+    assert window._thread_turn_statuses["thread-a"] == "needs_approval"
+    window.close()
+
+
+def test_thread_list_keeps_selected_status_fallback_when_runtime_status_is_missing() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread("thread-a")
+    status_key = next(key for key, _, _ in client.requests if key.endswith(":status"))
+    client.result(
+        status_key,
+        {"thread_id": "thread-a", "state": "needs_approval", "recent_activities": []},
+    )
+
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+
+    assert window._thread_turn_statuses["thread-a"] == "needs_approval"
+    assert window.thread_pane._thread_for_id("thread-a") is not None
+    window.close()
+
+
+def test_turn_history_status_is_projected_into_thread_list() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    client.result("threads", {"threads": [{"id": "thread-a", "name": "A"}]})
+    window.select_thread("thread-a")
+    turns_key = f"selection:{window._selection_generation}:turns"
+
+    client.result(turns_key, {"turns": [{"id": "turn-a", "status": "needs_input"}]})
+
+    assert window._thread_turn_statuses["thread-a"] == "needs_input"
+    assert window.thread_pane._thread_for_id("thread-a") is not None
     window.close()
 
 

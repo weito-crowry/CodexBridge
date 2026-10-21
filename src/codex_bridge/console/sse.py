@@ -180,9 +180,25 @@ def parse_activity_event(event: SseEvent) -> dict[str, object] | None:
         return None
 
     safe_details: dict[str, object] = {}
-    exit_code = details.get("exit_code")
-    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
-        safe_details["exit_code"] = exit_code
+    for key in ("exit_code", "duration_ms", "started_at_ms", "completed_at_ms"):
+        value = details.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            safe_details[key] = value
+    for key in ("cwd", "process_id"):
+        value = _bounded_string(details.get(key), 4_096 if key == "cwd" else 512)
+        if value is not None:
+            safe_details[key] = value
+    request_id = details.get("request_id")
+    if isinstance(request_id, int) and not isinstance(request_id, bool):
+        safe_details["request_id"] = request_id
+    elif _bounded_string(request_id, 512) is not None:
+        safe_details["request_id"] = request_id
+    output_truncated = details.get("output_truncated")
+    if isinstance(output_truncated, bool):
+        safe_details["output_truncated"] = output_truncated
+    output_source = _bounded_string(details.get("output_source"), 64)
+    if output_source == "completed_item":
+        safe_details["output_source"] = output_source
     decision = _bounded_string(details.get("decision"), 256)
     if decision is not None:
         safe_details["decision"] = decision

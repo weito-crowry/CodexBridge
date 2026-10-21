@@ -328,6 +328,28 @@ def copy_to_clipboard(text: str) -> None:
         application.clipboard().setText(text)
 
 
+def _thread_status_marker(status: str | None) -> str:
+    if status is None:
+        return ""
+    return {
+        "in_progress": "\u25cf ",
+        "needs_approval": "\u23f8 ",
+        "needs_input": "\u270e ",
+        "needs_user_input": "\u270e ",
+        "waiting": "\u23f8 ",
+    }.get(status, "")
+
+
+def _thread_status_label(status: str) -> str:
+    return {
+        "in_progress": "Running",
+        "needs_approval": "Waiting for approval",
+        "needs_input": "Waiting for input",
+        "needs_user_input": "Waiting for input",
+        "waiting": "Waiting",
+    }.get(status, status)
+
+
 class ThreadListPane(QWidget):
     refresh_requested = Signal()
     bulk_thread_naming_requested = Signal()
@@ -342,6 +364,8 @@ class ThreadListPane(QWidget):
         super().__init__(parent)
         self._threads: list[dict[str, object]] = []
         self._active_thread_ids: set[str] = set()
+        self._thread_statuses: dict[str, str] = {}
+        self._has_thread_statuses = False
         self._project_names: dict[str, str] = {}
         self._collapsed_group_keys: set[str] = set()
         self._selected_thread_id: str | None = None
@@ -375,6 +399,7 @@ class ThreadListPane(QWidget):
         threads: Sequence[Mapping[str, object]],
         *,
         active_thread_ids: Collection[str] | None = None,
+        thread_statuses: Mapping[str, str] | None = None,
         project_names: Mapping[str, str] | None = None,
     ) -> None:
         self._threads = [dict(thread) for thread in threads]
@@ -385,10 +410,18 @@ class ThreadListPane(QWidget):
             self._selected_thread_id = None
         if active_thread_ids is not None:
             self._active_thread_ids = set(active_thread_ids)
+        if thread_statuses is not None:
+            self._thread_statuses = dict(thread_statuses)
+            self._has_thread_statuses = True
         self._render()
 
     def set_active_thread_ids(self, thread_ids: Collection[str]) -> None:
         self._active_thread_ids = set(thread_ids)
+        self._render()
+
+    def set_thread_statuses(self, thread_statuses: Mapping[str, str]) -> None:
+        self._thread_statuses = dict(thread_statuses)
+        self._has_thread_statuses = True
         self._render()
 
     @property
@@ -400,6 +433,7 @@ class ThreadListPane(QWidget):
 
     def _render(self) -> None:
         query = self.filter_edit.text().casefold()
+        scroll_value = self.list_widget.verticalScrollBar().value()
         current_item = self.list_widget.currentItem()
         if current_item is not None:
             self._remember_selected_thread(current_item, None)
@@ -464,11 +498,14 @@ class ThreadListPane(QWidget):
                     if not isinstance(thread_id, str):
                         continue
                     title = _safe_text(thread.get("name")) or "New スレッド"
-                    is_active = thread_id in self._active_thread_ids
-                    item = QTreeWidgetItem([f"\u25cf {title}" if is_active else title])
+                    status = self._thread_statuses.get(thread_id)
+                    status_marker = _thread_status_marker(status)
+                    if not self._has_thread_statuses and thread_id in self._active_thread_ids:
+                        status_marker = "\u25cf "
+                    item = QTreeWidgetItem([f"{status_marker}{title}" if status_marker else title])
                     item.setData(0, Qt.ItemDataRole.UserRole, thread_id)
                     item.setToolTip(0, thread_id)
-                    if is_active:
+                    if status_marker:
                         font = QFont(item.font(0))
                         font.setWeight(QFont.Weight.DemiBold)
                         item.setFont(0, font)
@@ -484,6 +521,7 @@ class ThreadListPane(QWidget):
                 parent.setExpanded(bool(query) or not collapsed)
             if selected_item is not None:
                 self.list_widget.setCurrentItem(selected_item)
+            self.list_widget.verticalScrollBar().setValue(scroll_value)
         finally:
             self._rendering = False
 
@@ -565,7 +603,13 @@ class ThreadListPane(QWidget):
         cwd = self._cached_cwd(thread.get("cwd"))
         if cwd is not None:
             lines.append(f"CWD: {cwd}")
-        lines.append(f"Status: {'active' if thread_id in self._active_thread_ids else 'inactive'}")
+        status = self._thread_statuses.get(thread_id)
+        if status is not None:
+            lines.append(f"Turn status: {_thread_status_label(status)}")
+        elif not self._has_thread_statuses:
+            lines.append(
+                f"Status: {'active' if thread_id in self._active_thread_ids else 'inactive'}"
+            )
         return "\n".join(lines)
 
     @staticmethod
@@ -722,13 +766,18 @@ class HistoryPane(QWidget):
         self.details_mode_button = QPushButton("Details")
         self.details_mode_button.setObjectName("historyModeButton")
         self.details_mode_button.setCheckable(True)
+        self.messages_mode_button = QPushButton("Messages")
+        self.messages_mode_button.setObjectName("historyModeButton")
+        self.messages_mode_button.setCheckable(True)
         mode_group = QButtonGroup(self)
         mode_group.setExclusive(True)
         mode_group.addButton(self.conversation_mode_button)
         mode_group.addButton(self.details_mode_button)
+        mode_group.addButton(self.messages_mode_button)
         self.conversation_mode_button.setChecked(True)
         self.conversation_mode_button.clicked.connect(lambda: self.set_mode("Conversation"))
         self.details_mode_button.clicked.connect(lambda: self.set_mode("Details"))
+        self.messages_mode_button.clicked.connect(lambda: self.set_mode("Messages"))
         self.activity_toggle_button = QPushButton("Hide Activity")
         self.activity_toggle_button.setObjectName("activityVisibilityButton")
         self.activity_toggle_button.clicked.connect(self.activity_visibility_requested.emit)
@@ -743,6 +792,7 @@ class HistoryPane(QWidget):
         mode_bar.setSpacing(4)
         mode_bar.addWidget(self.conversation_mode_button)
         mode_bar.addWidget(self.details_mode_button)
+        mode_bar.addWidget(self.messages_mode_button)
         mode_bar.addStretch(1)
         mode_bar.addWidget(self.activity_toggle_button)
         self.load_older_button = QPushButton("Load older")
@@ -787,7 +837,7 @@ class HistoryPane(QWidget):
         return self._mode
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"Conversation", "Details"}:
+        if mode not in {"Conversation", "Details", "Messages"}:
             raise ValueError(f"Unsupported history mode: {mode}")
         if mode == self._mode:
             return
@@ -799,12 +849,13 @@ class HistoryPane(QWidget):
         self._mode = mode
         self.conversation_mode_button.setChecked(mode == "Conversation")
         self.details_mode_button.setChecked(mode == "Details")
+        self.messages_mode_button.setChecked(mode == "Messages")
         self._render_generation += 1
         generation = self._render_generation
         self._scroll_update_pending = True
         self._render_timeline_rows(tuple(self._timeline_rows))
-        self._empty_label.setVisible(not any(row.kind == "card" for row in self._timeline_rows))
-        has_entries = any(row.kind == "card" for row in self._timeline_rows)
+        has_entries = self._has_visible_timeline_entries()
+        self._empty_label.setVisible(not has_entries)
         self._scroll.setVisible(has_entries)
         self._content.updateGeometry()
         self._scroll_restore_state = (
@@ -822,7 +873,12 @@ class HistoryPane(QWidget):
         scroll_value = self._scroll.verticalScrollBar().value()
         for row in self._timeline_rows:
             widget = self._timeline_row_widgets.get(row.key)
-            if widget is not None and widget.geometry().bottom() >= scroll_value:
+            if (
+                widget is not None
+                and not widget.isHidden()
+                and row.kind == "card"
+                and widget.geometry().bottom() >= scroll_value
+            ):
                 return row.key, widget.geometry().top() - scroll_value
         return None
 
@@ -875,7 +931,7 @@ class HistoryPane(QWidget):
     def _timeline_row_widget(self, row: _HistoryRenderRow) -> QWidget:
         if row.kind == "card":
             assert isinstance(row.value, TimelineEntry)
-            if self._mode == "Conversation":
+            if self._mode in {"Conversation", "Messages"}:
                 entry = row.value
                 item_key = (entry.turn_id, entry.item_id)
                 timing = (
@@ -937,6 +993,27 @@ class HistoryPane(QWidget):
             self._content_layout.addWidget(widget)
             self._timeline_row_widgets[row.key] = widget
         self._timeline_rows = list(rows)
+        self._update_mode_visibility()
+
+    def _row_is_visible_in_mode(self, row: _HistoryRenderRow) -> bool:
+        if self._mode != "Messages":
+            return True
+        return (
+            row.kind == "card"
+            and isinstance(row.value, TimelineEntry)
+            and row.value.kind in {"User", "Commentary", "Agent"}
+        )
+
+    def _has_visible_timeline_entries(self) -> bool:
+        return any(
+            row.kind == "card" and self._row_is_visible_in_mode(row) for row in self._timeline_rows
+        )
+
+    def _update_mode_visibility(self) -> None:
+        for row in self._timeline_rows:
+            widget = self._timeline_row_widgets.get(row.key)
+            if widget is not None:
+                widget.setVisible(self._row_is_visible_in_mode(row))
 
     def _layout_index(self, widget: QWidget) -> int | None:
         for index in range(self._content_layout.count()):
@@ -990,6 +1067,7 @@ class HistoryPane(QWidget):
             self._content_layout.insertWidget(index, widget)
             self._timeline_row_widgets[row.key] = widget
         self._timeline_rows = list(rows)
+        self._update_mode_visibility()
 
     def set_timeline(
         self,
@@ -1078,9 +1156,10 @@ class HistoryPane(QWidget):
             self._reconcile_timeline_rows(render_rows)
         else:
             self._render_timeline_rows(render_rows)
-        self._empty_label.setVisible(not render_entries)
-        self._scroll.setVisible(bool(render_entries))
-        if not render_entries:
+        has_visible_entries = self._has_visible_timeline_entries()
+        self._empty_label.setVisible(not has_visible_entries)
+        self._scroll.setVisible(has_visible_entries)
+        if not has_visible_entries:
             should_follow = True
             self._follow_newest = True
         self._timeline_render_signature = render_signature

@@ -75,6 +75,10 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.appearance_button.setText("Appearance")
     window.appearance_button.setObjectName("appearanceButton")
     window.appearance_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+    window.notification_settings_button = QToolButton()
+    window.notification_settings_button.setText("Notifications")
+    window.notification_settings_button.setObjectName("notificationSettingsButton")
+    window.notification_settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
     window.diagnostics_toggle_button = QPushButton("Diagnostics")
     window.diagnostics_clear_button = QPushButton("Clear")
     window.retry_now_button = QPushButton("Retry now")
@@ -212,6 +216,7 @@ def build_main_window_ui(window: MainWindow) -> None:
     status_bar.addWidget(window.usage_status_label)
     status_bar.addWidget(window.status_button)
     status_bar.addWidget(window.appearance_button)
+    status_bar.addWidget(window.notification_settings_button)
 
     window.thread_pane = ThreadListPane()
     window.history_pane = HistoryPane()
