@@ -252,6 +252,7 @@ class ActivityPane(QWidget):
             self._command_output_activity_order.clear()
             self._command_output_items.clear()
             self._command_output_item_order.clear()
+        self.process_monitor.set_app_server_os_pid(snapshot.get("app_server_os_pid"))
         self.merge_activities(snapshot.get("recent_activities"))
         self._set_pending_request_state(pending_label)
 
@@ -517,6 +518,7 @@ class ActivityPane(QWidget):
         self._state_section.show()
 
     def set_error(self, text: str) -> None:
+        self.process_monitor.set_app_server_os_pid(None)
         self.state_label.setText(text)
         self._set_effective_access_unavailable("Unavailable")
         self.pending_label.clear()

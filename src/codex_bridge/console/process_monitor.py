@@ -207,11 +207,33 @@ class ProcessMonitorWidget(QWidget):
             self.refresh_processes()
 
     def set_snapshot(self, snapshot: Mapping[str, object]) -> None:
+        self.set_app_server_os_pid(snapshot.get("app_server_os_pid"))
         recent = snapshot.get("recent_activities")
         if isinstance(recent, list):
             for activity in recent:
                 if isinstance(activity, Mapping):
                     self.append_activity(activity)
+
+    def set_app_server_os_pid(self, value: object) -> None:
+        pid = (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= value <= 4_294_967_295
+            else None
+        )
+        if pid == self._evidence.app_server_os_pid:
+            return
+        self._generation += 1
+        if self._active_cancel is not None:
+            self._active_cancel.set()
+        self._evidence = ProcessEvidence(app_server_os_pid=pid)
+        self._last_result = None
+        self._refresh_pending = bool(self._records)
+        self.process_status_label.setText("App Server process changed; refreshing…")
+        self.process_text.setPlainText("Previous process observations cleared.")
+        if self._records:
+            self.refresh_processes()
 
     def reset(self) -> None:
         self._generation += 1
@@ -394,12 +416,16 @@ class ProcessMonitorWidget(QWidget):
     def _prune_evidence(self) -> None:
         keys = set(self._records)
         self._evidence = ProcessEvidence(
+            app_server_os_pid=self._evidence.app_server_os_pid,
+            app_server_identity=self._evidence.app_server_identity,
             roots=tuple((key, value) for key, value in self._evidence.roots if key in keys),
             children=tuple((key, value) for key, value in self._evidence.children if key in keys),
         )
 
     def _remove_evidence_for(self, key: CommandKey) -> None:
         self._evidence = ProcessEvidence(
+            app_server_os_pid=self._evidence.app_server_os_pid,
+            app_server_identity=self._evidence.app_server_identity,
             roots=tuple(
                 (record_key, value)
                 for record_key, value in self._evidence.roots
@@ -506,6 +532,7 @@ def _process_lines(process: ProcessView, *, prefix: str) -> list[str]:
     return [
         f"{prefix}Windows PID: {process.pid}",
         f"{prefix}Name: {_display(process.name)}",
+        f"{prefix}Executable: {_display(process.executable)}",
         f"{prefix}Created: {_time_text(process.create_time)}",
         f"{prefix}Command line: {_display(process.command_line)}",
         f"{prefix}Parent PID: {_display(str(process.ppid) if process.ppid is not None else None)}",

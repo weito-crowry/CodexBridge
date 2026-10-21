@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+import ntpath
+import re
 import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Event
 from typing import Any, cast
 
@@ -14,8 +16,12 @@ _ROOT_CREATED_BEFORE_COMMAND_SECONDS = 60.0
 _ROOT_CREATED_AFTER_COMMAND_SECONDS = 10.0
 _MAX_TRACKED_CHILDREN = 100
 _MAX_SCANNED_PROCESSES = 5_000
+_MAX_ROOT_CANDIDATES = 100
 _MAX_SCAN_SECONDS = 1.0
-_PROCESS_ITER_ATTRIBUTES = ["pid", "ppid", "create_time"]
+_PROCESS_ITER_ATTRIBUTES = ["pid", "ppid", "create_time", "name"]
+_COMMAND_LINE_LIMIT = 8_000
+_COMMAND_ARGUMENT_LIMIT = 256
+_COMMAND_ARGUMENTS_TOTAL_LIMIT = 16_000
 
 
 @dataclass(frozen=True, order=True)
@@ -44,6 +50,8 @@ class ProcessIdentity:
 
 @dataclass(frozen=True)
 class ProcessEvidence:
+    app_server_os_pid: int | None = None
+    app_server_identity: ProcessIdentity | None = None
     roots: tuple[tuple[CommandKey, ProcessIdentity], ...] = ()
     children: tuple[tuple[CommandKey, tuple[ProcessIdentity, ...]], ...] = ()
 
@@ -57,6 +65,8 @@ class ProcessView:
     ppid: int | None
     status: str | None
     state: str
+    executable: str | None = None
+    arguments: tuple[str, ...] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,12 @@ def inspect_command_processes(
         )
     if _is_cancelled(cancelled):
         return InspectionResult(_empty_states(command_list, "Unknown"), evidence)
+    anchor_pid = _positive_integer(evidence.app_server_os_pid)
+    if anchor_pid is None:
+        return InspectionResult(
+            _empty_states(command_list, "Unverified: App Server anchor unavailable"),
+            ProcessEvidence(),
+        )
     if psutil_module is None:
         try:
             import psutil  # type: ignore[import-untyped]
@@ -109,9 +125,46 @@ def inspect_command_processes(
 
     now = time.time() if observed_at is None else observed_at
     errors = _psutil_errors(psutil_module)
+    try:
+        anchor_process = runtime_psutil.Process(anchor_pid)
+        anchor_create_time = _number(anchor_process.create_time())
+    except errors.access_denied:
+        return InspectionResult(
+            _empty_states(command_list, "Unverified: App Server anchor access denied"),
+            ProcessEvidence(app_server_os_pid=anchor_pid),
+        )
+    except errors.all:
+        anchor_create_time = None
+    if anchor_create_time is None:
+        return InspectionResult(
+            _empty_states(command_list, "Unverified: App Server anchor unavailable"),
+            ProcessEvidence(app_server_os_pid=anchor_pid),
+        )
+
+    anchor_identity = ProcessIdentity(anchor_pid, anchor_create_time)
+    prior_anchor = (
+        evidence.app_server_identity if evidence.app_server_os_pid == anchor_pid else None
+    )
+    if prior_anchor is not None and not _same_identity(prior_anchor, anchor_identity):
+        return InspectionResult(
+            _empty_states(command_list, "Unverified: App Server anchor PID reused"),
+            ProcessEvidence(
+                app_server_os_pid=anchor_pid,
+                app_server_identity=anchor_identity,
+            ),
+        )
+
     command_keys = {command.key for command in command_list}
-    old_roots = {key: identity for key, identity in evidence.roots if key in command_keys}
-    old_children = {key: list(items) for key, items in evidence.children if key in command_keys}
+    old_roots = (
+        {key: identity for key, identity in evidence.roots if key in command_keys}
+        if prior_anchor is not None
+        else {}
+    )
+    old_children = (
+        {key: list(items) for key, items in evidence.children if key in command_keys}
+        if prior_anchor is not None
+        else {}
+    )
     roots = dict(old_roots)
     children = {key: list(items) for key, items in old_children.items()}
     states: dict[CommandKey, CommandProcessState] = {}
@@ -125,90 +178,127 @@ def inspect_command_processes(
     }
 
     for command in command_list:
-        if _is_cancelled(cancelled):
-            break
-        pid = _windows_pid(command.app_server_process_id)
         prior = old_roots.get(command.key)
-        if pid is None or (prior is not None and prior.pid != pid):
-            roots.pop(command.key, None)
-            children.pop(command.key, None)
-            prior = None
-        if pid is None:
-            root_views[command.key] = None
-            states[command.key] = CommandProcessState(
-                command,
-                "Unverified: App Server ID is not a decimal Windows PID",
-                None,
-                (),
-            )
-            continue
-        try:
-            process = runtime_psutil.Process(pid)
-            create_time = _number(process.create_time())
-        except errors.zombie:
-            root_views[command.key] = _prior_view(prior, "Exited")
-            states[command.key] = CommandProcessState(
-                command, "Exited (zombie)", root_views[command.key], ()
-            )
-            continue
-        except errors.no_such_process:
-            root_views[command.key] = _prior_view(prior, "Exited")
-            status = "Exited" if prior is not None else "Exited (not observed)"
-            states[command.key] = CommandProcessState(command, status, root_views[command.key], ())
-            continue
-        except errors.access_denied:
-            root_views[command.key] = _prior_view(prior, "Access denied")
-            states[command.key] = CommandProcessState(
-                command, "Access denied", root_views[command.key], ()
-            )
-            continue
-
-        if create_time is None:
-            root_views[command.key] = _prior_view(prior, "Unknown")
-            states[command.key] = CommandProcessState(
-                command, "Unknown: process creation time unavailable", root_views[command.key], ()
-            )
-            continue
-        identity = ProcessIdentity(pid, create_time)
-        if prior is not None and not _same_identity(prior, identity):
-            root_views[command.key] = None
-            states[command.key] = CommandProcessState(command, "PID reused", None, ())
-            continue
         if prior is None:
-            if command.started_at_seconds is None:
-                root_views[command.key] = None
-                states[command.key] = CommandProcessState(
-                    command,
-                    "Unverified: command start timestamp is unavailable",
-                    None,
-                    (),
-                )
-                continue
-            age = command.started_at_seconds - create_time
-            if age > _ROOT_CREATED_BEFORE_COMMAND_SECONDS:
-                root_views[command.key] = None
-                states[command.key] = CommandProcessState(
-                    command,
-                    "Unverified: process predates command by more than 60s",
-                    None,
-                    (),
-                )
-                continue
-            if age < -_ROOT_CREATED_AFTER_COMMAND_SECONDS:
-                root_views[command.key] = None
-                states[command.key] = CommandProcessState(
-                    command,
-                    "Unverified: process was created more than 10s after command",
-                    None,
-                    (),
-                )
-                continue
-        roots[command.key] = identity
-        state, view, active = _read_live_process(process, identity, errors)
+            continue
+        state, view, active = _read_identity(runtime_psutil, prior, errors)
+        # Keep the original identity as evidence after PID reuse. Dropping it
+        # could let a replacement process match this command on the next poll.
         root_views[command.key] = view
         if active:
-            root_active[command.key] = identity
+            root_active[command.key] = prior
         states[command.key] = CommandProcessState(command, state, view, ())
+
+    scan = _scan_processes(runtime_psutil, errors, cancelled)
+    descendants = _descendants(anchor_identity, scan, now)
+    try:
+        after_scan_time = _number(runtime_psutil.Process(anchor_pid).create_time())
+    except errors.all:
+        after_scan_time = None
+    if after_scan_time is None or not _same_identity(
+        anchor_identity, ProcessIdentity(anchor_pid, after_scan_time)
+    ):
+        return InspectionResult(
+            _empty_states(command_list, "Unverified: App Server anchor changed during inspection"),
+            ProcessEvidence(app_server_os_pid=anchor_pid),
+        )
+
+    candidate_views: dict[ProcessIdentity, tuple[str, ProcessView | None]] = {}
+    matches: dict[CommandKey, list[tuple[ProcessIdentity, ProcessView, str]]] = {}
+    unverified_reasons: dict[CommandKey, str] = {}
+    candidate_limit_reached: set[CommandKey] = set()
+    inspected_candidates = 0
+    for command in command_list:
+        if _is_cancelled(cancelled) or command.key in states:
+            continue
+        if command.started_at_seconds is None:
+            unverified_reasons[command.key] = "Unverified: command start timestamp unavailable"
+            continue
+        command_started_at = command.started_at_seconds
+        if command_started_at < anchor_identity.create_time - 1.0:
+            unverified_reasons[command.key] = (
+                "Unverified: App Server anchor started after this command"
+            )
+            continue
+        eligible_count = 0
+        inaccessible = False
+        unavailable_reason: str | None = None
+        time_mismatch = False
+        for identity in sorted(
+            descendants,
+            key=lambda candidate: abs(command_started_at - candidate.create_time),
+        ):
+            age = command_started_at - identity.create_time
+            if (
+                age > _ROOT_CREATED_BEFORE_COMMAND_SECONDS
+                or age < -_ROOT_CREATED_AFTER_COMMAND_SECONDS
+            ):
+                time_mismatch = True
+                continue
+            scanned_process = scan.get(identity.pid)
+            scanned_name = scanned_process[2].name if scanned_process is not None else None
+            if not _may_be_command_shell(command.summary, scanned_name):
+                continue
+            eligible_count += 1
+            cached = candidate_views.get(identity)
+            if cached is None:
+                if inspected_candidates >= _MAX_ROOT_CANDIDATES:
+                    candidate_limit_reached.add(command.key)
+                    continue
+                inspected_candidates += 1
+                candidate_views[identity] = _observe_candidate(runtime_psutil, identity, errors)
+                candidate_state, candidate_view = candidate_views[identity]
+            else:
+                candidate_state, candidate_view = cached
+            if candidate_state == "Access denied":
+                inaccessible = True
+                continue
+            if candidate_view is None:
+                if candidate_state.startswith("Unverified:"):
+                    unavailable_reason = candidate_state
+                continue
+            if _command_matches(command.summary, candidate_view):
+                matches.setdefault(command.key, []).append(
+                    (identity, candidate_view, candidate_state)
+                )
+        if eligible_count == 0 and time_mismatch:
+            unverified_reasons[command.key] = (
+                "Unverified: no Codex child within command time window"
+            )
+        elif inaccessible:
+            unverified_reasons[command.key] = (
+                "Unverified: Codex child command metadata access denied"
+            )
+        elif unavailable_reason is not None:
+            unverified_reasons[command.key] = unavailable_reason
+        elif not matches.get(command.key):
+            unverified_reasons[command.key] = "Unverified: no matching Codex child"
+
+    candidate_owners: dict[ProcessIdentity, list[CommandKey]] = {}
+    for key, command_matches in matches.items():
+        for identity, _view, _state in command_matches:
+            candidate_owners.setdefault(identity, []).append(key)
+
+    for command in command_list:
+        if command.key in states:
+            continue
+        command_matches = matches.get(command.key, [])
+        root_view: ProcessView | None = None
+        if command.key in candidate_limit_reached:
+            status = "Unverified: Codex child candidate limit reached"
+        elif len(command_matches) > 1:
+            status = "Unverified: ambiguous matching Codex children"
+        elif command_matches and len(candidate_owners[command_matches[0][0]]) > 1:
+            status = "Unverified: Codex child matches multiple commands"
+        elif command_matches:
+            identity, root_view, status = command_matches[0]
+            roots[command.key] = identity
+            root_views[command.key] = root_view
+            if status == "Running":
+                root_active[command.key] = identity
+        else:
+            status = unverified_reasons.get(command.key, "Unverified: no matching Codex child")
+        states[command.key] = CommandProcessState(command, status, root_view, ())
 
     for command in command_list:
         if _is_cancelled(cancelled):
@@ -219,8 +309,7 @@ def inspect_command_processes(
             if active:
                 child_active.setdefault(command.key, set()).add(identity)
 
-    if any(root_active.values()) or any(child_active.values()):
-        scan = _scan_processes(psutil_module, errors, cancelled)
+    if root_active or any(child_active.values()):
         command_by_key = {command.key: command for command in command_list}
         for key, identity in tuple(root_active.items()):
             state, view, active = _read_identity(runtime_psutil, identity, errors)
@@ -258,6 +347,8 @@ def inspect_command_processes(
     return InspectionResult(
         tuple(states[command.key] for command in command_list if command.key in states),
         ProcessEvidence(
+            app_server_os_pid=anchor_pid,
+            app_server_identity=anchor_identity,
             roots=tuple(roots.items()),
             children=tuple((key, tuple(items)) for key, items in children.items() if items),
         ),
@@ -268,16 +359,6 @@ def _empty_states(
     commands: Sequence[CommandDescriptor], message: str
 ) -> tuple[CommandProcessState, ...]:
     return tuple(CommandProcessState(command, message, None, ()) for command in commands)
-
-
-def _windows_pid(value: str) -> int | None:
-    if not value or not value.isascii() or not value.isdecimal():
-        return None
-    try:
-        pid = int(value)
-    except ValueError:
-        return None
-    return pid if 1 <= pid <= 4_294_967_295 else None
 
 
 def _number(value: object) -> float | None:
@@ -315,6 +396,8 @@ def _safe_call(process: object, name: str, errors: Any) -> object | None:
         return cast(object | None, getattr(process, name)())
     except errors.all:
         return None
+    except (AttributeError, OSError, TypeError):
+        return None
 
 
 def _read_live_process(
@@ -322,7 +405,9 @@ def _read_live_process(
 ) -> tuple[str, ProcessView, bool]:
     runtime_process: Any = process
     name = _string_or_none(_safe_call(process, "name", errors))
-    command_line = _command_line(_safe_call(process, "cmdline", errors))
+    executable = _string_or_none(_safe_call(process, "exe", errors))
+    arguments = _command_arguments(_safe_call(process, "cmdline", errors))
+    command_line = _command_line(arguments)
     ppid = _positive_integer(_safe_call(process, "ppid", errors))
     ended = False
     inaccessible = False
@@ -364,6 +449,8 @@ def _read_live_process(
             ppid,
             process_status,
             state,
+            executable,
+            arguments,
         ),
         state == "Running",
     )
@@ -383,7 +470,13 @@ def _read_identity(
     except errors.access_denied:
         return "Access denied", _identity_view(identity, "Access denied"), False
     current = ProcessIdentity(identity.pid, create_time or 0.0)
-    if create_time is None or not _same_identity(identity, current):
+    if create_time is None:
+        return (
+            "Unknown: creation time unavailable",
+            _identity_view(identity, "Unknown: creation time unavailable"),
+            False,
+        )
+    if not _same_identity(identity, current):
         return "PID reused", _identity_view(identity, "PID reused"), False
     return _read_live_process(process, identity, errors)
 
@@ -419,15 +512,219 @@ def _scan_processes(
             if pid is None or create_time is None:
                 continue
             ppid = _positive_integer(info.get("ppid"))
+            name = _string_or_none(info.get("name"))
             identity = ProcessIdentity(pid, create_time)
             result[pid] = (
                 identity,
                 ppid,
-                ProcessView(pid, create_time, None, None, ppid, None, "Unknown"),
+                ProcessView(pid, create_time, name, None, ppid, None, "Unknown"),
             )
     except errors.all:
         pass
     return result
+
+
+def _descendants(
+    anchor: ProcessIdentity,
+    scanned: Mapping[int, tuple[ProcessIdentity, int | None, ProcessView]],
+    observed_at: float,
+) -> dict[ProcessIdentity, int | None]:
+    """Return only processes whose observed parent chain reaches this anchor identity."""
+    by_pid: dict[int, ProcessIdentity] = {anchor.pid: anchor}
+    descendants: dict[ProcessIdentity, int | None] = {}
+    changed = True
+    while changed:
+        changed = False
+        for identity, parent_pid, _view in scanned.values():
+            if identity.pid in by_pid or parent_pid is None:
+                continue
+            parent = by_pid.get(parent_pid)
+            if parent is None or identity.create_time < parent.create_time:
+                continue
+            if identity.create_time > observed_at + 10:
+                continue
+            by_pid[identity.pid] = identity
+            descendants[identity] = parent_pid
+            changed = True
+    return descendants
+
+
+def _observe_candidate(
+    psutil_module: object, identity: ProcessIdentity, errors: Any
+) -> tuple[str, ProcessView | None]:
+    try:
+        runtime_psutil: Any = psutil_module
+        process = runtime_psutil.Process(identity.pid)
+        create_time = _number(process.create_time())
+    except errors.access_denied:
+        return "Access denied", _identity_view(identity, "Access denied")
+    except errors.all:
+        return "Unverified: Codex child disappeared before inspection", None
+    current = ProcessIdentity(identity.pid, create_time or 0.0)
+    if create_time is None:
+        return "Unverified: Codex child creation time unavailable", None
+    if not _same_identity(identity, current):
+        return "Unverified: Codex child PID changed during inspection", None
+    state, view, _active = _read_live_process(process, identity, errors)
+    if state == "Exited":
+        return "Unverified: Codex child exited before verification", None
+    return state, view
+
+
+def _command_matches(summary: str, process: ProcessView) -> bool:
+    executable = process.executable
+    name = process.name
+    arguments = process.arguments
+    if not executable or not name or not arguments:
+        return False
+    executable_name = ntpath.basename(executable).casefold()
+    if ntpath.basename(name).casefold() != executable_name:
+        return False
+    argument_executable = arguments[0]
+    if ntpath.basename(argument_executable).casefold() != executable_name:
+        return False
+    if _has_windows_path(argument_executable) and not _same_windows_path(
+        argument_executable, executable
+    ):
+        return False
+
+    token, remainder = _split_command_prefix(summary)
+    token_matches = bool(token) and _executable_token_matches(token, executable)
+    explicit_executable = token_matches or _explicit_executable_token(token)
+    if explicit_executable:
+        if not token_matches:
+            return False
+        expected_body = _summary_command_body(remainder)
+        actual_body = _argv_command_payload(arguments[1:])
+        if actual_body is None:
+            actual_body = _argv_command_body(arguments[1:])
+        return (
+            expected_body is not None
+            and actual_body is not None
+            and _normalize_command(expected_body) == _normalize_command(actual_body)
+        )
+
+    if executable_name not in {"pwsh.exe", "powershell.exe", "cmd.exe"}:
+        return False
+    actual_script = _argv_command_payload(arguments[1:])
+    return actual_script is not None and _normalize_command(summary) == _normalize_command(
+        actual_script
+    )
+
+
+def _may_be_command_shell(summary: str, process_name: str | None) -> bool:
+    if process_name is None:
+        return True
+    token, _remainder = _split_command_prefix(summary)
+    name = ntpath.basename(process_name).casefold()
+    if _explicit_executable_token(token):
+        return _executable_token_matches(token, process_name)
+    return name in {
+        "pwsh.exe",
+        "powershell.exe",
+        "cmd.exe",
+        "bash.exe",
+        "sh.exe",
+        "wsl.exe",
+    }
+
+
+def _split_command_prefix(command: str) -> tuple[str, str]:
+    value = command.strip()
+    if not value:
+        return "", ""
+    if value[0] in {'"', "'"}:
+        closing = value.find(value[0], 1)
+        if closing > 0:
+            return value[1:closing], value[closing + 1 :].strip()
+    parts = value.split(None, 1)
+    return parts[0], parts[1] if len(parts) == 2 else ""
+
+
+def _explicit_executable_token(token: str) -> bool:
+    if not token or any(character.isspace() for character in token):
+        return False
+    basename = ntpath.basename(token).casefold()
+    return (
+        basename in {"pwsh", "pwsh.exe", "powershell", "powershell.exe", "cmd", "cmd.exe"}
+        or token.casefold().endswith(".exe")
+        or _has_windows_path(token)
+    )
+
+
+def _executable_token_matches(token: str, executable: str) -> bool:
+    if _has_windows_path(token):
+        return _same_windows_path(token, executable)
+    expected = ntpath.basename(token).casefold()
+    actual = ntpath.basename(executable).casefold()
+    if expected.endswith(".exe"):
+        expected = expected[:-4]
+    if actual.endswith(".exe"):
+        actual = actual[:-4]
+    return expected == actual
+
+
+def _has_windows_path(value: str) -> bool:
+    return "\\" in value or "/" in value or (len(value) > 1 and value[1] == ":")
+
+
+def _same_windows_path(first: str, second: str) -> bool:
+    return ntpath.normcase(ntpath.normpath(first)) == ntpath.normcase(ntpath.normpath(second))
+
+
+def _summary_command_body(value: str) -> str | None:
+    match = re.search(r"(?i)(?:^|\s)(?:-command|-c|/c|/k)\s+(.+)$", value, re.DOTALL)
+    if match is not None:
+        return _strip_outer_quotes(match.group(1))
+    return value
+
+
+def _argv_command_body(arguments: Sequence[str]) -> str | None:
+    if not arguments:
+        return ""
+    return subprocess.list2cmdline(list(arguments))
+
+
+def _argv_command_payload(arguments: Sequence[str]) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument.casefold() in {"-command", "-c", "/c", "/k"}:
+            payload = arguments[index + 1 :]
+            if not payload:
+                return None
+            return " ".join(payload)
+    return None
+
+
+def _strip_outer_quotes(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        return stripped[1:-1]
+    return stripped
+
+
+def _normalize_command(value: str) -> str:
+    value = _strip_outer_quotes(value)
+    output: list[str] = []
+    quote: str | None = None
+    pending_space = False
+    escaped = False
+    for character in value:
+        if quote is None:
+            if character.isspace():
+                pending_space = bool(output)
+                continue
+            if pending_space:
+                output.append(" ")
+                pending_space = False
+            output.append(character)
+            if character in {'"', "'"}:
+                quote = character
+            continue
+        output.append(character)
+        if character == quote and not escaped:
+            quote = None
+        escaped = character == "`" if quote == '"' else False
+    return "".join(output)
 
 
 def _discover_children(
@@ -488,11 +785,22 @@ def _discover_children(
 
 
 def _command_line(value: object) -> str | None:
-    if not isinstance(value, (list, tuple)) or not all(isinstance(part, str) for part in value):
+    if not isinstance(value, tuple) or not value:
         return None
-    if not value:
+    return subprocess.list2cmdline(list(value))[:_COMMAND_LINE_LIMIT]
+
+
+def _command_arguments(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, (list, tuple)) or not value:
         return None
-    return subprocess.list2cmdline(list(value))[:8_000]
+    if len(value) > _COMMAND_ARGUMENT_LIMIT or not all(
+        isinstance(part, str) and len(part) <= _COMMAND_ARGUMENTS_TOTAL_LIMIT for part in value
+    ):
+        return None
+    arguments = tuple(value)
+    if sum(len(argument) for argument in arguments) > _COMMAND_ARGUMENTS_TOTAL_LIMIT:
+        return None
+    return arguments
 
 
 def _string_or_none(value: object) -> str | None:

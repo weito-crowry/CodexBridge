@@ -96,6 +96,17 @@ class AppServerClient:
     def failure(self) -> str | None:
         return self._failure
 
+    @property
+    def os_pid(self) -> int | None:
+        """Return the live managed App Server process ID for local observation."""
+        process = self._process
+        if process is None or self._transport is None or process.returncode is not None:
+            return None
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, bool) or not isinstance(pid, int) or not 1 <= pid <= 4_294_967_295:
+            return None
+        return pid
+
     async def start(self) -> None:
         if self._transport is not None:
             return

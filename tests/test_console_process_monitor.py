@@ -148,6 +148,108 @@ def test_refresh_button_and_timer_use_worker_and_manual_refresh_is_available() -
     widget.shutdown()
 
 
+def test_status_anchor_is_captured_for_worker_and_cleared_on_selection_reset() -> None:
+    application = _application()
+    observed_anchors: list[object] = []
+
+    def inspector(
+        commands: tuple[CommandDescriptor, ...], evidence: ProcessEvidence, cancel: object
+    ):
+        observed_anchors.append(getattr(evidence, "app_server_os_pid", None))
+        result = _result(commands[0])
+        return InspectionResult(result.commands, evidence)
+
+    widget = ProcessMonitorWidget(inspector=inspector, platform_name="win32")
+    widget.show()
+    widget.set_snapshot(
+        {
+            "app_server_os_pid": 220132,
+            "recent_activities": [_activity("command_started", process_id="11385")],
+        }
+    )
+
+    assert _wait(application, lambda: observed_anchors == [220132])
+    widget.reset()
+    widget.append_activity(_activity("command_started", activity_id="next-command"))
+
+    assert _wait(application, lambda: len(observed_anchors) == 2)
+    assert observed_anchors == [220132, None]
+    widget.shutdown()
+
+
+def test_activity_pane_forwards_and_clears_local_process_anchor() -> None:
+    application = _application()
+    observed_anchors: list[int | None] = []
+
+    def inspector(
+        commands: tuple[CommandDescriptor, ...], evidence: ProcessEvidence, cancel: object
+    ) -> InspectionResult:
+        observed_anchors.append(evidence.app_server_os_pid)
+        result = _result(commands[0])
+        return InspectionResult(result.commands, evidence)
+
+    monitor = ProcessMonitorWidget(inspector=inspector, platform_name="win32")
+    pane = ActivityPane(process_monitor=monitor)
+    pane.show()
+    pane.set_snapshot(
+        {
+            "state": "in_progress",
+            "thread_metadata": {},
+            "app_server_os_pid": 220132,
+            "recent_activities": [_activity("command_started")],
+        },
+        reset=True,
+    )
+
+    assert _wait(application, lambda: observed_anchors == [220132])
+    pane.set_error("connection unavailable")
+
+    assert _wait(application, lambda: observed_anchors == [220132, None])
+    assert "App Server anchor unavailable" not in monitor.process_text.toPlainText()
+    pane.set_empty_state("Select a thread")
+    assert monitor.record_count == 0
+    pane.close()
+    monitor.shutdown()
+
+
+def test_app_server_restart_discards_stale_worker_result() -> None:
+    application = _application()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    observed_anchors: list[int | None] = []
+
+    def inspector(
+        commands: tuple[CommandDescriptor, ...], evidence: ProcessEvidence, cancel: object
+    ) -> InspectionResult:
+        anchor = evidence.app_server_os_pid
+        observed_anchors.append(anchor)
+        if anchor == 220132:
+            first_started.set()
+            release_first.wait(1.0)
+        result = _result(commands[0])
+        return InspectionResult(result.commands, evidence)
+
+    widget = ProcessMonitorWidget(inspector=inspector, platform_name="win32")
+    widget.show()
+    widget.set_app_server_os_pid(220132)
+    widget.append_activity(_activity("command_started"))
+    assert first_started.wait(1.0)
+
+    widget.set_app_server_os_pid(330)
+    release_first.set()
+
+    assert _wait(
+        application,
+        lambda: (
+            observed_anchors == [220132, 330]
+            and not widget._busy
+            and "command for thread-a" in widget.process_text.toPlainText()
+        ),
+    )
+    assert widget._evidence.app_server_os_pid == 330
+    widget.shutdown()
+
+
 def test_selection_change_discards_stale_completion_and_clears_previous_records() -> None:
     application = _application()
     started = threading.Event()
