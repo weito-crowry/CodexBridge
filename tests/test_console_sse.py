@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from codex_bridge.activity import Activity
 from codex_bridge.console.sse import SseEvent, SseParser, SseProtocolError, parse_activity_event
 
 
@@ -85,17 +86,29 @@ def test_activity_parser_rejects_malformed_or_incomplete_json(data: bytes) -> No
 
 
 def test_activity_parser_requires_safe_fields_and_ignores_unknown_fields() -> None:
+    payload = json.loads(_payload())
+    payload.update(
+        {
+            "raw": "never display",
+            "secret": "never display",
+            "api_key": "never display",
+        }
+    )
+    payload["details"]["secret"] = "never display"
     activity = parse_activity_event(
         SseEvent(
             event="activity",
             event_id="ignored",
-            data=json.dumps({**json.loads(_payload()), "raw": "never display"}),
+            data=json.dumps(payload),
         )
     )
 
     assert activity is not None
     assert activity["activity_id"] == "activity-1"
     assert "raw" not in activity
+    assert "secret" not in activity
+    assert "api_key" not in activity
+    assert "secret" not in activity["details"]  # type: ignore[operator]
     assert activity["details"] == {
         "exit_code": 0,
         "paths": ["src/a.py"],
@@ -132,6 +145,72 @@ def test_activity_parser_allows_bounded_command_monitor_metadata() -> None:
         "output_truncated": True,
         "output_source": "completed_item",
     }
+
+
+def test_activity_parser_preserves_item_id_from_activity_serialization() -> None:
+    item_id = "exec-8f9a6194-83db-4e07-bf44-f618c7171b4c"
+    source = Activity(
+        activity_id="activity-live-command",
+        timestamp="2026-10-22T12:00:00Z",
+        thread_id="thread-live",
+        turn_id="turn-live",
+        item_id=item_id,
+        type="command_started",
+        status="in_progress",
+        summary="PowerShell live command",
+        details={"process_id": "8648", "started_at_ms": 1_792_670_400_000},
+    )
+
+    parsed = parse_activity_event(
+        SseEvent(
+            event="activity",
+            event_id=None,
+            data=json.dumps(source.to_dict(), ensure_ascii=False),
+        )
+    )
+
+    assert parsed is not None
+    assert parsed["item_id"] == item_id
+    assert parsed["thread_id"] == "thread-live"
+    assert parsed["turn_id"] == "turn-live"
+    assert parsed["details"]["process_id"] == "8648"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("include_item_id", "item_id", "expected"),
+    [
+        (True, None, None),
+        (False, None, None),
+        (True, 8648, None),
+        (True, "x" * 513, None),
+    ],
+)
+def test_activity_parser_keeps_missing_or_invalid_item_id_unassociated(
+    include_item_id: bool, item_id: object, expected: None
+) -> None:
+    payload = json.loads(_payload())
+    if include_item_id:
+        payload["item_id"] = item_id
+
+    parsed = parse_activity_event(
+        SseEvent(event="activity", event_id=None, data=json.dumps(payload))
+    )
+
+    assert parsed is not None
+    assert parsed["item_id"] is expected
+    assert parsed["activity_id"] == "activity-1"
+    assert "raw" not in parsed
+
+
+def test_activity_parser_accepts_item_id_at_512_character_limit() -> None:
+    item_id = "x" * 512
+
+    parsed = parse_activity_event(
+        SseEvent(event="activity", event_id=None, data=_payload(item_id=item_id).decode())
+    )
+
+    assert parsed is not None
+    assert parsed["item_id"] == item_id
 
 
 def test_activity_parser_keeps_bounded_notification_request_id() -> None:

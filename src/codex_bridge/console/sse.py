@@ -162,6 +162,7 @@ def parse_activity_event(event: SseEvent) -> dict[str, object] | None:
     activity_id = _bounded_string(payload.get("activity_id"), 512)
     timestamp = _bounded_string(payload.get("timestamp"), 128)
     thread_id = _bounded_string(payload.get("thread_id"), 512)
+    item_id = _bounded_string(payload.get("item_id"), 512)
     activity_type = _bounded_string(payload.get("type"), 128)
     status = _bounded_string(payload.get("status"), 128)
     turn_id = payload.get("turn_id")
@@ -215,6 +216,7 @@ def parse_activity_event(event: SseEvent) -> dict[str, object] | None:
         "timestamp": timestamp,
         "thread_id": thread_id,
         "turn_id": turn_id,
+        "item_id": item_id,
         "type": activity_type,
         "status": status,
         "summary": summary,
