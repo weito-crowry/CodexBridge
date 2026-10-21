@@ -486,7 +486,7 @@ def test_slow_rooted_enumeration_is_incomplete_not_a_negative_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     psutil = _anchored_processes()
-    clock_values = iter((0.0, 0.0, 2.0))
+    clock_values = iter((0.0, 0.0, 5.0))
     monkeypatch.setattr(
         process_inspection,
         "time",
