@@ -114,6 +114,50 @@ def _controller(
     return controller, window, widget, client, roots[0]
 
 
+def test_unloaded_history_metadata_is_readonly_and_selection_generation_bound(
+    tmp_path: Path,
+) -> None:
+    _application()
+    controller, window, widget, client, _root = _controller(tmp_path)
+    window.thread_pane.thread_selected.emit("thread-a")
+    baseline_requests = list(client.get_json_calls)
+    client.json_succeeded.emit(
+        "selection:1:status",
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+
+    controller.apply_history_model_metadata(
+        "thread-a",
+        1,
+        ["turn-a"],
+        {
+            "turn-a": {
+                "model_candidates": [{"model": "history-model", "reasoning_effort": "high"}],
+                "model_resolution_status": "resolved",
+            }
+        },
+    )
+
+    assert widget.model_combo.itemText(0) == "Model: history-model"
+    assert widget.effort_combo.itemText(0) == "Effort: high"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    assert client.get_json_calls == baseline_requests
+    assert client.post_calls == []
+
+    window.thread_pane.thread_selected.emit("thread-b")
+    controller.apply_history_model_metadata("thread-a", 1, ["turn-a"], {})
+    client.json_succeeded.emit(
+        "selection:1:status",
+        {
+            "thread_id": "thread-a",
+            "state": "completed",
+            "thread_metadata": {"model": "late-model-a"},
+        },
+    )
+    assert widget.model_combo.itemText(0) == "Model: Unknown"
+    assert widget.access_combo.itemText(0) == "Access: Unknown"
+
+
 def test_new_thread_draft_is_local_and_first_send_uses_confirmed_options(tmp_path: Path) -> None:
     _application()
     controller, window, widget, client, root = _controller(tmp_path)
