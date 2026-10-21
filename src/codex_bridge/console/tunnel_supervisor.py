@@ -122,6 +122,7 @@ class TunnelSupervisor(QObject):
         *,
         executable: str | None,
         profile: str,
+        profile_file: str | None = None,
         process_factory: ProcessFactory | None = None,
         network_manager: Any | None = None,
         health_port_provider: HealthPortProvider | None = None,
@@ -136,6 +137,9 @@ class TunnelSupervisor(QObject):
         self._validate_version = validate_version
         self._client_version: str | None = None
         self._profile = profile
+        if profile_file is not None and not profile_file.strip():
+            raise ValueError("Tunnel profile file must not be empty")
+        self._profile_file = profile_file
         self._process_factory = process_factory or (lambda owner: QProcess(owner))
         self._network_manager = network_manager or QNetworkAccessManager(self)
         self._health_port_provider = health_port_provider or default_health_port_provider
@@ -486,11 +490,15 @@ class TunnelSupervisor(QObject):
                 lambda process=process: self._read_doctor_output(process, standard_error=True)
             )
             process.setProgram(self._executable)
+            profile_arguments = (
+                ["--profile-file", self._profile_file]
+                if self._profile_file is not None
+                else ["--profile", self._profile]
+            )
             process.setArguments(
                 [
                     "doctor",
-                    "--profile",
-                    self._profile,
+                    *profile_arguments,
                     "--explain",
                     "--health.listen-addr",
                     "127.0.0.1:0",
@@ -583,11 +591,15 @@ class TunnelSupervisor(QObject):
                 lambda *_args, process=process: self._on_process_error(process)
             )
             process.setProgram(executable)
+            profile_arguments = (
+                ["--profile-file", self._profile_file]
+                if self._profile_file is not None
+                else ["--profile", self._profile]
+            )
             process.setArguments(
                 [
                     "run",
-                    "--profile",
-                    self._profile,
+                    *profile_arguments,
                     "--health.listen-addr",
                     f"{_HEALTH_HOST}:{port}",
                 ]

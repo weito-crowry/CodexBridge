@@ -9,6 +9,7 @@ from typing import Any
 
 from PySide6.QtCore import QIODevice, QProcess, QProcessEnvironment
 
+from ..config import MANAGED_CONFIG_ENVIRONMENT_KEYS
 from ..observability import bridge_runtime_stderr_log_path, bridge_runtime_stdout_log_path
 from ..runtime_mode import INTERNAL_RUNTIME_FLAG
 
@@ -44,14 +45,21 @@ class BridgeRuntimeLauncher:
         ui_port: int,
         control_token: str,
         allowed_roots: tuple[str, ...] = (),
+        managed_config_path: str | None = None,
     ) -> DetachedLaunchResult:
         process = self._process_factory()
         environment = self._environment_factory()
-        environment.insert("CODEX_BRIDGE_CODEX_EXECUTABLE", codex_executable)
-        environment.insert("CODEX_BRIDGE_UI_PORT", str(ui_port))
+        if managed_config_path is not None:
+            environment.remove("CODEX_BRIDGE_CONFIG")
+            for variable in MANAGED_CONFIG_ENVIRONMENT_KEYS:
+                environment.remove(variable)
+            environment.insert("CODEX_BRIDGE_CONFIG", managed_config_path)
+        else:
+            environment.insert("CODEX_BRIDGE_CODEX_EXECUTABLE", codex_executable)
+            environment.insert("CODEX_BRIDGE_UI_PORT", str(ui_port))
+            if allowed_roots:
+                environment.insert("CODEX_BRIDGE_ALLOWED_ROOTS", os.pathsep.join(allowed_roots))
         environment.insert("CODEX_BRIDGE_CONTROL_TOKEN", control_token)
-        if allowed_roots:
-            environment.insert("CODEX_BRIDGE_ALLOWED_ROOTS", os.pathsep.join(allowed_roots))
         frozen = bool(getattr(sys, "frozen", False))
         if frozen:
             environment.insert("PYINSTALLER_RESET_ENVIRONMENT", "1")

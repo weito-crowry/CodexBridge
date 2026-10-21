@@ -169,52 +169,23 @@ or reverse proxy to reach it.
 
 ## Configuration
 
-CodexBridge reads a user-local TOML file. Set `CODEX_BRIDGE_CONFIG` to use a different file.
+Copy [`config.example.toml`](config.example.toml) to `config.toml` at the repository root and
+replace its example paths and Tunnel values. The source checkout discovers this file independently
+of the current working directory. `config.toml` and `.runtime/` are ignored by Git. Packaged
+installations without a repository-root config continue to read `%APPDATA%\CodexBridge\config.toml`
+on Windows and `$XDG_CONFIG_HOME/codexbridge/config.toml` (or `~/.config/codexbridge/config.toml`)
+elsewhere. Set `CODEX_BRIDGE_CONFIG` to select an explicit config file in either mode.
 
-A fuller example:
+In managed mode, TOML is the source for non-secret settings. A `CODEX_BRIDGE_*` variable that also
+sets one of those TOML fields causes a clear startup error; remove the duplicate variable or move
+the value into TOML. `CODEX_BRIDGE_CONFIG` remains the explicit file locator. Secrets and per-launch
+control values stay in the environment, including `CODEX_BRIDGE_GITHUB_PAT` and
+`CODEX_BRIDGE_CONTROL_TOKEN`.
 
-```toml
-[bridge]
-allowed_roots = ["C:\\Users\\you\\Documents\\src"]
-# file_put_dir = "C:\\Users\\you\\Documents\\CodexBridge-Inbox"
-# codex_executable = "C:\\path\\to\\codex.exe"
-
-[console]
-ui_port = 8001
-
-[tunnel]
-# executable = "C:\\path\\to\\tunnel-client.exe"
-profile = "codex-bridge"
-
-[github_mcp]
-enabled = false
-url = "https://api.githubcopilot.com/mcp/x/all"
-prefix = "github_"
-include = ["*"]
-exclude = []
-toolsets = []
-max_tools = 0
-
-[targets.main-pc]
-name = "Main PC"
-kind = "local"
-
-[targets.notebook]
-name = "Notebook PC"
-kind = "remote"
-url = "https://notebook.example.test/mcp"
-```
-
-Configuration precedence is:
+Outside managed mode, precedence remains:
 
 ```text
-explicit CLI option
-    >
-environment variable
-    >
-user config file
-    >
-built-in default
+explicit CLI option > environment variable > config file > built-in default
 ```
 
 `allowed_roots` is required at Bridge startup and every supplied or persisted working directory is
@@ -255,6 +226,30 @@ not supported. CodexBridge does not synchronize project files between machines.
 
 The config file intentionally does not accept API keys, runtime control tokens, or the GitHub MCP
 PAT.
+
+### Tunnel profile migration
+
+The `[tunnel]` section can describe a Tunnel client v1 profile. `config.example.toml` shows the
+supported fields. Keep API keys and other Tunnel secrets outside TOML, then reference them with
+`env:VARIABLE_NAME` or `file:path` values. When the profile settings are present, Console writes
+`.runtime/tunnel-profile.yaml` beside the active config (or under `tunnel.profile_dir`), asks the
+configured Tunnel client to validate the staged file, and atomically installs it only after
+validation succeeds. Tunnel `doctor` and `run` use that same explicit profile file. If generation or
+validation fails, the prior generated file stays in place and Console does not fall back to a named
+default profile. A config containing only the legacy `tunnel.profile` name continues to use that
+named profile until it is manually migrated.
+
+To migrate an existing profile, review its current non-secret connection values and add the
+equivalent supported values to your local TOML file. Put credentials in an environment variable or
+protected file and reference them from the profile settings. Review the TOML and generated profile
+before starting the Tunnel. CodexBridge does not import, change, or migrate an existing Tunnel
+identity, credentials, or profile automatically.
+
+Use **Settings → Open settings file** or **Open settings folder** to edit the active file. **Reload
+settings** validates it and reports changes that need a restart; it leaves the current Bridge,
+Tunnel, drafts, history, and Codex turns running. Choose **Restart Console to apply pending
+settings…** and confirm only when you are ready to stop Console-managed Bridge and Tunnel processes.
+That restart may interrupt active Codex work. Opening or reloading settings never restarts a process.
 
 ### Native file, Git, and inbox tools
 

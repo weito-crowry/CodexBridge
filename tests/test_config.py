@@ -16,6 +16,17 @@ def isolate_user_config_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setenv("CODEX_BRIDGE_CONFIG", str(tmp_path / "missing-config.toml"))
 
 
+def test_config_example_is_valid_and_uses_only_secret_references() -> None:
+    from codex_bridge.config_file import load_user_config
+
+    example_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+
+    config = load_user_config(path=example_path)
+
+    assert config["bridge"]["allowed_roots"] == [r"C:\path\to\allowed"]
+    assert config["tunnel"]["control_plane"]["api_key"] == "env:TUNNEL_API_KEY"
+
+
 def test_empty_allowed_roots_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CODEX_BRIDGE_ALLOWED_ROOTS", raising=False)
 
@@ -563,3 +574,89 @@ def test_execution_targets_reject_more_than_sixteen_targets(tmp_path) -> None:
 
     with pytest.raises(ConfigurationError, match="16"):
         BridgeConfig.from_sources(environ={}, config_data=load_user_config(path=config_path))
+
+
+def test_repository_config_is_discovered_before_legacy_user_config(tmp_path, monkeypatch) -> None:
+    from codex_bridge import config_file
+
+    package = tmp_path / "src" / "codex_bridge"
+    package.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    monkeypatch.setattr(config_file, "__file__", str(package / "config_file.py"))
+    repo_config = tmp_path / "config.toml"
+    repo_config.write_text("[bridge]\nport = 8122\n", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+    assert config_file.default_config_path(environ={}, platform="win32") == repo_config
+
+
+def test_config_schema_rejects_secret_key_without_echoing_value(tmp_path) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[bridge]\ncontrol_token = "never-print-this-secret-value"\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigFileError, match="secret") as exc_info:
+        load_user_config(path=config_path)
+
+    assert "never-print-this-secret-value" not in str(exc_info.value)
+
+
+def test_config_schema_accepts_bridge_listener_and_wait_settings(tmp_path) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[bridge]\nhost = "127.0.0.1"\nport = 8122\n'
+        'allowed_hosts = ["localhost"]\nallowed_origins = ["https://example.test"]\n'
+        "wait_default_seconds = 25.0\nwait_max_seconds = 40.0\nshutdown_grace_seconds = 4.0\n",
+        encoding="utf-8",
+    )
+
+    parsed = load_user_config(path=config_path)
+    assert parsed["bridge"]["port"] == 8122
+    config = BridgeConfig.from_sources(environ={}, config_data=parsed)
+    assert (config.host, config.port, config.ui_port) == ("127.0.0.1", 8122, 8001)
+    assert config.allowed_hosts == ("localhost",)
+    assert config.allowed_origins == ("https://example.test",)
+    assert (config.wait_default_seconds, config.wait_max_seconds) == (25.0, 40.0)
+
+
+def test_repository_managed_settings_reject_legacy_environment_conflicts(
+    tmp_path, monkeypatch
+) -> None:
+    from codex_bridge import config_file
+
+    package = tmp_path / "src" / "codex_bridge"
+    package.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    monkeypatch.setattr(config_file, "__file__", str(package / "config_file.py"))
+    (tmp_path / "config.toml").write_text("[bridge]\nport = 8122\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="conflicts") as exc_info:
+        BridgeConfig.from_sources(environ={"CODEX_BRIDGE_PORT": "8123"})
+
+    assert "8123" not in str(exc_info.value)
+
+
+def test_tunnel_profile_schema_accepts_references_and_rejects_literal_secrets(tmp_path) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[tunnel.control_plane]\nbase_url = "https://control.example.test"\n'
+        'tunnel_id = "bridge-main"\napi_key = "env:TUNNEL_API_KEY"\n'
+        '[tunnel.log]\nlevel = "info"\nformat = "json"\n',
+        encoding="utf-8",
+    )
+    parsed = load_user_config(path=config_path)
+    assert parsed["tunnel"]["control_plane"]["api_key"] == "env:TUNNEL_API_KEY"
+
+    config_path.write_text(
+        '[tunnel.control_plane]\napi_key = "literal-secret-value"\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigFileError, match="reference") as exc_info:
+        load_user_config(path=config_path)
+    assert "literal-secret-value" not in str(exc_info.value)

@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import ConfigurationError, validate_allowed_roots
-from ..config_file import ConfigFileError, load_user_config
+from ..config_file import ConfigFileError, active_config_source, load_user_config
 
 
 class ConsoleConfigurationError(ValueError):
@@ -75,11 +75,17 @@ class ConsoleConfig:
     port: int = 8001
     tunnel_executable: str | None = None
     tunnel_profile: str = "codex-bridge"
+    tunnel_profile_dir: str | None = None
+    tunnel_profile_file: str | None = None
+    tunnel_profile_settings: Mapping[str, object] = field(default_factory=dict)
     allowed_roots: tuple[str, ...] = ()
     attachment_staging_directory: str | None = None
     codex_executable: str | None = None
     codex_executable_source: str = "default"
     tunnel_executable_source: str = "default"
+    config_path: str | None = None
+    config_mode: str = "legacy"
+    explicit_overrides: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.host != "127.0.0.1":
@@ -120,14 +126,34 @@ class ConsoleConfig:
         explicit_codex_executable: str | None = None,
         explicit_tunnel_executable: str | None = None,
         explicit_tunnel_profile: str | None = None,
+        explicit_tunnel_profile_dir: str | None = None,
         explicit_attachment_staging_directory: str | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> ConsoleConfig:
         values = os.environ if environ is None else environ
         try:
-            file_config = load_user_config(values)
+            source = active_config_source(values)
+            file_config = load_user_config(path=source.path)
         except ConfigFileError as exc:
             raise ConsoleConfigurationError(str(exc)) from exc
+        if source.mode == "managed":
+            managed_settings = {
+                "CODEX_BRIDGE_UI_PORT": ("console", "ui_port"),
+                "CODEX_BRIDGE_ALLOWED_ROOTS": ("bridge", "allowed_roots"),
+                "CODEX_BRIDGE_ATTACHMENT_STAGING_DIRECTORY": (
+                    "console",
+                    "attachment_staging_directory",
+                ),
+                "CODEX_BRIDGE_CODEX_EXECUTABLE": ("bridge", "codex_executable"),
+                "CODEX_BRIDGE_TUNNEL_EXECUTABLE": ("tunnel", "executable"),
+                "CODEX_BRIDGE_TUNNEL_PROFILE": ("tunnel", "profile"),
+                "CODEX_BRIDGE_TUNNEL_PROFILE_DIR": ("tunnel", "profile_dir"),
+            }
+            for variable, (section, key) in managed_settings.items():
+                if variable in values:
+                    raise ConsoleConfigurationError(
+                        f"{variable} conflicts with managed TOML configuration ({section}.{key})"
+                    )
         bridge_config = file_config.get("bridge", {})
         console_config = file_config.get("console", {})
         tunnel_config = file_config.get("tunnel", {})
@@ -209,13 +235,55 @@ class ConsoleConfig:
             profile = tunnel_config["profile"]
         else:
             profile = "codex-bridge"
+        if explicit_tunnel_profile_dir is not None:
+            profile_dir: object = explicit_tunnel_profile_dir
+        else:
+            profile_dir = tunnel_config.get("profile_dir")
+        if profile_dir is not None and (
+            not isinstance(profile_dir, str) or not profile_dir.strip()
+        ):
+            raise ConsoleConfigurationError("tunnel.profile_dir must be a non-empty path")
+        if profile_dir is not None and not Path(profile_dir).is_absolute():
+            raise ConsoleConfigurationError("tunnel.profile_dir must be an absolute path")
+        profile_file: Path | None = None
+        if source.mode in {"explicit", "managed"}:
+            profile_directory = (
+                Path(profile_dir)
+                if profile_dir is not None
+                else source.path.resolve(strict=False).parent / ".runtime"
+            )
+            profile_file = profile_directory / "tunnel-profile.yaml"
+        profile_settings = {
+            key: value
+            for key, value in tunnel_config.items()
+            if key not in {"executable", "profile", "profile_dir"}
+        }
+        profile_settings.setdefault("config_version", 1)
+        explicit_overrides: dict[str, object] = {}
+        for name, value in (
+            ("explicit_port", explicit_port),
+            ("explicit_allowed_roots", explicit_allowed_roots),
+            ("explicit_codex_executable", explicit_codex_executable),
+            ("explicit_tunnel_executable", explicit_tunnel_executable),
+            ("explicit_tunnel_profile", explicit_tunnel_profile),
+            ("explicit_tunnel_profile_dir", explicit_tunnel_profile_dir),
+            ("explicit_attachment_staging_directory", explicit_attachment_staging_directory),
+        ):
+            if value is not None:
+                explicit_overrides[name] = value
         return cls(
             port=port,
             tunnel_executable=tunnel_executable,
             tunnel_profile=parse_tunnel_profile(profile, source="CODEX_BRIDGE_TUNNEL_PROFILE"),
+            tunnel_profile_dir=profile_dir,
+            tunnel_profile_file=None if profile_file is None else str(profile_file),
+            tunnel_profile_settings=profile_settings,
             allowed_roots=allowed_roots,
             attachment_staging_directory=staging_directory,
             codex_executable=codex_executable,
             codex_executable_source=codex_source,
             tunnel_executable_source=tunnel_source,
+            config_path=str(source.path),
+            config_mode=source.mode,
+            explicit_overrides=explicit_overrides,
         )

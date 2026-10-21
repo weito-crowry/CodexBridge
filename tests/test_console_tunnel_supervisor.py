@@ -214,6 +214,43 @@ def test_doctor_uses_direct_process_with_profile_and_ephemeral_health_option() -
     supervisor.close()
 
 
+def test_generated_profile_file_is_used_for_doctor_and_tunnel_run(tmp_path) -> None:
+    _application()
+    profile_file = tmp_path / ".runtime" / "tunnel-profile.yaml"
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    processes = [doctor, tunnel]
+    supervisor = TunnelSupervisor(
+        executable="C:/tools/tunnel-client.exe",
+        profile="ignored-when-profile-file-is-set",
+        profile_file=str(profile_file),
+        process_factory=lambda _parent: processes.pop(0),
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+
+    supervisor.set_bridge_ready(True)
+    assert doctor.arguments == [
+        "doctor",
+        "--profile-file",
+        str(profile_file),
+        "--explain",
+        "--health.listen-addr",
+        "127.0.0.1:0",
+    ]
+    doctor.finished.emit(0, 0)
+    supervisor.start()
+
+    assert tunnel.arguments == [
+        "run",
+        "--profile-file",
+        str(profile_file),
+        "--health.listen-addr",
+        "127.0.0.1:41001",
+    ]
+    supervisor.close()
+
+
 def test_successful_doctor_autostarts_and_discards_raw_output() -> None:
     _application()
     process = FakeProcess()

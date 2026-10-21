@@ -193,6 +193,7 @@ class FakeLauncher:
         self.started = started
         self.calls: list[tuple[str, int]] = []
         self.control_tokens: list[str] = []
+        self.managed_config_paths: list[str | None] = []
         self.closes = 0
 
     def launch(
@@ -202,10 +203,12 @@ class FakeLauncher:
         ui_port: int,
         control_token: str,
         allowed_roots: tuple[str, ...] = (),
+        managed_config_path: str | None = None,
     ) -> DetachedLaunchResult:
         del allowed_roots
         self.calls.append((codex_executable, ui_port))
         self.control_tokens.append(control_token)
+        self.managed_config_paths.append(managed_config_path)
         return DetachedLaunchResult(self.started, 1234 if self.started else None)
 
     def close(self) -> None:

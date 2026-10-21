@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
 from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.codex_updates import CodexUpdateInfo
+from codex_bridge.console.config import ConsoleConfig, ConsoleConfigurationError
 from codex_bridge.console.main_window import MainWindow
 from tests.console_main_window_test_support import (
     FakeClient,
     FakeCodexProbe,
     FakeCodexUpdateProbe,
     FakeDiagnosticsReader,
+    StableTunnel,
     _application,
     _complete_history_snapshot,
     _config,
@@ -29,6 +31,20 @@ from tests.console_main_window_test_support import (
     _thread_item,
     _usage_window,
 )
+from tests.console_main_window_test_support import (
+    _set_usage_ready as _set_usage_ready,
+)
+
+
+def _settings_window(config: ConsoleConfig, client: FakeClient | None = None) -> MainWindow:
+    return MainWindow(
+        config,
+        api_client=client or FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        tunnel_supervisor=StableTunnel(),
+        tray_available=False,
+    )
 
 
 def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> None:
@@ -50,6 +66,150 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.splitter.count() == 3
     assert window.diagnostics_pane.isHidden()
     assert not window.diagnostics_timer.isActive()
+    window.close()
+
+
+def test_settings_menu_contains_config_actions_and_existing_appearance_modes() -> None:
+    _application()
+    window = _settings_window(_config())
+
+    actions = window.settings_button.menu().actions()
+    labels = [action.text() for action in actions]
+    appearance_action = next(action for action in actions if action.text() == "Appearance")
+
+    assert labels[:3] == ["Open settings file", "Reload settings", "Open settings folder"]
+    assert appearance_action.menu() is not None
+    assert [action.text() for action in appearance_action.menu().actions()] == [
+        "System",
+        "Light",
+        "Dark",
+    ]
+    assert window.settings_button.toolTip() == "Settings"
+    window.close()
+
+
+def test_settings_open_file_and_folder_use_active_config_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _application()
+    config_path = tmp_path / "settings" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("[bridge]\n", encoding="utf-8")
+    opened: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toLocalFile()) or True,
+    )
+    window = _settings_window(ConsoleConfig(config_path=str(config_path), config_mode="managed"))
+
+    window._open_settings_file()
+    window._open_settings_folder()
+
+    assert [Path(path) for path in opened] == [config_path, config_path.parent]
+    window.close()
+
+
+def test_settings_reload_stages_valid_changes_without_disturbing_live_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _application()
+    active = ConsoleConfig(config_path=str(tmp_path / "config.toml"), config_mode="managed")
+    pending = ConsoleConfig(
+        port=8123,
+        config_path=str(tmp_path / "config.toml"),
+        config_mode="managed",
+    )
+    client = FakeClient()
+    window = _settings_window(active, client)
+    selected_thread = "thread-1"
+    window._selected_thread_id = selected_thread
+    before_requests = list(client.requests)
+    monkeypatch.setattr(ConsoleConfig, "from_sources", classmethod(lambda cls, **_kwargs: pending))
+    messages: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        lambda _parent, _title, text: messages.append(text),
+    )
+
+    window._reload_configuration()
+
+    assert window._config is active
+    assert window._pending_config is pending
+    assert window._selected_thread_id == selected_thread
+    assert client.requests == before_requests
+    assert not client.aborted_all
+    assert "restart" in window.config_status_label.text().casefold()
+    assert messages and "Bridge" in messages[0] and "Tunnel" in messages[0]
+    window.close()
+
+
+def test_invalid_settings_reload_keeps_last_good_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _application()
+    active = ConsoleConfig(config_path=str(tmp_path / "config.toml"), config_mode="managed")
+    window = _settings_window(active)
+    previous_pending = ConsoleConfig(
+        port=8123,
+        config_path=active.config_path,
+        config_mode="managed",
+    )
+    window._pending_config = previous_pending
+    window._apply_pending_settings_action.setEnabled(True)
+    monkeypatch.setattr(
+        ConsoleConfig,
+        "from_sources",
+        classmethod(
+            lambda cls, **_kwargs: (_ for _ in ()).throw(
+                ConsoleConfigurationError("configuration contains invalid TOML")
+            )
+        ),
+    )
+    messages: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, text: messages.append(text),
+    )
+
+    window._reload_configuration()
+
+    assert window._config is active
+    assert window._pending_config is previous_pending
+    assert messages == ["configuration contains invalid TOML"]
+    window.close()
+
+
+def test_apply_pending_settings_requires_confirmation_before_console_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _application()
+    window = _settings_window(_config())
+    window._pending_config = ConsoleConfig(port=8123, allowed_roots=_config().allowed_roots)
+    exits: list[bool] = []
+    monkeypatch.setattr(window, "_begin_exit", lambda: exits.append(True))
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+
+    window._apply_pending_configuration()
+
+    assert exits == []
+    assert not window._restart_after_settings_apply
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window._apply_pending_configuration()
+
+    assert exits == [True]
+    assert window._restart_after_settings_apply
     window.close()
 
 
