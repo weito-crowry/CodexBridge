@@ -182,6 +182,7 @@ class ComposerAttachmentBar(QWidget):
         existing = list(self._attachments)
         seen = {os.path.normcase(path) for path in existing}
         invalid = duplicate = overflow = False
+        size_errors: list[str] = []
         staged: list[str] = []
         stage_errors: list[str] = []
         staged_sources: set[str] = set()
@@ -197,7 +198,8 @@ class ComposerAttachmentBar(QWidget):
                 continue
             try:
                 candidate = Path(raw_path).resolve(strict=True)
-                if not stat.S_ISREG(candidate.stat().st_mode):
+                candidate_stat = candidate.stat()
+                if not stat.S_ISREG(candidate_stat.st_mode):
                     invalid = True
                     continue
             except (OSError, RuntimeError):
@@ -207,20 +209,46 @@ class ComposerAttachmentBar(QWidget):
             if len(existing) >= _MAX_ATTACHMENTS:
                 overflow = True
                 continue
-            if self._allowed_roots and not self._is_under_allowed_root(canonical):
+            external = bool(self._allowed_roots) and not self._is_under_allowed_root(canonical)
+            if external:
                 source_key = os.path.normcase(canonical)
                 if source_key in staged_sources:
                     duplicate = True
                     continue
                 staged_sources.add(source_key)
+            elif os.path.normcase(canonical) in seen:
+                duplicate = True
+                continue
+            is_image = candidate.suffix.casefold() in _IMAGE_SUFFIXES
+            file_limit = MAX_IMAGE_FILE_BYTES if is_image else MAX_OTHER_FILE_BYTES
+            file_limit_message = (
+                "画像添付は20 MiB以下にしてください"
+                if is_image
+                else "その他の添付は50 MiB以下にしてください"
+            )
+            if candidate_stat.st_size > file_limit:
+                size_errors.append(file_limit_message)
+                continue
+            if total_size + candidate_stat.st_size > MAX_TOTAL_BYTES:
+                size_errors.append("添付ファイルの合計は100 MiB以下にしてください")
+                continue
+            if external:
                 try:
                     canonical = self._stage_external_file(
                         candidate, existing_total_bytes=total_size
                     )
                     staged.append(canonical)
                 except (OSError, RuntimeError, ValueError) as exc:
+                    message = str(exc)
+                    if message in {
+                        "画像添付は20 MiB以下にしてください",
+                        "その他の添付は50 MiB以下にしてください",
+                        "添付ファイルの合計は100 MiB以下にしてください",
+                    }:
+                        size_errors.append(message)
+                        continue
                     invalid = True
-                    stage_errors.append(f"添付ファイルをステージングできません: {exc}")
+                    stage_errors.append(f"添付ファイルをステージングできません: {message}")
                     continue
             normalized = os.path.normcase(canonical)
             if normalized in seen:
@@ -241,8 +269,8 @@ class ComposerAttachmentBar(QWidget):
             self._attachments = updated
             self._render_chips()
             self.attachments_changed.emit(updated)
-        if invalid or duplicate or overflow:
-            messages = []
+        messages = []
+        if invalid or duplicate or overflow or size_errors:
             if invalid:
                 if stage_errors:
                     messages.extend(stage_errors)
@@ -252,8 +280,9 @@ class ComposerAttachmentBar(QWidget):
                 messages.append("同じファイルは重複して添付できません")
             if overflow:
                 messages.append("添付は最大8件です")
+            messages.extend(dict.fromkeys(size_errors))
             self.validation_notice.emit("。".join(messages))
-        if staged:
+        if staged and not messages:
             self.validation_notice.emit(
                 "許可されたフォルダーへコピーしました: " + "、".join(staged)
             )
