@@ -169,6 +169,7 @@ A fuller example:
 ```toml
 [bridge]
 allowed_roots = ["C:\\Users\\you\\Documents\\src"]
+# file_put_dir = "C:\\Users\\you\\Documents\\CodexBridge-Inbox"
 # codex_executable = "C:\\path\\to\\codex.exe"
 
 [console]
@@ -226,6 +227,7 @@ not supported. CodexBridge does not synchronize project files between machines.
 | `CODEX_BRIDGE_PORT` | `8000` | MCP bind port. |
 | `CODEX_BRIDGE_UI_PORT` | `8001` | Separate loopback-only UI API port. |
 | `CODEX_BRIDGE_ALLOWED_ROOTS` | empty | Required path-separated allowed working roots. |
+| `CODEX_BRIDGE_FILE_PUT_DIR` | unset | Optional existing inbox directory for new UTF-8 files written by `file_put`; it must be inside an allowed root. |
 | `CODEX_BRIDGE_ALLOWED_HOSTS` | SDK loopback defaults | Exact Host allowlist for MCP transport security. |
 | `CODEX_BRIDGE_ALLOWED_ORIGINS` | SDK loopback defaults | Exact browser Origin allowlist. |
 | `CODEX_BRIDGE_CODEX_EXECUTABLE` | resolver | Explicit Codex executable name or path. |
@@ -246,6 +248,26 @@ not supported. CodexBridge does not synchronize project files between machines.
 
 The config file intentionally does not accept API keys, runtime control tokens, or the GitHub MCP
 PAT.
+
+### Native file, Git, and inbox tools
+
+The MCP endpoint exposes bounded `file_read`, `directory_list`, and `file_search` tools for paths
+inside `allowed_roots`. File reads and content searches accept UTF-8 text and report when a size,
+line, time, or result limit truncates the response. `git_status` and `git_diff` run read-only Git
+queries in an allowed repository; `git_diff` excludes untracked file contents. The fixed
+`command_execute_probe` runs only `git --version` and reports its bounded output, exit code, and
+timeout state.
+
+`file_put` is disabled unless `CODEX_BRIDGE_FILE_PUT_DIR` or `[bridge].file_put_dir` names an
+existing inbox directory inside `allowed_roots`. It creates one new UTF-8 file of at most 1 MiB and
+never replaces an existing file. The inbox must be used as a transfer destination only: CodexBridge
+does not execute, import, or automatically consume files written there. Review and move a transferred
+file yourself when it is ready for another workflow.
+
+These tools are available to MCP clients that can reach the existing `/mcp` endpoint. Allowed roots
+bound file and Git access, and the configured inbox bounds writes. Host and Origin allowlists protect
+the HTTP transport boundary; they do not identify or authenticate an individual MCP client. Keep the
+endpoint reachable only from clients you trust.
 
 ## Connecting through a tunnel
 

@@ -244,6 +244,67 @@ def test_empty_and_invalid_allowed_roots_fail_preflight(tmp_path) -> None:
     assert validate_allowed_roots((str(root),)) == (str(root.resolve()).casefold(),)
 
 
+def test_file_put_inbox_is_disabled_by_default() -> None:
+    config = BridgeConfig.from_sources(environ={}, config_data={})
+
+    assert config.file_put_dir is None
+
+
+def test_file_put_inbox_is_canonicalized_inside_allowed_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    inbox = root / "専用 inbox"
+    inbox.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ROOTS", os.fspath(root))
+    monkeypatch.setenv("CODEX_BRIDGE_FILE_PUT_DIR", os.fspath(inbox))
+
+    config = BridgeConfig.from_env()
+
+    assert config.file_put_dir == os.fspath(inbox.resolve())
+
+
+@pytest.mark.parametrize("invalid", ["relative", "missing"])
+def test_file_put_inbox_rejects_non_absolute_or_missing_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ROOTS", os.fspath(root))
+    value = invalid if invalid == "relative" else os.fspath(root / invalid)
+    monkeypatch.setenv("CODEX_BRIDGE_FILE_PUT_DIR", value)
+
+    with pytest.raises(ConfigurationError, match="file put inbox"):
+        BridgeConfig.from_env()
+
+
+def test_file_put_inbox_must_be_inside_allowed_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("CODEX_BRIDGE_ALLOWED_ROOTS", os.fspath(root))
+    monkeypatch.setenv("CODEX_BRIDGE_FILE_PUT_DIR", os.fspath(outside))
+
+    with pytest.raises(ConfigurationError, match="file put inbox"):
+        BridgeConfig.from_env()
+
+
+def test_file_put_inbox_can_be_configured_in_toml(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    config = BridgeConfig.from_sources(
+        environ={},
+        config_data={
+            "bridge": {"allowed_roots": [os.fspath(tmp_path)], "file_put_dir": os.fspath(inbox)}
+        },
+    )
+
+    assert config.file_put_dir == os.fspath(inbox.resolve())
+
+
 def test_github_mcp_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "CODEX_BRIDGE_GITHUB_MCP_ENABLED",
