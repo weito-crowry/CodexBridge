@@ -41,6 +41,7 @@ from PySide6.QtWidgets import QMessageBox as QMessageBox
 from ..models import ApprovalDecision
 from ..tunnel_profile import TunnelProfileError, generate_tunnel_profile
 from .api_client import ApiClient
+from .api_result_dispatcher import ApiResultDispatcher
 from .appearance import AppearanceController, install_appearance
 from .bridge_managed_retry import BridgeManagedRetryCoordinator
 from .bridge_readiness import BridgeReadinessCoordinator
@@ -336,6 +337,11 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._build_timers()
         self._thread_interactions = ThreadInteractionController(self)
+        self._api_result_dispatcher = ApiResultDispatcher(
+            self,
+            read_project_names=lambda: read_local_project_names(),
+            observe_thread_status=lambda thread: _runtime_thread_status_observation(thread),
+        )
         self._project_folder_actions_controller = ProjectFolderActionsController(self)
         self._bulk_thread_naming = BulkThreadNamingController(self)
         self._diagnostics_panel = DiagnosticsPanelController(self)
@@ -1394,149 +1400,7 @@ class MainWindow(QMainWindow):
         return self._thread_interactions._is_current_selection(key)
 
     def apply_json_result(self, key: str, payload: object) -> None:
-        if key in self._pending_thread_copies:
-            self._apply_thread_copy_page(key, payload)
-            return
-        if self._bulk_thread_naming.handle_result(key, payload):
-            return
-        if key.startswith("rename:"):
-            self._thread_interactions.apply_rename_success(key)
-            return
-        if self._bridge_stop_confirmation.active and key in {"health", "bridge-status"}:
-            if key == "health":
-                self._health_observed = True
-                self._health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
-                self._bridge_stop_confirmation.observe_health(True)
-            elif isinstance(payload, Mapping):
-                self._status_observed = True
-                self._bridge_ready = payload.get("bridge") in {"ready", "connected"}
-                self._app_server_ready = payload.get("app_server") in {"ready", "connected"}
-                self._bridge_stop_confirmation.observe_status(True)
-            self._maybe_finish_stop_confirmation()
-            return
-        if key == "health":
-            self._health_observed = True
-            self._health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
-            if self._health_ok:
-                self.bottom_status_label.setText("Bridge reachable")
-            self._apply_runtime_observation()
-            self._sync_overall_status()
-            self._sync_empty_state()
-            return
-        if key == "bridge-status":
-            self._status_observed = True
-            was_ready = self._bridge_ready and self._app_server_ready
-            if isinstance(payload, Mapping):
-                bridge = payload.get("bridge")
-                app_server = payload.get("app_server")
-                self._bridge_ready = bridge in {"ready", "connected"}
-                self._app_server_ready = app_server in {"ready", "connected"}
-                self.bridge_status_label.setText(
-                    "Bridge: connected" if self._bridge_ready else "Bridge: disconnected"
-                )
-                self.app_server_status_label.setText(
-                    "App Server: ready" if self._app_server_ready else "App Server: failed"
-                )
-                self._apply_runtime_observation()
-            else:
-                self._bridge_ready = False
-                self._app_server_ready = False
-                self.bridge_status_label.setText("Bridge: disconnected")
-                self.app_server_status_label.setText("App Server: failed")
-                self._apply_runtime_observation()
-            self._record_bridge_status_observation(self._bridge_ready and self._app_server_ready)
-            ready = self._usage_ready
-            if ready and not was_ready:
-                self._begin_usage_sequence()
-                self._schedule_codex_update_auto_check()
-            elif not ready:
-                self._invalidate_usage_sequence()
-            self._sync_overall_status()
-            self._sync_empty_state()
-            return
-        if key == "usage":
-            self._usage_requests.apply_result(payload)
-            return
-        if key == "launch:health":
-            self._apply_launch_health(payload)
-            return
-        if key == "launch:status":
-            self._apply_launch_status(payload)
-            return
-        if key == "threads":
-            if isinstance(payload, Mapping) and isinstance(payload.get("threads"), list):
-                threads = [thread for thread in payload["threads"] if isinstance(thread, Mapping)]
-                thread_ids = {
-                    thread_id
-                    for thread in threads
-                    if isinstance((thread_id := thread.get("id")), str)
-                }
-                statuses = {
-                    thread_id: state
-                    for thread_id, state in self._thread_turn_statuses.items()
-                    if thread_id in thread_ids
-                }
-                for thread in threads:
-                    thread_id = thread.get("id")
-                    if not isinstance(thread_id, str):
-                        continue
-                    observed, state = _runtime_thread_status_observation(thread)
-                    if observed:
-                        if state is None:
-                            statuses.pop(thread_id, None)
-                        else:
-                            statuses[thread_id] = state
-                self._thread_turn_statuses = statuses
-                self._active_thread_ids = {
-                    thread_id
-                    for thread_id, state in statuses.items()
-                    if state in ACTIVE_TURN_STATES
-                }
-                self.thread_pane.set_threads(
-                    threads,
-                    thread_statuses=self._thread_turn_statuses,
-                    project_names=read_local_project_names(),
-                )
-                if not threads:
-                    self.thread_pane.set_empty_state("No threads found.")
-                self._sync_empty_state()
-            return
-
-        selection = self._is_current_selection(key)
-        if selection is None:
-            return
-        _, suffix = selection
-        live_refresh = suffix.startswith("history:")
-        if live_refresh:
-            suffix = suffix.removeprefix("history:")
-        if suffix == "detail":
-            return
-        if suffix == "turns":
-            has_active_turn = self._history_timeline.apply_turns(payload, live_refresh=live_refresh)
-            if has_active_turn is not None:
-                if self._selected_thread_id is not None:
-                    active_states = [
-                        state
-                        for state in self._turn_statuses.values()
-                        if state in ACTIVE_TURN_STATES
-                    ]
-                    if active_states:
-                        self._update_thread_activity(self._selected_thread_id, active_states[-1])
-                    else:
-                        self._update_thread_activity(self._selected_thread_id, "completed")
-                self._render_timeline()
-            self._finish_selected_history_request(key)
-            return
-        if suffix == "items":
-            self._apply_items(payload, prepend=False, live_refresh=live_refresh)
-            self._finish_selected_history_request(key)
-            return
-        if suffix == "status":
-            self._apply_status(payload)
-            return
-        if suffix.startswith("older:"):
-            self._apply_items(payload, prepend=True)
-            self._finish_selected_history_request(key)
+        self._api_result_dispatcher.apply_result(key, payload)
 
     def _apply_items(self, payload: object, *, prepend: bool, live_refresh: bool = False) -> None:
         if self._history_timeline.apply_items(payload, prepend=prepend, live_refresh=live_refresh):
@@ -1588,69 +1452,7 @@ class MainWindow(QMainWindow):
         self._history_requests.request_older(self._history_request_context())
 
     def _apply_json_error(self, key: str, message: str) -> None:
-        if key in self._pending_thread_copies:
-            self._thread_interactions.discard_copy(key)
-            return
-        if self._bulk_thread_naming.handle_error(key, message):
-            return
-        if key.startswith("rename:"):
-            self._thread_interactions.discard_rename(key)
-            return
-        if key == "launch:health":
-            self._bridge_readiness.fail_health()
-            return
-        if key == "launch:status":
-            self._bridge_readiness.fail_status()
-            return
-        if self._bridge_stop_confirmation.active and key in {"health", "bridge-status"}:
-            if key == "health":
-                self._health_observed = True
-                self._health_ok = False
-                self.bridge_status_label.setText("Bridge: disconnected")
-                self._bridge_stop_confirmation.observe_health(False)
-            else:
-                self._status_observed = True
-                self._bridge_ready = False
-                self._app_server_ready = False
-                self.app_server_status_label.setText("App Server: failed")
-                self._bridge_stop_confirmation.observe_status(False)
-            self._maybe_finish_stop_confirmation()
-            return
-        if key in {"health", "bridge-status"}:
-            if key == "health":
-                self._health_observed = True
-                self._health_ok = False
-            else:
-                self._status_observed = True
-                self._bridge_ready = False
-                self._app_server_ready = False
-                self._invalidate_usage_sequence()
-            self.bridge_status_label.setText("Bridge: disconnected")
-            self.app_server_status_label.setText("App Server: failed")
-            self.bottom_status_label.setText(message)
-            self._apply_runtime_observation()
-            if key == "bridge-status":
-                self._record_bridge_status_observation(False)
-            self._sync_overall_status()
-            self._sync_empty_state()
-            return
-        if key == "usage":
-            self._usage_requests.apply_error(message)
-            return
-        selection = self._is_current_selection(key)
-        if selection is None:
-            return
-        _, suffix = selection
-        live_refresh = suffix.startswith("history:")
-        if live_refresh:
-            suffix = suffix.removeprefix("history:")
-        self.bottom_status_label.setText(message)
-        if suffix in {"items", "turns"} or suffix.startswith("older:"):
-            if not live_refresh:
-                self.history_pane.set_error(message)
-        if suffix == "status":
-            self._history_stream.status_request_failed(message)
-        self._finish_selected_history_request(key)
+        self._api_result_dispatcher.apply_error(key, message)
 
     def _apply_activity(self, generation: int, payload: object) -> None:
         self._history_stream.apply_activity(generation, payload)
