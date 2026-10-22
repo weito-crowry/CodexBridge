@@ -159,6 +159,7 @@ def test_api_client_streams_safe_activity_and_ignores_stale_reply() -> None:
 
     expected = json.loads(_activity().split(b"data: ", 1)[1].split(b"\n", 1)[0])
     expected["thread_id"] = "thread-2"
+    expected["item_id"] = None
     assert received == [(2, expected)]
     assert old_reply.aborted
     assert old_reply.deleted
