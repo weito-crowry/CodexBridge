@@ -4,7 +4,6 @@ import os
 import sys
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
@@ -13,12 +12,14 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 if TYPE_CHECKING:
     from PySide6.QtCore import QTimer
 
-from PySide6.QtCore import QProcess, QSettings, QTimer, QUrl
+from PySide6.QtCore import QProcess, QSettings, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
-    QDesktopServices,
     QIcon,
+)
+from PySide6.QtGui import (
+    QDesktopServices as QDesktopServices,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -57,7 +58,7 @@ from .codex_resolver import (
 from .codex_update_controller import CodexUpdateController
 from .codex_updates import CodexUpdateProbe
 from .composer_controller import create_composer_controller
-from .config import ConsoleConfig, ConsoleConfigurationError
+from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
 from .diagnostics_panel import DiagnosticsPanelController
 from .history_requests import (
@@ -72,9 +73,11 @@ from .history_stream import (
 from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
 from .main_window_layout import build_main_window_ui
 from .notification_controller import NotificationController, NotificationSettingsDialog
+from .project_folder_actions import ProjectFolderActionsController
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
 from .runtime_ui import RuntimeUiPresenter
+from .settings_actions import SettingsActionController
 from .thread_interactions import ThreadInteractionController
 from .timer_bootstrap import build_console_timers
 from .tray_controller import TrayController
@@ -207,6 +210,8 @@ class MainWindow(QMainWindow):
     _appearance_actions: dict[str, QAction]
     _appearance_controller: AppearanceController
     _appearance_settings: QSettings
+    _settings_controller: SettingsActionController
+    _project_folder_actions_controller: ProjectFolderActionsController
     advanced_controls: QWidget
     thread_pane: ThreadListPane
     history_pane: HistoryPane
@@ -311,6 +316,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.thread_pane.set_thread_statuses(self._thread_turn_statuses)
         install_appearance(self, appearance_settings, appearance_system_scheme_getter)
+        self._settings_controller = SettingsActionController(self)
         self._install_settings_menu()
         self._notification_controller = NotificationController(
             self._appearance_settings,
@@ -330,6 +336,7 @@ class MainWindow(QMainWindow):
         self._set_initial_size()
         self._build_timers()
         self._thread_interactions = ThreadInteractionController(self)
+        self._project_folder_actions_controller = ProjectFolderActionsController(self)
         self._bulk_thread_naming = BulkThreadNamingController(self)
         self._diagnostics_panel = DiagnosticsPanelController(self)
         self._connect_client()
@@ -635,135 +642,25 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _install_settings_menu(self) -> None:
-        appearance_menu = self.appearance_button.menu()
-        self._appearance_menu = appearance_menu or QMenu(self.settings_button)
-        menu = QMenu(self.settings_button)
-        self._settings_actions = {
-            "Open settings file": menu.addAction("Open settings file", self._open_settings_file),
-            "Reload settings": menu.addAction("Reload settings", self._reload_configuration),
-            "Open settings folder": menu.addAction(
-                "Open settings folder", self._open_settings_folder
-            ),
-        }
-        menu.addSeparator()
-        appearance_menu_item = menu.addMenu("Appearance")
-        appearance_menu_item.addActions(self._appearance_menu.actions())
-        menu.addSeparator()
-        self._apply_pending_settings_action = menu.addAction(
-            "Restart Console to apply pending settings…",
-            self._apply_pending_configuration,
-        )
-        self._apply_pending_settings_action.setEnabled(False)
-        self.settings_button.setMenu(menu)
-        self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.settings_menu = menu
+        self._settings_controller.install_settings_menu()
 
     def _active_config_path(self) -> Path | None:
-        path = self._config.config_path
-        if not path:
-            return None
-        return Path(path).expanduser()
+        return self._settings_controller.active_config_path()
 
     def _open_settings_file(self) -> None:
-        path = self._active_config_path()
-        if path is None:
-            QMessageBox.warning(self, "Settings", "The active configuration file is unavailable.")
-            return
-        try:
-            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(os.fspath(path)))
-        except Exception:
-            opened = False
-        if not opened:
-            QMessageBox.warning(self, "Settings", "Could not open the active configuration file.")
+        self._settings_controller.open_settings_file()
 
     def _open_settings_folder(self) -> None:
-        path = self._active_config_path()
-        if path is None:
-            QMessageBox.warning(self, "Settings", "The active configuration folder is unavailable.")
-            return
-        try:
-            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(os.fspath(path.parent)))
-        except Exception:
-            opened = False
-        if not opened:
-            QMessageBox.warning(self, "Settings", "Could not open the active configuration folder.")
+        self._settings_controller.open_settings_folder()
 
     def _settings_change_names(self, candidate: ConsoleConfig) -> tuple[str, ...]:
-        display_names = {
-            "allowed_roots": "Allowed roots",
-            "attachment_staging_directory": "Attachment staging directory",
-            "codex_executable": "Codex executable",
-            "config_mode": "Configuration source mode",
-            "config_path": "Configuration source path",
-            "port": "Console UI port",
-            "tunnel_executable": "Tunnel executable",
-            "tunnel_profile": "Tunnel profile",
-            "tunnel_profile_dir": "Tunnel profile directory",
-            "tunnel_profile_file": "Generated Tunnel profile path",
-            "tunnel_profile_settings": "Tunnel connection settings",
-        }
-        changed: list[str] = []
-        for item in dataclass_fields(self._config):
-            if item.name == "explicit_overrides":
-                continue
-            if getattr(self._config, item.name) != getattr(candidate, item.name):
-                changed.append(display_names.get(item.name, item.name.replace("_", " ").title()))
-        return tuple(changed)
+        return self._settings_controller.settings_change_names(candidate)
 
     def _reload_configuration(self) -> None:
-        explicit_overrides = cast(dict[str, Any], dict(self._config.explicit_overrides))
-        try:
-            candidate = ConsoleConfig.from_sources(**explicit_overrides)
-        except ConsoleConfigurationError as exc:
-            QMessageBox.warning(self, "Settings", str(exc))
-            self.bottom_status_label.setText(
-                "Settings reload failed; current settings remain active"
-            )
-            return
-
-        changed = self._settings_change_names(candidate)
-        self._pending_config = candidate if changed else None
-        self._apply_pending_settings_action.setEnabled(bool(changed))
-        if changed:
-            changed_text = ", ".join(changed)
-            self.config_status_label.setText(
-                f"Config: {candidate.config_mode} · {len(changed)} pending restart"
-            )
-            self.config_status_label.setToolTip(
-                f"Validated pending changes: {changed_text}. Restart Console to apply."
-            )
-            message = (
-                f"Settings reloaded and validated. Pending changes: {changed_text}. "
-                "Restart Console to apply them. Bridge and Tunnel were not restarted."
-            )
-            self.bottom_status_label.setText("Settings reloaded; restart required to apply changes")
-        else:
-            self.config_status_label.setText(
-                f"Config: {candidate.config_mode} · roots {candidate.roots_count}"
-            )
-            self.config_status_label.setToolTip(
-                candidate.roots_error or "Allowed roots are ready; settings are current"
-            )
-            message = "Settings reloaded and validated. No restart is required."
-            self.bottom_status_label.setText("Settings reloaded")
-        QMessageBox.information(self, "Settings reloaded", message)
+        self._settings_controller.reload_configuration()
 
     def _apply_pending_configuration(self) -> None:
-        if self._pending_config is None:
-            return
-        answer = QMessageBox.question(
-            self,
-            "Restart Console to apply settings",
-            "This closes Console and stops its managed Bridge and Tunnel so the validated "
-            "settings can load. Active Codex work may be interrupted. Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self._restart_after_settings_apply = True
-        self.bottom_status_label.setText("Applying settings and restarting Console…")
-        self._begin_exit()
+        self._settings_controller.apply_pending_configuration()
 
     def _show_notification(self, title: str, body: str) -> None:
         if self.tray_icon is None:
@@ -1424,49 +1321,16 @@ class MainWindow(QMainWindow):
         self._thread_interactions._copy_thread_content(thread_id)
 
     def _validated_project_folder(self, cwd: str) -> str | None:
-        folder = self.thread_pane._openable_cwd(cwd)
-        if folder is None:
-            self.bottom_status_label.setText("Project folder is no longer available")
-        return folder
+        return self._project_folder_actions_controller.validated_project_folder(cwd)
 
     def _new_thread_for_folder(self, cwd: str) -> None:
-        folder = self._validated_project_folder(cwd)
-        if folder is not None:
-            self._composer_controller.open_new_thread_draft(folder)
+        self._project_folder_actions_controller.new_thread_for_folder(cwd)
 
     def _open_project_folder(self, cwd: str) -> None:
-        folder = self._validated_project_folder(cwd)
-        if folder is None:
-            return
-        try:
-            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-        except Exception:
-            opened = False
-        if not opened:
-            self.bottom_status_label.setText("Could not open project folder in Explorer")
+        self._project_folder_actions_controller.open_project_folder(cwd)
 
     def _open_project_terminal(self, cwd: str) -> None:
-        folder = self._validated_project_folder(cwd)
-        if folder is None:
-            return
-        if sys.platform == "win32":
-            commands: tuple[tuple[str, list[str]], ...] = (
-                ("wt.exe", ["-d", folder]),
-                ("cmd.exe", []),
-            )
-        elif sys.platform == "darwin":
-            commands = (("open", ["-a", "Terminal"]),)
-        else:
-            commands = (("x-terminal-emulator", []),)
-        for program, arguments in commands:
-            try:
-                result = QProcess.startDetached(program, arguments, folder)
-            except Exception:
-                continue
-            started = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
-            if started:
-                return
-        self.bottom_status_label.setText("Could not open a terminal in the project folder")
+        self._project_folder_actions_controller.open_project_terminal(cwd)
 
     def _request_thread_copy_page(
         self, key: str, thread_id: str, cursor: str | None = None
