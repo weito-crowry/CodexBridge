@@ -43,6 +43,7 @@ from ..tunnel_profile import TunnelProfileError, generate_tunnel_profile
 from .api_client import ApiClient
 from .api_result_dispatcher import ApiResultDispatcher
 from .appearance import AppearanceController, install_appearance
+from .bridge_lifecycle_actions import BridgeLifecycleController
 from .bridge_managed_retry import BridgeManagedRetryCoordinator
 from .bridge_readiness import BridgeReadinessCoordinator
 from .bridge_runtime_observer import BridgeRuntimeObserver
@@ -212,6 +213,7 @@ class MainWindow(QMainWindow):
     _appearance_controller: AppearanceController
     _appearance_settings: QSettings
     _settings_controller: SettingsActionController
+    _bridge_lifecycle_controller: BridgeLifecycleController
     _project_folder_actions_controller: ProjectFolderActionsController
     advanced_controls: QWidget
     thread_pane: ThreadListPane
@@ -336,6 +338,10 @@ class MainWindow(QMainWindow):
         self._global_stream_retry_timer.timeout.connect(self._retry_global_stream)
         self._set_initial_size()
         self._build_timers()
+        self._bridge_lifecycle_controller = BridgeLifecycleController(
+            self,
+            generate_control_token=lambda: token_urlsafe(32),
+        )
         self._thread_interactions = ThreadInteractionController(self)
         self._api_result_dispatcher = ApiResultDispatcher(
             self,
@@ -1018,40 +1024,13 @@ class MainWindow(QMainWindow):
         self._runtime_ui._update_lifecycle_controls()
 
     def _can_start_bridge(self) -> bool:
-        return (
-            not self._closing
-            and self._config.roots_ready
-            and self._codex_resolution is not None
-            and self._health_observed
-            and self._status_observed
-            and not self._health_ok
-            and not self._bridge_ready
-            and not self._app_server_ready
-            and not self._bridge_seen_ready
-            and not self._launch_in_progress
-            and not self._detached_launch_started
-            and not self._bridge_transition
-            and not self._tunnel_is_transitioning()
-            and not self.bridge_start_retry_timer.isActive()
-            and not self._bridge_start_retry_exhausted
-            and self._runtime_state in {"unavailable", "stopped", "launch_failed"}
-        )
+        return self._bridge_lifecycle_controller.can_start_bridge()
 
     def _maybe_auto_start_bridge(self) -> None:
         self._bridge_managed_retry_coordinator.maybe_auto_start_bridge()
 
     def _retry_now(self) -> None:
-        if self._closing or self._launch_in_progress or self._bridge_transition:
-            return
-        bridge_ready = self._health_ok and self._bridge_ready and self._app_server_ready
-        if bridge_ready and self._tunnel_state != "ready":
-            retry_now = getattr(self._tunnel, "retry_now", None)
-            if callable(retry_now):
-                retry_now()
-            return
-        self._bridge_managed_retry_coordinator.reset_for_retry_now()
-        if self._can_start_bridge():
-            self._start_bridge(managed=True)
+        self._bridge_lifecycle_controller.retry_now()
 
     def _restart_codexbridge(self) -> None:
         self._restart_bridge()
@@ -1063,57 +1042,10 @@ class MainWindow(QMainWindow):
         self._bridge_managed_retry_coordinator.on_retry_timeout()
 
     def _start_bridge(self, *, managed: bool = False) -> None:
-        resolution = self._codex_resolution
-        if resolution is None or not self._can_start_bridge():
-            return
-        if managed:
-            self._bridge_managed_retry_coordinator.activate()
-        self._bridge_transition_coordinator.reset_for_launch()
-        self._bridge_transition = True
-        self._sync_tunnel_controls()
-        self._launch_bridge(resolution.path)
+        self._bridge_lifecycle_controller.start_bridge(managed=managed)
 
     def _launch_bridge(self, codex_executable: str) -> None:
-        self._launch_generation += 1
-        control_token = token_urlsafe(32)
-        self._control_token = control_token
-        self._launch_in_progress = True
-        self._set_runtime_state("launching")
-        try:
-            if self._config.config_mode == "managed" and self._config.config_path is not None:
-                result = self._launcher.launch(
-                    codex_executable=codex_executable,
-                    ui_port=self._config.port,
-                    control_token=control_token,
-                    allowed_roots=self._config.allowed_roots,
-                    managed_config_path=self._config.config_path,
-                )
-            else:
-                result = self._launcher.launch(
-                    codex_executable=codex_executable,
-                    ui_port=self._config.port,
-                    control_token=control_token,
-                    allowed_roots=self._config.allowed_roots,
-                )
-        except Exception:
-            self._launch_in_progress = False
-            self._control_token = None
-            self._bridge_transition = False
-            self._set_runtime_state("launch_failed")
-            self.bottom_status_label.setText("Bridge launch failed")
-            self._schedule_managed_bridge_retry()
-            return
-        if not result.started:
-            self._launch_in_progress = False
-            self._control_token = None
-            self._bridge_transition = False
-            self._set_runtime_state("launch_failed")
-            self.bottom_status_label.setText("Bridge launch failed")
-            self._schedule_managed_bridge_retry()
-            return
-        self._detached_launch_started = True
-        self._detached_pid = result.pid
-        self._bridge_readiness.begin()
+        self._bridge_lifecycle_controller.launch_bridge(codex_executable)
 
     def _request_launch_readiness(self) -> None:
         self._bridge_readiness.request()
@@ -1128,53 +1060,20 @@ class MainWindow(QMainWindow):
         self._bridge_readiness.apply_status(payload)
 
     def _on_launch_readiness_timeout(self) -> None:
-        self._launch_in_progress = False
-        self._bridge_transition = False
-        if self._managed_start_active:
-            self._set_runtime_state("launch_failed")
-        else:
-            self._set_runtime_state("launch_timed_out")
-        self.bottom_status_label.setText("Bridge launch timed out; it may still be starting")
-        self._schedule_managed_bridge_retry()
+        self._bridge_lifecycle_controller.on_launch_readiness_timeout()
 
     def _finish_launch_if_ready(self) -> None:
-        if not self._bridge_readiness.ready():
-            return
-        self.readiness_timer.stop()
-        self._launch_in_progress = False
-        self._health_ok = True
-        self._bridge_ready = True
-        self._app_server_ready = True
-        self._bridge_seen_ready = True
-        self._bridge_runtime_observer.reset_loss_count()
-        self._bridge_managed_retry_coordinator.reset_after_ready()
-        self._bridge_transition = False
-        self._set_runtime_state("console_started", label="Runtime: started by Console")
-        self.bottom_status_label.setText("Bridge started by Console")
-        self._tunnel.set_bridge_ready(True)
-        self._begin_usage_sequence()
-        self._restore_restarted_tunnel()
+        self._bridge_lifecycle_controller.finish_launch_if_ready()
 
     def _restore_restarted_tunnel(self) -> None:
         if self._bridge_transition_coordinator.consume_restart_tunnel_flag():
             self._tunnel.start()
 
     def _bridge_control_allowed(self) -> bool:
-        return (
-            self._runtime_state == "console_started"
-            and self._bridge_ready
-            and self._app_server_ready
-            and self._control_token is not None
-            and not self._bridge_transition
-            and not self._tunnel_is_transitioning()
-            and not self._closing
-        )
+        return self._bridge_lifecycle_controller.bridge_control_allowed()
 
     def _tunnel_owned_running(self) -> bool:
-        actions = getattr(self._tunnel, "action_state", None)
-        return bool(getattr(actions, "stop_enabled", False)) and getattr(
-            self._tunnel, "state", "running"
-        ) in {"running", "ready", "not_ready"}
+        return self._bridge_lifecycle_controller.tunnel_owned_running()
 
     def _stop_bridge(self) -> None:
         if not self._bridge_control_allowed():
@@ -1254,49 +1153,10 @@ class MainWindow(QMainWindow):
         self._confirm_bridge_stopped()
 
     def _on_stop_confirmation_timed_out(self) -> None:
-        if self._exit_shutdown_pending:
-            self._finish_exit()
-            return
-        self._bridge_transition = False
-        self._stop_outcome_uncertain = True
-        self._health_observed = False
-        self._status_observed = False
-        self._set_runtime_state("stop_timed_out")
-        self.bottom_status_label.setText("Bridge stop timed out")
+        self._bridge_lifecycle_controller.on_stop_confirmation_timed_out()
 
     def _confirm_bridge_stopped(self) -> None:
-        action = self._bridge_transition_coordinator.pending_action
-        stop_outcome_was_uncertain = self._stop_outcome_uncertain
-        self._bridge_stop_confirmation.complete()
-        self._stop_outcome_uncertain = False
-        self._bridge_ready = False
-        self._app_server_ready = False
-        self._health_ok = False
-        self._control_token = None
-        self._detached_pid = None
-        self._detached_launch_started = False
-        self._bridge_seen_ready = False
-        self._bridge_runtime_observer.reset_loss_count()
-        self._launch_in_progress = False
-        self._tunnel.set_bridge_ready(False)
-        self._bridge_transition_coordinator.clear_pending_action()
-        if action == "restart" and not stop_outcome_was_uncertain:
-            resolution = self._codex_resolution
-            if resolution is None:
-                self._bridge_transition = False
-                self._bridge_transition_coordinator.clear_restart_flag()
-                self._set_runtime_state("launch_failed")
-                self.bottom_status_label.setText("Bridge relaunch failed")
-                return
-            self._launch_bridge(resolution.path)
-            return
-        self._bridge_transition_coordinator.clear_restart_flag()
-        self._bridge_transition = False
-        self._sync_tunnel_controls()
-        self.bridge_status_label.setText("Bridge: disconnected")
-        self.app_server_status_label.setText("App Server: failed")
-        self._set_runtime_state("stopped")
-        self.bottom_status_label.setText("Bridge stopped")
+        self._bridge_lifecycle_controller.confirm_bridge_stopped()
 
     def _apply_runtime_observation(self) -> None:
         self._bridge_runtime_observer.apply_runtime_observation()
