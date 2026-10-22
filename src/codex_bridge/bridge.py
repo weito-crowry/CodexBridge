@@ -38,7 +38,13 @@ from .models import (
     validate_sandbox_mode,
 )
 from .paths import AllowedPathPolicy
-from .rollout_metadata import TurnModelMetadata, read_turn_model_metadata, unavailable_metadata
+from .rollout_metadata import (
+    TurnAccessMetadata,
+    TurnModelMetadata,
+    read_turn_execution_metadata,
+    unavailable_access_metadata,
+    unavailable_metadata,
+)
 from .setup_capabilities import normalize_capabilities
 from .state import StateStore
 from .thread_titles import derive_thread_title, normalize_explicit_title
@@ -67,11 +73,12 @@ def _with_turn_model_metadata(
     thread = thread_response.get("thread")
     rollout_path = thread.get("path") if isinstance(thread, Mapping) else None
     try:
-        resolved = read_turn_model_metadata(rollout_path)
+        resolved = read_turn_execution_metadata(rollout_path)
     except Exception:
         resolved = {}
 
     metadata: dict[str, TurnModelMetadata] = {}
+    access_metadata: dict[str, TurnAccessMetadata] = {}
     items = result.get("items")
     if isinstance(items, list):
         for entry in items:
@@ -80,8 +87,25 @@ def _with_turn_model_metadata(
             turn_id = entry.get("turn_id")
             if not isinstance(turn_id, str) or turn_id in metadata:
                 continue
-            metadata[turn_id] = resolved.get(turn_id, unavailable_metadata())
+            turn_metadata = resolved.get(turn_id)
+            metadata[turn_id] = (
+                {
+                    "model_candidates": turn_metadata["model_candidates"],
+                    "model_resolution_status": turn_metadata["model_resolution_status"],
+                }
+                if turn_metadata is not None
+                else unavailable_metadata()
+            )
+            access_metadata[turn_id] = (
+                {
+                    "access_candidates": turn_metadata["access_candidates"],
+                    "access_resolution_status": turn_metadata["access_resolution_status"],
+                }
+                if turn_metadata is not None
+                else unavailable_access_metadata()
+            )
     result["turn_model_metadata"] = metadata
+    result["turn_access_metadata"] = access_metadata
     return result
 
 

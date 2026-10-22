@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .history_metadata import _turn_model_metadata_from_payload
+from .history_metadata import (
+    _turn_access_metadata_from_payload,
+    _turn_model_metadata_from_payload,
+)
 from .usage import CodexUsageSnapshot
 from .widgets import HistoryPane, TimelineEntry, timeline_entries
 
@@ -20,6 +23,7 @@ class HistoryTimelineState:
     def __init__(self) -> None:
         self._entries: list[TimelineEntry] = []
         self._turn_model_metadata: dict[str, Mapping[str, object]] = {}
+        self._turn_access_metadata: dict[str, Mapping[str, object]] = {}
         self._turn_statuses: dict[str, str] = {}
         self._next_cursor: str | None = None
         self._has_loaded_older = False
@@ -37,6 +41,10 @@ class HistoryTimelineState:
         return self._turn_model_metadata
 
     @property
+    def turn_access_metadata(self) -> dict[str, Mapping[str, object]]:
+        return self._turn_access_metadata
+
+    @property
     def turn_statuses(self) -> dict[str, str]:
         return self._turn_statuses
 
@@ -51,6 +59,7 @@ class HistoryTimelineState:
     def reset(self) -> None:
         self._entries = []
         self._turn_model_metadata = {}
+        self._turn_access_metadata = {}
         self._turn_statuses = {}
         self._next_cursor = None
         self._has_loaded_older = False
@@ -83,14 +92,18 @@ class HistoryTimelineState:
             return False
         new_entries = timeline_entries(payload)
         page_metadata = _turn_model_metadata_from_payload(payload)
+        page_access_metadata = _turn_access_metadata_from_payload(payload)
         if prepend:
             self._turn_model_metadata.update(page_metadata)
+            self._turn_access_metadata.update(page_access_metadata)
             self._has_loaded_older = True
         elif live_refresh:
             self._turn_model_metadata.update(page_metadata)
+            self._turn_access_metadata.update(page_access_metadata)
         else:
             self._has_loaded_older = False
             self._turn_model_metadata = page_metadata
+            self._turn_access_metadata = page_access_metadata
         if prepend:
             existing = {(entry.turn_id, entry.item_id) for entry in self._entries}
             new_entries = tuple(

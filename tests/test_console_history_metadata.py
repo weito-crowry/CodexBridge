@@ -11,6 +11,12 @@ def _summarize(turn_ids: list[str], metadata: dict[str, Any]) -> Any:
     return summarize(turn_ids, metadata)
 
 
+def _summarize_access(turn_ids: list[str], metadata: dict[str, Any]) -> Any:
+    summarize = getattr(history_metadata, "summarize_turn_access_metadata", None)
+    assert callable(summarize), "access history summary helper has not been implemented"
+    return summarize(turn_ids, metadata)
+
+
 def _entry(model: str, effort: str | None, *, status: str = "resolved") -> dict[str, object]:
     return {
         "model_candidates": [{"model": model, "reasoning_effort": effort}],
@@ -134,3 +140,94 @@ def test_tooltips_include_history_source_and_are_truncated() -> None:
     assert len(summary.effort_tooltip) <= 1200
     assert "読み込んだ履歴" in summary.model_tooltip
     assert "省略" in summary.model_tooltip
+
+
+def test_observed_access_is_summarized_only_for_displayed_turns() -> None:
+    summary = _summarize_access(
+        ["turn-1", "turn-2"],
+        {
+            "turn-1": {
+                "access_candidates": ["danger-full-access"],
+                "access_resolution_status": "resolved",
+            },
+            "turn-2": {
+                "access_candidates": ["danger-full-access"],
+                "access_resolution_status": "resolved",
+            },
+            "orphan": {
+                "access_candidates": ["workspace-write"],
+                "access_resolution_status": "resolved",
+            },
+        },
+    )
+
+    assert summary.access == "danger-full-access"
+    assert "turn-1" in summary.tooltip
+    assert "turn-2" in summary.tooltip
+    assert "orphan" not in summary.tooltip
+    assert "現在の実行権限を保証しません" in summary.tooltip
+
+
+def test_access_conflicts_across_turns_or_within_a_turn_are_multiple() -> None:
+    summary = _summarize_access(
+        ["turn-1", "turn-2"],
+        {
+            "turn-1": {
+                "access_candidates": ["danger-full-access", "workspace-write"],
+                "access_resolution_status": "multiple",
+            },
+            "turn-2": {
+                "access_candidates": ["read-only"],
+                "access_resolution_status": "resolved",
+            },
+        },
+    )
+
+    assert summary.access == "Multiple"
+    assert "danger-full-access" in summary.tooltip
+    assert "workspace-write" in summary.tooltip
+    assert "read-only" in summary.tooltip
+
+
+def test_partial_access_history_shows_observed_value_and_missing_turns() -> None:
+    summary = _summarize_access(
+        ["known", "missing"],
+        {
+            "known": {
+                "access_candidates": ["workspace-write"],
+                "access_resolution_status": "resolved",
+            },
+            "missing": {
+                "access_candidates": [],
+                "access_resolution_status": "unavailable",
+            },
+        },
+    )
+
+    assert summary.access == "workspace-write"
+    assert "一部のターンではAccessを取得できていません" in summary.tooltip
+    assert "missing [unavailable]" in summary.tooltip
+
+
+def test_unknown_access_and_oversized_tooltip_remain_bounded() -> None:
+    turn_ids = [f"turn-{index:02d}-" + "x" * 100 for index in range(20)]
+    metadata = {
+        turn_id: {
+            "access_candidates": [] if index == 0 else ["danger-full-access"],
+            "access_resolution_status": "unavailable" if index == 0 else "resolved",
+        }
+        for index, turn_id in enumerate(turn_ids)
+    }
+
+    summary = _summarize_access(turn_ids, metadata)
+
+    assert summary.access == "danger-full-access"
+    assert len(summary.tooltip) <= 1200
+    assert "一部" in summary.tooltip
+    assert "省略" in summary.tooltip
+    unknown = _summarize_access(
+        ["unknown"],
+        {"unknown": {"access_candidates": [{"private": "value"}], "access_resolution_status": []}},
+    )
+    assert unknown.access is None
+    assert "履歴からAccessを取得できませんでした" in unknown.tooltip

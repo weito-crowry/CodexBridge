@@ -49,6 +49,10 @@ def _metadata(model: str) -> dict[str, object]:
     }
 
 
+def _access_metadata(access: str) -> dict[str, object]:
+    return {"access_candidates": [access], "access_resolution_status": "resolved"}
+
+
 def test_snapshot_live_refresh_and_explicit_snapshot_update_statuses_and_entries() -> None:
     state = HistoryTimelineState()
     assert (
@@ -127,6 +131,7 @@ def test_older_items_prepend_without_duplicate_ids_and_merge_metadata() -> None:
             ],
             "next_cursor": "older-1",
             "turn_model_metadata": {"turn-current": _metadata("model-current")},
+            "turn_access_metadata": {"turn-current": _access_metadata("danger-full-access")},
         },
         prepend=False,
     )
@@ -138,6 +143,7 @@ def test_older_items_prepend_without_duplicate_ids_and_merge_metadata() -> None:
             ],
             "next_cursor": "older-2",
             "turn_model_metadata": {"turn-old": _metadata("model-old")},
+            "turn_access_metadata": {"turn-old": _access_metadata("read-only")},
         },
         prepend=True,
     )
@@ -150,6 +156,12 @@ def test_older_items_prepend_without_duplicate_ids_and_merge_metadata() -> None:
     assert state.next_cursor == "older-2"
     assert state.has_loaded_older
     assert set(state.turn_model_metadata) == {"turn-current", "turn-old"}
+    assert getattr(state, "turn_access_metadata", {}) == {
+        "turn-current": _access_metadata("danger-full-access"),
+        "turn-old": _access_metadata("read-only"),
+    }
+    state.reset()
+    assert state.turn_access_metadata == {}
 
 
 def test_live_refresh_after_older_load_preserves_older_cursor() -> None:

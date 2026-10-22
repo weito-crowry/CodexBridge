@@ -89,9 +89,19 @@ def test_readonly_metadata_tooltips_are_replaced_and_cleared() -> None:
     assert widget.model_combo.toolTip() == "history model source"
     assert widget.effort_combo.toolTip() == "history effort source"
 
+    history_access_tooltip = "historical access only"
+    widget.set_readonly_metadata(
+        "history-model",
+        "high",
+        "danger-full-access",
+        access_tooltip=history_access_tooltip,
+    )
+    assert widget.access_combo.toolTip() == history_access_tooltip
+
     widget.set_readonly_metadata("current-model", "high", "workspace-write")
     assert widget.model_combo.toolTip() == ""
     assert widget.effort_combo.toolTip() == ""
+    assert widget.access_combo.toolTip() == ""
 
 
 def test_footer_values_remain_fully_visible_at_ordinary_and_narrow_widths() -> None:

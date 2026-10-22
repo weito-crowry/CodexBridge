@@ -17,6 +17,17 @@ class HistoryModelSummary:
     effort_tooltip: str
 
 
+@dataclass(frozen=True, slots=True)
+class HistoryAccessSummary:
+    access: str | None
+    tooltip: str
+
+
+_KNOWN_ACCESS_VALUES = frozenset(
+    {"danger-full-access", "read-only", "workspace-write", "external-sandbox"}
+)
+
+
 def _turn_model_metadata_from_payload(payload: object) -> dict[str, Mapping[str, object]]:
     if not isinstance(payload, Mapping):
         return {}
@@ -58,6 +69,44 @@ def _turn_model_metadata_from_payload(payload: object) -> dict[str, Mapping[str,
             "model_candidates": candidates,
             "model_resolution_status": status,
         }
+    return result
+
+
+def _turn_access_metadata_from_payload(payload: object) -> dict[str, Mapping[str, object]]:
+    if not isinstance(payload, Mapping):
+        return {}
+    raw_metadata = payload.get("turn_access_metadata")
+    if not isinstance(raw_metadata, Mapping):
+        return {}
+    result: dict[str, Mapping[str, object]] = {}
+    for turn_id, raw_entry in raw_metadata.items():
+        if not isinstance(turn_id, str) or not isinstance(raw_entry, Mapping):
+            continue
+        raw_candidates = raw_entry.get("access_candidates")
+        candidates: list[str] = []
+        if isinstance(raw_candidates, list):
+            for raw_candidate in raw_candidates:
+                if (
+                    isinstance(raw_candidate, str)
+                    and raw_candidate in _KNOWN_ACCESS_VALUES
+                    and raw_candidate not in candidates
+                ):
+                    candidates.append(raw_candidate)
+        status = raw_entry.get("access_resolution_status")
+        if not candidates:
+            status = "unavailable"
+        elif not isinstance(status, str) or status not in {
+            "resolved",
+            "multiple",
+            "partial",
+            "unavailable",
+        }:
+            status = "resolved" if len(candidates) == 1 else "multiple"
+        elif status == "unavailable":
+            candidates = []
+        elif len(candidates) > 1 and status == "resolved":
+            status = "multiple"
+        result[turn_id] = {"access_candidates": candidates, "access_resolution_status": status}
     return result
 
 
@@ -106,6 +155,36 @@ def summarize_turn_model_metadata(
     )
 
 
+def summarize_turn_access_metadata(
+    turn_ids: Iterable[str], turn_access_metadata: Mapping[str, object]
+) -> HistoryAccessSummary:
+    """Summarize historical sandbox values for turns represented in the timeline."""
+    parsed = _turn_access_metadata_from_payload({"turn_access_metadata": turn_access_metadata})
+    ordered_turn_ids = tuple(dict.fromkeys(turn_id for turn_id in turn_ids if turn_id))
+    records: list[tuple[str, str, tuple[str, ...]]] = []
+    access_values: set[str] = set()
+    partial = False
+
+    for turn_id in ordered_turn_ids:
+        entry = parsed.get(turn_id)
+        status = entry.get("access_resolution_status") if entry is not None else "unavailable"
+        status = status if isinstance(status, str) else "unavailable"
+        raw_candidates = entry.get("access_candidates") if entry is not None else None
+        candidates = tuple(raw_candidates) if isinstance(raw_candidates, list) else ()
+        access_values.update(candidates)
+        if not candidates or status in {"partial", "unavailable"}:
+            partial = True
+        records.append((turn_id, status, candidates))
+
+    access = _single_observed_value(access_values)
+    return HistoryAccessSummary(
+        access=access,
+        tooltip=_access_history_tooltip(
+            records, partial=partial, has_observed_value=bool(access_values)
+        ),
+    )
+
+
 def _single_observed_value(values: set[str]) -> str | None:
     if len(values) > 1:
         return "Multiple"
@@ -136,6 +215,35 @@ def _history_tooltip(
             if len(candidates) > 6:
                 values += "; …"
             lines.append(f"{safe_turn_id} [{status}]: {values}")
+        else:
+            lines.append(f"{safe_turn_id} [{status}]")
+    omitted = len(records) - len(shown_records)
+    if omitted:
+        lines.append(f"ほか{omitted}件のturnを省略しました。")
+    tooltip = "\n".join(lines)
+    if len(tooltip) > _MAX_TOOLTIP_CHARS:
+        tooltip = tooltip[: _MAX_TOOLTIP_CHARS - 12].rstrip() + "\n…省略…"
+    return tooltip
+
+
+def _access_history_tooltip(
+    records: list[tuple[str, str, tuple[str, ...]]],
+    *,
+    partial: bool,
+    has_observed_value: bool,
+) -> str:
+    lines = ["履歴から観測したsandbox設定です。現在の実行権限を保証しません。"]
+    if partial:
+        lines.append(
+            "一部のターンではAccessを取得できていません。"
+            if has_observed_value
+            else "履歴からAccessを取得できませんでした。"
+        )
+    shown_records = list(reversed(records[-_MAX_TOOLTIP_TURNS:]))
+    for turn_id, status, candidates in shown_records:
+        safe_turn_id = _tooltip_value(_single_line(turn_id) or "Unknown turn")
+        if candidates:
+            lines.append(f"{safe_turn_id} [{status}]: {'; '.join(candidates[:6])}")
         else:
             lines.append(f"{safe_turn_id} [{status}]")
     omitted = len(records) - len(shown_records)
