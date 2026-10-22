@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 
+from codex_bridge.console.thread_list_pane import ThreadListPane as DirectThreadListPane
 from codex_bridge.console.widgets import ThreadListPane
 
 
@@ -28,6 +29,31 @@ def _thread_item(pane: ThreadListPane, thread_id: str) -> QTreeWidgetItem:
     return next(
         item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
     )
+
+
+def test_thread_list_import_paths_preserve_class_widget_and_signals() -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    assert ThreadListPane is DirectThreadListPane
+
+    compatibility_pane = ThreadListPane()
+    direct_pane = DirectThreadListPane()
+    signal_names = (
+        "refresh_requested",
+        "bulk_thread_naming_requested",
+        "thread_selected",
+        "thread_rename_requested",
+        "thread_open_requested",
+        "thread_copy_requested",
+        "new_thread_for_folder_requested",
+        "folder_explorer_requested",
+        "folder_terminal_requested",
+    )
+
+    assert compatibility_pane.list_widget.objectName() == "threadList"
+    assert direct_pane.list_widget.objectName() == "threadList"
+    assert all(hasattr(compatibility_pane, name) for name in signal_names)
+    assert all(hasattr(direct_pane, name) for name in signal_names)
 
 
 def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
