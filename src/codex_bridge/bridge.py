@@ -20,6 +20,7 @@ from .history import (
     validate_history_query,
     validate_legacy_cursor,
 )
+from .history_metadata_projection import attach_turn_execution_metadata
 from .item_lifecycle import ItemLifecycleStore
 from .jsonrpc import JsonRpcClosedError, JsonRpcRemoteError
 from .logging_utils import log_event
@@ -38,13 +39,6 @@ from .models import (
     validate_sandbox_mode,
 )
 from .paths import AllowedPathPolicy
-from .rollout_metadata import (
-    TurnAccessMetadata,
-    TurnModelMetadata,
-    read_turn_execution_metadata,
-    unavailable_access_metadata,
-    unavailable_metadata,
-)
 from .setup_capabilities import normalize_capabilities
 from .state import StateStore
 from .thread_titles import derive_thread_title, normalize_explicit_title
@@ -65,48 +59,6 @@ class BridgeError(RuntimeError):
 
 class ApprovalConflictError(ValueError):
     """Raised when an approval request is no longer pending."""
-
-
-def _with_turn_model_metadata(
-    result: dict[str, object], thread_response: Mapping[str, Any]
-) -> dict[str, object]:
-    thread = thread_response.get("thread")
-    rollout_path = thread.get("path") if isinstance(thread, Mapping) else None
-    try:
-        resolved = read_turn_execution_metadata(rollout_path)
-    except Exception:
-        resolved = {}
-
-    metadata: dict[str, TurnModelMetadata] = {}
-    access_metadata: dict[str, TurnAccessMetadata] = {}
-    items = result.get("items")
-    if isinstance(items, list):
-        for entry in items:
-            if not isinstance(entry, Mapping):
-                continue
-            turn_id = entry.get("turn_id")
-            if not isinstance(turn_id, str) or turn_id in metadata:
-                continue
-            turn_metadata = resolved.get(turn_id)
-            metadata[turn_id] = (
-                {
-                    "model_candidates": turn_metadata["model_candidates"],
-                    "model_resolution_status": turn_metadata["model_resolution_status"],
-                }
-                if turn_metadata is not None
-                else unavailable_metadata()
-            )
-            access_metadata[turn_id] = (
-                {
-                    "access_candidates": turn_metadata["access_candidates"],
-                    "access_resolution_status": turn_metadata["access_resolution_status"],
-                }
-                if turn_metadata is not None
-                else unavailable_access_metadata()
-            )
-    result["turn_model_metadata"] = metadata
-    result["turn_access_metadata"] = access_metadata
-    return result
 
 
 _APPROVAL_METHODS = {
@@ -1104,7 +1056,7 @@ class Bridge:
                     limit=limit,
                 )
                 self._merge_item_lifecycle(thread_id, result)
-                return _with_turn_model_metadata(result, metadata_response)
+                return attach_turn_execution_metadata(result, metadata_response)
             except HistoryValidationError as exc:
                 raise BridgeError("malformed thread items response") from exc
 
@@ -1121,7 +1073,7 @@ class Bridge:
                 cursor=cursor,
             )
             self._merge_item_lifecycle(thread_id, result)
-            return _with_turn_model_metadata(result, metadata_response)
+            return attach_turn_execution_metadata(result, metadata_response)
         except HistoryValidationError as exc:
             raise BridgeError("malformed legacy thread history response") from exc
 
