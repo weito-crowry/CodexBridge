@@ -1689,6 +1689,7 @@ class MainWindow(QMainWindow):
                         if isinstance(entry.turn_id, str)
                     ),
                     self._history_timeline.turn_model_metadata,
+                    turn_access_metadata=self._history_timeline.turn_access_metadata,
                 )
 
     def _render_timeline(self, *, prepend: bool = False) -> None:

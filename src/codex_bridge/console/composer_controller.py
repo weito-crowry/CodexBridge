@@ -11,7 +11,12 @@ from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtWidgets import QMessageBox, QTreeWidget, QTreeWidgetItem
 
 from .composer_widget import ComposerWidget
-from .history_metadata import HistoryModelSummary, summarize_turn_model_metadata
+from .history_metadata import (
+    HistoryAccessSummary,
+    HistoryModelSummary,
+    summarize_turn_access_metadata,
+    summarize_turn_model_metadata,
+)
 
 if TYPE_CHECKING:
     from .api_client import ApiClient
@@ -94,6 +99,7 @@ class ComposerController(QObject):
         self._active_thread_metadata: ThreadMetadataSnapshot | None = None
         self._metadata_selection: tuple[str, int] | None = None
         self._history_model_summary: HistoryModelSummary | None = None
+        self._history_access_summary: HistoryAccessSummary | None = None
         self._unknown_sends: dict[str, SendContext] = {}
         self._awaiting_turns: dict[str, str] = {}
         self._current_draft_key = "new:unselected"
@@ -188,6 +194,7 @@ class ComposerController(QObject):
         )
         self._active_thread_metadata = None
         self._history_model_summary = None
+        self._history_access_summary = None
         self._current_cwd = None
         self._is_new_draft = False
         self._current_draft_key = f"thread:{thread_id}" if thread_id else "new:unselected"
@@ -207,10 +214,15 @@ class ComposerController(QObject):
         selection_generation: int,
         turn_ids: Sequence[str],
         turn_model_metadata: Mapping[str, object],
+        *,
+        turn_access_metadata: Mapping[str, object] | None = None,
     ) -> None:
         if not self._is_current_metadata_selection(thread_id, selection_generation):
             return
         self._history_model_summary = summarize_turn_model_metadata(turn_ids, turn_model_metadata)
+        self._history_access_summary = summarize_turn_access_metadata(
+            turn_ids, turn_access_metadata or {}
+        )
         status = self._active_thread_metadata
         if (
             status is not None
@@ -235,6 +247,8 @@ class ComposerController(QObject):
         self._pending_create_selection = None
         self._pending_create_notice_shown = False
         self._current_thread_id = None
+        self._history_model_summary = None
+        self._history_access_summary = None
         self._is_new_draft = True
         candidate = cwd if isinstance(cwd, str) and cwd.strip() else None
         self._current_cwd = candidate
@@ -452,13 +466,17 @@ class ComposerController(QObject):
                 ):
                     if snapshot.state == "not_loaded":
                         summary = self._history_model_summary
+                        access_summary = self._history_access_summary
                         self._widget.set_readonly_metadata(
                             summary.model if summary is not None else None,
                             summary.effort if summary is not None else None,
-                            None,
+                            access_summary.access if access_summary is not None else None,
                             model_tooltip=(summary.model_tooltip if summary is not None else None),
                             effort_tooltip=(
                                 summary.effort_tooltip if summary is not None else None
+                            ),
+                            access_tooltip=(
+                                access_summary.tooltip if access_summary is not None else None
                             ),
                         )
                     else:

@@ -369,6 +369,7 @@ class ComposerWidget(QWidget):
     def set_access(self, mode: str) -> None:
         self._rendering = True
         self.access_combo.blockSignals(True)
+        self.access_combo.setToolTip("")
         if mode not in {"inherit", "danger-full-access"}:
             self.access_combo.clear()
             self.access_combo.addItem(f"Access: {mode or 'Unknown'}", None)
@@ -393,6 +394,7 @@ class ComposerWidget(QWidget):
         *,
         model_tooltip: str | None = None,
         effort_tooltip: str | None = None,
+        access_tooltip: str | None = None,
     ) -> None:
         self.set_draft_mode(False)
         self.set_model_options([], None, available=False)
@@ -408,6 +410,7 @@ class ComposerWidget(QWidget):
         self._refresh_combo_size_hint(self.effort_combo)
         self._update_controls_layout()
         self.set_access(sandbox_mode or "Unknown")
+        self.access_combo.setToolTip(access_tooltip or "")
 
     def set_status(self, text: str, *, error: bool = False) -> None:
         self.status_label.setText(text)

@@ -34,10 +34,18 @@ def test_history_summary_tracks_older_pages_live_refresh_and_reload() -> None:
             "items": [{"turn_id": "t2", "item": _item("new", "agentMessage", text="new")}],
             "next_cursor": "older",
             "turn_model_metadata": {"t2": _entry("gpt-5", "high")},
+            "turn_access_metadata": {
+                "t2": {
+                    "access_candidates": ["danger-full-access"],
+                    "access_resolution_status": "resolved",
+                }
+            },
         },
     )
     widget = window.composer_widget
     assert widget.model_combo.itemText(0) == "Model: gpt-5"
+    assert widget.access_combo.currentText() == "Access: Full Access"
+    assert "現在の実行権限を保証しません" in widget.access_combo.toolTip()
 
     window.history_pane.older_requested.emit()
     older_key = next(key for key, _, _ in client.requests if ":older:" in key)
@@ -53,11 +61,24 @@ def test_history_summary_tracks_older_pages_live_refresh_and_reload() -> None:
                 "t1": _entry("gpt-5", "high"),
                 "t2": _entry("gpt-5", "high"),
             },
+            "turn_access_metadata": {
+                "t1": {
+                    "access_candidates": ["workspace-write"],
+                    "access_resolution_status": "resolved",
+                },
+                "t2": {
+                    "access_candidates": ["danger-full-access"],
+                    "access_resolution_status": "resolved",
+                },
+            },
         },
     )
     assert widget.model_combo.itemText(0) == "Model: gpt-5"
     assert "t1" in widget.model_combo.toolTip()
     assert "t2" in widget.model_combo.toolTip()
+    assert widget.access_combo.itemText(0) == "Access: Multiple"
+    assert "t1" in widget.access_combo.toolTip()
+    assert "t2" in widget.access_combo.toolTip()
 
     client.activity(
         window._selection_generation,
@@ -77,6 +98,12 @@ def test_history_summary_tracks_older_pages_live_refresh_and_reload() -> None:
                         {"turn_id": "t3", "item": _item("latest", "agentMessage", text="latest")}
                     ],
                     "turn_model_metadata": {"t3": _entry("gpt-5.6", "high")},
+                    "turn_access_metadata": {
+                        "t3": {
+                            "access_candidates": ["read-only"],
+                            "access_resolution_status": "resolved",
+                        }
+                    },
                 },
             )
     assert widget.model_combo.itemText(0) == "Model: Multiple"
@@ -94,8 +121,56 @@ def test_history_summary_tracks_older_pages_live_refresh_and_reload() -> None:
         {
             "items": [{"turn_id": "t4", "item": _item("latest", "agentMessage", text="fresh")}],
             "turn_model_metadata": {"t4": _entry("gpt-6", "low")},
+            "turn_access_metadata": {
+                "t4": {
+                    "access_candidates": ["read-only"],
+                    "access_resolution_status": "resolved",
+                }
+            },
         },
     )
     assert widget.model_combo.itemText(0) == "Model: gpt-6"
+    assert widget.access_combo.itemText(0) == "Access: read-only"
+    assert "t1" not in widget.access_combo.toolTip()
     assert "t1" not in widget.model_combo.toolTip()
+    window.close()
+
+
+def test_loaded_thread_uses_current_sandbox_metadata_instead_of_history() -> None:
+    _application()
+    client = FakeClient()
+    window = MainWindow(_config(), api_client=client, tray_available=False)
+    window.thread_pane.thread_selected.emit("thread-a")
+    client.result(
+        "selection:1:status",
+        {"thread_id": "thread-a", "state": "not_loaded", "thread_metadata": None},
+    )
+    client.result("selection:1:turns", {"turns": []})
+    client.result(
+        "selection:1:items",
+        {
+            "items": [{"turn_id": "t1", "item": _item("old", "agentMessage", text="old")}],
+            "turn_access_metadata": {
+                "t1": {
+                    "access_candidates": ["danger-full-access"],
+                    "access_resolution_status": "resolved",
+                }
+            },
+        },
+    )
+    widget = window.composer_widget
+    assert widget.access_combo.currentText() == "Access: Full Access"
+    assert "履歴から観測したsandbox設定" in widget.access_combo.toolTip()
+
+    client.result(
+        "selection:1:status",
+        {
+            "thread_id": "thread-a",
+            "state": "completed",
+            "thread_metadata": {"sandbox_mode": "workspace-write"},
+        },
+    )
+
+    assert widget.access_combo.itemText(0) == "Access: workspace-write"
+    assert widget.access_combo.toolTip() == ""
     window.close()

@@ -403,15 +403,31 @@ async def test_read_thread_items_adds_turn_model_metadata_from_thread_read_path(
         rollout_path,
         {
             "type": "turn_context",
-            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna", "effort": "xhigh"},
+            "payload": {
+                "turn_id": "turn-1",
+                "model": "gpt-5.6-luna",
+                "effort": "xhigh",
+                "sandbox_policy": {"type": "danger-full-access"},
+                "future_field": {"secret": "not-forwarded"},
+            },
         },
         {
             "type": "turn_context",
-            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-luna", "effort": "xhigh"},
+            "payload": {
+                "turn_id": "turn-1",
+                "model": "gpt-5.6-luna",
+                "effort": "xhigh",
+                "sandbox_policy": {"type": "danger-full-access"},
+            },
         },
         {
             "type": "turn_context",
-            "payload": {"turn_id": "turn-1", "model": "gpt-5.6-sol", "effort": "high"},
+            "payload": {
+                "turn_id": "turn-1",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "sandbox_policy": {"type": "danger-full-access"},
+            },
         },
         {
             "type": "turn_context",
@@ -451,6 +467,19 @@ async def test_read_thread_items_adds_turn_model_metadata_from_thread_read_path(
         },
     }
     assert "orphan" not in result["turn_model_metadata"]
+    assert result.get("turn_access_metadata") == {
+        "turn-1": {
+            "access_candidates": ["danger-full-access"],
+            "access_resolution_status": "resolved",
+        },
+        "turn-2": {
+            "access_candidates": [],
+            "access_resolution_status": "unavailable",
+        },
+    }
+    assert "orphan" not in result.get("turn_access_metadata", {})
+    assert "not-forwarded" not in str(result)
+    assert "sandbox_policy" not in str(result)
     assert str(rollout_path) not in str(result)
 
 

@@ -136,16 +136,33 @@ def test_unloaded_history_metadata_is_readonly_and_selection_generation_bound(
                 "model_resolution_status": "resolved",
             }
         },
+        turn_access_metadata={
+            "turn-a": {
+                "access_candidates": ["danger-full-access"],
+                "access_resolution_status": "resolved",
+            }
+        },
     )
 
     assert widget.model_combo.itemText(0) == "Model: history-model"
     assert widget.effort_combo.itemText(0) == "Effort: high"
-    assert widget.access_combo.itemText(0) == "Access: Unknown"
+    assert widget.access_combo.currentText() == "Access: Full Access"
     assert client.get_json_calls == baseline_requests
     assert client.post_calls == []
 
     window.thread_pane.thread_selected.emit("thread-b")
-    controller.apply_history_model_metadata("thread-a", 1, ["turn-a"], {})
+    controller.apply_history_model_metadata(
+        "thread-a",
+        1,
+        ["turn-a"],
+        {},
+        turn_access_metadata={
+            "turn-a": {
+                "access_candidates": ["read-only"],
+                "access_resolution_status": "resolved",
+            }
+        },
+    )
     client.json_succeeded.emit(
         "selection:1:status",
         {
