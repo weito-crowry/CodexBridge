@@ -146,27 +146,22 @@ class ComposerWidget(QWidget):
         self.access_combo.addItem("Access: Default", "inherit")
         self.access_combo.addItem("Access: Full Access", "danger-full-access")
         self.access_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
         )
-        self.access_combo.setMinimumContentsLength(8)
         self.access_combo.currentIndexChanged.connect(self._emit_access_changed)
 
         self.model_combo = QComboBox()
         self.model_combo.setObjectName("composerModel")
         self.model_combo.addItem("Model: Default", None)
-        self.model_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.model_combo.setMinimumContentsLength(8)
+        self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
         self.model_combo.currentIndexChanged.connect(self._emit_model_changed)
 
         self.effort_combo = QComboBox()
         self.effort_combo.setObjectName("composerEffort")
         self.effort_combo.addItem("Effort: Default", None)
         self.effort_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
         )
-        self.effort_combo.setMinimumContentsLength(7)
         for combo in (self.access_combo, self.model_combo, self.effort_combo):
             combo.setMinimumWidth(0)
             combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -208,11 +203,33 @@ class ComposerWidget(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._set_controls_compact(event.size().width() < 600)
+        self._update_controls_layout(event.size().width())
 
     def minimumSizeHint(self) -> QSize:
         hint = super().minimumSizeHint()
         return QSize(0, hint.height())
+
+    @staticmethod
+    def _refresh_combo_size_hint(combo: QComboBox) -> None:
+        # Invalidate the cached hint while retaining expansion into the stretched cell.
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        combo.updateGeometry()
+
+    def _update_controls_layout(self, width: int | None = None) -> None:
+        available_width = self.width() if width is None else width
+        outer_layout = self.layout()
+        margins = outer_layout.contentsMargins() if outer_layout is not None else None
+        horizontal_margins = margins.left() + margins.right() if margins is not None else 0
+        spacing = max(self.controls_grid.horizontalSpacing(), 0)
+        controls: list[QWidget] = [self.access_combo, self.model_combo, self.effort_combo]
+        if not self.stop_button.isHidden():
+            controls.append(self.stop_button)
+        controls.append(self.send_button)
+        single_row_width = sum(control.sizeHint().width() for control in controls)
+        single_row_width += 4 * spacing
+        single_row_width += horizontal_margins
+        self._set_controls_compact(available_width < single_row_width)
 
     def _set_controls_compact(self, compact: bool) -> None:
         if compact == self._compact_controls:
@@ -220,7 +237,7 @@ class ComposerWidget(QWidget):
         self._compact_controls = compact
         while self.controls_grid.count():
             self.controls_grid.takeAt(0)
-        for column in (1, 2, 3):
+        for column in range(5):
             self.controls_grid.setColumnStretch(column, 0)
         if compact:
             self.controls_grid.addWidget(self.access_combo, 0, 0, 1, 2)
@@ -231,7 +248,9 @@ class ComposerWidget(QWidget):
             self.controls_grid.addWidget(self.access_combo, 0, 0)
             self.controls_grid.addWidget(self.model_combo, 0, 1)
             self.controls_grid.addWidget(self.effort_combo, 0, 2)
-            self.controls_grid.setColumnStretch(3, 1)
+            self.controls_grid.setColumnStretch(0, 1)
+            self.controls_grid.setColumnStretch(1, 2)
+            self.controls_grid.setColumnStretch(2, 1)
             button_row = 0
         self.controls_grid.addWidget(self.stop_button, button_row, 3 if not compact else 0)
         self.controls_grid.addWidget(self.send_button, button_row, 4 if not compact else 1)
@@ -328,6 +347,8 @@ class ComposerWidget(QWidget):
         self.model_combo.setEnabled(self._new_draft and available)
         self.model_combo.blockSignals(False)
         self._rendering = False
+        self._refresh_combo_size_hint(self.model_combo)
+        self._update_controls_layout()
 
     def set_effort_options(self, efforts: Sequence[tuple[str, str]], selected: str | None) -> None:
         self._rendering = True
@@ -342,6 +363,8 @@ class ComposerWidget(QWidget):
         self.effort_combo.setEnabled(self._new_draft and self.selected_model is not None)
         self.effort_combo.blockSignals(False)
         self._rendering = False
+        self._refresh_combo_size_hint(self.effort_combo)
+        self._update_controls_layout()
 
     def set_access(self, mode: str) -> None:
         self._rendering = True
@@ -359,6 +382,8 @@ class ComposerWidget(QWidget):
             self.access_combo.setCurrentIndex(0 if mode == "inherit" else 1)
         self.access_combo.blockSignals(False)
         self._rendering = False
+        self._refresh_combo_size_hint(self.access_combo)
+        self._update_controls_layout()
 
     def set_readonly_metadata(
         self,
@@ -373,10 +398,15 @@ class ComposerWidget(QWidget):
         self.set_model_options([], None, available=False)
         self.model_combo.setItemText(0, f"Model: {model or 'Unknown'}")
         self.model_combo.setToolTip(model_tooltip or "")
+        self._refresh_combo_size_hint(self.model_combo)
+        self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
         self.effort_combo.addItem(f"Effort: {effort or 'Unknown'}", None)
         self.effort_combo.setToolTip(effort_tooltip or "")
         self.effort_combo.setEnabled(False)
+        self.effort_combo.blockSignals(False)
+        self._refresh_combo_size_hint(self.effort_combo)
+        self._update_controls_layout()
         self.set_access(sandbox_mode or "Unknown")
 
     def set_status(self, text: str, *, error: bool = False) -> None:
@@ -395,6 +425,7 @@ class ComposerWidget(QWidget):
     def set_stop_state(self, *, visible: bool, enabled: bool) -> None:
         self.stop_button.setVisible(visible)
         self.stop_button.setEnabled(enabled)
+        self._update_controls_layout()
 
     def _emit_cwd_changed(self, value: str) -> None:
         if not self._rendering:
