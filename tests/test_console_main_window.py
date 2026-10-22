@@ -88,6 +88,50 @@ def test_settings_menu_contains_config_actions_and_existing_appearance_modes() -
     window.close()
 
 
+def test_settings_compatibility_methods_delegate_to_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _application()
+    window = _settings_window(_config())
+    calls: list[tuple[str, object]] = []
+    controller = window._settings_controller
+    monkeypatch.setattr(
+        controller, "install_settings_menu", lambda: calls.append(("install", None))
+    )
+    monkeypatch.setattr(controller, "active_config_path", lambda: Path("settings.toml"))
+    monkeypatch.setattr(controller, "open_settings_file", lambda: calls.append(("file", None)))
+    monkeypatch.setattr(controller, "open_settings_folder", lambda: calls.append(("folder", None)))
+    monkeypatch.setattr(
+        controller,
+        "settings_change_names",
+        lambda candidate: calls.append(("changes", candidate)) or ("Port",),
+    )
+    monkeypatch.setattr(controller, "reload_configuration", lambda: calls.append(("reload", None)))
+    monkeypatch.setattr(
+        controller, "apply_pending_configuration", lambda: calls.append(("apply", None))
+    )
+
+    candidate = _config()
+    window._install_settings_menu()
+    assert window._active_config_path() == Path("settings.toml")
+    window._open_settings_file()
+    window._open_settings_folder()
+    assert window._settings_change_names(candidate) == ("Port",)
+    window._reload_configuration()
+    window._apply_pending_configuration()
+
+    assert [name for name, _value in calls] == [
+        "install",
+        "file",
+        "folder",
+        "changes",
+        "reload",
+        "apply",
+    ]
+    assert calls[3][1] is candidate
+    window.close()
+
+
 def test_settings_open_file_and_folder_use_active_config_location(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -142,6 +186,42 @@ def test_settings_reload_stages_valid_changes_without_disturbing_live_console(
     assert not client.aborted_all
     assert "restart" in window.config_status_label.text().casefold()
     assert messages and "Bridge" in messages[0] and "Tunnel" in messages[0]
+    window.close()
+
+
+def test_settings_reload_without_changes_clears_pending_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _application()
+    active = _config()
+    window = _settings_window(active)
+    window._pending_config = ConsoleConfig(port=8123, allowed_roots=active.allowed_roots)
+    window._apply_pending_settings_action.setEnabled(True)
+    monkeypatch.setattr(ConsoleConfig, "from_sources", classmethod(lambda cls, **_kwargs: active))
+    messages: list[str] = []
+    questions: list[bool] = []
+    exits: list[bool] = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        lambda _parent, _title, text: messages.append(text),
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: questions.append(True),
+    )
+    monkeypatch.setattr(window, "_begin_exit", lambda: exits.append(True))
+
+    window._reload_configuration()
+    window._apply_pending_configuration()
+
+    assert window._pending_config is None
+    assert not window._apply_pending_settings_action.isEnabled()
+    assert messages == ["Settings reloaded and validated. No restart is required."]
+    assert questions == []
+    assert exits == []
+    assert not window._restart_after_settings_apply
     window.close()
 
 
@@ -935,6 +1015,48 @@ def test_project_parent_actions_open_folder_terminal_and_only_create_an_unsent_d
     window.close()
 
 
+def test_project_folder_compatibility_methods_delegate_to_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _application()
+    window = _settings_window(_config())
+    calls: list[tuple[str, str]] = []
+    controller = window._project_folder_actions_controller
+    monkeypatch.setattr(
+        controller,
+        "validated_project_folder",
+        lambda cwd: calls.append(("validate", cwd)) or "validated",
+    )
+    monkeypatch.setattr(
+        controller,
+        "new_thread_for_folder",
+        lambda cwd: calls.append(("draft", cwd)),
+    )
+    monkeypatch.setattr(
+        controller,
+        "open_project_folder",
+        lambda cwd: calls.append(("explorer", cwd)),
+    )
+    monkeypatch.setattr(
+        controller,
+        "open_project_terminal",
+        lambda cwd: calls.append(("terminal", cwd)),
+    )
+
+    assert window._validated_project_folder("requested") == "validated"
+    window._new_thread_for_folder("requested")
+    window._open_project_folder("requested")
+    window._open_project_terminal("requested")
+
+    assert calls == [
+        ("validate", "requested"),
+        ("draft", "requested"),
+        ("explorer", "requested"),
+        ("terminal", "requested"),
+    ]
+    window.close()
+
+
 def test_project_folder_launch_failures_are_reported(tmp_path, monkeypatch) -> None:
     _application()
     cwd = tmp_path / "project"
@@ -950,13 +1072,20 @@ def test_project_folder_launch_failures_are_reported(tmp_path, monkeypatch) -> N
     menu.actions()[2].trigger()
     assert "Could not open project folder" in window.bottom_status_label.text()
 
-    monkeypatch.setattr(
-        main_window_module.QProcess,
-        "startDetached",
-        lambda *_args: (False, 0),
-    )
+    detached: list[tuple[str, list[str], str]] = []
+
+    def _failed_start(program: str, arguments: list[str], working_directory: str):
+        detached.append((program, arguments, working_directory))
+        return False, 0
+
+    monkeypatch.setattr(main_window_module.QProcess, "startDetached", _failed_start)
     menu.actions()[4].trigger()
     assert "Could not open a terminal" in window.bottom_status_label.text()
+    if main_window_module.sys.platform == "win32":
+        assert [program for program, _arguments, _cwd in detached] == ["wt.exe", "cmd.exe"]
+        assert all(
+            working_directory == str(cwd) for _program, _arguments, working_directory in detached
+        )
     window.close()
 
 
