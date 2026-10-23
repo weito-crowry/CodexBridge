@@ -13,6 +13,8 @@ from typing import TypeAlias
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _ENV_REFERENCE = re.compile(r"env:[A-Za-z_][A-Za-z0-9_]*\Z")
 _FILE_REFERENCE = re.compile(r"file:[^\r\n]+\Z")
+_HTTP_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_\`|~0-9A-Za-z]+\Z", re.ASCII)
+_INVALID_HEADER_VALUE = re.compile(r"[\r\n\x00\x85\u2028\u2029]")
 _SECRET_KEYS = frozenset(
     {
         "api_key",
@@ -25,6 +27,10 @@ _SECRET_KEYS = frozenset(
         "token",
     }
 )
+_CREDENTIAL_HEADER_NAMES = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+)
+_CREDENTIAL_HEADER_TERMS = ("token", "secret", "credential", "api-key", "authentication")
 _SECRET_ASSIGNMENT = re.compile(
     r"(?im)(?:^|[{,]\s*)[\"']?(?P<key>api_key|authorization|bearer|client_key|password|"
     r"private_key|secret|token)[\"']?\s*:\s*(?P<value>[^,\n}]+)"
@@ -48,18 +54,52 @@ class TunnelProfileResult:
     profile_name: str
 
 
-def _normalize_mapping(value: object) -> object:
+def _normalize_mcp_extra_headers(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise TunnelProfileError("Tunnel MCP extra_headers must be a mapping of safe strings")
+    normalized: dict[str, str] = {}
+    for header_name, header_value in value.items():
+        if (
+            not isinstance(header_name, str)
+            or _HTTP_FIELD_NAME.fullmatch(header_name) is None
+            or not isinstance(header_value, str)
+            or _INVALID_HEADER_VALUE.search(header_value) is not None
+        ):
+            raise TunnelProfileError(
+                "Tunnel MCP extra_headers must map valid HTTP header names to safe strings"
+            )
+        lowered_name = header_name.casefold()
+        credential_header = (
+            lowered_name in _CREDENTIAL_HEADER_NAMES
+            or lowered_name in _SECRET_KEYS
+            or any(term in lowered_name for term in _CREDENTIAL_HEADER_TERMS)
+        )
+        if credential_header and (
+            _ENV_REFERENCE.fullmatch(header_value) is None
+            and _FILE_REFERENCE.fullmatch(header_value) is None
+        ):
+            raise TunnelProfileError(
+                "Tunnel MCP credential headers must use env: or file: references"
+            )
+        normalized[header_name] = header_value
+    return normalized
+
+
+def _normalize_mapping(value: object, path: tuple[str, ...] = ()) -> object:
     if isinstance(value, Mapping):
         normalized: dict[str, object] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TunnelProfileError("Tunnel profile mapping keys must be strings")
+            if path == ("mcp",) and key == "extra_headers":
+                normalized[key] = _normalize_mcp_extra_headers(item)
+                continue
             if key.casefold() in _SECRET_KEYS:
                 _validate_secret_reference(item)
-            normalized[key] = _normalize_mapping(item)
+            normalized[key] = _normalize_mapping(item, (*path, key))
         return normalized
     if isinstance(value, (list, tuple)):
-        return [_normalize_mapping(item) for item in value]
+        return [_normalize_mapping(item, (*path, "[]")) for item in value]
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
     raise TunnelProfileError("Tunnel profile contains an unsupported value type")

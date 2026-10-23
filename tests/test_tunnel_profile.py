@@ -9,6 +9,7 @@ import pytest
 
 from codex_bridge.tunnel_profile import (
     TunnelProfileError,
+    _render_profile,
     generate_tunnel_profile,
 )
 
@@ -231,3 +232,144 @@ def test_rendered_yaml_is_validated_by_client_without_exposing_content(
     )
 
     assert (tmp_path / "codex-bridge.yaml").read_text(encoding="utf-8") == rendered
+
+
+def test_config_mcp_headers_are_preserved_through_console_render_and_fake_doctor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_bridge.config_file import load_user_config
+    from codex_bridge.console.config import ConsoleConfig
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[tunnel.control_plane]\n"
+        'base_url = "https://control.example.test"\n'
+        'tunnel_id = "dummy-tunnel-id"\n'
+        'api_key = "env:TUNNEL_API_KEY"\n'
+        "[tunnel.mcp]\n"
+        'startup_wait_timeout = "60s"\n'
+        "[tunnel.mcp.extra_headers]\n"
+        'X-Debug-Mode = "1"\n'
+        'Authorization = "env:TUNNEL_MCP_AUTH"\n'
+        'Cookie = "file:C:/dummy/mcp-cookie.txt"\n',
+        encoding="utf-8",
+    )
+    loaded = load_user_config(path=config_path)
+    console_config = ConsoleConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+    profile = console_config.tunnel_profile_settings
+    expected_mcp = {
+        "startup_wait_timeout": "60s",
+        "extra_headers": {
+            "X-Debug-Mode": "1",
+            "Authorization": "env:TUNNEL_MCP_AUTH",
+            "Cookie": "file:C:/dummy/mcp-cookie.txt",
+        },
+    }
+    assert loaded["tunnel"]["mcp"] == expected_mcp
+    assert profile["mcp"] == expected_mcp
+
+    rendered = _render_profile(profile)
+    assert json.loads(rendered)["mcp"] == expected_mcp
+
+    doctor = FakeDoctor()
+
+    def inspect_staged_profile(args: list[str], _: object) -> None:
+        assert args[0] == "fake-tunnel-client.exe"
+        assert json.loads(Path(args[3]).read_text(encoding="utf-8"))["mcp"] == expected_mcp
+
+    doctor.during_call = inspect_staged_profile
+    install_doctor(monkeypatch, doctor)
+    result = generate_tunnel_profile(
+        profile,
+        profile_dir=tmp_path / "profiles",
+        profile_name="codex-bridge",
+        client_executable="fake-tunnel-client.exe",
+    )
+
+    assert doctor.calls[0][0][0] == "fake-tunnel-client.exe"
+    assert json.loads(result.path.read_text(encoding="utf-8"))["mcp"] == expected_mcp
+
+
+@pytest.mark.parametrize(
+    "extra_headers,secret_value",
+    [
+        ("not-a-mapping", "dummy-secret-value"),
+        (["not-a-mapping"], "dummy-secret-value"),
+        ({"X-Count": 3}, "dummy-secret-value"),
+        ({"": "dummy-secret-value"}, "dummy-secret-value"),
+        ({"X:Bad": "dummy-secret-value"}, "dummy-secret-value"),
+        ({"X-é": "dummy-secret-value"}, "dummy-secret-value"),
+        ({"X-Debug": "dummy\r\nX-Injected: yes"}, "dummy\r\nX-Injected: yes"),
+        ({"X-Debug": "dummy\u0000value"}, "dummy\u0000value"),
+        ({"X-Debug": "dummy\u0085value"}, "dummy\u0085value"),
+        ({"X-Debug": "dummy\u2028value"}, "dummy\u2028value"),
+        ({"X-Debug": "dummy\u2029value"}, "dummy\u2029value"),
+        ({"Authorization": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"Proxy-Authorization": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"Cookie": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"Set-Cookie": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"X-API-Key": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"X-API-Key-Value": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"X-Access-Token": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"X-Client-Secret": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"X-User-Credential": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"X-Authentication-Mode": "dummy-header-secret"}, "dummy-header-secret"),
+        ({"Authorization": "env:"}, "env:"),
+        ({"Cookie": "file:"}, "file:"),
+    ],
+)
+def test_mapping_mcp_extra_headers_are_validated_before_write_or_doctor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_headers: object,
+    secret_value: str,
+) -> None:
+    profile = json.loads(json.dumps(PROFILE))
+    profile["mcp"]["extra_headers"] = extra_headers
+    doctor = FakeDoctor()
+    install_doctor(monkeypatch, doctor)
+
+    with pytest.raises(TunnelProfileError) as exc_info:
+        generate_tunnel_profile(
+            profile,
+            profile_dir=tmp_path,
+            profile_name="codex-bridge",
+            client_executable="fake-tunnel-client.exe",
+        )
+
+    if secret_value not in {"env:", "file:"}:
+        assert secret_value not in str(exc_info.value)
+    assert doctor.calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_mapping_mcp_extra_headers_accept_references_and_noncredential_literals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = json.loads(json.dumps(PROFILE))
+    profile["mcp"].update(
+        {
+            "startup_wait_timeout": "60s",
+            "extra_headers": {
+                "X-Debug-Mode": "1",
+                "X-Monkey-Key": "enabled",
+                "Authorization": "env:TUNNEL_MCP_AUTH",
+                "Cookie": "file:C:/dummy/mcp-cookie.txt",
+            },
+        }
+    )
+    doctor = FakeDoctor()
+    install_doctor(monkeypatch, doctor)
+
+    result = generate_tunnel_profile(
+        profile,
+        profile_dir=tmp_path,
+        profile_name="codex-bridge",
+        client_executable="fake-tunnel-client.exe",
+    )
+
+    assert json.loads(result.path.read_text(encoding="utf-8"))["mcp"] == profile["mcp"]
+    assert len(doctor.calls) == 1
+    assert doctor.calls[0][0][0] == "fake-tunnel-client.exe"
