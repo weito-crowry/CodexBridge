@@ -20,6 +20,36 @@ from tests.console_main_window_test_support import (
 )
 
 
+def _managed_tunnel_config(tmp_path):
+    profile_path = tmp_path / ".runtime" / "tunnel-profile.yaml"
+    profile_settings = {
+        "config_version": 1,
+        "control_plane": {
+            "base_url": "https://control.example.test",
+            "tunnel_id": "example-id",
+            "api_key": "env:TUNNEL_API_KEY",
+        },
+    }
+    config = ConsoleConfig(
+        allowed_roots=_config().allowed_roots,
+        config_path=str(tmp_path / "config.toml"),
+        config_mode="explicit",
+        tunnel_executable="C:/tools/tunnel-client.exe",
+        tunnel_executable_source="explicit",
+        tunnel_profile_file=str(profile_path),
+        tunnel_profile_settings=profile_settings,
+    )
+    return config, profile_path, profile_settings
+
+
+def _report_bridge_ready(client: FakeClient, *, key_prefix: str = "") -> None:
+    client.result(f"{key_prefix}health", {"status": "ok"})
+    client.result(
+        f"{key_prefix}status" if key_prefix else "bridge-status",
+        {"bridge": "ready", "app_server": "ready"},
+    )
+
+
 def test_close_stops_timers_and_aborts_only_client_replies() -> None:
     _application()
     client = FakeClient()
@@ -112,27 +142,12 @@ def test_managed_config_path_is_passed_to_bridge_launcher() -> None:
 
 def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch) -> None:
     _application()
-    config_path = tmp_path / "config.toml"
-    profile_path = tmp_path / ".runtime" / "tunnel-profile.yaml"
-    profile_settings = {
-        "config_version": 1,
-        "control_plane": {
-            "base_url": "https://control.example.test",
-            "tunnel_id": "example-id",
-            "api_key": "env:TUNNEL_API_KEY",
-        },
-    }
-    config = ConsoleConfig(
-        allowed_roots=_config().allowed_roots,
-        config_path=str(config_path),
-        config_mode="explicit",
-        tunnel_executable="C:/tools/tunnel-client.exe",
-        tunnel_executable_source="explicit",
-        tunnel_profile_file=str(profile_path),
-        tunnel_profile_settings=profile_settings,
-    )
+    config, profile_path, profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
     generator_calls = []
     supervisor_options = []
+    supervisor_readiness = []
+    events = []
     monkeypatch.setattr(
         main_window_module,
         "enumerate_tunnel_candidates",
@@ -141,22 +156,38 @@ def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch)
 
     def generate(profile, **kwargs):
         generator_calls.append((profile, kwargs))
+        events.append(("generate",))
         return TunnelProfileResult(profile_path, "tunnel-profile")
 
     def create_supervisor(**kwargs):
         supervisor_options.append(kwargs)
-        return StableTunnel()
+        tunnel = StableTunnel()
+        tunnel.set_bridge_ready = lambda ready: (
+            supervisor_readiness.append(ready),
+            events.append(("supervisor_ready", ready)),
+        )
+        return tunnel
 
     monkeypatch.setattr(main_window_module, "generate_tunnel_profile", generate)
     monkeypatch.setattr(main_window_module, "TunnelSupervisor", create_supervisor)
     window = MainWindow(
         config,
-        api_client=FakeClient(),
+        api_client=client,
         codex_probe=FakeCodexProbe(),
         codex_update_probe=FakeCodexUpdateProbe(),
         runtime_launcher=FakeLauncher(),
         tray_available=False,
     )
+
+    assert generator_calls == []
+    assert supervisor_options[0]["profile_file"] == str(profile_path)
+    assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
+    assert window._tunnel_profile_status == "not_run"
+    assert "Managed profile generation and doctor: Not run" in (
+        window.tunnel_init_diagnostics_label.text()
+    )
+
+    _report_bridge_ready(client)
 
     assert generator_calls == [
         (
@@ -168,14 +199,19 @@ def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch)
             },
         )
     ]
+    assert events.index(("generate",)) < events.index(("supervisor_ready", True))
     assert supervisor_options[0]["profile_file"] == str(profile_path)
     assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
     assert window._tunnel_resolution_status == "passed"
     assert window._tunnel_profile_status == "passed"
+    assert supervisor_readiness[-1] is True
     assert "Executable resolution: Passed" in window.tunnel_init_diagnostics_label.text()
     assert "Managed profile generation and doctor: Passed" in (
         window.tunnel_init_diagnostics_label.text()
     )
+
+    _report_bridge_ready(client)
+    assert len(generator_calls) == 1
     window.close()
 
 
@@ -208,24 +244,11 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
     tmp_path, monkeypatch
 ) -> None:
     _application()
-    profile_settings = {
-        "config_version": 1,
-        "control_plane": {
-            "base_url": "https://control.example.test",
-            "tunnel_id": "example-id",
-            "api_key": "env:TUNNEL_API_KEY",
-        },
-    }
-    config = ConsoleConfig(
-        allowed_roots=_config().allowed_roots,
-        config_path=str(tmp_path / "config.toml"),
-        config_mode="explicit",
-        tunnel_executable="C:/tools/tunnel-client.exe",
-        tunnel_executable_source="explicit",
-        tunnel_profile_file=str(tmp_path / ".runtime" / "tunnel-profile.yaml"),
-        tunnel_profile_settings=profile_settings,
-    )
+    config, profile_path, _profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
+    generator_calls = []
     supervisor_options = []
+    supervisor_readiness = []
     monkeypatch.setattr(
         main_window_module,
         "enumerate_tunnel_candidates",
@@ -233,6 +256,7 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
     )
 
     def reject_profile(*_args, **_kwargs):
+        generator_calls.append(True)
         raise TunnelProfileError(
             "Tunnel client rejected profile at https://private.example.test "
             "tunnel_id=private-id api_key=private-secret profile: private-body"
@@ -240,21 +264,32 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
 
     def create_supervisor(**kwargs):
         supervisor_options.append(kwargs)
-        return StableTunnel()
+        tunnel = StableTunnel()
+        tunnel.set_bridge_ready = lambda ready: supervisor_readiness.append(ready)
+        return tunnel
 
     monkeypatch.setattr(main_window_module, "generate_tunnel_profile", reject_profile)
     monkeypatch.setattr(main_window_module, "TunnelSupervisor", create_supervisor)
     window = MainWindow(
         config,
-        api_client=FakeClient(),
+        api_client=client,
         codex_probe=FakeCodexProbe(),
         codex_update_probe=FakeCodexUpdateProbe(),
         runtime_launcher=FakeLauncher(),
         tray_available=False,
     )
 
-    assert supervisor_options[0]["executable"] is None
-    assert supervisor_options[0]["profile_file"] is None
+    assert generator_calls == []
+    assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
+    assert supervisor_options[0]["profile_file"] == str(profile_path)
+    assert window._tunnel_profile_status == "not_run"
+
+    _report_bridge_ready(client)
+    _report_bridge_ready(client)
+
+    assert generator_calls == [True]
+    assert not any(supervisor_readiness)
+    assert window._tunnel.started == 0
     assert (
         window._tunnel_resolution_error
         == "Managed Tunnel profile generation or doctor validation failed"
@@ -270,6 +305,258 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
     assert "private-id" not in tooltip
     assert "private-secret" not in tooltip
     assert "private-body" not in tooltip
+    window.close()
+
+
+def test_retry_now_retries_failed_managed_tunnel_profile_generation_once(
+    tmp_path, monkeypatch
+) -> None:
+    _application()
+    config, profile_path, _profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
+    generator_calls = []
+    supervisor_readiness = []
+    supervisor_retry_calls = []
+    tunnel = LifecycleTunnel()
+    tunnel.set_bridge_ready = lambda ready: supervisor_readiness.append(ready)
+    tunnel.retry_now = lambda: supervisor_retry_calls.append(True)
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def generate(profile, **kwargs):
+        generator_calls.append((profile, kwargs))
+        if len(generator_calls) == 1:
+            raise TunnelProfileError(
+                "doctor failed for https://private.example.test api_key=private-secret"
+            )
+        return TunnelProfileResult(profile_path, "tunnel-profile")
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", generate)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", lambda **_kwargs: tunnel)
+    window = MainWindow(
+        config,
+        api_client=client,
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    _report_bridge_ready(client)
+    _report_bridge_ready(client)
+
+    assert len(generator_calls) == 1
+    assert supervisor_readiness and not any(supervisor_readiness)
+    assert window._tunnel_profile_status == "failed"
+    assert window.retry_now_button.isEnabled()
+
+    window.retry_now_button.click()
+
+    assert len(generator_calls) == 2
+    assert supervisor_readiness[-1] is True
+    assert supervisor_readiness.count(True) == 1
+    assert supervisor_retry_calls == []
+    assert window._tunnel_profile_status == "passed"
+    assert "Managed profile generation and doctor: Passed" in (
+        window.tunnel_init_diagnostics_label.text()
+    )
+    assert "private.example.test" not in window.tunnel_init_diagnostics_label.text()
+    assert "private-secret" not in window.tunnel_init_diagnostics_label.text()
+
+    _report_bridge_ready(client)
+    assert len(generator_calls) == 2
+    window.close()
+
+
+def test_retry_now_keeps_managed_tunnel_stopped_when_profile_retry_fails(
+    tmp_path, monkeypatch
+) -> None:
+    _application()
+    config, _profile_path, _profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
+    generator_calls = []
+    supervisor_readiness = []
+    supervisor_retry_calls = []
+    tunnel = LifecycleTunnel()
+    tunnel.set_bridge_ready = lambda ready: supervisor_readiness.append(ready)
+    tunnel.retry_now = lambda: supervisor_retry_calls.append(True)
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def reject_profile(*_args, **_kwargs):
+        generator_calls.append(True)
+        raise TunnelProfileError("doctor failed with api_key=private-secret")
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", reject_profile)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", lambda **_kwargs: tunnel)
+    window = MainWindow(
+        config,
+        api_client=client,
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    _report_bridge_ready(client)
+    window._retry_now()
+
+    assert generator_calls == [True, True]
+    assert supervisor_readiness and not any(supervisor_readiness)
+    assert supervisor_retry_calls == []
+    assert tunnel.started == 0
+    assert window._tunnel_profile_status == "failed"
+    assert window._tunnel_resolution_error == (
+        "Managed Tunnel profile generation or doctor validation failed"
+    )
+    diagnostics = window.tunnel_init_diagnostics_label.text()
+    assert "Managed profile generation and doctor: Failed" in diagnostics
+    assert "private-secret" not in diagnostics
+    window.close()
+
+
+def test_retry_now_does_not_retry_failed_managed_profile_when_bridge_unready_or_transitioning(
+    tmp_path, monkeypatch
+) -> None:
+    _application()
+    config, _profile_path, _profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
+    generator_calls = []
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def reject_profile(*_args, **_kwargs):
+        generator_calls.append(True)
+        raise TunnelProfileError("doctor failed")
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", reject_profile)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", lambda **_kwargs: StableTunnel())
+    window = MainWindow(
+        config,
+        api_client=client,
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    _report_bridge_ready(client)
+    assert generator_calls == [True]
+    window._health_ok = False
+    window._retry_now()
+    assert generator_calls == [True]
+
+    window._health_ok = True
+    window._bridge_transition = True
+    window._retry_now()
+
+    assert generator_calls == [True]
+    window.close()
+
+
+def test_retry_now_uses_supervisor_for_valid_managed_profile(tmp_path, monkeypatch) -> None:
+    _application()
+    config, profile_path, _profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
+    generator_calls = []
+    tunnel = LifecycleTunnel()
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def generate(*_args, **_kwargs):
+        generator_calls.append(True)
+        return TunnelProfileResult(profile_path, "tunnel-profile")
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", generate)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", lambda **_kwargs: tunnel)
+    window = MainWindow(
+        config,
+        api_client=client,
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    _report_bridge_ready(client)
+    assert window._tunnel_profile_status == "passed"
+    tunnel.emit_state("failed")
+
+    window._retry_now()
+
+    assert generator_calls == [True]
+    assert tunnel.retry_calls == 1
+    window.close()
+
+
+def test_managed_tunnel_profile_is_rechecked_after_bridge_restart(tmp_path, monkeypatch) -> None:
+    _application()
+    config, profile_path, profile_settings = _managed_tunnel_config(tmp_path)
+    client = FakeClient()
+    probe = FakeCodexProbe()
+    launcher = FakeLauncher()
+    generator_calls = []
+    supervisor_readiness = []
+    tunnel = ManagedTunnel()
+    tunnel.set_bridge_ready = lambda ready: supervisor_readiness.append(ready)
+    monkeypatch.setattr(
+        main_window_module,
+        "enumerate_tunnel_candidates",
+        lambda **_kwargs: (TunnelCandidate("C:/tools/tunnel-client.exe", "explicit"),),
+    )
+
+    def generate(profile, **kwargs):
+        generator_calls.append((profile, kwargs))
+        return TunnelProfileResult(profile_path, "tunnel-profile")
+
+    monkeypatch.setattr(main_window_module, "generate_tunnel_profile", generate)
+    monkeypatch.setattr(main_window_module, "TunnelSupervisor", lambda **_kwargs: tunnel)
+    window = MainWindow(
+        config,
+        api_client=client,
+        codex_probe=probe,
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "explicit"))
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    window.start_bridge_button.click()
+    _report_bridge_ready(client, key_prefix="launch:")
+    assert len(generator_calls) == 1
+
+    window.restart_bridge_button.click()
+    client.control_success("control:shutdown")
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+    assert len(generator_calls) == 1
+    assert window._tunnel_profile_status == "not_run"
+    assert "Managed profile generation and doctor: Not run" in (
+        window.tunnel_init_diagnostics_label.text()
+    )
+    _report_bridge_ready(client, key_prefix="launch:")
+
+    assert len(generator_calls) == 2
+    assert window._tunnel_profile_status == "passed"
+    assert "Managed profile generation and doctor: Passed" in (
+        window.tunnel_init_diagnostics_label.text()
+    )
+    assert all(call[0] is profile_settings for call in generator_calls)
+    assert supervisor_readiness[-1] is True
+    assert tunnel.started == 1
     window.close()
 
 
@@ -671,6 +958,8 @@ def test_retry_now_routes_to_tunnel_when_bridge_ready_but_tunnel_unavailable() -
     _set_ready_components(window, tunnel_state="failed")
     window._runtime_state = "external"
     window._sync_overall_status()
+    assert window._config.tunnel_profile == "codex-bridge"
+    assert window._managed_tunnel_profile is None
 
     window._retry_now()
 

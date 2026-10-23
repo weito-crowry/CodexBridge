@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from .bridge_runtime_observer import advance_bridge_generation, set_tunnel_bridge_ready
+
 if TYPE_CHECKING:
     from .main_window import MainWindow
 
@@ -42,6 +44,14 @@ class BridgeLifecycleController:
         if window._closing or window._launch_in_progress or window._bridge_transition:
             return
         bridge_ready = window._health_ok and window._bridge_ready and window._app_server_ready
+        if (
+            bridge_ready
+            and window._managed_tunnel_profile is not None
+            and window._tunnel_profile_status == "failed"
+        ):
+            window._managed_tunnel_profile_attempted_generation = None
+            set_tunnel_bridge_ready(window, True)
+            return
         if bridge_ready and window._tunnel_state != "ready":
             retry_now = getattr(window._tunnel, "retry_now", None)
             if callable(retry_now):
@@ -66,6 +76,7 @@ class BridgeLifecycleController:
     def launch_bridge(self, codex_executable: str) -> None:
         window = self._window
         window._launch_generation += 1
+        advance_bridge_generation(window)
         control_token = self._generate_control_token()
         window._control_token = control_token
         window._launch_in_progress = True
@@ -132,7 +143,7 @@ class BridgeLifecycleController:
         window._bridge_transition = False
         window._set_runtime_state("console_started", label="Runtime: started by Console")
         window.bottom_status_label.setText("Bridge started by Console")
-        window._tunnel.set_bridge_ready(True)
+        set_tunnel_bridge_ready(window, True)
         window._begin_usage_sequence()
         window._restore_restarted_tunnel()
 
