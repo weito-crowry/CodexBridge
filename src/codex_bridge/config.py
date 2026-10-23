@@ -593,7 +593,9 @@ class BridgeConfig:
             wait_default_seconds=wait_default,
             wait_max_seconds=wait_max,
             shutdown_grace_seconds=_positive_float(
-                "CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS", 3.0, values
+                "CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS",
+                float(bridge_config.get("shutdown_grace_seconds", 3.0)),
+                values,
             ),
             control_token=_control_token(values),
             file_put_dir=file_put_dir,
