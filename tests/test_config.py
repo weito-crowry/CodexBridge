@@ -622,6 +622,30 @@ def test_config_schema_accepts_bridge_listener_and_wait_settings(tmp_path) -> No
     assert config.allowed_hosts == ("localhost",)
     assert config.allowed_origins == ("https://example.test",)
     assert (config.wait_default_seconds, config.wait_max_seconds) == (25.0, 40.0)
+    assert config.shutdown_grace_seconds == 4.0
+
+
+def test_shutdown_grace_seconds_uses_builtin_default() -> None:
+    config = BridgeConfig.from_sources(environ={}, config_data={})
+
+    assert config.shutdown_grace_seconds == 3.0
+
+
+def test_shutdown_grace_seconds_environment_overrides_config() -> None:
+    config = BridgeConfig.from_sources(
+        environ={"CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS": "2.5"},
+        config_data={"bridge": {"shutdown_grace_seconds": 4.0}},
+    )
+
+    assert config.shutdown_grace_seconds == 2.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_shutdown_grace_seconds_rejects_nonpositive_environment_value(value: str) -> None:
+    with pytest.raises(ConfigurationError, match="must be a positive number"):
+        BridgeConfig.from_sources(
+            environ={"CODEX_BRIDGE_SHUTDOWN_GRACE_SECONDS": value}, config_data={}
+        )
 
 
 def test_repository_managed_settings_reject_legacy_environment_conflicts(
