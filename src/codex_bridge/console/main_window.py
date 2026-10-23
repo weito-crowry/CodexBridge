@@ -109,6 +109,41 @@ from .widgets import (
 
 _EXIT_TIMEOUT_SECONDS = 12.0
 
+_SAFE_TUNNEL_PROFILE_ERRORS = frozenset(
+    {
+        "Tunnel MCP extra_headers must be a mapping of safe strings",
+        "Tunnel MCP extra_headers must map valid HTTP header names to safe strings",
+        "Tunnel MCP credential headers must use env: or file: references",
+        "Tunnel profile mapping keys must be strings",
+        "Tunnel profile contains an unsupported value type",
+        "Tunnel secret fields must use env: or file: references",
+        "Tunnel profile YAML is empty or invalid",
+        "Tunnel profile must use config_version 1",
+        "Tunnel profile must provide an API key reference",
+        "Tunnel profile mapping cannot be rendered",
+        "Tunnel profile must be a mapping or rendered YAML string",
+        "Tunnel profile exceeds the maximum supported size",
+        "Tunnel profile name is invalid",
+        "Tunnel client executable is required",
+        "Tunnel client could not validate the staged profile",
+        "Tunnel client rejected the staged profile",
+        "Tunnel profile could not be atomically installed",
+        "Tunnel profile could not be written",
+    }
+)
+
+
+def _safe_tunnel_profile_error(error: TunnelProfileError) -> str:
+    message = str(error)
+    if message in _SAFE_TUNNEL_PROFILE_ERRORS:
+        return message
+    prefix = "Tunnel client rejected the staged profile (exit code "
+    if message.startswith(prefix) and message.endswith(")"):
+        exit_code = message[len(prefix) : -1]
+        if exit_code.isdecimal():
+            return message
+    return "Managed Tunnel profile generation or doctor validation failed"
+
 
 def _runtime_thread_status_observation(thread: Mapping[str, object]) -> tuple[bool, str | None]:
     status = thread.get("runtime_status")
@@ -175,6 +210,7 @@ class MainWindow(QMainWindow):
     runtime_status_label: QLabel
     tunnel_status_label: QLabel
     tunnel_client_status_label: QLabel
+    tunnel_init_diagnostics_label: QLabel
     config_status_label: QLabel
     overall_status_label: QLabel
     overall_detail_label: QLabel
@@ -265,6 +301,9 @@ class MainWindow(QMainWindow):
             diagnostics_reader if diagnostics_reader is not None else DiagnosticsReader()
         )
         self._tunnel_resolution_error: str | None = None
+        self._tunnel_resolution_status = "not_run"
+        self._tunnel_profile_status = "not_run"
+        self._tunnel_profile_skip_reason = "Managed profile is not configured"
         self._tunnel = (
             tunnel_supervisor if tunnel_supervisor is not None else self._new_tunnel_supervisor()
         )
@@ -527,7 +566,16 @@ class MainWindow(QMainWindow):
             )
         except TunnelResolutionError as exc:
             candidates = ()
-            self._tunnel_resolution_error = str(exc)
+            self._tunnel_resolution_status = "failed"
+            self._tunnel_resolution_error = (
+                str(exc)
+                if str(exc) == "Configured Tunnel executable was not found"
+                else "Configured Tunnel executable could not be resolved"
+            )
+        else:
+            self._tunnel_resolution_status = "passed" if candidates else "failed"
+            if not candidates:
+                self._tunnel_resolution_error = "Tunnel executable was not found"
         executable = candidates[0].path if candidates else None
         profile_file: str | None = None
         profile_settings = self._config.tunnel_profile_settings
@@ -546,10 +594,16 @@ class MainWindow(QMainWindow):
                     client_executable=executable,
                 )
             except TunnelProfileError as exc:
-                self._tunnel_resolution_error = str(exc)
+                self._tunnel_profile_status = "failed"
+                self._tunnel_profile_skip_reason = ""
+                self._tunnel_resolution_error = _safe_tunnel_profile_error(exc)
                 executable = None
             else:
                 profile_file = os.fspath(generated.path)
+                self._tunnel_profile_status = "passed"
+                self._tunnel_profile_skip_reason = ""
+        elif executable is None:
+            self._tunnel_profile_skip_reason = "Executable resolution failed"
         return TunnelSupervisor(
             executable=executable,
             profile=self._config.tunnel_profile,

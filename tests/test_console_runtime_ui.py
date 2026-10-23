@@ -48,6 +48,7 @@ class FakeWindow:
     def __init__(self) -> None:
         for name in (
             "tunnel_client_status_label",
+            "tunnel_init_diagnostics_label",
             "start_tunnel_button",
             "stop_tunnel_button",
             "restart_tunnel_button",
@@ -75,6 +76,8 @@ class FakeWindow:
             client_version=None,
             resolution_source="unavailable",
             executable=None,
+            validation_status="not_run",
+            validation_detail="Waiting for Bridge readiness",
             state="unavailable",
             action_state=SimpleNamespace(
                 start_enabled=False,
@@ -88,6 +91,9 @@ class FakeWindow:
         self.thread_pane = SimpleNamespace(thread_count=0)
         self._selected_thread_id: str | None = None
         self._tunnel_resolution_error: str | None = None
+        self._tunnel_resolution_status = "not_run"
+        self._tunnel_profile_status = "not_run"
+        self._tunnel_profile_skip_reason = "Managed profile is not configured"
         self._closing = False
         self._runtime_state = "unavailable"
         self._bridge_ready = False
@@ -186,6 +192,80 @@ def test_tunnel_client_status_preserves_resolution_text_and_tooltip_precedence(
 
     assert window.tunnel_client_status_label.text() == expected_text
     assert window.tunnel_client_status_label.toolTip() == expected_tooltip
+
+
+@pytest.mark.parametrize(
+    ("resolution", "profile", "profile_skip", "validation", "validation_detail", "expected"),
+    (
+        (
+            "failed",
+            "not_run",
+            "Executable resolution failed",
+            "not_run",
+            "Executable unavailable",
+            "Executable resolution: Failed — Configured Tunnel executable was not found\n"
+            "Managed profile generation and doctor: Not run — Executable resolution failed\n"
+            "Tunnel Supervisor validation: Not run — Executable unavailable",
+        ),
+        (
+            "passed",
+            "failed",
+            "",
+            "not_run",
+            "Managed profile generation and doctor failed",
+            "Executable resolution: Passed\n"
+            "Managed profile generation and doctor: Failed — "
+            "Tunnel client rejected the staged profile\n"
+            "Tunnel Supervisor validation: Not run — Managed profile "
+            "generation and doctor validation failed",
+        ),
+        (
+            "passed",
+            "passed",
+            "",
+            "failed",
+            "Supervisor doctor check failed",
+            "Executable resolution: Passed\n"
+            "Managed profile generation and doctor: Passed\n"
+            "Tunnel Supervisor validation: Failed — Supervisor doctor check failed",
+        ),
+        (
+            "passed",
+            "passed",
+            "",
+            "passed",
+            "Version and doctor checks passed",
+            "Executable resolution: Passed\n"
+            "Managed profile generation and doctor: Passed\n"
+            "Tunnel Supervisor validation: Passed — Version and doctor checks passed",
+        ),
+    ),
+)
+def test_tunnel_initialization_diagnostics_show_each_stage(
+    resolution: str,
+    profile: str,
+    profile_skip: str,
+    validation: str,
+    validation_detail: str,
+    expected: str,
+) -> None:
+    window = FakeWindow()
+    window._tunnel_resolution_status = resolution
+    window._tunnel_profile_status = profile
+    window._tunnel_profile_skip_reason = profile_skip
+    window._tunnel_resolution_error = (
+        "Configured Tunnel executable was not found"
+        if resolution == "failed"
+        else "Tunnel client rejected the staged profile"
+        if profile == "failed"
+        else None
+    )
+    window._tunnel.validation_status = validation
+    window._tunnel.validation_detail = validation_detail
+
+    RuntimeUiPresenter(window)._update_tunnel_client_status()
+
+    assert window.tunnel_init_diagnostics_label.text() == expected
 
 
 @pytest.mark.parametrize(

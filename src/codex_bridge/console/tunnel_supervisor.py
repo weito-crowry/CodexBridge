@@ -136,6 +136,10 @@ class TunnelSupervisor(QObject):
         self._resolution_source = resolution_source
         self._validate_version = validate_version
         self._client_version: str | None = None
+        self._validation_status = "not_run"
+        self._validation_detail = (
+            "Waiting for Bridge readiness" if executable is not None else "Executable unavailable"
+        )
         self._profile = profile
         if profile_file is not None and not profile_file.strip():
             raise ValueError("Tunnel profile file must not be empty")
@@ -197,6 +201,14 @@ class TunnelSupervisor(QObject):
     @property
     def client_version(self) -> str | None:
         return self._client_version
+
+    @property
+    def validation_status(self) -> str:
+        return self._validation_status
+
+    @property
+    def validation_detail(self) -> str:
+        return self._validation_detail
 
     @property
     def recovery_timer(self) -> QTimer:
@@ -374,6 +386,8 @@ class TunnelSupervisor(QObject):
             self._set_state("unavailable")
             return
         self._version_checked = True
+        self._validation_status = "running"
+        self._validation_detail = "Version check in progress"
         process: Any | None = None
         try:
             process = self._process_factory(self)
@@ -456,6 +470,8 @@ class TunnelSupervisor(QObject):
             active_process.kill()
             active_process.deleteLater()
         self._client_version = None
+        self._validation_status = "failed"
+        self._validation_detail = "Tunnel version check failed"
         self._set_state("failed", message=message or "Tunnel: version check failed")
 
     def _set_state(self, state: str, *, message: str | None = None) -> None:
@@ -471,6 +487,8 @@ class TunnelSupervisor(QObject):
             self._set_state("unavailable")
             return
         self._doctor_started = True
+        self._validation_status = "running"
+        self._validation_detail = "Supervisor doctor check in progress"
         self._set_state("checking")
         process: Any | None = None
         try:
@@ -543,6 +561,12 @@ class TunnelSupervisor(QObject):
             return
         if exit_code == 0:
             self._doctor_passed = True
+            self._validation_status = "passed"
+            self._validation_detail = (
+                "Version and doctor checks passed"
+                if self._validate_version
+                else "Doctor check passed"
+            )
             if self._bridge_ready:
                 self._start_process()
             else:
@@ -568,6 +592,8 @@ class TunnelSupervisor(QObject):
             active_process.kill()
             active_process.deleteLater()
         self._doctor_passed = False
+        self._validation_status = "failed"
+        self._validation_detail = "Supervisor doctor check failed"
         self._set_state("failed", message="Tunnel: configuration check failed")
 
     def _start_process(self) -> bool:

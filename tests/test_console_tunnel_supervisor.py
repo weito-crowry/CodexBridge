@@ -195,6 +195,69 @@ def test_version_preflight_allows_supported_future_client_then_runs_doctor() -> 
     supervisor.close()
 
 
+@pytest.mark.parametrize(
+    ("version_output", "doctor_exit_code", "expected_status", "expected_detail"),
+    (
+        (
+            b"tunnel-client 0.0.14\n",
+            0,
+            "passed",
+            "Version and doctor checks passed",
+        ),
+        (
+            b"version unknown\n",
+            0,
+            "failed",
+            "Tunnel version check failed",
+        ),
+        (
+            b"tunnel-client 0.0.14\n",
+            1,
+            "failed",
+            "Supervisor doctor check failed",
+        ),
+    ),
+)
+def test_supervisor_validation_diagnostic_reports_safe_stage_outcome(
+    version_output: bytes,
+    doctor_exit_code: int,
+    expected_status: str,
+    expected_detail: str,
+) -> None:
+    _application()
+    version = FakeProcess()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    doctor.exit_code = doctor_exit_code
+    doctor.stderr = b"private URL https://private.example.test api_key=private-secret"
+    processes = [version, doctor, tunnel]
+    supervisor = TunnelSupervisor(
+        executable="C:/tools/tunnel-client.exe",
+        profile="codex-bridge",
+        process_factory=lambda _parent: processes.pop(0),
+        validate_version=True,
+        network_manager=FakeNetworkManager(),
+        health_port_provider=lambda: 41001,
+    )
+
+    assert supervisor.validation_status == "not_run"
+    assert supervisor.validation_detail == "Waiting for Bridge readiness"
+    supervisor.set_bridge_ready(True)
+    assert supervisor.validation_status == "running"
+    assert supervisor.validation_detail == "Version check in progress"
+    version.stdout = version_output
+    version.finished.emit(0, 0)
+    if version_output.startswith(b"tunnel-client"):
+        assert supervisor.validation_detail == "Supervisor doctor check in progress"
+        doctor.finished.emit(0, 0)
+
+    assert supervisor.validation_status == expected_status
+    assert supervisor.validation_detail == expected_detail
+    assert "private.example.test" not in supervisor.validation_detail
+    assert "private-secret" not in supervisor.validation_detail
+    supervisor.close()
+
+
 def test_doctor_uses_direct_process_with_profile_and_ephemeral_health_option() -> None:
     _application()
     process = FakeProcess()

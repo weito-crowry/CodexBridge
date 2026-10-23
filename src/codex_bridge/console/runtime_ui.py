@@ -24,6 +24,53 @@ class RuntimeUiPresenter:
             window.tunnel_client_status_label.setToolTip(executable)
         if window._tunnel_resolution_error is not None:
             window.tunnel_client_status_label.setToolTip(window._tunnel_resolution_error)
+        window.tunnel_init_diagnostics_label.setText(self._tunnel_initialization_diagnostics())
+
+    def _tunnel_initialization_diagnostics(self) -> str:
+        window = self._window
+        resolution_status = getattr(window, "_tunnel_resolution_status", "not_run")
+        resolution_detail = (
+            window._tunnel_resolution_error if resolution_status == "failed" else None
+        )
+        profile_status = getattr(window, "_tunnel_profile_status", "not_run")
+        profile_detail = (
+            window._tunnel_resolution_error
+            if profile_status == "failed"
+            else getattr(window, "_tunnel_profile_skip_reason", None)
+            if profile_status == "not_run"
+            else None
+        )
+        validation_status = getattr(window._tunnel, "validation_status", "not_run")
+        validation_detail = getattr(window._tunnel, "validation_detail", None)
+        if validation_status == "not_run" and profile_status == "failed":
+            validation_detail = "Managed profile generation and doctor validation failed"
+
+        return "\n".join(
+            (
+                self._tunnel_stage_line(
+                    "Executable resolution", resolution_status, resolution_detail
+                ),
+                self._tunnel_stage_line(
+                    "Managed profile generation and doctor", profile_status, profile_detail
+                ),
+                self._tunnel_stage_line(
+                    "Tunnel Supervisor validation", validation_status, validation_detail
+                ),
+            )
+        )
+
+    @staticmethod
+    def _tunnel_stage_line(name: str, status: object, detail: object) -> str:
+        labels = {
+            "passed": "Passed",
+            "failed": "Failed",
+            "running": "Running",
+        }
+        label = labels.get(status, "Not run") if isinstance(status, str) else "Not run"
+        line = f"{name}: {label}"
+        if isinstance(detail, str) and detail:
+            line += f" — {detail}"
+        return line
 
     def _apply_tunnel_controls(self, start: bool, stop: bool, restart: bool) -> None:
         window = self._window

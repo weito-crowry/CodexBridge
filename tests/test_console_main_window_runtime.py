@@ -4,7 +4,7 @@ from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.config import ConsoleConfig
 from codex_bridge.console.main_window import MainWindow
-from codex_bridge.console.tunnel_resolver import TunnelCandidate
+from codex_bridge.console.tunnel_resolver import TunnelCandidate, TunnelResolutionError
 from codex_bridge.tunnel_profile import TunnelProfileError, TunnelProfileResult
 from tests.console_main_window_test_support import (
     FakeClient,
@@ -170,6 +170,37 @@ def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch)
     ]
     assert supervisor_options[0]["profile_file"] == str(profile_path)
     assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
+    assert window._tunnel_resolution_status == "passed"
+    assert window._tunnel_profile_status == "passed"
+    assert "Executable resolution: Passed" in window.tunnel_init_diagnostics_label.text()
+    assert "Managed profile generation and doctor: Passed" in (
+        window.tunnel_init_diagnostics_label.text()
+    )
+    window.close()
+
+
+def test_missing_tunnel_executable_is_reported_in_status_dialog(monkeypatch) -> None:
+    _application()
+
+    def reject_executable(**_kwargs):
+        raise TunnelResolutionError("Configured Tunnel executable was not found")
+
+    monkeypatch.setattr(main_window_module, "enumerate_tunnel_candidates", reject_executable)
+    window = MainWindow(
+        _config(),
+        api_client=FakeClient(),
+        codex_probe=FakeCodexProbe(),
+        codex_update_probe=FakeCodexUpdateProbe(),
+        runtime_launcher=FakeLauncher(),
+        tray_available=False,
+    )
+
+    diagnostics = window.tunnel_init_diagnostics_label.text()
+    assert "Executable resolution: Failed" in diagnostics
+    assert "Managed profile generation and doctor: Not run — Executable resolution failed" in (
+        diagnostics
+    )
+    assert "Tunnel Supervisor validation: Not run — Executable unavailable" in diagnostics
     window.close()
 
 
@@ -202,7 +233,10 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
     )
 
     def reject_profile(*_args, **_kwargs):
-        raise TunnelProfileError("Tunnel client rejected the staged profile")
+        raise TunnelProfileError(
+            "Tunnel client rejected profile at https://private.example.test "
+            "tunnel_id=private-id api_key=private-secret profile: private-body"
+        )
 
     def create_supervisor(**kwargs):
         supervisor_options.append(kwargs)
@@ -221,7 +255,21 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
 
     assert supervisor_options[0]["executable"] is None
     assert supervisor_options[0]["profile_file"] is None
-    assert window._tunnel_resolution_error == "Tunnel client rejected the staged profile"
+    assert (
+        window._tunnel_resolution_error
+        == "Managed Tunnel profile generation or doctor validation failed"
+    )
+    diagnostics = window.tunnel_init_diagnostics_label.text()
+    assert "Managed profile generation and doctor: Failed" in diagnostics
+    assert "private.example.test" not in diagnostics
+    assert "private-id" not in diagnostics
+    assert "private-secret" not in diagnostics
+    assert "private-body" not in diagnostics
+    tooltip = window.tunnel_client_status_label.toolTip()
+    assert "private.example.test" not in tooltip
+    assert "private-id" not in tooltip
+    assert "private-secret" not in tooltip
+    assert "private-body" not in tooltip
     window.close()
 
 
