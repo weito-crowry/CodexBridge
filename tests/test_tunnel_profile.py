@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,8 @@ def test_mapping_renders_exact_client_v1_yaml_shape_and_validates_before_replace
         staged = Path(args[3])
         assert staged.parent == profile_dir
         assert staged != target
+        assert staged.suffix == ".yaml"
+        assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", staged.stem)
         assert target.read_text(encoding="utf-8") == "old-valid-profile\n"
         staged_profile = json.loads(staged.read_text(encoding="utf-8"))
         assert staged_profile == PROFILE
@@ -113,7 +116,7 @@ def test_doctor_rejection_preserves_existing_profile_and_hides_client_output(
     assert "resolved API key" not in str(raised.value)
     assert "secret output" not in str(raised.value)
     assert target.read_text(encoding="utf-8") == old
-    assert list(profile_dir.glob("*.tmp")) == []
+    assert list(profile_dir.glob("codex-bridge.*.yaml")) == []
     assert doctor.returncode == 2
 
 
@@ -213,7 +216,41 @@ def test_replace_failure_preserves_target_and_cleans_staged_file(
 
     assert "filesystem detail" not in str(raised.value)
     assert target.read_text(encoding="utf-8") == old
-    assert list(tmp_path.glob(".codex-bridge.*.yaml.tmp")) == []
+    assert list(tmp_path.glob("codex-bridge.*.yaml")) == []
+
+
+def test_64_character_profile_name_stages_valid_client_filename_without_leakage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_name = "a" * 64
+    target = tmp_path / f"{profile_name}.yaml"
+    old = "previous-valid-profile\n"
+    target.write_text(old, encoding="utf-8")
+    doctor = FakeDoctor()
+
+    def inspect_temp(args: list[str], _: object) -> None:
+        staged = Path(args[3])
+        assert staged != target
+        assert staged.suffix == ".yaml"
+        assert staged.stem.startswith(f"{profile_name}.")
+        assert len(staged.stem) <= 128
+        assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", staged.stem)
+        assert target.read_text(encoding="utf-8") == old
+
+    doctor.during_call = inspect_temp
+    install_doctor(monkeypatch, doctor)
+
+    result = generate_tunnel_profile(
+        PROFILE,
+        profile_dir=tmp_path,
+        profile_name=profile_name,
+        client_executable="tunnel-client.exe",
+    )
+
+    assert result.path == target
+    assert target.read_text(encoding="utf-8") != old
+    assert list(tmp_path.glob(f"{profile_name}.*.yaml")) == []
 
 
 def test_rendered_yaml_is_validated_by_client_without_exposing_content(

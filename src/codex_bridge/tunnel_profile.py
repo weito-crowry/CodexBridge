@@ -196,8 +196,8 @@ def generate_tunnel_profile(
     try:
         directory.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{profile_name}.",
-            suffix=".yaml.tmp",
+            prefix=f"{profile_name}.",
+            suffix=".yaml",
             dir=directory,
         )
         temp_path = Path(temp_name)
