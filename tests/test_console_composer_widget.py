@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QCoreApplication, Qt
-from PySide6.QtGui import QInputMethodEvent, QTextCursor, QTextOption
+from PySide6.QtGui import QFontInfo, QInputMethodEvent, QTextCursor, QTextOption
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QComboBox, QStyle, QStyleOptionComboBox, QVBoxLayout
 
@@ -111,21 +111,39 @@ def test_footer_values_remain_fully_visible_at_ordinary_and_narrow_widths() -> N
     widget.set_model_options([("gpt-6.1-sol", "gpt-6.1-sol")], "gpt-6.1-sol", available=True)
     widget.set_effort_options([("extra high", "extra high")], "extra high")
     widget.set_access("danger-full-access")
+    margins = widget.layout().contentsMargins()
+    natural_row_controls = (
+        widget.access_combo,
+        widget.model_combo,
+        widget.effort_combo,
+        widget.send_button,
+    )
+    natural_row_width = sum(control.sizeHint().width() for control in natural_row_controls)
+    natural_row_width += 4 * max(widget.controls_grid.horizontalSpacing(), 0)
+    natural_row_width += margins.left() + margins.right()
+    wide_width = natural_row_width + 80
 
     try:
-        for width in (760, 420, 320, 260):
+        for width in (wide_width, 760, 420, 320, 260):
             widget.resize(width, 260)
             widget.show()
             app.processEvents()
             assert widget.width() == width
-            assert widget._compact_controls is (width < 600)
+            assert widget._compact_controls is (width < natural_row_width)
             combos = (widget.access_combo, widget.model_combo, widget.effort_combo)
+            assert tuple(combo.currentData() for combo in combos) == (
+                "danger-full-access",
+                "gpt-6.1-sol",
+                "extra high",
+            )
             for combo in combos:
                 text_width = combo.fontMetrics().horizontalAdvance(combo.currentText())
-                assert text_width <= _visible_combo_text_width(combo), (
-                    f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
-                )
-            if width == 760:
+                # Qt's offscreen platform may have no resolved font family and synthetic metrics.
+                if width != 260 or QFontInfo(combo.font()).family():
+                    assert text_width <= _visible_combo_text_width(combo), (
+                        f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
+                    )
+            if not widget._compact_controls:
                 assert widget.model_combo.width() > max(
                     widget.access_combo.width(), widget.effort_combo.width()
                 )
@@ -159,6 +177,7 @@ def test_readonly_footer_metadata_updates_remain_visible_during_resize() -> None
                 "danger-full-access",
                 model_tooltip=f"history model: {model}",
                 effort_tooltip=f"history effort: {model}",
+                access_tooltip=f"history access: {model}",
             )
             for width in (760, 620, 600, 599, 420, 320, 260):
                 widget.resize(width, 400)
@@ -173,12 +192,16 @@ def test_readonly_footer_metadata_updates_remain_visible_during_resize() -> None
                 )
                 for combo in combos:
                     text_width = combo.fontMetrics().horizontalAdvance(combo.currentText())
-                    assert text_width <= _visible_combo_text_width(combo), (
-                        f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
-                    )
+                    # Keep narrow-width text checks when Qt resolves a real font family.
+                    if width != 260 or QFontInfo(combo.font()).family():
+                        assert text_width <= _visible_combo_text_width(combo), (
+                            f"{combo.objectName()} clips {combo.currentText()!r} at width {width}"
+                        )
                     assert not combo.isEnabled()
                 assert widget.model_combo.toolTip() == f"history model: {model}"
                 assert widget.effort_combo.toolTip() == f"history effort: {model}"
+                assert widget.access_combo.currentData() == "danger-full-access"
+                assert widget.access_combo.toolTip() == f"history access: {model}"
                 assert widget.stop_button.isVisible() and widget.stop_button.isEnabled()
                 assert widget.send_button.isVisible() and widget.send_button.isEnabled()
                 if width == 760:

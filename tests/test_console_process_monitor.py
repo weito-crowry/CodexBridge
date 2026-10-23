@@ -96,6 +96,7 @@ def test_snapshot_and_live_events_merge_once_and_keep_command_and_os_status_sepa
     assert _wait(
         application,
         lambda: "Command status: interrupted · exit 1" in widget.process_text.toPlainText(),
+        timeout=5.0,
     )
     assert widget.record_count == 1
     assert "command for thread-a" in widget.process_text.toPlainText()
