@@ -31,6 +31,9 @@ from .project_names import normalize_cwd
 from .widget_helpers import _safe_text, copy_to_clipboard
 
 _EXTERNAL_MARKER_ICON: QIcon | None = None
+_MANAGED_RUNTIME_STATUSES = frozenset(
+    {"in_progress", "needs_approval", "needs_input", "needs_user_input", "waiting"}
+)
 
 
 def _external_marker_icon() -> QIcon:
@@ -188,7 +191,11 @@ class ThreadListPane(QWidget):
 
     def _is_external_running_candidate(self, thread_id: str) -> bool:
         external = self._external_running_threads.get(thread_id)
-        if external is None or is_codexbridge_originator(external.get("originator")):
+        if (
+            external is None
+            or self._thread_statuses.get(thread_id) in _MANAGED_RUNTIME_STATUSES
+            or is_codexbridge_originator(external.get("originator"))
+        ):
             return False
         return not any(
             thread.get("id") == thread_id and is_codexbridge_originator(thread.get("originator"))

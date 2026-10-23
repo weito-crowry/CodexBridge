@@ -131,6 +131,72 @@ def test_thread_list_distinguishes_observed_turn_states_without_promoting_waits_
     assert _thread_item(pane, "stopping").text(0) == "Stopping"
 
 
+def test_managed_runtime_statuses_override_external_estimates_without_originator(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path)
+    managed_statuses = {
+        "managed-running": "in_progress",
+        "managed-approval": "needs_approval",
+        "managed-input": "needs_input",
+        "managed-user-input": "needs_user_input",
+        "managed-waiting": "waiting",
+    }
+    titles = {
+        "managed-running": "Running",
+        "managed-approval": "Approval",
+        "managed-input": "Input",
+        "managed-user-input": "User input",
+        "managed-waiting": "Waiting",
+        "not-loaded": "Not loaded",
+    }
+    threads = [{"id": thread_id, "name": title, "cwd": cwd} for thread_id, title in titles.items()]
+    threads[1]["originator"] = ""
+    threads[3]["originator"] = ""
+    threads[5]["runtime_status"] = {"type": "notLoaded"}
+    pane = ThreadListPane()
+
+    pane.set_threads(threads, thread_statuses=managed_statuses)
+    pane.set_external_running_threads(
+        {thread_id: {"id": thread_id, "cwd": cwd} for thread_id in titles}
+    )
+
+    assert pane._thread_statuses == managed_statuses
+    expected_text = {
+        "managed-running": "\u25cf Running",
+        "managed-approval": "\u23f8 Approval",
+        "managed-input": "\u270e Input",
+        "managed-user-input": "\u270e User input",
+        "managed-waiting": "\u23f8 Waiting",
+    }
+    for thread_id, text in expected_text.items():
+        item = _thread_item(pane, thread_id)
+        assert item.text(0) == text
+        assert item.icon(0).isNull()
+        assert item.toolTip(0) == thread_id
+        assert item.foreground(0).color() == pane.list_widget.palette().color(
+            QPalette.ColorRole.Link
+        )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    assert running_section.text(0) == "現在処理中"
+    running_ids: list[str] = []
+
+    def collect_running_ids(item: QTreeWidgetItem) -> None:
+        thread_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(thread_id, str):
+            running_ids.append(thread_id)
+        for child_index in range(item.childCount()):
+            collect_running_ids(item.child(child_index))
+
+    collect_running_ids(running_section)
+    assert running_ids == ["managed-running", "not-loaded"]
+
+    not_loaded = _thread_item(pane, "not-loaded")
+    assert not_loaded.icon(0).pixmap(12, 12).toImage().pixelColor(6, 6) == QColor("#d93025")
+    assert not_loaded.toolTip(0) == "not-loaded\n推定実行中"
+
+
 def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp_path) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
