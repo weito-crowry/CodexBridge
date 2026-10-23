@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QMessageBox as QMessageBox
 
 from ..models import ApprovalDecision
-from ..tunnel_profile import TunnelProfileError, generate_tunnel_profile
+from ..tunnel_profile import generate_tunnel_profile
 from .api_client import ApiClient
 from .api_result_dispatcher import ApiResultDispatcher
 from .appearance import AppearanceController, install_appearance
@@ -108,41 +108,6 @@ from .widgets import (
 )
 
 _EXIT_TIMEOUT_SECONDS = 12.0
-
-_SAFE_TUNNEL_PROFILE_ERRORS = frozenset(
-    {
-        "Tunnel MCP extra_headers must be a mapping of safe strings",
-        "Tunnel MCP extra_headers must map valid HTTP header names to safe strings",
-        "Tunnel MCP credential headers must use env: or file: references",
-        "Tunnel profile mapping keys must be strings",
-        "Tunnel profile contains an unsupported value type",
-        "Tunnel secret fields must use env: or file: references",
-        "Tunnel profile YAML is empty or invalid",
-        "Tunnel profile must use config_version 1",
-        "Tunnel profile must provide an API key reference",
-        "Tunnel profile mapping cannot be rendered",
-        "Tunnel profile must be a mapping or rendered YAML string",
-        "Tunnel profile exceeds the maximum supported size",
-        "Tunnel profile name is invalid",
-        "Tunnel client executable is required",
-        "Tunnel client could not validate the staged profile",
-        "Tunnel client rejected the staged profile",
-        "Tunnel profile could not be atomically installed",
-        "Tunnel profile could not be written",
-    }
-)
-
-
-def _safe_tunnel_profile_error(error: TunnelProfileError) -> str:
-    message = str(error)
-    if message in _SAFE_TUNNEL_PROFILE_ERRORS:
-        return message
-    prefix = "Tunnel client rejected the staged profile (exit code "
-    if message.startswith(prefix) and message.endswith(")"):
-        exit_code = message[len(prefix) : -1]
-        if exit_code.isdecimal():
-            return message
-    return "Managed Tunnel profile generation or doctor validation failed"
 
 
 def _runtime_thread_status_observation(thread: Mapping[str, object]) -> tuple[bool, str | None]:
@@ -304,6 +269,11 @@ class MainWindow(QMainWindow):
         self._tunnel_resolution_status = "not_run"
         self._tunnel_profile_status = "not_run"
         self._tunnel_profile_skip_reason = "Managed profile is not configured"
+        self._bridge_generation = 0
+        self._managed_tunnel_profile: (
+            tuple[Mapping[str, object], Path, str, str, Callable[..., object]] | None
+        ) = None
+        self._managed_tunnel_profile_attempted_generation: int | None = None
         self._tunnel = (
             tunnel_supervisor if tunnel_supervisor is not None else self._new_tunnel_supervisor()
         )
@@ -586,22 +556,16 @@ class MainWindow(QMainWindow):
             and has_managed_tunnel_profile
         ):
             configured_profile_path = Path(self._config.tunnel_profile_file)
-            try:
-                generated = generate_tunnel_profile(
-                    profile_settings,
-                    profile_dir=configured_profile_path.parent,
-                    profile_name=configured_profile_path.stem,
-                    client_executable=executable,
-                )
-            except TunnelProfileError as exc:
-                self._tunnel_profile_status = "failed"
-                self._tunnel_profile_skip_reason = ""
-                self._tunnel_resolution_error = _safe_tunnel_profile_error(exc)
-                executable = None
-            else:
-                profile_file = os.fspath(generated.path)
-                self._tunnel_profile_status = "passed"
-                self._tunnel_profile_skip_reason = ""
+            profile_name = configured_profile_path.stem
+            self._managed_tunnel_profile = (
+                profile_settings,
+                configured_profile_path.parent,
+                profile_name,
+                executable,
+                generate_tunnel_profile,
+            )
+            profile_file = os.fspath(configured_profile_path.parent / f"{profile_name}.yaml")
+            self._tunnel_profile_skip_reason = "Waiting for Bridge and App Server readiness"
         elif executable is None:
             self._tunnel_profile_skip_reason = "Executable resolution failed"
         return TunnelSupervisor(

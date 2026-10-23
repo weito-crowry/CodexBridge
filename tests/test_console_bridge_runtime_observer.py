@@ -83,6 +83,8 @@ class _Window:
         self._runtime_state = "unavailable"
         self._control_token: str | None = None
         self._bridge_loss_count = 0
+        self._bridge_generation = 0
+        self._managed_tunnel_profile = None
 
     @property
     def _managed_start_active(self) -> bool:
@@ -263,6 +265,7 @@ def test_two_external_losses_reset_seen_ready_and_keep_auto_start() -> None:
     observer.record_bridge_status_observation(False)
 
     assert observer.loss_count == 2
+    assert window._bridge_generation == 1
     assert not window._bridge_seen_ready
     assert window._runtime_state == "unavailable"
     assert window.trace == [("update_start_button",), ("maybe_auto_start",)]
