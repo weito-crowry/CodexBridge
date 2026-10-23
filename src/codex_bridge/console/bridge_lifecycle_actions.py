@@ -44,6 +44,14 @@ class BridgeLifecycleController:
         if window._closing or window._launch_in_progress or window._bridge_transition:
             return
         bridge_ready = window._health_ok and window._bridge_ready and window._app_server_ready
+        if (
+            bridge_ready
+            and window._managed_tunnel_profile is not None
+            and window._tunnel_profile_status == "failed"
+        ):
+            window._managed_tunnel_profile_attempted_generation = None
+            set_tunnel_bridge_ready(window, True)
+            return
         if bridge_ready and window._tunnel_state != "ready":
             retry_now = getattr(window._tunnel, "retry_now", None)
             if callable(retry_now):
