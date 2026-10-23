@@ -4,7 +4,7 @@ import os
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 
 from codex_bridge.console.thread_list_pane import ThreadListPane as DirectThreadListPane
@@ -129,6 +129,82 @@ def test_thread_list_distinguishes_observed_turn_states_without_promoting_waits_
     assert _thread_item(pane, "input").text(0) == "\u270e Input"
     assert _thread_item(pane, "locked").text(0) == "Locked"
     assert _thread_item(pane, "stopping").text(0) == "Stopping"
+
+
+def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = tmp_path / "project-a"
+    second_cwd = tmp_path / "project-b"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    pane = ThreadListPane()
+
+    pane.set_threads(
+        [
+            {"id": "managed", "name": "Managed", "cwd": str(first_cwd)},
+            {"id": "shared", "name": "Shared", "cwd": str(first_cwd)},
+            {"id": "waiting", "name": "Waiting", "cwd": str(first_cwd)},
+        ],
+        thread_statuses={"managed": "in_progress", "waiting": "needs_approval"},
+    )
+    pane.set_external_running_threads(
+        {
+            "managed": {"cwd": str(first_cwd)},
+            "shared": {"cwd": str(first_cwd)},
+            "waiting": {"cwd": str(first_cwd)},
+            "outside-api-limit": {"cwd": str(second_cwd)},
+        }
+    )
+
+    managed = _thread_item(pane, "managed")
+    external = _thread_item(pane, "shared")
+    omitted = _thread_item(pane, "outside-api-limit")
+    waiting = _thread_item(pane, "waiting")
+    running = pane.list_widget.topLevelItem(0)
+    assert running.text(0) == "現在処理中"
+    assert pane.thread_count == 4
+    assert managed.text(0) == "\u25cf Managed"
+    assert managed.foreground(0).color() == pane.list_widget.palette().color(
+        QPalette.ColorRole.Link
+    )
+    assert external.text(0) == "\u25cf Shared"
+    assert external.foreground(0).color() == QColor("#d93025")
+    assert external.toolTip(0) == "shared\n推定実行中"
+    for external_copy in [
+        item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == "shared"
+    ]:
+        assert external_copy.text(0) == "\u25cf Shared"
+        assert external_copy.foreground(0).color() == QColor("#d93025")
+        assert external_copy.toolTip(0) == "shared\n推定実行中"
+    assert omitted.text(0) == "\u25cf outside-api-limit"
+    assert omitted.foreground(0).color() == QColor("#d93025")
+    assert waiting.text(0) == "\u25cf Waiting"
+    assert waiting.foreground(0).color() == QColor("#d93025")
+    assert waiting.toolTip(0) == "waiting\n推定実行中"
+    assert pane._thread_statuses["waiting"] == "needs_approval"
+    assert (
+        sum(item.data(0, Qt.ItemDataRole.UserRole) == "shared" for item in _thread_items(pane)) == 2
+    )
+    assert (
+        sum(
+            item.data(0, Qt.ItemDataRole.UserRole) == "outside-api-limit"
+            for item in _thread_items(pane)
+        )
+        == 2
+    )
+
+    pane.set_external_running_threads({})
+
+    assert pane.thread_count == 3
+    assert _thread_item(pane, "shared").text(0) == "Shared"
+    assert (
+        sum(item.data(0, Qt.ItemDataRole.UserRole) == "shared" for item in _thread_items(pane)) == 1
+    )
+    assert all(
+        item.data(0, Qt.ItemDataRole.UserRole) != "outside-api-limit"
+        for item in _thread_items(pane)
+    )
 
 
 def test_thread_status_refresh_preserves_selection_groups_expansion_rows_and_scroll(
@@ -321,7 +397,7 @@ def test_running_aggregate_refresh_preserves_project_expansion_selection_and_scr
     scroll.setValue(scroll.maximum())
     previous_scroll = scroll.value()
 
-    pane.set_thread_statuses({"second-10": "in_progress"})
+    pane.set_external_running_threads({"second-10": {"cwd": second_cwd}})
     application.processEvents()
 
     current = pane.list_widget.currentItem()
@@ -330,6 +406,12 @@ def test_running_aggregate_refresh_preserves_project_expansion_selection_and_scr
     assert current.parent().text(0) == "second-project"
     assert not pane.list_widget.topLevelItem(1).isExpanded()
     assert scroll.value() == previous_scroll
+    pane.filter_edit.setText("second-10")
+    assert any(
+        item.data(0, Qt.ItemDataRole.UserRole) == "second-10" for item in _thread_items(pane)
+    )
+    pane.filter_edit.clear()
+    assert not pane.list_widget.topLevelItem(1).isExpanded()
     pane.close()
 
 

@@ -4,7 +4,7 @@ import os
 from collections.abc import Collection, Mapping, Sequence
 
 from PySide6.QtCore import QDir, QPoint, Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QDesktopServices, QFont, QPalette
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QPalette
 from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
@@ -63,6 +63,8 @@ class ThreadListPane(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._threads: list[dict[str, object]] = []
+        self._server_threads: list[dict[str, object]] = []
+        self._external_running_threads: dict[str, dict[str, object]] = {}
         self._active_thread_ids: set[str] = set()
         self._thread_statuses: dict[str, str] = {}
         self._has_thread_statuses = False
@@ -104,7 +106,8 @@ class ThreadListPane(QWidget):
         thread_statuses: Mapping[str, str] | None = None,
         project_names: Mapping[str, str] | None = None,
     ) -> None:
-        self._threads = [dict(thread) for thread in threads]
+        self._server_threads = [dict(thread) for thread in threads]
+        self._rebuild_threads()
         self._project_names = dict(project_names or {})
         if self._selected_thread_id is not None and not any(
             thread.get("id") == self._selected_thread_id for thread in self._threads
@@ -116,6 +119,45 @@ class ThreadListPane(QWidget):
             self._thread_statuses = dict(thread_statuses)
             self._has_thread_statuses = True
         self._render()
+
+    def set_external_running_threads(self, threads: Mapping[str, Mapping[str, object]]) -> None:
+        self._external_running_threads = {
+            thread_id: dict(thread)
+            for thread_id, thread in threads.items()
+            if isinstance(thread_id, str) and isinstance(thread, Mapping)
+        }
+        self._rebuild_threads()
+        if self._selected_thread_id is not None and not any(
+            thread.get("id") == self._selected_thread_id for thread in self._threads
+        ):
+            self._selected_thread_id = None
+        self._render()
+
+    def _rebuild_threads(self) -> None:
+        combined: list[dict[str, object]] = []
+        included_ids: set[str] = set()
+        for server_thread in self._server_threads:
+            thread = dict(server_thread)
+            thread_id = thread.get("id")
+            if isinstance(thread_id, str):
+                included_ids.add(thread_id)
+                external = self._external_running_threads.get(thread_id)
+                if external is not None:
+                    for key, value in external.items():
+                        current_value = thread.get(key)
+                        if not isinstance(current_value, str) or not current_value.strip():
+                            thread[key] = value
+            combined.append(thread)
+        for thread_id, external in self._external_running_threads.items():
+            if thread_id in included_ids:
+                continue
+            thread = dict(external)
+            thread["id"] = thread_id
+            name = thread.get("name")
+            if not isinstance(name, str) or not name.strip():
+                thread["name"] = thread_id
+            combined.append(thread)
+        self._threads = combined
 
     def set_active_thread_ids(self, thread_ids: Collection[str]) -> None:
         self._active_thread_ids = set(thread_ids)
@@ -226,20 +268,33 @@ class ThreadListPane(QWidget):
                         continue
                     title = _safe_text(thread.get("name")) or "New スレッド"
                     status = self._thread_statuses.get(thread_id)
-                    status_marker = _thread_status_marker(status)
+                    external_running = thread_id in self._external_running_threads
+                    managed_running = status == "in_progress" or (
+                        not self._has_thread_statuses and thread_id in self._active_thread_ids
+                    )
+                    status_marker = (
+                        "\u25cf "
+                        if managed_running or external_running
+                        else _thread_status_marker(status)
+                    )
                     if not self._has_thread_statuses and thread_id in self._active_thread_ids:
                         status_marker = "\u25cf "
                     item = QTreeWidgetItem([f"{status_marker}{title}" if status_marker else title])
                     item.setData(0, Qt.ItemDataRole.UserRole, thread_id)
                     item.setToolTip(0, thread_id)
+                    external_marker = external_running and not managed_running
+                    if external_marker:
+                        item.setToolTip(0, f"{thread_id}\n推定実行中")
                     if status_marker:
                         font = QFont(item.font(0))
                         font.setWeight(QFont.Weight.DemiBold)
                         item.setFont(0, font)
-                        item.setForeground(
-                            0,
-                            QBrush(self.list_widget.palette().color(QPalette.ColorRole.Link)),
+                        marker_color = (
+                            QColor("#d93025")
+                            if external_marker
+                            else self.list_widget.palette().color(QPalette.ColorRole.Link)
                         )
+                        item.setForeground(0, QBrush(marker_color))
                     parent.addChild(item)
                     if thread_id == selected_thread_id:
                         if fallback_selected_item is None:
@@ -260,7 +315,10 @@ class ThreadListPane(QWidget):
                     thread
                     for thread in group_threads
                     if isinstance(thread.get("id"), str)
-                    and self._thread_statuses.get(str(thread.get("id"))) == "in_progress"
+                    and (
+                        self._thread_statuses.get(str(thread.get("id"))) == "in_progress"
+                        or str(thread.get("id")) in self._external_running_threads
+                    )
                 ]
                 if running_threads:
                     running_groups[group_key] = running_threads
