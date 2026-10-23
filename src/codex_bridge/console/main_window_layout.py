@@ -60,6 +60,8 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.runtime_status_label = QLabel("Runtime: unavailable")
     window.tunnel_status_label = QLabel("Tunnel: unavailable")
     window.tunnel_client_status_label = QLabel("Tunnel Client: unavailable")
+    window.tunnel_init_diagnostics_label = QLabel("Tunnel initialization checks have not run.")
+    window.tunnel_init_diagnostics_label.setWordWrap(True)
     config_state = "ready" if window._config.roots_ready else "error"
     window.config_status_label = QLabel(
         f"Config: {config_state} · roots {window._config.roots_count}"
@@ -181,6 +183,7 @@ def build_main_window_ui(window: MainWindow) -> None:
         [
             ("Tunnel", window.tunnel_status_label),
             ("Client", window.tunnel_client_status_label),
+            ("Initialization", window.tunnel_init_diagnostics_label),
         ],
     )
     add_section("Configuration", [("Config", window.config_status_label)])
