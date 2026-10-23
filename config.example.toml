@@ -37,6 +37,15 @@ open_browser = false
 level = "info"
 format = "text"
 
+# Optional MCP listener wait and static HTTP headers.
+[tunnel.mcp]
+# startup_wait_timeout = "60s"
+# extra_headers = { "X-Debug-Mode" = "1", Authorization = "env:TUNNEL_MCP_AUTH" }
+# Or use a table:
+# [tunnel.mcp.extra_headers]
+# X-Debug-Mode = "1"
+# Authorization = "env:TUNNEL_MCP_AUTH"
+
 # Add the actual MCP server URL required by your Tunnel deployment.
 # [[tunnel.mcp.server_urls]]
 # channel = "mcp"

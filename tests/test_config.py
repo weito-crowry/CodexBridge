@@ -684,3 +684,114 @@ def test_tunnel_profile_schema_accepts_references_and_rejects_literal_secrets(tm
     with pytest.raises(ConfigFileError, match="reference") as exc_info:
         load_user_config(path=config_path)
     assert "literal-secret-value" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "extra_headers_table",
+    [
+        'extra_headers = { "X-Debug-Mode" = "1", "X-Monkey-Key" = "enabled", '
+        'Authorization = "env:TUNNEL_MCP_AUTH", Cookie = "file:C:/dummy/cookie.txt" }\n',
+        "[tunnel.mcp.extra_headers]\n"
+        'X-Debug-Mode = "1"\n'
+        'X-Monkey-Key = "enabled"\n'
+        'Authorization = "env:TUNNEL_MCP_AUTH"\n'
+        'Cookie = "file:C:/dummy/cookie.txt"\n',
+    ],
+)
+def test_tunnel_mcp_schema_preserves_startup_timeout_and_headers(
+    tmp_path: Path, extra_headers_table: str
+) -> None:
+    from codex_bridge.config_file import load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[tunnel.mcp]\nstartup_wait_timeout = "60s"\n' + extra_headers_table,
+        encoding="utf-8",
+    )
+
+    parsed = load_user_config(path=config_path)
+
+    assert parsed["tunnel"]["mcp"]["startup_wait_timeout"] == "60s"
+    assert parsed["tunnel"]["mcp"]["extra_headers"] == {
+        "X-Debug-Mode": "1",
+        "X-Monkey-Key": "enabled",
+        "Authorization": "env:TUNNEL_MCP_AUTH",
+        "Cookie": "file:C:/dummy/cookie.txt",
+    }
+
+
+@pytest.mark.parametrize(
+    "mcp_settings",
+    [
+        'extra_headers = "not-a-table"\n',
+        'extra_headers = ["not-a-table"]\n',
+        'extra_headers = { "X-Count" = 3 }\n',
+        '[tunnel.mcp.extra_headers.X-Nested]\nvalue = "not-a-header-string"\n',
+        'extra_headers = { "" = "blank-name" }\n',
+        'extra_headers = { " Bad-Name" = "invalid-name" }\n',
+        'extra_headers = { "X:Bad" = "invalid-name" }\n',
+        'extra_headers = { "X-é" = "invalid-name" }\n',
+        'extra_headers = { "X-Debug" = "bad\\r\\nX-Injected: yes" }\n',
+        'extra_headers = { "X-Debug" = "bad\\u0000value" }\n',
+        'extra_headers = { "X-Debug" = "bad\\u0085value" }\n',
+        'extra_headers = { "X-Debug" = "bad\\u2028value" }\n',
+        'extra_headers = { "X-Debug" = "bad\\u2029value" }\n',
+        "startup_wait_timeout = 60\n",
+        "startup_wait_timeout = true\n",
+    ],
+)
+def test_tunnel_mcp_schema_rejects_invalid_header_tables_and_timeout_types(
+    tmp_path: Path, mcp_settings: str
+) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[tunnel.mcp]\n" + mcp_settings, encoding="utf-8")
+
+    with pytest.raises(ConfigFileError):
+        load_user_config(path=config_path)
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        "Authorization",
+        "Proxy-Authorization",
+        "Cookie",
+        "Set-Cookie",
+        "X-API-Key",
+        "X-API-Key-Value",
+        "X-Access-Token",
+        "X-Client-Secret",
+        "X-User-Credential",
+        "X-Authentication-Mode",
+    ],
+)
+@pytest.mark.parametrize("reference", [False, True], ids=["plaintext", "bare-reference"])
+def test_tunnel_mcp_credential_headers_reject_plaintext_and_bare_references(
+    tmp_path: Path, header_name: str, reference: bool
+) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    value = "env:" if reference else "dummy-header-secret-value"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[tunnel.mcp.extra_headers]\n"{header_name}" = "{value}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigFileError) as exc_info:
+        load_user_config(path=config_path)
+
+    if value not in {"env:", "file:"}:
+        assert value not in str(exc_info.value)
+
+
+def test_tunnel_mcp_rejects_unknown_keys_without_broadening_schema(tmp_path: Path) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[tunnel.mcp]\nunknown_option = "value"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigFileError, match="unsupported CodexBridge configuration key"):
+        load_user_config(path=config_path)

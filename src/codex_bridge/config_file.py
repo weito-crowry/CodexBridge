@@ -61,9 +61,15 @@ _TUNNEL_SECTIONS: dict[str, dict[str, type[object]]] = {
     "health": {"listen_addr": str},
     "admin_ui": {"open_browser": bool},
     "log": {"level": str, "format": str},
-    "mcp": {"server_urls": list},
+    "mcp": {"server_urls": list, "startup_wait_timeout": str, "extra_headers": dict},
 }
 _SECRET_REFERENCE = re.compile(r"(?:env:[A-Za-z_][A-Za-z0-9_]*|file:.+)", re.ASCII)
+_HTTP_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_\`|~0-9A-Za-z]+\Z", re.ASCII)
+_INVALID_HEADER_VALUE = re.compile(r"[\r\n\x00\x85\u2028\u2029]")
+_CREDENTIAL_HEADER_NAMES = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+)
+_CREDENTIAL_HEADER_TERMS = ("token", "secret", "credential", "api-key", "authentication")
 
 
 def _repository_config_path() -> Path | None:
@@ -129,6 +135,32 @@ def _secret_setting(section: str, key: str) -> bool:
     return any(term in lowered for term in _SECRET_TERMS)
 
 
+def _validate_mcp_extra_headers(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ConfigFileError("tunnel.mcp.extra_headers must be a TOML table")
+    normalized: dict[str, str] = {}
+    for header_name, header_value in value.items():
+        if (
+            not isinstance(header_name, str)
+            or _HTTP_FIELD_NAME.fullmatch(header_name) is None
+            or not isinstance(header_value, str)
+            or _INVALID_HEADER_VALUE.search(header_value) is not None
+        ):
+            raise ConfigFileError(
+                "tunnel.mcp.extra_headers must map valid HTTP header names to safe strings"
+            )
+        lowered_name = header_name.casefold()
+        credential_header = lowered_name in _CREDENTIAL_HEADER_NAMES or any(
+            term in lowered_name for term in _CREDENTIAL_HEADER_TERMS
+        )
+        if credential_header and _SECRET_REFERENCE.fullmatch(header_value) is None:
+            raise ConfigFileError(
+                "tunnel.mcp.extra_headers credential values must use env: or file: references"
+            )
+        normalized[header_name] = header_value
+    return normalized
+
+
 def _validate_tunnel_section(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigFileError(f"tunnel.{name} must be a TOML table")
@@ -151,6 +183,9 @@ def _validate_tunnel_section(value: object, name: str) -> dict[str, Any]:
                     )
                 entries.append({"channel": entry["channel"], "url": entry["url"]})
             normalized[key] = entries
+            continue
+        if name == "mcp" and key == "extra_headers":
+            normalized[key] = _validate_mcp_extra_headers(item)
             continue
         if expected is bool and not isinstance(item, bool):
             raise ConfigFileError(f"tunnel.{name}.{key} must be a boolean")
