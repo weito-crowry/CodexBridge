@@ -1224,6 +1224,8 @@ class MainWindow(QMainWindow):
             if thread.get("id") != thread_id or not isinstance(thread.get("cwd"), str):
                 continue
             threads[thread_id] = dict(thread)
+        if threads == self._external_running_threads:
+            return
         self._external_running_threads = threads
         self.thread_pane.set_external_running_threads(threads)
 

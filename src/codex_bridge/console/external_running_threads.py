@@ -37,6 +37,10 @@ _RELEVANT_RECORD_MARKERS = (
 _REVERSE_READ_BYTES = 64 * 1024
 
 
+def is_codexbridge_originator(originator: object) -> bool:
+    return isinstance(originator, str) and originator.strip().casefold() == "codexbridge"
+
+
 def _event_data(raw_line: bytes) -> tuple[str, str | None] | None:
     if not any(marker in raw_line for marker in _RELEVANT_RECORD_MARKERS[1:]):
         return None
@@ -46,13 +50,14 @@ def _event_data(raw_line: bytes) -> tuple[str, str | None] | None:
         return None
     if not isinstance(record, Mapping):
         return None
+    if record.get("type") != "event_msg":
+        return None
     payload = record.get("payload")
     payload_mapping = payload if isinstance(payload, Mapping) else {}
     event_type = payload_mapping.get("type")
-    if not isinstance(event_type, str):
-        candidate = record.get("type")
-        event_type = candidate if isinstance(candidate, str) else ""
-    if event_type not in _START_EVENTS and event_type not in _TERMINAL_EVENTS:
+    if not isinstance(event_type, str) or (
+        event_type not in _START_EVENTS and event_type not in _TERMINAL_EVENTS
+    ):
         return None
     turn_id = payload_mapping.get("turn_id", record.get("turn_id"))
     if not isinstance(turn_id, str) or not turn_id:
@@ -119,7 +124,11 @@ class _SessionState:
 
 
 class CodexSessionScanner:
-    """Track the latest turn in allowed Codex session files without full rescans."""
+    """Track latest turns without full rescans, excluding bridge-originated sessions.
+
+    Originator is creation-source metadata rather than OS process ownership. This initial
+    heuristic can therefore also hide a bridge-created session later resumed in Desktop.
+    """
 
     def __init__(
         self,
@@ -332,7 +341,11 @@ class CodexSessionScanner:
             elif info.st_size > state.position or info.st_mtime_ns != state.modified_ns:
                 self._apply_appended_data(path, state, cancelled)
                 state.modified_ns = info.st_mtime_ns
-            if not state.latest_is_running or state.cwd is None:
+            if (
+                not state.latest_is_running
+                or state.cwd is None
+                or is_codexbridge_originator(state.originator)
+            ):
                 continue
             try:
                 cwd = policy.validate_cwd(state.cwd)

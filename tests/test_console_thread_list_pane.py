@@ -144,7 +144,13 @@ def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp
         [
             {"id": "managed", "name": "Managed", "cwd": str(first_cwd)},
             {"id": "shared", "name": "Shared", "cwd": str(first_cwd)},
-            {"id": "waiting", "name": "Waiting", "cwd": str(first_cwd)},
+            {
+                "id": "waiting",
+                "name": "Waiting",
+                "cwd": str(first_cwd),
+                "originator": " CoDeXBrIdGe ",
+            },
+            {"id": "idle", "name": "Idle", "cwd": str(first_cwd)},
         ],
         thread_statuses={"managed": "in_progress", "waiting": "needs_approval"},
     )
@@ -161,27 +167,36 @@ def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp
     external = _thread_item(pane, "shared")
     omitted = _thread_item(pane, "outside-api-limit")
     waiting = _thread_item(pane, "waiting")
+    idle = _thread_item(pane, "idle")
     running = pane.list_widget.topLevelItem(0)
     assert running.text(0) == "現在処理中"
-    assert pane.thread_count == 4
+    assert pane.thread_count == 5
     assert managed.text(0) == "\u25cf Managed"
     assert managed.foreground(0).color() == pane.list_widget.palette().color(
         QPalette.ColorRole.Link
     )
-    assert external.text(0) == "\u25cf Shared"
-    assert external.foreground(0).color() == QColor("#d93025")
+    assert external.text(0) == "Shared"
+    assert not external.icon(0).isNull()
+    assert external.icon(0).pixmap(12, 12).toImage().pixelColor(6, 6) == QColor("#d93025")
+    assert external.foreground(0) == idle.foreground(0)
     assert external.toolTip(0) == "shared\n推定実行中"
     for external_copy in [
         item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == "shared"
     ]:
-        assert external_copy.text(0) == "\u25cf Shared"
-        assert external_copy.foreground(0).color() == QColor("#d93025")
+        assert external_copy.text(0) == "Shared"
+        assert not external_copy.icon(0).isNull()
+        assert external_copy.foreground(0) == idle.foreground(0)
         assert external_copy.toolTip(0) == "shared\n推定実行中"
-    assert omitted.text(0) == "\u25cf outside-api-limit"
-    assert omitted.foreground(0).color() == QColor("#d93025")
-    assert waiting.text(0) == "\u25cf Waiting"
-    assert waiting.foreground(0).color() == QColor("#d93025")
-    assert waiting.toolTip(0) == "waiting\n推定実行中"
+    assert omitted.text(0) == "outside-api-limit"
+    assert not omitted.icon(0).isNull()
+    assert omitted.icon(0).pixmap(12, 12).toImage().pixelColor(6, 6) == QColor("#d93025")
+    assert omitted.foreground(0) == idle.foreground(0)
+    assert waiting.text(0) == "\u23f8 Waiting"
+    assert waiting.icon(0).isNull()
+    assert waiting.foreground(0).color() == pane.list_widget.palette().color(
+        QPalette.ColorRole.Link
+    )
+    assert waiting.toolTip(0) == "waiting"
     assert pane._thread_statuses["waiting"] == "needs_approval"
     assert (
         sum(item.data(0, Qt.ItemDataRole.UserRole) == "shared" for item in _thread_items(pane)) == 2
@@ -196,7 +211,7 @@ def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp
 
     pane.set_external_running_threads({})
 
-    assert pane.thread_count == 3
+    assert pane.thread_count == 4
     assert _thread_item(pane, "shared").text(0) == "Shared"
     assert (
         sum(item.data(0, Qt.ItemDataRole.UserRole) == "shared" for item in _thread_items(pane)) == 1

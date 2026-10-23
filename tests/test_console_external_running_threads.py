@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Event, get_ident
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 from codex_bridge.console import external_running_threads
 
@@ -55,9 +55,17 @@ def _scanner(tmp_path: Path, *roots: Path):
     )
 
 
-def _write_session(path: Path, cwd: Path, *events: dict[str, object]) -> None:
+def _write_session(
+    path: Path,
+    cwd: Path,
+    *events: dict[str, object],
+    originator: str = "codex_desktop",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_record(_metadata(cwd)) + b"".join(_record(event) for event in events))
+    path.write_bytes(
+        _record(_metadata(cwd, originator=originator))
+        + b"".join(_record(event) for event in events)
+    )
 
 
 THREAD_A = "01a16aba-cdff-7413-90e6-f467224b821d"
@@ -77,6 +85,36 @@ def test_task_started_without_a_terminal_event_is_estimated_running(tmp_path: Pa
     assert scanner.scan() == {
         THREAD_A: {"id": THREAD_A, "cwd": str(project.resolve()), "originator": "codex_desktop"}
     }
+
+
+@pytest.mark.parametrize("originator", ("codexbridge", " CodexBridge ", "CODEXBRIDGE"))
+def test_codexbridge_unterminated_turn_is_not_an_external_candidate(
+    tmp_path: Path, originator: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    scanner = _scanner(tmp_path, project)
+    _write_session(
+        _session_file(tmp_path / "codex-home", THREAD_A),
+        project,
+        _event("task_started", "turn-a"),
+        originator=originator,
+    )
+
+    assert scanner.scan() == {}
+
+
+def test_non_event_msg_payload_does_not_start_a_turn(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    scanner = _scanner(tmp_path, project)
+    _write_session(
+        _session_file(tmp_path / "codex-home", THREAD_A),
+        project,
+        {"type": "response_item", "payload": {"type": "task_started", "turn_id": "turn-a"}},
+    )
+
+    assert scanner.scan() == {}
 
 
 def test_initial_scan_parses_only_metadata_and_relevant_event_rows(
@@ -296,7 +334,7 @@ class _BlockingScanner:
 
 
 def test_monitor_scans_off_gui_without_overlap_and_suppresses_results_after_stop() -> None:
-    app = QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
     assert app is not None
     scanner = _BlockingScanner()
     monitor = _monitor_class()(allowed_roots=(), scanner=scanner)
@@ -317,7 +355,7 @@ def test_monitor_scans_off_gui_without_overlap_and_suppresses_results_after_stop
 
 
 def test_monitor_turns_scanner_errors_into_empty_updates() -> None:
-    app = QCoreApplication.instance() or QCoreApplication([])
+    app = QApplication.instance() or QApplication([])
     assert app is not None
 
     class BrokenScanner:

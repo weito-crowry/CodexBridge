@@ -3,8 +3,17 @@ from __future__ import annotations
 import os
 from collections.abc import Collection, Mapping, Sequence
 
-from PySide6.QtCore import QDir, QPoint, Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QPalette
+from PySide6.QtCore import QDir, QPoint, QRectF, Qt, QUrl, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QPainter,
+    QPalette,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
@@ -17,8 +26,26 @@ from PySide6.QtWidgets import (
 )
 
 from .bulk_thread_naming import build_thread_list_header, loaded_untitled_thread_rows
+from .external_running_threads import is_codexbridge_originator
 from .project_names import normalize_cwd
 from .widget_helpers import _safe_text, copy_to_clipboard
+
+_EXTERNAL_MARKER_ICON: QIcon | None = None
+
+
+def _external_marker_icon() -> QIcon:
+    global _EXTERNAL_MARKER_ICON
+    if _EXTERNAL_MARKER_ICON is None:
+        pixmap = QPixmap(12, 12)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#d93025"))
+        painter.drawEllipse(QRectF(1.0, 1.0, 10.0, 10.0))
+        painter.end()
+        _EXTERNAL_MARKER_ICON = QIcon(pixmap)
+    return _EXTERNAL_MARKER_ICON
 
 
 def _thread_status_marker(status: str | None) -> str:
@@ -159,6 +186,15 @@ class ThreadListPane(QWidget):
             combined.append(thread)
         self._threads = combined
 
+    def _is_external_running_candidate(self, thread_id: str) -> bool:
+        external = self._external_running_threads.get(thread_id)
+        if external is None or is_codexbridge_originator(external.get("originator")):
+            return False
+        return not any(
+            thread.get("id") == thread_id and is_codexbridge_originator(thread.get("originator"))
+            for thread in self._server_threads
+        )
+
     def set_active_thread_ids(self, thread_ids: Collection[str]) -> None:
         self._active_thread_ids = set(thread_ids)
         self._render()
@@ -268,15 +304,16 @@ class ThreadListPane(QWidget):
                         continue
                     title = _safe_text(thread.get("name")) or "New スレッド"
                     status = self._thread_statuses.get(thread_id)
-                    external_running = thread_id in self._external_running_threads
+                    external_running = self._is_external_running_candidate(thread_id)
                     managed_running = status == "in_progress" or (
                         not self._has_thread_statuses and thread_id in self._active_thread_ids
                     )
-                    status_marker = (
-                        "\u25cf "
-                        if managed_running or external_running
-                        else _thread_status_marker(status)
-                    )
+                    if managed_running:
+                        status_marker = "\u25cf "
+                    elif external_running:
+                        status_marker = ""
+                    else:
+                        status_marker = _thread_status_marker(status)
                     if not self._has_thread_statuses and thread_id in self._active_thread_ids:
                         status_marker = "\u25cf "
                     item = QTreeWidgetItem([f"{status_marker}{title}" if status_marker else title])
@@ -284,16 +321,13 @@ class ThreadListPane(QWidget):
                     item.setToolTip(0, thread_id)
                     external_marker = external_running and not managed_running
                     if external_marker:
+                        item.setIcon(0, _external_marker_icon())
                         item.setToolTip(0, f"{thread_id}\n推定実行中")
                     if status_marker:
                         font = QFont(item.font(0))
                         font.setWeight(QFont.Weight.DemiBold)
                         item.setFont(0, font)
-                        marker_color = (
-                            QColor("#d93025")
-                            if external_marker
-                            else self.list_widget.palette().color(QPalette.ColorRole.Link)
-                        )
+                        marker_color = self.list_widget.palette().color(QPalette.ColorRole.Link)
                         item.setForeground(0, QBrush(marker_color))
                     parent.addChild(item)
                     if thread_id == selected_thread_id:
@@ -317,7 +351,7 @@ class ThreadListPane(QWidget):
                     if isinstance(thread.get("id"), str)
                     and (
                         self._thread_statuses.get(str(thread.get("id"))) == "in_progress"
-                        or str(thread.get("id")) in self._external_running_threads
+                        or self._is_external_running_candidate(str(thread.get("id")))
                     )
                 ]
                 if running_threads:

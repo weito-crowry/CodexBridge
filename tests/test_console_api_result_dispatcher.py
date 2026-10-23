@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QColor, QPalette
 
 from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.main_window import MainWindow
@@ -119,7 +119,16 @@ def test_external_running_thread_survives_http_thread_refresh() -> None:
     window._apply_external_running_threads(
         {
             "outside-api-limit": {"id": "outside-api-limit", "cwd": cwd},
-            "external-not-loaded": {"id": "external-not-loaded", "cwd": cwd},
+            "external-not-loaded": {
+                "id": "external-not-loaded",
+                "cwd": cwd,
+                "originator": "codex_desktop",
+            },
+            "external-interrupted": {
+                "id": "external-interrupted",
+                "cwd": cwd,
+                "originator": "codex_desktop",
+            },
         }
     )
 
@@ -136,6 +145,11 @@ def test_external_running_thread_survives_http_thread_refresh() -> None:
                     "id": "external-not-loaded",
                     "cwd": cwd,
                     "runtime_status": {"type": "notLoaded"},
+                },
+                {
+                    "id": "external-interrupted",
+                    "cwd": cwd,
+                    "runtime_status": {"type": "interrupted"},
                 },
             ]
         },
@@ -160,10 +174,135 @@ def test_external_running_thread_survives_http_thread_refresh() -> None:
         item for item in thread_items if item.data(0, Qt.ItemDataRole.UserRole) == "managed"
     )
     assert external_item.toolTip(0) == "external-not-loaded\n推定実行中"
+    interrupted_item = next(
+        item
+        for item in thread_items
+        if item.data(0, Qt.ItemDataRole.UserRole) == "external-interrupted"
+    )
+    assert interrupted_item.toolTip(0) == "external-interrupted\n推定実行中"
     assert managed_item.foreground(0).color() == window.thread_pane.list_widget.palette().color(
         QPalette.ColorRole.Link
     )
     assert "external-not-loaded" in window._external_running_threads
+    assert "external-interrupted" in window._external_running_threads
+    window.close()
+
+
+def test_http_codexbridge_originator_suppresses_external_overlay_but_keeps_statuses() -> None:
+    _application()
+    client = FakeClient()
+    window = _window(client)
+    cwd = os.getcwd()
+    managed_ids = ("managed-running", "managed-approval", "managed-input", "managed-waiting")
+    window._apply_external_running_threads(
+        {thread_id: {"id": thread_id, "cwd": cwd} for thread_id in managed_ids}
+    )
+
+    client.result(
+        "threads",
+        {
+            "threads": [
+                {
+                    "id": "managed-running",
+                    "name": "Running",
+                    "cwd": cwd,
+                    "originator": "codexbridge",
+                    "runtime_status": {"type": "active", "active_flags": []},
+                },
+                {
+                    "id": "managed-approval",
+                    "name": "Approval",
+                    "cwd": cwd,
+                    "originator": " CodexBridge ",
+                    "runtime_status": {
+                        "type": "active",
+                        "active_flags": ["waitingOnApproval"],
+                    },
+                },
+                {
+                    "id": "managed-input",
+                    "name": "Input",
+                    "cwd": cwd,
+                    "originator": "CODEXBRIDGE",
+                    "runtime_status": {
+                        "type": "active",
+                        "active_flags": ["waitingOnUserInput"],
+                    },
+                },
+                {
+                    "id": "managed-waiting",
+                    "name": "Waiting",
+                    "cwd": cwd,
+                    "originator": "codexbridge",
+                    "runtime_status": {"type": "active", "active_flags": ["other"]},
+                },
+            ]
+        },
+    )
+
+    by_id = {
+        item.data(0, Qt.ItemDataRole.UserRole): item
+        for index in range(window.thread_pane.list_widget.topLevelItemCount())
+        for item in _children(window.thread_pane.list_widget.topLevelItem(index))
+        if isinstance(item.data(0, Qt.ItemDataRole.UserRole), str)
+    }
+    assert by_id["managed-running"].text(0) == "\u25cf Running"
+    assert window._thread_turn_statuses == {
+        "managed-running": "in_progress",
+        "managed-approval": "needs_approval",
+        "managed-input": "needs_input",
+        "managed-waiting": "waiting",
+    }
+    assert by_id["managed-running"].foreground(
+        0
+    ).color() == window.thread_pane.list_widget.palette().color(QPalette.ColorRole.Link)
+    assert by_id["managed-approval"].text(0) == "\u23f8 Approval"
+    assert by_id["managed-input"].text(0) == "\u270e Input"
+    assert by_id["managed-waiting"].text(0) == "\u23f8 Waiting"
+    for thread_id in managed_ids:
+        assert by_id[thread_id].icon(0).isNull()
+        assert by_id[thread_id].toolTip(0) == thread_id
+        assert by_id[thread_id].foreground(0).color() != QColor("#d93025")
+    running_section = window.thread_pane.list_widget.topLevelItem(0)
+    assert running_section.text(0) == "現在処理中"
+    assert [
+        item.data(0, Qt.ItemDataRole.UserRole)
+        for item in _children(running_section)
+        if item.data(0, Qt.ItemDataRole.UserRole) is not None
+    ] == ["managed-running"]
+    assert set(window._external_running_threads) == set(managed_ids)
+    window.close()
+
+
+def test_unchanged_external_thread_snapshots_do_not_rerender_the_tree(monkeypatch) -> None:
+    _application()
+    client = FakeClient()
+    window = _window(client)
+    cwd = os.getcwd()
+    first_id = "external-one"
+    first = {first_id: {"id": first_id, "cwd": cwd, "originator": "codex_desktop"}}
+    window._apply_external_running_threads(first)
+
+    render_calls: list[None] = []
+    original_render = window.thread_pane._render
+
+    def track_render() -> None:
+        render_calls.append(None)
+        original_render()
+
+    monkeypatch.setattr(window.thread_pane, "_render", track_render)
+    window._apply_external_running_threads(first)
+    assert render_calls == []
+
+    second_id = "external-two"
+    window._apply_external_running_threads(
+        {
+            **first,
+            second_id: {"id": second_id, "cwd": cwd, "originator": "codex_desktop"},
+        }
+    )
+    assert len(render_calls) == 1
+    assert window.thread_pane.thread_count == 2
     window.close()
 
 
@@ -205,7 +344,9 @@ def test_main_window_applies_external_monitor_updates_and_stops_on_exit() -> Non
         for item in _children(window.thread_pane.list_widget.topLevelItem(0))
         if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
     )
-    assert external_item.text(0) == f"\u25cf {thread_id}"
+    assert external_item.text(0) == thread_id
+    assert not external_item.icon(0).isNull()
+    assert external_item.icon(0).pixmap(12, 12).toImage().pixelColor(6, 6) == QColor("#d93025")
     assert external_item.toolTip(0) == f"{thread_id}\n推定実行中"
     window.thread_pane.thread_selected.emit(thread_id)
     assert window._selected_thread_id == thread_id
