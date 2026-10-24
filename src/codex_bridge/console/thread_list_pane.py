@@ -3,16 +3,19 @@ from __future__ import annotations
 import os
 from collections.abc import Collection, Mapping, Sequence
 
-from PySide6.QtCore import QDir, QPoint, QRectF, Qt, QUrl, Signal
+from PySide6.QtCore import QDir, QPoint, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QDesktopServices,
     QFont,
+    QHideEvent,
     QIcon,
     QPainter,
     QPalette,
+    QPen,
     QPixmap,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
     QLabel,
@@ -30,25 +33,12 @@ from .external_running_threads import is_codexbridge_originator
 from .project_names import normalize_cwd
 from .widget_helpers import _safe_text, copy_to_clipboard
 
-_EXTERNAL_MARKER_ICON: QIcon | None = None
 _MANAGED_RUNTIME_STATUSES = frozenset(
     {"in_progress", "needs_approval", "needs_input", "needs_user_input", "waiting"}
 )
-
-
-def _external_marker_icon() -> QIcon:
-    global _EXTERNAL_MARKER_ICON
-    if _EXTERNAL_MARKER_ICON is None:
-        pixmap = QPixmap(12, 12)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#d93025"))
-        painter.drawEllipse(QRectF(1.0, 1.0, 10.0, 10.0))
-        painter.end()
-        _EXTERNAL_MARKER_ICON = QIcon(pixmap)
-    return _EXTERNAL_MARKER_ICON
+_SPINNER_INTERVAL_MS = 90
+_SPINNER_ANGLE_STEP = 30
+_SPINNER_SIZE = 16
 
 
 def _thread_status_marker(status: str | None) -> str:
@@ -88,6 +78,7 @@ class ThreadListPane(QWidget):
     _RUNNING_SECTION_ROLE = Qt.ItemDataRole.UserRole + 3
     _RUNNING_PROJECT_ROLE = Qt.ItemDataRole.UserRole + 4
     _RUNNING_PROJECT_KEY_ROLE = Qt.ItemDataRole.UserRole + 5
+    _RUNNING_MARKER_ROLE = Qt.ItemDataRole.UserRole + 6
     _OTHER_GROUP_KEY = "\x00other"
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -104,6 +95,12 @@ class ThreadListPane(QWidget):
         self._selected_thread_id: str | None = None
         self._running_section_expanded = True
         self._rendering = False
+        self._spinner_angle = 0
+        self._spinner_icons: dict[tuple[int, int], QIcon] = {}
+        self._running_marker_count = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(_SPINNER_INTERVAL_MS)
+        self._spinner_timer.timeout.connect(self._advance_running_spinner)
         title = QLabel("Threads")
         self.refresh_button = QPushButton("Refresh")
         self.filter_edit = QLineEdit()
@@ -202,6 +199,96 @@ class ThreadListPane(QWidget):
             for thread in self._server_threads
         )
 
+    def _running_marker_color(self, marker_kind: str) -> QColor:
+        if marker_kind == "external":
+            return QColor("#d93025")
+        return self.list_widget.palette().color(QPalette.ColorRole.Link)
+
+    def _running_spinner_icon(self, color: QColor, angle: int) -> QIcon | None:
+        key = (color.rgba(), angle)
+        cached = self._spinner_icons.get(key)
+        if cached is not None:
+            return cached
+
+        pixmap = QPixmap(_SPINNER_SIZE, _SPINNER_SIZE)
+        if pixmap.isNull():
+            return None
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter()
+        if not painter.begin(pixmap):
+            return None
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(color)
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(QRectF(3.0, 3.0, 10.0, 10.0), angle * 16, 250 * 16)
+        painter.end()
+        icon = QIcon(pixmap)
+        if icon.isNull():
+            return None
+        self._spinner_icons[key] = icon
+        return icon
+
+    def _sync_running_spinner_timer(self) -> None:
+        should_run = self._running_marker_count > 0 and self.isVisible() and not self._rendering
+        if should_run:
+            if not self._spinner_timer.isActive():
+                self._spinner_timer.start()
+        else:
+            self._spinner_timer.stop()
+
+    def _refresh_running_spinner_item(self, item: QTreeWidgetItem) -> int:
+        marker_kind = item.data(0, self._RUNNING_MARKER_ROLE)
+        if marker_kind not in {"managed", "external"}:
+            return 0
+        color = self._running_marker_color(marker_kind)
+        icon = self._running_spinner_icon(color, self._spinner_angle)
+        if icon is None:
+            title = item.text(0)
+            if not title.startswith("\u25cf "):
+                item.setText(0, f"\u25cf {title}")
+            item.setIcon(0, QIcon())
+            item.setData(0, self._RUNNING_MARKER_ROLE, None)
+            item.setForeground(0, QBrush(color))
+            return 0
+        item.setIcon(0, icon)
+        item.setForeground(0, QBrush(color))
+        return 1
+
+    def _refresh_running_spinner_items(self) -> None:
+        marker_count = 0
+
+        def visit(item: QTreeWidgetItem) -> None:
+            nonlocal marker_count
+            marker_count += self._refresh_running_spinner_item(item)
+            for child_index in range(item.childCount()):
+                child = item.child(child_index)
+                if child is not None:
+                    visit(child)
+
+        for top_index in range(self.list_widget.topLevelItemCount()):
+            item = self.list_widget.topLevelItem(top_index)
+            if item is not None:
+                visit(item)
+        self._running_marker_count = marker_count
+
+    def _advance_running_spinner(self) -> None:
+        if self._rendering or not self.isVisible() or self._running_marker_count == 0:
+            return
+        self._spinner_angle = (self._spinner_angle + _SPINNER_ANGLE_STEP) % 360
+        self._refresh_running_spinner_items()
+        self._sync_running_spinner_timer()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._refresh_running_spinner_items()
+        self._sync_running_spinner_timer()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        self._spinner_timer.stop()
+        super().hideEvent(event)
+
     def set_active_thread_ids(self, thread_ids: Collection[str]) -> None:
         self._active_thread_ids = set(thread_ids)
         self._render()
@@ -240,6 +327,7 @@ class ThreadListPane(QWidget):
                 group_cwds[group_key] = cwd if group_key is not None else None
             groups[group_key].append(thread)
 
+        self._running_marker_count = 0
         self._rendering = True
         try:
             self.list_widget.clear()
@@ -315,22 +403,29 @@ class ThreadListPane(QWidget):
                     managed_running = status == "in_progress" or (
                         not self._has_thread_statuses and thread_id in self._active_thread_ids
                     )
-                    if managed_running:
-                        status_marker = "\u25cf "
-                    elif external_running:
-                        status_marker = ""
-                    else:
-                        status_marker = _thread_status_marker(status)
-                    if not self._has_thread_statuses and thread_id in self._active_thread_ids:
-                        status_marker = "\u25cf "
+                    marker_kind = (
+                        "managed" if managed_running else "external" if external_running else None
+                    )
+                    status_marker = "" if marker_kind is not None else _thread_status_marker(status)
                     item = QTreeWidgetItem([f"{status_marker}{title}" if status_marker else title])
                     item.setData(0, Qt.ItemDataRole.UserRole, thread_id)
                     item.setToolTip(0, thread_id)
-                    external_marker = external_running and not managed_running
-                    if external_marker:
-                        item.setIcon(0, _external_marker_icon())
+                    if marker_kind is not None:
+                        color = self._running_marker_color(marker_kind)
+                        icon = self._running_spinner_icon(color, self._spinner_angle)
+                        if icon is None:
+                            item.setText(0, f"\u25cf {title}")
+                        else:
+                            item.setIcon(0, icon)
+                            item.setData(0, self._RUNNING_MARKER_ROLE, marker_kind)
+                            self._running_marker_count += 1
+                        font = QFont(item.font(0))
+                        font.setWeight(QFont.Weight.DemiBold)
+                        item.setFont(0, font)
+                        item.setForeground(0, QBrush(color))
+                    if marker_kind == "external":
                         item.setToolTip(0, f"{thread_id}\n推定実行中")
-                    if status_marker:
+                    elif status_marker:
                         font = QFont(item.font(0))
                         font.setWeight(QFont.Weight.DemiBold)
                         item.setFont(0, font)
@@ -394,6 +489,7 @@ class ThreadListPane(QWidget):
             self.list_widget.verticalScrollBar().setValue(scroll_value)
         finally:
             self._rendering = False
+            self._sync_running_spinner_timer()
 
     def _remember_selected_thread(
         self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None

@@ -30,6 +30,13 @@ def _window(client: FakeClient, *, external_thread_monitor=None) -> MainWindow:
     )
 
 
+def _icon_contains_color(item, color: QColor) -> bool:
+    image = item.icon(0).pixmap(16, 16).toImage()
+    return any(
+        image.pixelColor(x, y) == color for y in range(image.height()) for x in range(image.width())
+    )
+
+
 class _FakeExternalThreadMonitor:
     def __init__(self) -> None:
         self.updated = Signal()
@@ -174,12 +181,14 @@ def test_external_running_thread_survives_http_thread_refresh() -> None:
         item for item in thread_items if item.data(0, Qt.ItemDataRole.UserRole) == "managed"
     )
     assert external_item.toolTip(0) == "external-not-loaded\n推定実行中"
+    assert _icon_contains_color(external_item, QColor("#d93025"))
     interrupted_item = next(
         item
         for item in thread_items
         if item.data(0, Qt.ItemDataRole.UserRole) == "external-interrupted"
     )
     assert interrupted_item.toolTip(0) == "external-interrupted\n推定実行中"
+    assert _icon_contains_color(interrupted_item, QColor("#d93025"))
     assert managed_item.foreground(0).color() == window.thread_pane.list_widget.palette().color(
         QPalette.ColorRole.Link
     )
@@ -246,7 +255,11 @@ def test_http_codexbridge_originator_suppresses_external_overlay_but_keeps_statu
         for item in _children(window.thread_pane.list_widget.topLevelItem(index))
         if isinstance(item.data(0, Qt.ItemDataRole.UserRole), str)
     }
-    assert by_id["managed-running"].text(0) == "\u25cf Running"
+    assert by_id["managed-running"].text(0) == "Running"
+    assert _icon_contains_color(
+        by_id["managed-running"],
+        window.thread_pane.list_widget.palette().color(QPalette.ColorRole.Link),
+    )
     assert window._thread_turn_statuses == {
         "managed-running": "in_progress",
         "managed-approval": "needs_approval",
@@ -259,7 +272,7 @@ def test_http_codexbridge_originator_suppresses_external_overlay_but_keeps_statu
     assert by_id["managed-approval"].text(0) == "\u23f8 Approval"
     assert by_id["managed-input"].text(0) == "\u270e Input"
     assert by_id["managed-waiting"].text(0) == "\u23f8 Waiting"
-    for thread_id in managed_ids:
+    for thread_id in managed_ids[1:]:
         assert by_id[thread_id].icon(0).isNull()
         assert by_id[thread_id].toolTip(0) == thread_id
         assert by_id[thread_id].foreground(0).color() != QColor("#d93025")
@@ -346,7 +359,8 @@ def test_main_window_applies_external_monitor_updates_and_stops_on_exit() -> Non
     )
     assert external_item.text(0) == thread_id
     assert not external_item.icon(0).isNull()
-    assert external_item.icon(0).pixmap(12, 12).toImage().pixelColor(6, 6) == QColor("#d93025")
+    assert _icon_contains_color(external_item, QColor("#d93025"))
+    assert external_item.foreground(0).color() == QColor("#d93025")
     assert external_item.toolTip(0) == f"{thread_id}\n推定実行中"
     window.thread_pane.thread_selected.emit(thread_id)
     assert window._selected_thread_id == thread_id
