@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -10,6 +11,9 @@ from .config import GitHubMcpConfig
 from .logging_utils import log_event
 from .mcp_catalog import CatalogError, CatalogListToolsResult, CatalogSnapshot, build_catalog
 from .mcp_remote import RemoteMcpError, RemoteMcpProvider
+
+_LEGACY_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"})
+_MODERN_PROTOCOL_VERSION = "2026-07-28"
 
 
 class RemoteProviderLike(Protocol):
@@ -99,12 +103,22 @@ class ToolRouter:
 
     async def list_tools(
         self,
-        _context: ServerRequestContext[Any] | None,
+        context: ServerRequestContext[Any] | None,
         _params: types.PaginatedRequestParams | None,
     ) -> CatalogListToolsResult:
         snapshot = self._snapshot
         if snapshot is None:
             raise RuntimeError("MCP tool router is not started")
+        tools = list(snapshot.tools)
+        if context is not None:
+            legacy_protocol = _is_legacy_protocol(context)
+            if legacy_protocol:
+                tools = [
+                    tool.model_copy(update={"output_schema": None})
+                    if tool.output_schema is not None and tool.output_schema.get("type") != "object"
+                    else tool
+                    for tool in snapshot.tools
+                ]
         log_event(
             "mcp.tools.list",
             provider="codexbridge",
@@ -119,7 +133,7 @@ class ToolRouter:
             ttl_ms=0,
             cache_scope="private",
             next_cursor=None,
-            tools=list(snapshot.tools),
+            tools=tools,
             result_type="complete",
         )
 
@@ -128,6 +142,7 @@ class ToolRouter:
         context: ServerRequestContext[Any] | None,
         params: types.CallToolRequestParams,
     ) -> types.CallToolResult | types.InputRequiredResult:
+        legacy_protocol = _is_legacy_protocol(context) if context is not None else False
         route = self._routes.get(params.name)
         if route is None:
             raise MCPError(
@@ -143,13 +158,16 @@ class ToolRouter:
         if request_meta is None and context is not None:
             request_meta = context.meta
         try:
-            return await self.remote_provider.call_tool(
+            result = await self.remote_provider.call_tool(
                 route.upstream_name,
                 params.arguments,
                 input_responses=params.input_responses,
                 request_state=params.request_state,
                 meta=request_meta,
             )
+            if legacy_protocol and isinstance(result, types.CallToolResult):
+                return _legacy_call_result(result)
+            return result
         except RemoteMcpError as exc:
             message = str(exc) or "GitHub Remote MCP call failed"
             pat = self.remote_provider.config.pat
@@ -159,3 +177,35 @@ class ToolRouter:
                 content=[types.TextContent(type="text", text=message)],
                 is_error=True,
             )
+
+
+def _is_legacy_protocol(context: ServerRequestContext[Any]) -> bool:
+    protocol_version = context.protocol_version
+    if protocol_version in _LEGACY_PROTOCOL_VERSIONS:
+        return True
+    if protocol_version == _MODERN_PROTOCOL_VERSION:
+        return False
+    raise MCPError(
+        code=types.UNSUPPORTED_PROTOCOL_VERSION,
+        message=f"Unsupported MCP protocol version: {protocol_version}",
+    ) from None
+
+
+def _legacy_call_result(result: types.CallToolResult) -> types.CallToolResult:
+    if "structured_content" not in result.model_fields_set or isinstance(
+        result.structured_content, dict
+    ):
+        return result
+
+    structured_text = json.dumps(
+        result.structured_content,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    content = list(result.content)
+    if not any(
+        isinstance(item, types.TextContent) and item.text == structured_text for item in content
+    ):
+        content.append(types.TextContent(type="text", text=structured_text))
+    return result.model_copy(update={"content": content, "structured_content": None})
