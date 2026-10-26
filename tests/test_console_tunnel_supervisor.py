@@ -3,11 +3,28 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, QProcess
 from PySide6.QtNetwork import QNetworkRequest
 from PySide6.QtWidgets import QApplication
 
 from codex_bridge.console.tunnel_supervisor import TunnelSupervisor, parse_tunnel_version
+
+
+@pytest.fixture(autouse=True)
+def isolated_tunnel_observability(tmp_path, monkeypatch):
+    from codex_bridge import observability as observability_module
+    from codex_bridge.console import tunnel_supervisor as tunnel_module
+
+    previous_singleton = observability_module._observer
+    observer = observability_module.ObservabilityLogger(tmp_path / "console-observability.jsonl")
+    monkeypatch.setattr(tunnel_module, "get_observer", lambda: observer)
+    try:
+        yield observer
+    finally:
+        assert observability_module._observer is previous_singleton
+        if observer._handler is not None:
+            observer._handler.flush()
+            observer._handler.close()
 
 
 class Signal:
@@ -34,6 +51,8 @@ class FakeProcess:
         self.stdout = b""
         self.stderr = b""
         self.exit_code = 0
+        self.pid = 4321
+        self.start_error: Exception | None = None
         self.start_calls = 0
         self.terminate_calls = 0
         self.kill_calls = 0
@@ -51,6 +70,11 @@ class FakeProcess:
 
     def start(self) -> None:
         self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+
+    def processId(self) -> int:
+        return self.pid if self.start_calls else 0
 
     def readAllStandardOutput(self) -> bytes:
         output, self.stdout = self.stdout, b""
@@ -433,17 +457,19 @@ def test_tunnel_lifecycle_and_recovery_are_observed(monkeypatch) -> None:
 
     class RecordingObserver:
         def __init__(self) -> None:
-            self.events: list[str] = []
+            self.events: list[tuple[str, dict[str, Any]]] = []
 
-        def tunnel_start(self) -> None:
-            self.events.append("tunnel.start")
+        def tunnel_start(self, **fields: Any) -> None:
+            self.events.append(("tunnel.start", fields))
 
-        def tunnel_exit(self, exit_code: int | None = None) -> None:
-            del exit_code
-            self.events.append("tunnel.exit")
+        def tunnel_started(self, **fields: Any) -> None:
+            self.events.append(("tunnel.started", fields))
 
-        def tunnel_recovery(self) -> None:
-            self.events.append("tunnel.recovery")
+        def tunnel_exit(self, exit_code: int | None = None, **fields: Any) -> None:
+            self.events.append(("tunnel.exit", {"exit_code": exit_code, **fields}))
+
+        def tunnel_recovery(self, **fields: Any) -> None:
+            self.events.append(("tunnel.recovery", fields))
 
     _application()
     observer = RecordingObserver()
@@ -453,13 +479,25 @@ def test_tunnel_lifecycle_and_recovery_are_observed(monkeypatch) -> None:
     supervisor = _managed_supervisor([doctor, tunnel])
 
     doctor.finished.emit(0, 0)
+    tunnel.started.emit()
     tunnel.finished.emit(1, 0)
 
-    assert observer.events == [
+    assert [event for event, _fields in observer.events] == [
         "tunnel.start",
+        "tunnel.started",
         "tunnel.exit",
         "tunnel.recovery",
     ]
+    start_fields = observer.events[0][1]
+    started_fields = observer.events[1][1]
+    exit_fields = observer.events[2][1]
+    recovery_fields = observer.events[3][1]
+    assert start_fields["supervisor_id"] == started_fields["supervisor_id"]
+    assert start_fields["attempt_id"] == started_fields["attempt_id"] == 1
+    assert started_fields["tunnel_pid"] == 4321
+    assert exit_fields["exit_code"] == 1
+    assert exit_fields["exit_status"] == "NormalExit"
+    assert recovery_fields["recovery_delay_ms"] == 1_000
     supervisor.close()
 
 
@@ -485,6 +523,21 @@ def test_doctor_pass_and_bridge_ready_auto_starts_tunnel() -> None:
 
     assert tunnel.start_calls == 1
     assert supervisor.state == "starting"
+    supervisor.close()
+
+
+def test_repeated_readiness_during_initial_start_does_not_duplicate_process() -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+    doctor.finished.emit(0, 0)
+
+    supervisor.set_bridge_ready(True)
+    supervisor.set_bridge_ready(True)
+
+    assert tunnel.start_calls == 1
+    assert supervisor._process is tunnel
     supervisor.close()
 
 
@@ -522,6 +575,91 @@ def test_unexpected_exit_uses_bounded_then_fallback_recovery_delays() -> None:
         assert supervisor.recovery_timer.interval() == expected_delay
         if tunnel is not tunnels[-1]:
             supervisor._on_recovery_timeout()
+    supervisor.close()
+
+
+def test_readiness_notification_does_not_bypass_recovery_timer() -> None:
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second])
+    doctor.finished.emit(0, 0)
+    first.started.emit()
+    first.finished.emit(1, 0)
+
+    assert supervisor.recovery_timer.isActive()
+    supervisor.set_bridge_ready(True)
+
+    assert second.start_calls == 0
+    assert supervisor.recovery_timer.isActive()
+    assert supervisor.recovery_timer.interval() == 1_000
+    supervisor.recovery_timer.stop()
+    supervisor._on_recovery_timeout()
+    assert second.start_calls == 1
+    assert supervisor.state == "starting"
+    supervisor.close()
+
+
+def test_supervisor_tunnel_tests_write_only_to_the_pytest_log(
+    isolated_tunnel_observability,
+) -> None:
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+    doctor.finished.emit(0, 0)
+    tunnel.started.emit()
+
+    observer = isolated_tunnel_observability
+    assert observer.log_path.name == "console-observability.jsonl"
+    assert observer.log_path.exists()
+    records = [
+        __import__("json").loads(line)
+        for line in observer.log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records
+    assert all(record["event"].startswith("tunnel.") for record in records)
+    supervisor.close()
+
+
+def test_tunnel_attempt_ids_and_unexpected_zero_exit_are_correlated(
+    isolated_tunnel_observability,
+) -> None:
+    import json
+
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second])
+    doctor.finished.emit(0, 0)
+    first.started.emit()
+    first.pid = 0
+    first.finished.emit(0, QProcess.ExitStatus.NormalExit)
+    assert supervisor.recovery_timer.isActive()
+    supervisor.recovery_timer.stop()
+    supervisor._on_recovery_timeout()
+    second.started.emit()
+
+    observer = isolated_tunnel_observability
+    records = [
+        json.loads(line) for line in observer.log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    starts = [record for record in records if record["event"] == "tunnel.start"]
+    started = [record for record in records if record["event"] == "tunnel.started"]
+    exits = [record for record in records if record["event"] == "tunnel.exit"]
+    recoveries = [record for record in records if record["event"] == "tunnel.recovery"]
+
+    assert [record["attempt_id"] for record in starts] == [1, 2]
+    assert [record["attempt_id"] for record in started] == [1, 2]
+    assert len({record["supervisor_id"] for record in starts + started + exits + recoveries}) == 1
+    assert all(record["tunnel_pid"] == 4321 for record in started + exits)
+    assert exits[0]["exit_code"] == 0
+    assert exits[0]["exit_status"] == "NormalExit"
+    assert exits[0]["reason"] == "unexpected_exit"
+    assert recoveries[0]["recovery_delay_ms"] == 1_000
+    assert starts[1]["reason"] == "recovery_timeout"
     supervisor.close()
 
 
@@ -598,6 +736,116 @@ def test_retry_now_attempts_immediately_when_bridge_and_preflight_are_ready() ->
 
     assert second.start_calls == 1
     assert supervisor.state == "starting"
+    supervisor.close()
+
+
+def test_explicit_start_cancels_pending_recovery() -> None:
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second])
+    doctor.finished.emit(0, 0)
+    first.finished.emit(1, 0)
+    assert supervisor.recovery_timer.isActive()
+
+    assert supervisor.start()
+
+    assert second.start_calls == 1
+    assert not supervisor.recovery_timer.isActive()
+    supervisor.close()
+
+
+def test_explicit_restart_cancels_pending_recovery_and_starts_immediately() -> None:
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second])
+    doctor.finished.emit(0, 0)
+    first.finished.emit(1, 0)
+    assert supervisor.recovery_timer.isActive()
+    assert supervisor.action_state.restart_enabled
+
+    assert supervisor.restart()
+
+    assert second.start_calls == 1
+    assert not supervisor.recovery_timer.isActive()
+    assert supervisor.state == "starting"
+    supervisor.close()
+
+
+def test_error_then_finished_schedules_only_one_recovery(isolated_tunnel_observability) -> None:
+    import json
+
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    supervisor = _managed_supervisor([doctor, tunnel])
+    doctor.finished.emit(0, 0)
+    tunnel.errorOccurred.emit(QProcess.ProcessError.Crashed)
+    tunnel.finished.emit(1, QProcess.ExitStatus.CrashExit)
+
+    assert supervisor.recovery_timer.isActive()
+    assert supervisor.recovery_timer.interval() == 1_000
+    records = [
+        json.loads(line)
+        for line in isolated_tunnel_observability.log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    exits = [record for record in records if record["event"] == "tunnel.exit"]
+    recoveries = [record for record in records if record["event"] == "tunnel.recovery"]
+    assert len(exits) == 1
+    assert exits[0]["process_error"] == "Crashed"
+    assert exits[0]["reason"] == "process_error"
+    assert len(recoveries) == 1
+    supervisor.close()
+
+
+def test_start_exception_is_logged_as_attempt_and_failure_without_started_event(
+    isolated_tunnel_observability,
+) -> None:
+    import json
+
+    _application()
+    doctor = FakeProcess()
+    tunnel = FakeProcess()
+    tunnel.start_error = RuntimeError("private tunnel command")
+    supervisor = _managed_supervisor([doctor, tunnel])
+    doctor.finished.emit(0, 0)
+
+    records = [
+        json.loads(line)
+        for line in isolated_tunnel_observability.log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["event"] for record in records] == [
+        "tunnel.start",
+        "tunnel.exit",
+        "tunnel.recovery",
+    ]
+    assert records[1]["reason"] == "start_failed"
+    assert records[1]["process_error"] == "RuntimeError"
+    assert "private tunnel command" not in json.dumps(records)
+    supervisor.close()
+
+
+def test_old_process_notifications_do_not_finish_current_process() -> None:
+    _application()
+    doctor = FakeProcess()
+    first = FakeProcess()
+    second = FakeProcess()
+    supervisor = _managed_supervisor([doctor, first, second])
+    doctor.finished.emit(0, 0)
+    first.finished.emit(1, QProcess.ExitStatus.CrashExit)
+    supervisor.recovery_timer.stop()
+    supervisor._on_recovery_timeout()
+    assert second.start_calls == 1
+
+    first.errorOccurred.emit(QProcess.ProcessError.Crashed)
+    first.finished.emit(1, QProcess.ExitStatus.CrashExit)
+
+    assert supervisor.state == "starting"
+    assert supervisor._process is second
+    assert not supervisor.recovery_timer.isActive()
     supervisor.close()
 
 

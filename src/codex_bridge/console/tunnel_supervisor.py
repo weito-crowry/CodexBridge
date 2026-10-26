@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QProcess, QTimer, QUrl, Signal
 from PySide6.QtNetwork import (
@@ -110,6 +111,25 @@ def _process_exit_code(process: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _process_pid(process: Any) -> int | None:
+    try:
+        value = process.processId()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _process_enum_name(value: Any, enum_type: Any) -> str | None:
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    try:
+        name = enum_type(value).name
+    except (TypeError, ValueError):
+        return None
+    return name if isinstance(name, str) else None
+
+
 class TunnelSupervisor(QObject):
     """Own and supervise exactly one Console-launched Tunnel process."""
 
@@ -167,6 +187,13 @@ class TunnelSupervisor(QObject):
         self._version_output = bytearray()
         self._version_checked = False
         self._recovery_index = 0
+        self._supervisor_id = uuid4().hex
+        self._attempt_id = 0
+        self._active_attempt_id: int | None = None
+        self._active_attempt_reason: str | None = None
+        self._active_tunnel_pid: int | None = None
+        self._process_error: str | None = None
+        self._stop_reason = "explicit_stop"
 
         self._doctor_timer = QTimer(self)
         self._doctor_timer.setSingleShot(True)
@@ -227,10 +254,13 @@ class TunnelSupervisor(QObject):
             and self._state not in transition | {"running", "ready", "not_ready"}
         )
         owned_running = process_running and self._state in {"running", "ready", "not_ready"}
+        recovery_pending = (
+            self._recovery_timer.isActive() and self._bridge_ready and self._doctor_passed
+        )
         return TunnelActionState(
             start_enabled=start_enabled,
             stop_enabled=not self._closed and owned_running,
-            restart_enabled=not self._closed and owned_running,
+            restart_enabled=not self._closed and (owned_running or recovery_pending),
         )
 
     def set_bridge_ready(self, ready: bool) -> None:
@@ -240,7 +270,7 @@ class TunnelSupervisor(QObject):
         if not ready:
             self._cancel_recovery()
         elif self._doctor_passed:
-            self._maybe_start_process()
+            self._maybe_start_process(reason="readiness")
         elif ready:
             if self._validate_version:
                 self._start_version_once()
@@ -252,7 +282,7 @@ class TunnelSupervisor(QObject):
         if not self.action_state.start_enabled:
             return False
         self._cancel_recovery()
-        return self._start_process()
+        return self._start_process(reason="explicit_start")
 
     def stop(self, *, on_finished: Callable[[], None] | None = None) -> bool:
         self._cancel_recovery()
@@ -266,12 +296,16 @@ class TunnelSupervisor(QObject):
             return False
         if on_finished is not None:
             self._stop_callbacks.append(on_finished)
+        self._stop_reason = "restart" if self._restart_requested else "explicit_stop"
         self._begin_stop()
         return True
 
     def restart(self) -> bool:
         if not self.action_state.restart_enabled:
             return False
+        if self._process is None:
+            self._cancel_recovery()
+            return self._start_process(reason="restart")
         self._restart_requested = True
         return self.stop()
 
@@ -298,6 +332,7 @@ class TunnelSupervisor(QObject):
             self._emit_controls()
             return
         self._restart_requested = False
+        self._stop_reason = "close"
         if on_finished is not None:
             self._stop_callbacks.append(on_finished)
         if self._state != "stopping":
@@ -315,7 +350,7 @@ class TunnelSupervisor(QObject):
         self._recovery_timer.stop()
         self._recovery_index = 0
 
-    def _schedule_recovery(self) -> None:
+    def _schedule_recovery(self, *, reason: str) -> None:
         if (
             self._closed
             or not self._bridge_ready
@@ -329,7 +364,13 @@ class TunnelSupervisor(QObject):
         else:
             interval = _TUNNEL_RECOVERY_FALLBACK_MS
         self._recovery_timer.start(interval)
-        get_observer().tunnel_recovery()
+        get_observer().tunnel_recovery(
+            supervisor_id=self._supervisor_id,
+            attempt_id=self._active_attempt_id,
+            reason=reason,
+            recovery_delay_ms=interval,
+        )
+        self._emit_controls()
 
     def _on_recovery_timeout(self) -> None:
         if (
@@ -339,17 +380,18 @@ class TunnelSupervisor(QObject):
             or self._process is not None
         ):
             return
-        self._start_process()
+        self._start_process(reason="recovery_timeout")
 
-    def _maybe_start_process(self) -> bool:
+    def _maybe_start_process(self, *, reason: str) -> bool:
         if (
             self._closed
             or not self._bridge_ready
             or not self._doctor_passed
             or self._process is not None
+            or self._recovery_timer.isActive()
         ):
             return False
-        return self._start_process()
+        return self._start_process(reason=reason)
 
     def retry_now(self) -> bool:
         if self._closed:
@@ -363,7 +405,7 @@ class TunnelSupervisor(QObject):
         ):
             return False
         if self._doctor_passed:
-            return self._start_process()
+            return self._start_process(reason="retry_now")
         self._doctor_passed = False
         if self._validate_version:
             self._version_checked = False
@@ -568,7 +610,7 @@ class TunnelSupervisor(QObject):
                 else "Doctor check passed"
             )
             if self._bridge_ready:
-                self._start_process()
+                self._maybe_start_process(reason="readiness")
             else:
                 self._set_state("unavailable")
         else:
@@ -596,10 +638,16 @@ class TunnelSupervisor(QObject):
         self._validation_detail = "Supervisor doctor check failed"
         self._set_state("failed", message="Tunnel: configuration check failed")
 
-    def _start_process(self) -> bool:
+    def _start_process(self, *, reason: str) -> bool:
         executable = self._executable
         if executable is None:
             return False
+        self._attempt_id += 1
+        self._active_attempt_id = self._attempt_id
+        self._active_attempt_reason = reason
+        self._active_tunnel_pid = None
+        self._process_error = None
+        process: Any | None = None
         try:
             port = self._health_port_provider()
             if isinstance(port, bool) or not 1 <= port <= 65_535:
@@ -611,10 +659,17 @@ class TunnelSupervisor(QObject):
             self._set_state("starting")
             process.started.connect(lambda process=process: self._on_process_started(process))
             process.finished.connect(
-                lambda *_args, process=process: self._on_process_finished(process)
+                lambda exit_code, exit_status, process=process: self._on_process_finished(
+                    process,
+                    exit_code,
+                    exit_status,
+                )
             )
             process.errorOccurred.connect(
-                lambda *_args, process=process: self._on_process_error(process)
+                lambda process_error, process=process: self._on_process_error(
+                    process,
+                    process_error,
+                )
             )
             process.setProgram(executable)
             profile_arguments = (
@@ -630,16 +685,26 @@ class TunnelSupervisor(QObject):
                     f"{_HEALTH_HOST}:{port}",
                 ]
             )
+            get_observer().tunnel_start(
+                supervisor_id=self._supervisor_id,
+                attempt_id=self._active_attempt_id,
+                reason=reason,
+            )
             process.start()
-            get_observer().tunnel_start()
-            return True
-        except Exception:
-            process = self._process
+            return process is self._process
+        except Exception as exc:
+            if process is not None and process is not self._process:
+                return False
             self._process = None
             if process is not None:
                 process.deleteLater()
+            self._log_tunnel_exit(
+                process,
+                reason="start_failed",
+                process_error=type(exc).__name__,
+            )
             self._set_state("failed")
-            self._schedule_recovery()
+            self._schedule_recovery(reason="start_failed")
             return False
 
     def _on_process_started(self, process: Any) -> None:
@@ -647,25 +712,50 @@ class TunnelSupervisor(QObject):
             return
         self._startup_deadline = self._clock() + _STARTUP_TIMEOUT_SECONDS
         self._health_ok = False
+        self._active_tunnel_pid = _process_pid(process)
+        get_observer().tunnel_started(
+            supervisor_id=self._supervisor_id,
+            attempt_id=self._active_attempt_id,
+            reason=self._active_attempt_reason,
+            tunnel_pid=self._active_tunnel_pid,
+        )
         self._set_state("running")
         self._health_timer.setInterval(_STARTUP_INTERVAL_MS)
         self._health_timer.start()
         self._poll_health()
 
-    def _on_process_error(self, process: Any) -> None:
+    def _on_process_error(self, process: Any, process_error: Any) -> None:
         if process is not self._process:
             return
+        error_name = _process_enum_name(process_error, QProcess.ProcessError)
         if self._state == "stopping":
+            self._process_error = error_name
             return
-        self._finish_unexpected_exit(process)
+        self._finish_unexpected_exit(process, reason="process_error", process_error=error_name)
 
-    def _on_process_finished(self, process: Any) -> None:
+    def _on_process_finished(
+        self,
+        process: Any,
+        exit_code: Any = None,
+        exit_status: Any = None,
+    ) -> None:
         if process is not self._process:
             return
+        code = (
+            exit_code
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            else _process_exit_code(process)
+        )
+        status = _process_enum_name(exit_status, QProcess.ExitStatus)
         if self._state == "stopping":
-            self._finish_stop(process)
+            self._finish_stop(process, exit_code=code, exit_status=status)
         else:
-            self._finish_unexpected_exit(process)
+            self._finish_unexpected_exit(
+                process,
+                reason="unexpected_exit",
+                exit_code=code,
+                exit_status=status,
+            )
 
     def _begin_stop(self) -> None:
         process = self._process
@@ -689,13 +779,26 @@ class TunnelSupervisor(QObject):
         except Exception:
             self._finish_stop(process)
 
-    def _finish_stop(self, process: Any) -> None:
+    def _finish_stop(
+        self,
+        process: Any,
+        *,
+        exit_code: int | None = None,
+        exit_status: str | None = None,
+    ) -> None:
         if process is not self._process:
             return
         self._stop_timer.stop()
         self._stop_health_poll()
         self._process = None
-        get_observer().tunnel_exit(_process_exit_code(process))
+        self._log_tunnel_exit(
+            process,
+            reason=self._stop_reason,
+            exit_code=exit_code,
+            process_error=self._process_error,
+            exit_status=exit_status,
+        )
+        self._process_error = None
         active_process: Any = process
         active_process.deleteLater()
         callbacks = self._stop_callbacks
@@ -706,19 +809,56 @@ class TunnelSupervisor(QObject):
         for callback in callbacks:
             callback()
         if restart:
-            self._start_process()
+            self._start_process(reason="restart")
 
-    def _finish_unexpected_exit(self, process: Any) -> None:
+    def _finish_unexpected_exit(
+        self,
+        process: Any,
+        *,
+        reason: str,
+        process_error: str | None = None,
+        exit_code: int | None = None,
+        exit_status: str | None = None,
+    ) -> None:
         if process is not self._process:
             return
         self._stop_timer.stop()
         self._stop_health_poll()
         self._process = None
-        get_observer().tunnel_exit(_process_exit_code(process))
+        self._log_tunnel_exit(
+            process,
+            reason=reason,
+            exit_code=exit_code,
+            process_error=process_error,
+            exit_status=exit_status,
+        )
+        self._process_error = None
         active_process: Any = process
         active_process.deleteLater()
         self._set_state("failed")
-        self._schedule_recovery()
+        self._schedule_recovery(reason=reason)
+
+    def _log_tunnel_exit(
+        self,
+        process: Any | None,
+        *,
+        reason: str,
+        exit_code: int | None = None,
+        process_error: str | None = None,
+        exit_status: str | None = None,
+    ) -> None:
+        tunnel_pid = self._active_tunnel_pid
+        if tunnel_pid is None and process is not None:
+            tunnel_pid = _process_pid(process)
+        get_observer().tunnel_exit(
+            _process_exit_code(process) if exit_code is None and process is not None else exit_code,
+            supervisor_id=self._supervisor_id,
+            attempt_id=self._active_attempt_id,
+            reason=reason,
+            tunnel_pid=tunnel_pid,
+            process_error=process_error,
+            exit_status=exit_status,
+        )
 
     def _on_health_poll_tick(self) -> None:
         if self._process is None or self._closed:
