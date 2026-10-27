@@ -151,13 +151,33 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
     pane.append_activity(complete)
     pane.append_activity(complete)
 
+    second_command_label = f"Thread / turn / item: thread-73 / turn-73 / {second_item_id}"
+
+    def _second_command_was_inspected() -> bool:
+        return any(
+            command.key.thread_id == "thread-73"
+            and command.key.turn_id == "turn-73"
+            and command.key.item_id == second_item_id
+            and command.app_server_process_id == "8648"
+            and command.exit_code == 0
+            for batch in inspected
+            for command in batch
+        )
+
+    def _second_command_block_shows_completion() -> bool:
+        second_command_block = next(
+            (
+                block
+                for block in monitor.process_text.toPlainText().split("\n\n")
+                if second_command_label in block
+            ),
+            "",
+        )
+        return "Command status: completed · exit 0" in second_command_block.splitlines()
+
     assert _wait(
         application,
-        lambda: (
-            f"Thread / turn / item: thread-73 / turn-73 / {second_item_id}"
-            in monitor.process_text.toPlainText()
-            and "Command status: completed · exit 0" in monitor.process_text.toPlainText()
-        ),
+        lambda: _second_command_was_inspected() and _second_command_block_shows_completion(),
     )
     process_text = monitor.process_text.toPlainText()
     assert process_text.count(second_item_id) == 1
