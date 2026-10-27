@@ -791,7 +791,8 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     )
 
     active_item = _thread_item(window, "thread-a")
-    assert active_item.text(0) == "\u25cf New \u30b9\u30ec\u30c3\u30c9"
+    assert active_item.text(0) == "New \u30b9\u30ec\u30c3\u30c9"
+    assert not active_item.icon(0).isNull()
     active_weight = active_item.font(0).weight()
 
     client.result("threads", {"threads": [{"id": "thread-a", "name": "Renamed"}]})
@@ -799,7 +800,8 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     current = window.thread_pane.list_widget.currentItem()
     assert current is not None
     assert current.data(0, Qt.ItemDataRole.UserRole) == "thread-a"
-    assert current.text(0) == "\u25cf Renamed"
+    assert current.text(0) == "Renamed"
+    assert not current.icon(0).isNull()
     assert current.font(0).weight() == active_weight
     window.close()
 

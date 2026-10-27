@@ -145,7 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _set_windows_app_user_model_id()
     application = QApplication([sys.argv[0]])
     application.setWindowIcon(_load_application_icon())
-    window = MainWindow(config)
+    window = MainWindow(config, enable_external_thread_monitor=True)
     window.show()
     previous_sigint = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, lambda *_args: window.request_sigint())

@@ -69,7 +69,7 @@ def test_selected_thread_turn_status_snapshots_keep_running_and_waiting_distinct
         )
 
     for state, expected_prefix in (
-        ("in_progress", "\u25cf "),
+        ("in_progress", None),
         ("needs_approval", "\u23f8 "),
         ("needs_input", "\u270e "),
         ("needs_user_input", "\u270e "),
@@ -79,7 +79,13 @@ def test_selected_thread_turn_status_snapshots_keep_running_and_waiting_distinct
             {"thread_id": "thread-a", "state": state, "recent_activities": []},
         )
         assert window._thread_turn_statuses["thread-a"] == state
-        assert thread_item().text(0).startswith(expected_prefix)
+        item = thread_item()
+        if expected_prefix is None:
+            assert item.text(0) == "A"
+            assert not item.icon(0).isNull()
+        else:
+            assert item.text(0).startswith(expected_prefix)
+            assert item.icon(0).isNull()
 
     for state in ("locked", "stopping", "completed"):
         client.result(
@@ -136,7 +142,8 @@ def test_thread_list_runtime_flags_show_waiting_without_calling_it_running() -> 
             if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
         )
 
-    assert thread_item("running").text(0) == "\u25cf Running"
+    assert thread_item("running").text(0) == "Running"
+    assert not thread_item("running").icon(0).isNull()
     assert thread_item("approval").text(0) == "\u23f8 Approval"
     assert thread_item("input").text(0) == "\u270e Input"
     assert thread_item("idle").text(0) == "Idle"
