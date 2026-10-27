@@ -128,6 +128,79 @@ def test_emit_writes_safe_jsonl_record(tmp_path) -> None:
     assert set(record) == {"timestamp", "event", "pid"}
 
 
+def test_tunnel_observability_records_lifecycle_fields_and_rejects_unlisted_data(tmp_path) -> None:
+    from codex_bridge.observability import ObservabilityLogger
+
+    log_path = tmp_path / "tunnel.jsonl"
+    observer = ObservabilityLogger(log_path)
+    supervisor_id = "a" * 32
+    observer.tunnel_start(
+        supervisor_id=supervisor_id,
+        attempt_id=2,
+        reason="recovery_timeout",
+    )
+    observer.tunnel_started(
+        supervisor_id=supervisor_id,
+        attempt_id=2,
+        reason="recovery",
+        tunnel_pid=4321,
+    )
+    observer.tunnel_exit(
+        0,
+        supervisor_id=supervisor_id,
+        attempt_id=2,
+        reason="unexpected_exit",
+        tunnel_pid=4321,
+        process_error="Crashed",
+        exit_status="CrashExit",
+    )
+    observer.tunnel_recovery(
+        supervisor_id=supervisor_id,
+        attempt_id=2,
+        reason="unexpected_exit",
+        recovery_delay_ms=1_000,
+    )
+    observer._emit("tunnel.start", token="private-token", command="private command")
+
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["event"] for record in records] == [
+        "tunnel.start",
+        "tunnel.started",
+        "tunnel.exit",
+        "tunnel.recovery",
+        "tunnel.start",
+    ]
+    assert records[0]["supervisor_id"] == supervisor_id
+    assert records[0]["attempt_id"] == 2
+    assert records[0]["reason"] == "recovery_timeout"
+    assert records[1]["tunnel_pid"] == 4321
+    assert records[2]["exit_code"] == 0
+    assert records[2]["process_error"] == "Crashed"
+    assert records[2]["exit_status"] == "CrashExit"
+    assert records[3]["recovery_delay_ms"] == 1_000
+    assert "token" not in records[4]
+    assert "command" not in records[4]
+
+
+def test_tunnel_observability_omits_invalid_field_types(tmp_path) -> None:
+    from codex_bridge.observability import ObservabilityLogger
+
+    log_path = tmp_path / "invalid-tunnel.jsonl"
+    observer = ObservabilityLogger(log_path)
+    observer.tunnel_recovery(
+        supervisor_id="bad\nidentifier",
+        attempt_id=True,
+        reason="unexpected_exit",
+        recovery_delay_ms=False,
+    )
+
+    record = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert record["event"] == "tunnel.recovery"
+    assert "supervisor_id" not in record
+    assert "attempt_id" not in record
+    assert "recovery_delay_ms" not in record
+
+
 @pytest.mark.asyncio
 async def test_mcp_request_records_status_duration_and_protocol_without_payloads(tmp_path) -> None:
     from codex_bridge.observability import MCPObservabilityMiddleware, ObservabilityLogger
