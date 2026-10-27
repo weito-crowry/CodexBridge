@@ -311,6 +311,11 @@ def project_thread_metadata(thread: object) -> dict[str, object] | None:
             bounded = _bounded_text(value)
             if bounded is not None:
                 result[target] = bounded
+    originator = thread.get("originator")
+    if isinstance(originator, str):
+        bounded_originator = _bounded_text(originator, 200)
+        if bounded_originator is not None:
+            result["originator"] = bounded_originator
     for source, target in (("createdAt", "created_at"), ("updatedAt", "updated_at")):
         value = _safe_int(thread.get(source))
         if value is not None:

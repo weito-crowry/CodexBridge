@@ -35,6 +35,7 @@ class FakeMainWindow(QObject):
         callback_names = (
             "_request_health",
             "_request_threads",
+            "_request_external_thread_scan",
             "_request_selected_status",
             "_request_selected_history",
             "_on_readiness_tick",
@@ -56,10 +57,16 @@ class FakeMainWindow(QObject):
 
             setattr(self, callback_name, callback)
 
+    def _stop_external_thread_monitor(self) -> None:
+        timer = getattr(self, "external_thread_timer", None)
+        if timer is not None:
+            timer.stop()
+
 
 TIMER_SPECS = (
     ("health_timer", 5_000, False, True, "_request_health"),
     ("thread_timer", 10_000, False, True, "_request_threads"),
+    ("external_thread_timer", 1_000, False, True, "_request_external_thread_scan"),
     ("selected_status_timer", 5_000, False, False, "_request_selected_status"),
     ("_history_refresh_timer", 250, True, False, "_request_selected_history"),
     ("readiness_timer", 350, False, False, "_on_readiness_tick"),

@@ -128,7 +128,7 @@ class ApiResultDispatcher:
                     thread_statuses=window._thread_turn_statuses,
                     project_names=self._read_project_names(),
                 )
-                if not threads:
+                if not threads and window.thread_pane.thread_count == 0:
                     window.thread_pane.set_empty_state("No threads found.")
                 window._sync_empty_state()
             return

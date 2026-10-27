@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QTreeWidgetItem
 
 from codex_bridge.console.thread_list_pane import ThreadListPane as DirectThreadListPane
@@ -29,6 +29,17 @@ def _thread_item(pane: ThreadListPane, thread_id: str) -> QTreeWidgetItem:
     return next(
         item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
     )
+
+
+def _icon_pixels(item: QTreeWidgetItem) -> tuple[int, ...]:
+    image = item.icon(0).pixmap(16, 16).toImage()
+    return tuple(
+        image.pixelColor(x, y).rgba() for y in range(image.height()) for x in range(image.width())
+    )
+
+
+def _icon_contains_color(item: QTreeWidgetItem, color: QColor) -> bool:
+    return color.rgba() in _icon_pixels(item)
 
 
 def test_thread_list_import_paths_preserve_class_widget_and_signals() -> None:
@@ -124,11 +135,317 @@ def test_thread_list_distinguishes_observed_turn_states_without_promoting_waits_
         },
     )
 
-    assert _thread_item(pane, "running").text(0) == "\u25cf Running"
+    running = _thread_item(pane, "running")
+    assert running.text(0) == "Running"
+    assert not running.icon(0).isNull()
+    assert _icon_contains_color(running, pane.list_widget.palette().color(QPalette.ColorRole.Link))
     assert _thread_item(pane, "approval").text(0) == "\u23f8 Approval"
     assert _thread_item(pane, "input").text(0) == "\u270e Input"
     assert _thread_item(pane, "locked").text(0) == "Locked"
     assert _thread_item(pane, "stopping").text(0) == "Stopping"
+
+
+def test_running_spinners_share_color_phase_and_update_without_rerender(
+    tmp_path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path)
+    pane = ThreadListPane()
+    pane.set_threads(
+        [
+            {"id": "managed", "name": "Managed", "cwd": cwd},
+            {"id": "external", "name": "External", "cwd": cwd},
+        ],
+        thread_statuses={"managed": "in_progress"},
+    )
+    pane.set_external_running_threads({"external": {"id": "external", "cwd": cwd}})
+    items_by_id = {
+        thread_id: [
+            item
+            for item in _thread_items(pane)
+            if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
+        ]
+        for thread_id in ("managed", "external")
+    }
+    managed_color = pane.list_widget.palette().color(QPalette.ColorRole.Link)
+    external_color = QColor("#d93025")
+
+    for thread_id, title, color in (
+        ("managed", "Managed", managed_color),
+        ("external", "External", external_color),
+    ):
+        assert len(items_by_id[thread_id]) == 2
+        for item in items_by_id[thread_id]:
+            assert item.text(0) == title
+            assert not item.icon(0).isNull()
+            assert item.foreground(0).color() == color
+            assert _icon_contains_color(item, color)
+    assert _icon_pixels(items_by_id["managed"][0]) == _icon_pixels(items_by_id["managed"][1])
+    assert _icon_pixels(items_by_id["external"][0]) == _icon_pixels(items_by_id["external"][1])
+
+    pane.show()
+    assert pane._spinner_timer.isActive()
+    assert pane._spinner_timer.interval() == 90
+    assert [child for child in pane.children() if isinstance(child, QTimer)] == [
+        pane._spinner_timer
+    ]
+    selected = items_by_id["external"][1]
+    pane.list_widget.setCurrentItem(selected)
+    render_calls: list[None] = []
+    original_render = pane._render
+
+    def track_render() -> None:
+        render_calls.append(None)
+        original_render()
+
+    monkeypatch.setattr(pane, "_render", track_render)
+    previous_managed = _icon_pixels(items_by_id["managed"][0])
+    previous_external = _icon_pixels(items_by_id["external"][0])
+    pane._advance_running_spinner()
+    after_one_managed = _icon_pixels(items_by_id["managed"][0])
+    after_one_external = _icon_pixels(items_by_id["external"][0])
+    pane._advance_running_spinner()
+    after_two_managed = _icon_pixels(items_by_id["managed"][0])
+    after_two_external = _icon_pixels(items_by_id["external"][0])
+    assert previous_managed != after_one_managed != after_two_managed
+    assert previous_external != after_one_external != after_two_external
+    assert _icon_pixels(items_by_id["managed"][1]) == after_two_managed
+    assert _icon_pixels(items_by_id["external"][1]) == after_two_external
+    assert _icon_contains_color(items_by_id["managed"][0], managed_color)
+    assert _icon_contains_color(items_by_id["external"][0], external_color)
+    assert pane.list_widget.currentItem() is selected
+    assert render_calls == []
+
+    updated_palette = pane.list_widget.palette()
+    updated_link_color = QColor("#315f9f")
+    updated_palette.setColor(QPalette.ColorRole.Link, updated_link_color)
+    pane.list_widget.setPalette(updated_palette)
+    pane._advance_running_spinner()
+    assert items_by_id["managed"][0].foreground(0).color() == updated_link_color
+    assert _icon_contains_color(items_by_id["managed"][0], updated_link_color)
+    assert items_by_id["external"][0].foreground(0).color() == external_color
+    assert render_calls == []
+
+    pane.hide()
+    assert not pane._spinner_timer.isActive()
+    hidden_phase = pane._spinner_angle
+    hidden_frame = _icon_pixels(items_by_id["managed"][0])
+    pane._advance_running_spinner()
+    assert pane._spinner_angle == hidden_phase
+    assert _icon_pixels(items_by_id["managed"][0]) == hidden_frame
+    pane.show()
+    assert pane._spinner_timer.isActive()
+
+    pane.set_threads([{"id": "idle", "name": "Idle", "cwd": cwd}], thread_statuses={})
+    render_count_before_tick = len(render_calls)
+    pane._advance_running_spinner()
+    assert len(render_calls) == render_count_before_tick
+    pane.set_external_running_threads({})
+    assert not pane._spinner_timer.isActive()
+    pane.close()
+    assert not pane._spinner_timer.isActive()
+    destroyed: list[None] = []
+    pane.destroyed.connect(lambda *_args: destroyed.append(None))
+    pane.deleteLater()
+    application.sendPostedEvents(pane, QEvent.Type.DeferredDelete)
+    assert destroyed == [None]
+
+
+def test_running_spinner_falls_back_to_a_colored_dot_when_icon_rendering_fails(
+    tmp_path, monkeypatch
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path)
+    pane = ThreadListPane()
+    monkeypatch.setattr(pane, "_running_spinner_icon", lambda _color, _angle: None)
+
+    pane.set_threads(
+        [
+            {"id": "managed", "name": "Managed", "cwd": cwd},
+            {"id": "external", "name": "External", "cwd": cwd},
+        ],
+        thread_statuses={"managed": "in_progress"},
+    )
+    pane.set_external_running_threads({"external": {"id": "external", "cwd": cwd}})
+
+    for thread_id, title, color in (
+        ("managed", "Managed", pane.list_widget.palette().color(QPalette.ColorRole.Link)),
+        ("external", "External", QColor("#d93025")),
+    ):
+        item = _thread_item(pane, thread_id)
+        assert item.text(0) == f"\u25cf {title}"
+        assert item.icon(0).isNull()
+        assert item.foreground(0).color() == color
+    assert not pane._spinner_timer.isActive()
+
+
+def test_managed_runtime_statuses_override_external_estimates_without_originator(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    cwd = str(tmp_path)
+    managed_statuses = {
+        "managed-running": "in_progress",
+        "managed-approval": "needs_approval",
+        "managed-input": "needs_input",
+        "managed-user-input": "needs_user_input",
+        "managed-waiting": "waiting",
+    }
+    titles = {
+        "managed-running": "Running",
+        "managed-approval": "Approval",
+        "managed-input": "Input",
+        "managed-user-input": "User input",
+        "managed-waiting": "Waiting",
+        "not-loaded": "Not loaded",
+    }
+    threads = [{"id": thread_id, "name": title, "cwd": cwd} for thread_id, title in titles.items()]
+    threads[1]["originator"] = ""
+    threads[3]["originator"] = ""
+    threads[5]["runtime_status"] = {"type": "notLoaded"}
+    pane = ThreadListPane()
+
+    pane.set_threads(threads, thread_statuses=managed_statuses)
+    pane.set_external_running_threads(
+        {thread_id: {"id": thread_id, "cwd": cwd} for thread_id in titles}
+    )
+
+    assert pane._thread_statuses == managed_statuses
+    expected_text = {
+        "managed-running": "Running",
+        "managed-approval": "\u23f8 Approval",
+        "managed-input": "\u270e Input",
+        "managed-user-input": "\u270e User input",
+        "managed-waiting": "\u23f8 Waiting",
+    }
+    for thread_id, text in expected_text.items():
+        item = _thread_item(pane, thread_id)
+        assert item.text(0) == text
+        if thread_id == "managed-running":
+            assert not item.icon(0).isNull()
+            assert _icon_contains_color(
+                item, pane.list_widget.palette().color(QPalette.ColorRole.Link)
+            )
+        else:
+            assert item.icon(0).isNull()
+        assert item.toolTip(0) == thread_id
+        assert item.foreground(0).color() == pane.list_widget.palette().color(
+            QPalette.ColorRole.Link
+        )
+
+    running_section = pane.list_widget.topLevelItem(0)
+    assert running_section.text(0) == "現在処理中"
+    running_ids: list[str] = []
+
+    def collect_running_ids(item: QTreeWidgetItem) -> None:
+        thread_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(thread_id, str):
+            running_ids.append(thread_id)
+        for child_index in range(item.childCount()):
+            collect_running_ids(item.child(child_index))
+
+    collect_running_ids(running_section)
+    assert running_ids == ["managed-running", "not-loaded"]
+
+    not_loaded = _thread_item(pane, "not-loaded")
+    assert _icon_contains_color(not_loaded, QColor("#d93025"))
+    assert not_loaded.toolTip(0) == "not-loaded\n推定実行中"
+
+
+def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    assert application is not None
+    first_cwd = tmp_path / "project-a"
+    second_cwd = tmp_path / "project-b"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    pane = ThreadListPane()
+
+    pane.set_threads(
+        [
+            {"id": "managed", "name": "Managed", "cwd": str(first_cwd)},
+            {"id": "shared", "name": "Shared", "cwd": str(first_cwd)},
+            {
+                "id": "waiting",
+                "name": "Waiting",
+                "cwd": str(first_cwd),
+                "originator": " CoDeXBrIdGe ",
+            },
+            {"id": "idle", "name": "Idle", "cwd": str(first_cwd)},
+        ],
+        thread_statuses={"managed": "in_progress", "waiting": "needs_approval"},
+    )
+    pane.set_external_running_threads(
+        {
+            "managed": {"cwd": str(first_cwd)},
+            "shared": {"cwd": str(first_cwd)},
+            "waiting": {"cwd": str(first_cwd)},
+            "outside-api-limit": {"cwd": str(second_cwd)},
+        }
+    )
+
+    managed = _thread_item(pane, "managed")
+    external = _thread_item(pane, "shared")
+    omitted = _thread_item(pane, "outside-api-limit")
+    waiting = _thread_item(pane, "waiting")
+    idle = _thread_item(pane, "idle")
+    running = pane.list_widget.topLevelItem(0)
+    assert running.text(0) == "現在処理中"
+    assert pane.thread_count == 5
+    assert managed.text(0) == "Managed"
+    assert not managed.icon(0).isNull()
+    assert managed.foreground(0).color() == pane.list_widget.palette().color(
+        QPalette.ColorRole.Link
+    )
+    assert external.text(0) == "Shared"
+    assert not external.icon(0).isNull()
+    assert _icon_contains_color(external, QColor("#d93025"))
+    assert external.foreground(0).color() == QColor("#d93025")
+    assert external.toolTip(0) == "shared\n推定実行中"
+    for external_copy in [
+        item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == "shared"
+    ]:
+        assert external_copy.text(0) == "Shared"
+        assert not external_copy.icon(0).isNull()
+        assert _icon_contains_color(external_copy, QColor("#d93025"))
+        assert external_copy.foreground(0).color() == QColor("#d93025")
+        assert external_copy.toolTip(0) == "shared\n推定実行中"
+    assert omitted.text(0) == "outside-api-limit"
+    assert not omitted.icon(0).isNull()
+    assert _icon_contains_color(omitted, QColor("#d93025"))
+    assert omitted.foreground(0).color() == QColor("#d93025")
+    assert idle.text(0) == "Idle"
+    assert idle.icon(0).isNull()
+    assert waiting.text(0) == "\u23f8 Waiting"
+    assert waiting.icon(0).isNull()
+    assert waiting.foreground(0).color() == pane.list_widget.palette().color(
+        QPalette.ColorRole.Link
+    )
+    assert waiting.toolTip(0) == "waiting"
+    assert pane._thread_statuses["waiting"] == "needs_approval"
+    assert (
+        sum(item.data(0, Qt.ItemDataRole.UserRole) == "shared" for item in _thread_items(pane)) == 2
+    )
+    assert (
+        sum(
+            item.data(0, Qt.ItemDataRole.UserRole) == "outside-api-limit"
+            for item in _thread_items(pane)
+        )
+        == 2
+    )
+
+    pane.set_external_running_threads({})
+
+    assert pane.thread_count == 4
+    assert _thread_item(pane, "shared").text(0) == "Shared"
+    assert (
+        sum(item.data(0, Qt.ItemDataRole.UserRole) == "shared" for item in _thread_items(pane)) == 1
+    )
+    assert all(
+        item.data(0, Qt.ItemDataRole.UserRole) != "outside-api-limit"
+        for item in _thread_items(pane)
+    )
 
 
 def test_thread_status_refresh_preserves_selection_groups_expansion_rows_and_scroll(
@@ -185,12 +502,15 @@ def test_thread_list_keeps_running_indicator_through_selection_and_state_changes
 
     pane.set_threads(threads, active_thread_ids={"active"})
 
-    assert _thread_item(pane, "active").text(0) == "\u25cf Active"
+    active = _thread_item(pane, "active")
+    assert active.text(0) == "Active"
+    assert not active.icon(0).isNull()
     assert _thread_item(pane, "idle").text(0) == "Idle"
     pane.list_widget.setCurrentItem(_thread_item(pane, "active"))
     selected = pane.list_widget.currentItem()
     assert selected is not None
-    assert selected.text(0) == "\u25cf Active"
+    assert selected.text(0) == "Active"
+    assert not selected.icon(0).isNull()
     assert selected.data(0, Qt.ItemDataRole.UserRole) == "active"
     pane.set_active_thread_ids(set())
 
@@ -321,7 +641,7 @@ def test_running_aggregate_refresh_preserves_project_expansion_selection_and_scr
     scroll.setValue(scroll.maximum())
     previous_scroll = scroll.value()
 
-    pane.set_thread_statuses({"second-10": "in_progress"})
+    pane.set_external_running_threads({"second-10": {"cwd": second_cwd}})
     application.processEvents()
 
     current = pane.list_widget.currentItem()
@@ -330,6 +650,12 @@ def test_running_aggregate_refresh_preserves_project_expansion_selection_and_scr
     assert current.parent().text(0) == "second-project"
     assert not pane.list_widget.topLevelItem(1).isExpanded()
     assert scroll.value() == previous_scroll
+    pane.filter_edit.setText("second-10")
+    assert any(
+        item.data(0, Qt.ItemDataRole.UserRole) == "second-10" for item in _thread_items(pane)
+    )
+    pane.filter_edit.clear()
+    assert not pane.list_widget.topLevelItem(1).isExpanded()
     pane.close()
 
 
@@ -556,7 +882,9 @@ def test_collapsed_groups_stay_collapsed_across_refresh_and_active_rerender(tmp_
     assert not pane.list_widget.topLevelItem(0).isExpanded()
     pane.set_active_thread_ids({"b"})
     assert not pane.list_widget.topLevelItem(0).isExpanded()
-    assert _thread_item(pane, "b").text(0).startswith("\u25cf ")
+    active = _thread_item(pane, "b")
+    assert active.text(0) == "New スレッド"
+    assert not active.icon(0).isNull()
     pane.list_widget.topLevelItem(0).setExpanded(True)
     assert pane.list_widget.topLevelItem(0).isExpanded()
 

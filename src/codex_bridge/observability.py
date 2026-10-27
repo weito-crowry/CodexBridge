@@ -23,6 +23,21 @@ _DEFAULT_MAX_BYTES = 1 * 1024 * 1024
 _DEFAULT_BACKUP_COUNT = 3
 _PROTOCOL_VERSION_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _SAFE_STRING_PATTERN = re.compile(r"[^\r\n\x00-\x1f\x7f]{1,256}\Z")
+_SUPERVISOR_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_TUNNEL_REASONS = frozenset(
+    {
+        "readiness",
+        "explicit_start",
+        "retry_now",
+        "restart",
+        "recovery_timeout",
+        "unexpected_exit",
+        "process_error",
+        "start_failed",
+        "explicit_stop",
+        "close",
+    }
+)
 _ALLOWED_FIELDS = {
     "method",
     "path",
@@ -32,6 +47,13 @@ _ALLOWED_FIELDS = {
     "exception_type",
     "cancelled",
     "exit_code",
+    "supervisor_id",
+    "attempt_id",
+    "reason",
+    "tunnel_pid",
+    "process_error",
+    "exit_status",
+    "recovery_delay_ms",
 }
 _observer: ObservabilityLogger | None = None
 
@@ -171,14 +193,73 @@ class ObservabilityLogger:
             fields["exception_type"] = exception_type
         self._emit("mcp.request.end", **fields)
 
-    def tunnel_start(self) -> None:
-        self._emit("tunnel.start")
+    def tunnel_start(
+        self,
+        *,
+        supervisor_id: str | None = None,
+        attempt_id: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self._emit(
+            "tunnel.start",
+            supervisor_id=supervisor_id,
+            attempt_id=attempt_id,
+            reason=reason,
+        )
 
-    def tunnel_exit(self, exit_code: int | None = None) -> None:
-        self._emit("tunnel.exit", exit_code=exit_code)
+    def tunnel_started(
+        self,
+        *,
+        supervisor_id: str | None = None,
+        attempt_id: int | None = None,
+        reason: str | None = None,
+        tunnel_pid: int | None = None,
+    ) -> None:
+        self._emit(
+            "tunnel.started",
+            supervisor_id=supervisor_id,
+            attempt_id=attempt_id,
+            reason=reason,
+            tunnel_pid=tunnel_pid,
+        )
 
-    def tunnel_recovery(self) -> None:
-        self._emit("tunnel.recovery")
+    def tunnel_exit(
+        self,
+        exit_code: int | None = None,
+        *,
+        supervisor_id: str | None = None,
+        attempt_id: int | None = None,
+        reason: str | None = None,
+        tunnel_pid: int | None = None,
+        process_error: str | None = None,
+        exit_status: str | None = None,
+    ) -> None:
+        self._emit(
+            "tunnel.exit",
+            exit_code=exit_code,
+            supervisor_id=supervisor_id,
+            attempt_id=attempt_id,
+            reason=reason,
+            tunnel_pid=tunnel_pid,
+            process_error=process_error,
+            exit_status=exit_status,
+        )
+
+    def tunnel_recovery(
+        self,
+        *,
+        supervisor_id: str | None = None,
+        attempt_id: int | None = None,
+        reason: str | None = None,
+        recovery_delay_ms: int | None = None,
+    ) -> None:
+        self._emit(
+            "tunnel.recovery",
+            supervisor_id=supervisor_id,
+            attempt_id=attempt_id,
+            reason=reason,
+            recovery_delay_ms=recovery_delay_ms,
+        )
 
     def _now(self) -> float:
         try:
@@ -224,12 +305,32 @@ class ObservabilityLogger:
             for key, value in fields.items():
                 if key not in _ALLOWED_FIELDS or value is None:
                     continue
-                if key in {"method", "path", "exception_type"}:
+                if key in {
+                    "method",
+                    "path",
+                    "exception_type",
+                    "process_error",
+                    "exit_status",
+                }:
                     value = self._safe_string(value)
                 elif key == "protocol_version":
                     value = self._safe_protocol_version(value)
-                elif key == "status" or key == "exit_code":
+                elif key == "supervisor_id":
+                    if not isinstance(value, str) or not _SUPERVISOR_ID_PATTERN.fullmatch(value):
+                        value = None
+                elif key == "reason":
+                    if not isinstance(value, str) or value not in _TUNNEL_REASONS:
+                        value = None
+                elif key in {
+                    "status",
+                    "exit_code",
+                    "attempt_id",
+                    "tunnel_pid",
+                    "recovery_delay_ms",
+                }:
                     if isinstance(value, bool) or not isinstance(value, int):
+                        value = None
+                    elif key in {"attempt_id", "tunnel_pid", "recovery_delay_ms"} and value < 1:
                         value = None
                 elif key == "duration_ms":
                     if not isinstance(value, (int, float)) or isinstance(value, bool):

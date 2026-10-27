@@ -68,6 +68,7 @@ def test_project_thread_metadata_exposes_only_known_runtime_status_fields() -> N
     active = project_thread_metadata(
         {
             "id": "thread-active",
+            "originator": "codex_desktop",
             "status": {"type": "active", "activeFlags": []},
             "path": "must not expose",
         }
@@ -87,6 +88,7 @@ def test_project_thread_metadata_exposes_only_known_runtime_status_fields() -> N
 
     assert active == {
         "id": "thread-active",
+        "originator": "codex_desktop",
         "runtime_status": {"type": "active", "active_flags": []},
     }
     assert waiting == {

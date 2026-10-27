@@ -63,6 +63,7 @@ from .composer_controller import create_composer_controller
 from .config import ConsoleConfig
 from .diagnostics import DiagnosticsReader
 from .diagnostics_panel import DiagnosticsPanelController
+from .external_running_threads import ExternalThreadMonitor
 from .history_requests import (
     HistoryRequestContext,
     HistoryRequestCoordinator,
@@ -154,6 +155,7 @@ class MainWindow(QMainWindow):
 
     health_timer: QTimer
     thread_timer: QTimer
+    external_thread_timer: QTimer
     selected_status_timer: QTimer
     _history_refresh_timer: QTimer
     readiness_timer: QTimer
@@ -245,6 +247,8 @@ class MainWindow(QMainWindow):
         usage_history_path: Path | None = None,
         appearance_settings: QSettings | None = None,
         appearance_system_scheme_getter: Callable[[], object] | None = None,
+        enable_external_thread_monitor: bool = False,
+        external_thread_monitor: Any | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -299,6 +303,8 @@ class MainWindow(QMainWindow):
         self._history_timeline = HistoryTimelineState()
         self._active_thread_ids: set[str] = set()
         self._thread_turn_statuses: dict[str, str] = {}
+        self._external_running_threads: dict[str, dict[str, object]] = {}
+        self._external_thread_monitor = external_thread_monitor
         self._runtime_state = "unavailable"
         self._usage_presentation = UsagePresentationController(self)
         self._usage_snapshot_store = UsageSnapshotStore(self)
@@ -347,6 +353,14 @@ class MainWindow(QMainWindow):
         self._global_stream_retry_timer.timeout.connect(self._retry_global_stream)
         self._set_initial_size()
         self._build_timers()
+        if enable_external_thread_monitor and self._external_thread_monitor is None:
+            self._external_thread_monitor = ExternalThreadMonitor(
+                allowed_roots=config.allowed_roots,
+                parent=self,
+            )
+        if self._external_thread_monitor is not None:
+            self._external_thread_monitor.updated.connect(self._apply_external_running_threads)
+            self._request_external_thread_scan()
         self._bridge_lifecycle_controller = BridgeLifecycleController(
             self,
             generate_control_token=lambda: token_urlsafe(32),
@@ -1195,6 +1209,34 @@ class MainWindow(QMainWindow):
     def _request_threads(self) -> None:
         self._client.get_json("/ui-api/threads", key="threads", query={"limit": 100})
 
+    def _request_external_thread_scan(self) -> None:
+        if self._closing or self._external_thread_monitor is None:
+            return
+        self._external_thread_monitor.request_scan()
+
+    def _apply_external_running_threads(self, payload: object) -> None:
+        if self._closing or not isinstance(payload, Mapping):
+            return
+        threads: dict[str, dict[str, object]] = {}
+        for thread_id, thread in payload.items():
+            if not isinstance(thread_id, str) or not isinstance(thread, Mapping):
+                continue
+            if thread.get("id") != thread_id or not isinstance(thread.get("cwd"), str):
+                continue
+            threads[thread_id] = dict(thread)
+        if threads == self._external_running_threads:
+            return
+        self._external_running_threads = threads
+        self.thread_pane.set_external_running_threads(threads)
+
+    def _stop_external_thread_monitor(self) -> None:
+        timer = getattr(self, "external_thread_timer", None)
+        if timer is not None:
+            timer.stop()
+        monitor = getattr(self, "_external_thread_monitor", None)
+        if monitor is not None:
+            monitor.stop()
+
     def _rename_thread(self, thread_id: str) -> None:
         self._thread_interactions._rename_thread(thread_id, get_text=QInputDialog.getText)
 
@@ -1394,6 +1436,7 @@ class MainWindow(QMainWindow):
             return
         self._closing = True
         self._global_stream_retry_timer.stop()
+        self._stop_external_thread_monitor()
         self._composer_controller.set_control_available(False)
         self.health_timer.stop()
         self.thread_timer.stop()
@@ -1424,6 +1467,7 @@ class MainWindow(QMainWindow):
         if self._exit_finished:
             return
         self._exit_finished = True
+        self._stop_external_thread_monitor()
         self.exit_timer.stop()
         self.signal_timer.stop()
         self.diagnostics_timer.stop()

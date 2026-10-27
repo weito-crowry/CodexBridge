@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtGui import QPalette
 
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.notification_controller import NotificationSettingsDialog
@@ -192,7 +193,11 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
         if child.data(0, Qt.ItemDataRole.UserRole) == "thread-b"
     )
     assert thread_b is not None
-    assert thread_b.text(0).startswith("\u25cf ")
+    assert thread_b.text(0) == "B"
+    assert not thread_b.icon(0).isNull()
+    assert thread_b.foreground(0).color() == window.thread_pane.list_widget.palette().color(
+        QPalette.ColorRole.Link
+    )
 
     client.global_activity(
         generation,
