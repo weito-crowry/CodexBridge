@@ -47,7 +47,8 @@ def test_entrypoint_constructs_and_runs_gui_after_configuration(monkeypatch) -> 
             return 0
 
     class FakeWindow:
-        def __init__(self, config) -> None:
+        def __init__(self, config, *, enable_external_thread_monitor: bool) -> None:
+            assert enable_external_thread_monitor is True
             calls.append(("window", config.port))
 
         def show(self) -> None:
@@ -166,7 +167,8 @@ def test_entrypoint_sets_application_icon_before_creating_window(monkeypatch) ->
             return 0
 
     class FakeWindow:
-        def __init__(self, config) -> None:
+        def __init__(self, config, *, enable_external_thread_monitor: bool) -> None:
+            assert enable_external_thread_monitor is True
             calls.append(("window", config.port))
 
         def show(self) -> None:
