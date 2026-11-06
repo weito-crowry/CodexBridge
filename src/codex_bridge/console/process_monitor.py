@@ -326,11 +326,9 @@ class ProcessMonitorWidget(QWidget):
             token,
         )
         task.signals.finished.connect(self._on_inspection_finished)
-        if not self._pool.tryStart(task):
-            self._busy = False
-            self._active_token = None
-            self._active_cancel = None
-            self.process_status_label.setText("Process inspection is busy")
+        # finished can arrive before run() releases the sole pool slot. Queue the
+        # next inspection so that an event-driven refresh is never dropped.
+        self._pool.start(task)
 
     def _on_inspection_finished(
         self, generation: int, token: int, result: object, error: object
