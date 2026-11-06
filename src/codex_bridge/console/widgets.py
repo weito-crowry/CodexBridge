@@ -82,6 +82,15 @@ def _safe_status(value: object) -> str | None:
 
 _MAX_EPOCH_MILLISECONDS = 253_402_300_799_999
 _TERMINAL_ITEM_STATUSES = {"completed", "failed", "interrupted", "error"}
+_MESSAGES_EXECUTION_KINDS = {
+    "Command",
+    "MCP",
+    "Dynamic tool",
+    "Function",
+    "Collaboration",
+    "Sub-agent",
+}
+_MESSAGES_EXECUTION_DETAILS_LABEL = "実行詳細を表示"
 _EFFECTIVE_SANDBOX_MODES = {
     "danger-full-access",
     "external-sandbox",
@@ -429,6 +438,11 @@ class HistoryPane(QWidget):
         self.conversation_mode_button.clicked.connect(lambda: self.set_mode("Conversation"))
         self.details_mode_button.clicked.connect(lambda: self.set_mode("Details"))
         self.messages_mode_button.clicked.connect(lambda: self.set_mode("Messages"))
+        self.execution_details_button = QPushButton(_MESSAGES_EXECUTION_DETAILS_LABEL)
+        self.execution_details_button.setObjectName("messagesExecutionDetailsButton")
+        self.execution_details_button.setCheckable(True)
+        self.execution_details_button.toggled.connect(self._execution_details_toggled)
+        self.execution_details_button.hide()
         self.activity_toggle_button = QPushButton("Hide Activity")
         self.activity_toggle_button.setObjectName("activityVisibilityButton")
         self.activity_toggle_button.clicked.connect(self.activity_visibility_requested.emit)
@@ -478,6 +492,7 @@ class HistoryPane(QWidget):
         scrollbar.sliderReleased.connect(self._on_slider_released)
         layout = QVBoxLayout(self)
         layout.addLayout(mode_bar)
+        layout.addWidget(self.execution_details_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.pending_notice_label)
         layout.addWidget(self.load_older_button)
         layout.addWidget(self._empty_label)
@@ -492,19 +507,31 @@ class HistoryPane(QWidget):
             raise ValueError(f"Unsupported history mode: {mode}")
         if mode == self._mode:
             return
+        self._mode = mode
+        self.conversation_mode_button.setChecked(mode == "Conversation")
+        self.details_mode_button.setChecked(mode == "Details")
+        self.messages_mode_button.setChecked(mode == "Messages")
+        self.execution_details_button.setVisible(mode == "Messages")
+        self._refresh_history_view(rebuild_rows=True)
+
+    def _execution_details_toggled(self, checked: bool) -> None:
+        del checked
+        if self._mode == "Messages":
+            self._refresh_history_view(rebuild_rows=False)
+
+    def _refresh_history_view(self, *, rebuild_rows: bool) -> None:
         scrollbar = self._scroll.verticalScrollBar()
         old_value = scrollbar.value()
         old_maximum = scrollbar.maximum()
         should_follow = self._follow_newest and not self._user_scrolling
         self._mode_scroll_anchor = None if should_follow else self._visible_scroll_anchor()
-        self._mode = mode
-        self.conversation_mode_button.setChecked(mode == "Conversation")
-        self.details_mode_button.setChecked(mode == "Details")
-        self.messages_mode_button.setChecked(mode == "Messages")
         self._render_generation += 1
         generation = self._render_generation
         self._scroll_update_pending = True
-        self._render_timeline_rows(tuple(self._timeline_rows))
+        if rebuild_rows:
+            self._render_timeline_rows(tuple(self._timeline_rows))
+        else:
+            self._update_mode_visibility()
         has_entries = self._has_visible_timeline_entries()
         self._empty_label.setVisible(not has_entries)
         self._scroll.setVisible(has_entries)
@@ -527,6 +554,7 @@ class HistoryPane(QWidget):
             if (
                 widget is not None
                 and not widget.isHidden()
+                and self._row_is_visible_in_mode(row)
                 and row.kind == "card"
                 and widget.geometry().bottom() >= scroll_value
             ):
@@ -652,7 +680,13 @@ class HistoryPane(QWidget):
         return (
             row.kind == "card"
             and isinstance(row.value, TimelineEntry)
-            and row.value.kind in {"User", "Commentary", "Agent"}
+            and (
+                row.value.kind in {"User", "Commentary", "Agent"}
+                or (
+                    self.execution_details_button.isChecked()
+                    and row.value.kind in _MESSAGES_EXECUTION_KINDS
+                )
+            )
         )
 
     def _has_visible_timeline_entries(self) -> bool:
