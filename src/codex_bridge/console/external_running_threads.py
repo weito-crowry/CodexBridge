@@ -201,10 +201,10 @@ class CodexSessionScanner:
                             terminal_ids.add(turn_id)
                         continue
                     turn_key = f"id:{turn_id}" if turn_id is not None else "anonymous:1"
-                    state.turns[turn_key] = (
-                        turn_id not in terminal_ids
-                        if turn_id is not None
-                        else not terminal_without_id
+                    # An unkeyed terminal ends the latest start, including a keyed one,
+                    # just as consume_line does during incremental monitoring.
+                    state.turns[turn_key] = not terminal_without_id and (
+                        turn_id is None or turn_id not in terminal_ids
                     )
                     state.latest_turn = turn_key
                     break

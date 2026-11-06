@@ -162,6 +162,23 @@ def test_matching_terminal_and_interruption_events_clear_running(
     assert scanner.scan() == {}
 
 
+@pytest.mark.parametrize("terminal_event", ("task_complete", "turn_aborted", "turn_interrupted"))
+def test_restart_scan_matches_live_scan_when_terminal_has_no_turn_id(
+    tmp_path: Path, terminal_event: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    scanner = _scanner(tmp_path, project)
+    path = _session_file(tmp_path / "codex-home", THREAD_A)
+    _write_session(path, project, _event("task_started", "turn-a"))
+    assert set(scanner.scan()) == {THREAD_A}
+    with path.open("ab") as session:
+        session.write(_record(_event(terminal_event)))
+
+    assert scanner.scan() == {}
+    assert _scanner(tmp_path, project).scan() == {}
+
+
 def test_latest_turn_controls_state_and_old_terminal_does_not_clear_it(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
