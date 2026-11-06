@@ -51,11 +51,20 @@ from PySide6.QtWidgets import (
 )
 
 from .appearance import AppearanceTheme, stylesheet_for_theme, system_appearance_theme
+from .usage import CodexUsage
+from .usage_forecast import (
+    FORECAST_LOOKBACK_HOURS,
+    UsageForecast,
+    UsageForecastWindow,
+    estimate_exhaustion,
+)
+from .usage_forecast_presentation import format_usage_forecast, reset_epoch
 from .usage_history import (
     UsageHistoryEvent,
     UsageHistorySample,
     get_confirmed_usage_events,
     get_latest_usage_remaining,
+    get_latest_usage_sample,
     get_usage_samples,
     get_usage_samples_for_display,
 )
@@ -139,6 +148,7 @@ class UsageHistoryWindow(QMainWindow):
         now: Callable[[], float] | None = None,
         settings: QSettings | None = None,
         appearance: AppearanceTheme | None = None,
+        usage_provider: Callable[[], CodexUsage] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -146,6 +156,8 @@ class UsageHistoryWindow(QMainWindow):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self._database_path = database_path
         self._now = time if now is None else now
+        self._usage_provider = usage_provider or CodexUsage
+        self.forecasts: dict[UsageForecastWindow, UsageForecast] = {}
         self._settings = settings if settings is not None else QSettings("CodexBridge", "Console")
         self._appearance = appearance or system_appearance_theme()
         self.setPalette(self._appearance.make_palette())
@@ -271,6 +283,31 @@ class UsageHistoryWindow(QMainWindow):
             self.summary_labels[key] = value
             summary.addWidget(card, 1)
         layout.addLayout(summary)
+
+        forecast_heading = QHBoxLayout()
+        forecast_heading.addWidget(QLabel("枯渇予測（参考）"))
+        self.forecast_period_combo = QComboBox(self)
+        self.forecast_period_combo.setObjectName("usageForecastPeriod")
+        for hours in FORECAST_LOOKBACK_HOURS:
+            self.forecast_period_combo.addItem(f"直近{hours}時間", hours)
+        self.forecast_period_combo.setCurrentIndex(1)
+        self.forecast_period_combo.setToolTip(
+            "グラフ期間とは独立した直近の観測を使用。3点以上・15分以上の観測が必要。"
+            "最新観測が5分を超える場合は算出不可。"
+        )
+        self.forecast_period_combo.currentIndexChanged.connect(lambda _index: self.refresh())
+        forecast_heading.addWidget(self.forecast_period_combo)
+        forecast_heading.addStretch(1)
+        layout.addLayout(forecast_heading)
+        self.forecast_labels: dict[UsageForecastWindow, QLabel] = {}
+        forecast_keys: tuple[UsageForecastWindow, ...] = ("five_hour", "weekly")
+        for key in forecast_keys:
+            forecast_label = QLabel(self)
+            forecast_label.setObjectName(f"usageForecast_{key}")
+            forecast_label.setWordWrap(True)
+            forecast_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.forecast_labels[key] = forecast_label
+            layout.addWidget(forecast_label)
 
         self.chart, self.time_axis, self.percent_axis = self._create_chart()
         self.five_hour_series = QLineSeries(self.chart)
@@ -560,7 +597,21 @@ class UsageHistoryWindow(QMainWindow):
             five_hour, weekly = get_latest_usage_remaining(
                 start, end, database_path=self._database_path
             )
+            forecast_now = self._now()
+            lookback_hours = int(self.forecast_period_combo.currentData())
+            forecast_samples = get_usage_samples(
+                forecast_now - lookback_hours * 3600,
+                forecast_now,
+                database_path=self._database_path,
+            )
+            if not forecast_samples:
+                latest = get_latest_usage_sample(forecast_now, database_path=self._database_path)
+                if latest is not None:
+                    forecast_samples = [latest]
         except (OSError, sqlite3.Error):
+            self.forecasts.clear()
+            for label in self.forecast_labels.values():
+                label.setText("算出不可: Usage Historyを読み取れません。")
             self._display_samples = []
             self._events = []
             self._clear_chart()
@@ -576,12 +627,33 @@ class UsageHistoryWindow(QMainWindow):
         self._render_chart(samples, events, start, end)
         self._set_summary(five_hour, weekly, len(events))
         self._render_reset_history(events)
+        self._render_forecasts(forecast_samples, forecast_now, lookback_hours)
         self.empty_state_label.setVisible(not samples)
         self.chart_stack.setCurrentWidget(self.chart_content)
         self.updated_label.setText(
             f"Updated {datetime.fromtimestamp(self._now()).astimezone().strftime('%H:%M')}"
         )
         return True
+
+    def _render_forecasts(
+        self, samples: list[UsageHistorySample], now_epoch: float, lookback_hours: int
+    ) -> None:
+        usage = self._usage_provider()
+        keys: tuple[UsageForecastWindow, ...] = ("five_hour", "weekly")
+        for key in keys:
+            label = "5h" if key == "five_hour" else "週間"
+            window = usage.five_hour if key == "five_hour" else usage.weekly
+            forecast = estimate_exhaustion(
+                samples,
+                window=key,
+                now_epoch=now_epoch,
+                lookback_hours=lookback_hours,
+                next_reset_epoch=reset_epoch(window),
+            )
+            self.forecasts[key] = forecast
+            self.forecast_labels[key].setText(
+                format_usage_forecast(forecast, label=label, lookback_hours=lookback_hours)
+            )
 
     def _clear_chart(self) -> None:
         self.five_hour_series.clear()

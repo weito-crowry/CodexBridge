@@ -419,3 +419,16 @@ def test_sample_without_any_usage_window_is_not_persisted(tmp_path: Path) -> Non
 
     assert saved is None
     assert not database_path.exists()
+
+
+def test_latest_history_sample_keeps_timestamp_and_respects_end(tmp_path: Path) -> None:
+    from codex_bridge.console.usage_history import get_latest_usage_sample
+
+    path = tmp_path / "latest.sqlite3"
+    assert get_latest_usage_sample(10000, database_path=path) is None
+    record_usage_sample(_usage(40, 80), captured_at_epoch=1000, database_path=path)
+    record_usage_sample(_usage(30, 79), captured_at_epoch=2000, database_path=path)
+    sample = get_latest_usage_sample(1500, database_path=path)
+    assert sample is not None
+    assert sample.captured_at_epoch == 1000
+    assert sample.five_hour_remaining == 40

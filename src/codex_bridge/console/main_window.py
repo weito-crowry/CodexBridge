@@ -776,6 +776,7 @@ class MainWindow(QMainWindow):
         if self._usage_history_window is None:
             self._usage_history_window = UsageHistoryWindow(
                 self._usage_history_path,
+                usage_provider=lambda: self._usage,
                 appearance=self._appearance_controller.theme,
                 settings=self._appearance_settings,
                 parent=self,

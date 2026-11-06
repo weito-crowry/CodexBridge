@@ -750,3 +750,84 @@ def test_usage_history_window_restores_saved_geometry_and_recovers_from_corrupti
     assert fallback.size().width() == 1_040
     assert fallback.size().height() == 700
     fallback.close()
+
+
+def test_forecast_uses_current_history_independently_of_chart_dates(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    database = tmp_path / "forecast.sqlite3"
+    for offset, value in [(-10800, 50), (-3600, 34), (-1800, 32), (0, 30)]:
+        record_usage_sample(
+            _usage(value, 80), captured_at_epoch=now + offset, database_path=database
+        )
+    window = UsageHistoryWindow(database, now=lambda: float(now))
+    assert window.forecast_period_combo.currentData() == 3
+    assert window.forecasts["five_hour"].rate_points_per_hour == pytest.approx(20 / 3)
+    assert "推定" in window.forecast_labels["five_hour"].text()
+    assert "次回リセット 不明" in window.forecast_labels["five_hour"].text()
+    window._set_range(now - 86400, now - 43200)
+    window.forecast_period_combo.setCurrentIndex(0)
+    assert window.forecasts["five_hour"].rate_points_per_hour == 4
+    assert not window._display_samples
+    assert window.end_edit.dateTime().toSecsSinceEpoch() == now - 43200
+    window.close()
+
+
+def test_forecast_reads_each_live_reset_label_and_hides_dates_after_reset(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    database = tmp_path / "forecast.sqlite3"
+    for offset, value in [(-3600, 40), (-1800, 35), (0, 30)]:
+        record_usage_sample(
+            _usage(value, value), captured_at_epoch=now + offset, database_path=database
+        )
+    live = CodexUsage(
+        UsageWindow(300, 30, datetime.fromtimestamp(now + 7200).strftime("%Y-%m-%d %H:%M:%S")),
+        UsageWindow(10080, 30, datetime.fromtimestamp(now + 86400).strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    window = UsageHistoryWindow(database, now=lambda: float(now), usage_provider=lambda: live)
+    assert window.forecasts["five_hour"].status == "reset_before_exhaustion"
+    assert "次回リセットまでの枯渇は予測されない" in window.forecast_labels["five_hour"].text()
+    assert "推定枯渇" not in window.forecast_labels["five_hour"].text()
+    assert window.forecasts["weekly"].status == "estimated"
+    assert "推定枯渇" in window.forecast_labels["weekly"].text()
+    assert "観測" in window.forecast_labels["weekly"].text()
+    window.close()
+
+
+def test_forecast_treats_non_timestamp_reset_labels_as_unknown(tmp_path: Path) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    database = tmp_path / "forecast.sqlite3"
+    for offset, value in [(-3600, 40), (-1800, 35), (0, 30)]:
+        record_usage_sample(
+            _usage(value, value), captured_at_epoch=now + offset, database_path=database
+        )
+    window = UsageHistoryWindow(
+        database, now=lambda: float(now), usage_provider=lambda: _usage(30, 30)
+    )
+    assert window.forecasts["five_hour"].next_reset_epoch is None
+    assert "次回リセット 不明" in window.forecast_labels["five_hour"].text()
+    window.close()
+
+
+def test_forecast_clears_estimates_on_database_failure(tmp_path: Path, monkeypatch) -> None:
+    _application()
+    now = _epoch(2026, 9, 30)
+    database = tmp_path / "forecast.sqlite3"
+    for offset, value in [(-3600, 40), (-1800, 35), (0, 30)]:
+        record_usage_sample(
+            _usage(value, value), captured_at_epoch=now + offset, database_path=database
+        )
+    window = UsageHistoryWindow(database, now=lambda: float(now))
+    assert window.forecasts["five_hour"].status == "estimated"
+
+    def failed(*args, **kwargs):
+        raise sqlite3.OperationalError("unavailable")
+
+    monkeypatch.setattr("codex_bridge.console.usage_history_window.get_usage_samples", failed)
+    assert not window.refresh()
+    assert not window.forecasts
+    assert "算出不可" in window.forecast_labels["five_hour"].text()
+    assert "推定枯渇" not in window.forecast_labels["five_hour"].text()
+    window.close()
