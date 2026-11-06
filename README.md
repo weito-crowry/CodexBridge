@@ -320,6 +320,28 @@ LLM-facing tools.
 Normalized turn states are `in_progress`, `needs_approval`, `needs_input`, `completed`,
 `interrupted`, and `failed`.
 
+`codex_status` and `/ui-api/threads/{id}/status` also return `last_turn` independently of
+the existing `state` and `turn_id`. In particular, `state: not_loaded` describes this App
+Server's observation, not successful turn completion. `last_turn` contains `turn_id`,
+`status` (`completed`, `failed`, `interrupted`, `in_progress`, or `unknown`), `observed_at`
+(ISO timestamp or null), `reason`, `category`, `evidence` (`live`, `persisted`, or `inferred`),
+and `needs_attention`; the latter is also available at the top level.
+`observed_at` uses the source event time when available, otherwise the time a saved
+turn was read; it does not claim that execution ended at the read time.
+
+Live turn observations take precedence. When no turn is known locally, the bridge reads
+cwd-validated saved history, using the rollout if turn history is unavailable. Saved
+`inProgress` is reported as `unknown` / `unconfirmed_execution`, since it cannot establish
+current execution in another process. Missing history alone does not require attention.
+Reasons distinguish `completed`, `user_stop`, `turn_failed`, `retrying`, `needs_approval`,
+`needs_input`, `running`, `connection_lost`, `unconfirmed_execution`, `history_unavailable`,
+and `unknown` (including an interruption whose cause is unavailable). A lost transport
+does not establish a failed turn in `last_turn`, even if the legacy `state` reports
+`failed`. Stop is identified only when explicitly observed; after restart, an interruption
+without a saved reason remains unknown. These reads never resume, continue, or resend a
+turn. Saved observations are cached for five seconds and survive transient empty reads
+within the process; after restart they are recovered again from saved history.
+
 ### MCP Apps setup
 
 | Tool | Purpose |

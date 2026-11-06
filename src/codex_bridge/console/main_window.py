@@ -1350,6 +1350,9 @@ class MainWindow(QMainWindow):
 
     def _apply_status(self, payload: object) -> None:
         self._history_stream.apply_status(payload)
+        if isinstance(payload, Mapping) and isinstance(last := payload.get("last_turn"), Mapping):
+            if isinstance(thread_id := payload.get("thread_id"), str):
+                self.thread_pane.set_last_turn(thread_id, last)
 
     def _set_thread_active(self, thread_id: str, active: bool) -> None:
         if active:

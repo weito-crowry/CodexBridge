@@ -43,6 +43,7 @@ from .setup_capabilities import normalize_capabilities
 from .state import StateStore
 from .thread_titles import derive_thread_title, normalize_explicit_title
 from .turn_input import build_turn_input
+from .turn_outcome import PersistedTurnReader, TurnOutcomeHints
 
 
 class AppServerPort(Protocol):
@@ -339,6 +340,8 @@ class Bridge:
         self._wait_default_seconds = wait_default_seconds
         self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
         self._approval_lock = asyncio.Lock()
+        self._turn_outcomes = TurnOutcomeHints()
+        self._persisted_reader = PersistedTurnReader()
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:
@@ -808,6 +811,7 @@ class Bridge:
 
     async def interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         await self._app_server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        self._turn_outcomes.stops.add((thread_id, turn_id))
         self._state.ensure_turn(thread_id, turn_id)
         log_event("turn.interrupt", thread_id=thread_id, turn_id=turn_id)
         return self._public_snapshot(thread_id, turn_id)
@@ -845,6 +849,7 @@ class Bridge:
         lines = error.splitlines()
         error_summary = _bounded_text(lines[0] if lines else error)
         for thread_id, turn_id in self._state.active_turns():
+            self._turn_outcomes.reasons[(thread_id, turn_id)] = "connection_lost"
             self._state.set_terminal(thread_id, turn_id, "failed", error)
             self._record_activity(
                 thread_id=thread_id,
@@ -1219,6 +1224,7 @@ class Bridge:
         await self._app_server.reject(request_id, -32601, "unsupported App Server request")
 
     def handle_notification(self, message: Mapping[str, Any]) -> None:
+        self._turn_outcomes.observe(message)
         method = message.get("method")
         params = message.get("params")
         if not isinstance(method, str) or not isinstance(params, dict):
@@ -1460,14 +1466,32 @@ class Bridge:
             if selected_turn_id is None:
                 selected_turn_id = self._activities.latest_known_turn(thread_id)
 
-        if selected_turn_id is None:
-            return self._not_loaded_status(thread_id, None)
-        if not self._state.has_turn(thread_id, selected_turn_id):
-            return self._not_loaded_status(thread_id, selected_turn_id)
-
-        result = self._public_snapshot(thread_id, selected_turn_id)
-        recent = self._activities.get_recent(thread_id, selected_turn_id, limit=activity_limit)
-        latest = self._activities.latest(thread_id, selected_turn_id)
-        result["latest_activity"] = latest.to_dict() if latest is not None else None
-        result["recent_activities"] = [activity.to_dict() for activity in recent]
+        if selected_turn_id is None or not self._state.has_turn(thread_id, selected_turn_id):
+            result = self._not_loaded_status(thread_id, selected_turn_id)
+        else:
+            result = self._public_snapshot(thread_id, selected_turn_id)
+            recent = self._activities.get_recent(thread_id, selected_turn_id, limit=activity_limit)
+            latest = self._activities.latest(thread_id, selected_turn_id)
+            result["latest_activity"] = latest.to_dict() if latest is not None else None
+            result["recent_activities"] = [activity.to_dict() for activity in recent]
+        # last_turn always describes the latest known turn, even when turn_id selects history.
+        last_id = self._state.latest_known_turn(thread_id)
+        if last_id is None:
+            result["last_turn"] = await self._persisted_last_turn(thread_id)
+            last_id = self._state.latest_known_turn(thread_id)
+        if last_id is not None:
+            last_activity = self._activities.latest(thread_id, last_id)
+            result["last_turn"] = self._turn_outcomes.live(
+                self._public_snapshot(thread_id, last_id),
+                last_activity.timestamp if last_activity is not None else None,
+            )
+        result["needs_attention"] = result["last_turn"]["needs_attention"]
         return result
+
+    async def _persisted_last_turn(self, thread_id: str) -> dict[str, Any]:
+        return await self._persisted_reader.read(
+            thread_id,
+            self._history_metadata,
+            self._legacy_history_response,
+            self._app_server.request,
+        )

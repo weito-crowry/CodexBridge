@@ -82,6 +82,9 @@ class ActivityPane(QWidget):
         super().__init__(parent)
         self.state_label = QLabel("not_loaded")
         self.state_label.setWordWrap(True)
+        self.last_turn_label = QLabel("")
+        self.last_turn_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.last_turn_label.setWordWrap(True)
         state_header = QLabel("Current state")
         self.sandbox_mode_label = QLabel("Sandbox: Unknown")
         self.sandbox_mode_label.setObjectName("effectiveSandboxMode")
@@ -148,6 +151,7 @@ class ActivityPane(QWidget):
         state_layout.setContentsMargins(0, 0, 0, 0)
         state_layout.addWidget(state_header)
         state_layout.addWidget(self.state_label)
+        state_layout.addWidget(self.last_turn_label)
         state_layout.addWidget(self._effective_access_section)
         state_layout.addWidget(self._pending_header)
         state_layout.addWidget(self.pending_label)
@@ -191,6 +195,16 @@ class ActivityPane(QWidget):
     def set_snapshot(self, snapshot: Mapping[str, object], *, reset: bool = False) -> None:
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
         self.state_label.setText(state)
+        last = snapshot.get("last_turn")
+        if isinstance(last, Mapping):
+            attention = " · 要確認" if last.get("needs_attention") else ""
+            self.last_turn_label.setText(
+                f"Last turn: {_safe_text(last.get('status'), 32)}{attention}"
+                f" · {_safe_text(last.get('reason'), 64)}"
+                f" · {_safe_text(last.get('evidence'), 16)}"
+            )
+        else:
+            self.last_turn_label.clear()
         self._set_effective_access(snapshot, state)
         pending = snapshot.get("pending_request")
         pending_label = ""
@@ -488,6 +502,7 @@ class ActivityPane(QWidget):
 
     def set_empty_state(self, text: str) -> None:
         self.state_label.setText(text)
+        self.last_turn_label.clear()
         self._set_pending_request_state("")
         self._set_effective_access_unavailable("Unknown")
         self.pending_label.clear()

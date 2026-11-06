@@ -88,6 +88,7 @@ class ThreadListPane(QWidget):
         self._external_running_threads: dict[str, dict[str, object]] = {}
         self._active_thread_ids: set[str] = set()
         self._thread_statuses: dict[str, str] = {}
+        self._last_turns: dict[str, Mapping[str, object]] = {}
         self._has_thread_statuses = False
         self._project_names: dict[str, str] = {}
         self._collapsed_group_keys: set[str] = set()
@@ -298,6 +299,11 @@ class ThreadListPane(QWidget):
         self._has_thread_statuses = True
         self._render()
 
+    def set_last_turn(self, thread_id: str, outcome: Mapping[str, object]) -> None:
+        if self._last_turns.get(thread_id) != outcome:
+            self._last_turns[thread_id] = dict(outcome)
+            self._render()
+
     @property
     def thread_count(self) -> int:
         return len(self._threads)
@@ -410,6 +416,20 @@ class ThreadListPane(QWidget):
                     item = QTreeWidgetItem([f"{status_marker}{title}" if status_marker else title])
                     item.setData(0, Qt.ItemDataRole.UserRole, thread_id)
                     item.setToolTip(0, thread_id)
+                    last = self._last_turns.get(thread_id)
+                    if marker_kind is None and status not in _MANAGED_RUNTIME_STATUSES and last:
+                        label = {
+                            "completed": "完了",
+                            "failed": "失敗",
+                            "interrupted": "中断",
+                            "unknown": "不明",
+                        }.get(str(last.get("status")), "")
+                        if label:
+                            attention = "・要確認" if last.get("needs_attention") else ""
+                            item.setText(0, f"{title} [{label}{attention}]")
+                            item.setToolTip(
+                                0, f"{thread_id}\n{last.get('reason')} · {last.get('evidence')}"
+                            )
                     if marker_kind is not None:
                         color = self._running_marker_color(marker_kind)
                         icon = self._running_spinner_icon(color, self._spinner_angle)
