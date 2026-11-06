@@ -181,6 +181,8 @@ async def test_real_mcp_sessions_read_history_and_reinitialize_without_turn_repl
     headers = {"Origin": ORIGIN, "Connection": "close"}
     if remote_peer:
         headers["Authorization"] = f"Bearer {TOKEN}"
+    else:
+        headers["X-Forwarded-For"] = "203.0.113.5"  # Existing local Tunnel forwarding.
     session_ids = []
 
     async def capture(response):
@@ -239,6 +241,22 @@ async def test_real_mcp_sessions_read_history_and_reinitialize_without_turn_repl
     assert not state.is_loaded("desktop")
     assert len(set(session_ids)) == 2
     assert TOKEN not in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_default_loopback_real_mcp_initialize_list_and_call(tmp_path):
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    async with serving(app) as url:
+        async with httpx.AsyncClient(headers={"Connection": "close"}) as http:
+            async with streamable_http_client(url, http_client=http) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    assert (await session.list_tools()).tools
+                    probe = await session.call_tool("mcp_request_headers_probe", {})
+                    assert probe.structured_content["codex_invoked"] is False
+    assert runtime.bridge.start_count == 0
+    assert runtime.start_count == runtime.shutdown_count == 1
 
 
 @pytest.mark.asyncio
