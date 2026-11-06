@@ -90,7 +90,7 @@ class ThreadInteractionController:
         key: str,
         payload: object,
         *,
-        copy_to_clipboard: Callable[[str], None],
+        copy_to_clipboard: Callable[[str], object],
     ) -> None:
         pending = self._pending_thread_copies.get(key)
         if pending is None or not isinstance(payload, Mapping):

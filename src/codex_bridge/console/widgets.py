@@ -36,7 +36,7 @@ from .activity_pane import activity_row as activity_row
 from .conversation_widgets import build_conversation_row, build_image_attachment_row
 from .thread_list_pane import ThreadListPane as ThreadListPane
 from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
-from .widget_helpers import _safe_text
+from .widget_helpers import CopyMessageButton, _safe_text
 from .widget_helpers import copy_to_clipboard as copy_to_clipboard
 
 
@@ -965,11 +965,8 @@ class HistoryPane(QWidget):
         header.addWidget(spinner)
         spinner.setVisible(_item_is_running(entry))
         if entry.kind in {"User", "Agent"}:
-            copy_button = QPushButton("Copy")
+            copy_button = CopyMessageButton(entry.body, lambda text: copy_to_clipboard(text), card)
             copy_button.setObjectName("copyMessageButton")
-            copy_button.clicked.connect(
-                lambda _checked=False, text=entry.body: copy_to_clipboard(text)
-            )
             copy_policy = copy_button.sizePolicy()
             copy_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
             copy_button.setSizePolicy(copy_policy)

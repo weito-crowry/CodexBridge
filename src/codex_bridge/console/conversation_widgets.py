@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .widget_helpers import CopyMessageButton
+
 if TYPE_CHECKING:
     from .widgets import TimelineEntry
 
@@ -254,7 +256,7 @@ def build_conversation_row(
     is_running: bool,
     timing: str | None,
     spinner_factory: Callable[[QWidget], QWidget],
-    copy_text: Callable[[str], None],
+    copy_text: Callable[[str], object],
     on_expanded_changed: Callable[[bool], None],
 ) -> QWidget:
     if entry.kind in _MESSAGE_OBJECT_NAMES:
@@ -272,10 +274,9 @@ def build_conversation_row(
             spinner = spinner_factory(frame)
             header.addWidget(spinner)
         if entry.kind in {"User", "Agent", "Commentary", "Plan"}:
-            button = QPushButton("Copy")
+            button = CopyMessageButton(entry.body, copy_text, frame)
             button.setObjectName("conversationCopyMessageButton")
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda _checked=False, text=entry.body: copy_text(text))
             header.addWidget(button)
         layout.addLayout(header)
         if entry.body:
