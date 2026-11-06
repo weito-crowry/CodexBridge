@@ -5,18 +5,18 @@ from collections import deque
 from collections.abc import Collection, Mapping
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QPalette, QTextCursor
+from PySide6.QtGui import QFont, QPalette
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from .command_output import CommandOutputWidget
 from .process_monitor import ProcessMonitorWidget
 
 _EFFECTIVE_SANDBOX_MODES = {
@@ -27,7 +27,6 @@ _EFFECTIVE_SANDBOX_MODES = {
 }
 _EFFECTIVE_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 _EFFECTIVE_APPROVALS_REVIEWERS = {"auto_review", "guardian_subagent", "user"}
-_MAX_COMMAND_OUTPUT_CHARS = 256_000
 
 
 def _safe_text(value: object, limit: int = 16_384) -> str:
@@ -170,29 +169,30 @@ class ActivityPane(QWidget):
         self._activity_header.setObjectName("recentActivitiesHeader")
         self.command_output_header = QLabel("Read-only command output")
         self.command_output_header.setObjectName("commandOutputHeader")
-        self.command_output_text = QPlainTextEdit()
-        self.command_output_text.setObjectName("commandOutputText")
-        self.command_output_text.setReadOnly(True)
-        self.command_output_text.setMaximumBlockCount(2_000)
-        self.command_output_text.setPlaceholderText(
-            "No command output deltas observed. Output may be unavailable or not yet produced."
-        )
+        self.command_output = CommandOutputWidget()
         self.process_monitor = process_monitor or ProcessMonitorWidget()
-        self._command_output_item_id: str | None = None
+        self._thread_id: str | None = None
         self._activity_ids: set[str] = set()
         self._command_output_activity_ids: set[str] = set()
         self._command_output_activity_order: deque[str] = deque()
-        self._command_output_items: set[str] = set()
-        self._command_output_item_order: deque[str] = deque()
         layout = QVBoxLayout(self)
         layout.addWidget(self._state_section)
         layout.addWidget(self._activity_header)
         layout.addWidget(self.activity_list, 1)
         layout.addWidget(self.process_monitor)
         layout.addWidget(self.command_output_header)
-        layout.addWidget(self.command_output_text, 1)
+        layout.addWidget(self.command_output, 1)
 
     def set_snapshot(self, snapshot: Mapping[str, object], *, reset: bool = False) -> None:
+        thread_id = snapshot.get("thread_id")
+        if (
+            not reset
+            and self._thread_id is not None
+            and isinstance(thread_id, str)
+            and thread_id
+            and thread_id != self._thread_id
+        ):
+            return
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
         self.state_label.setText(state)
         last = snapshot.get("last_turn")
@@ -259,13 +259,14 @@ class ActivityPane(QWidget):
         if reset:
             self.process_monitor.reset()
             self.activity_list.clear()
-            self.command_output_text.clear()
-            self._command_output_item_id = None
+            self.command_output.clear()
+            self._thread_id = None
             self._activity_ids.clear()
             self._command_output_activity_ids.clear()
             self._command_output_activity_order.clear()
-            self._command_output_items.clear()
-            self._command_output_item_order.clear()
+        thread_id = snapshot.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            self._thread_id = thread_id
         self.process_monitor.set_app_server_os_pid(snapshot.get("app_server_os_pid"))
         self.merge_activities(snapshot.get("recent_activities"))
         self._set_pending_request_state(pending_label)
@@ -382,6 +383,11 @@ class ActivityPane(QWidget):
                 self.append_activity(activity)
 
     def append_activity(self, activity: Mapping[str, object]) -> None:
+        thread_id = activity.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            if self._thread_id is not None and thread_id != self._thread_id:
+                return
+            self._thread_id = thread_id
         activity_id = activity.get("activity_id")
         if (
             not isinstance(activity_id, str)
@@ -391,7 +397,7 @@ class ActivityPane(QWidget):
             return
         activity_type = activity.get("type")
         if activity_type in {"command_started", "command_output", "command_completed"}:
-            self._append_command_activity(activity)
+            self.command_output.append_activity(activity)
         if activity_type in {"command_started", "command_completed"}:
             self.process_monitor.append_activity(activity)
         if activity_type == "command_output":
@@ -413,93 +419,6 @@ class ActivityPane(QWidget):
                 if isinstance(removed_id, str):
                     self._activity_ids.discard(removed_id)
 
-    def _append_command_activity(self, activity: Mapping[str, object]) -> None:
-        activity_type = activity.get("type")
-        raw_item_id = activity.get("item_id")
-        has_item_id = isinstance(raw_item_id, str) and bool(raw_item_id.strip())
-        item_id = _safe_text(raw_item_id, 512) or "unknown"
-        association_id = item_id if has_item_id else "\x00unattributed-output"
-        summary = _safe_text(activity.get("summary"), 2_000)
-        details = activity.get("details")
-        if not isinstance(details, Mapping):
-            details = {}
-
-        cursor = self.command_output_text.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        current_text = self.command_output_text.toPlainText()
-        if activity_type == "command_started":
-            self._command_output_item_id = association_id
-            process_id = _safe_text(details.get("process_id"), 512)
-            cwd = _safe_text(details.get("cwd"), 4_096)
-            metadata = "".join(
-                f" · {label}: {value}"
-                for label, value in (("App Server process id", process_id), ("cwd", cwd))
-                if value
-            )
-            separator = "\n" if current_text and not current_text.endswith("\n") else ""
-            cursor = self._insert_bounded_command_output(
-                cursor, f"{separator}[Command {item_id}{metadata}] {summary}\n"
-            )
-        elif activity_type == "command_output":
-            if self._command_output_item_id != association_id:
-                separator = "\n" if current_text and not current_text.endswith("\n") else ""
-                label = (
-                    f"[Output for command {item_id}]"
-                    if has_item_id
-                    else ("[Unattributed command output (missing item id)]")
-                )
-                cursor = self._insert_bounded_command_output(cursor, f"{separator}{label}\n")
-                self._command_output_item_id = association_id
-            if association_id not in self._command_output_items:
-                self._command_output_items.add(association_id)
-                self._command_output_item_order.append(association_id)
-                while len(self._command_output_item_order) > 500:
-                    self._command_output_items.discard(self._command_output_item_order.popleft())
-            if details.get("output_source") == "completed_item":
-                cursor = self._insert_bounded_command_output(
-                    cursor, "[Final output recovered from the completed App Server item]\n"
-                )
-            if details.get("output_truncated") is True:
-                cursor = self._insert_bounded_command_output(
-                    cursor, "[Output delta truncated to its most recent 2000 characters]\n"
-                )
-            cursor = self._insert_bounded_command_output(cursor, summary)
-        elif activity_type == "command_completed":
-            if self._command_output_item_id != association_id:
-                separator = "\n" if current_text and not current_text.endswith("\n") else ""
-                cursor = self._insert_bounded_command_output(
-                    cursor, f"{separator}[Command {item_id}] {summary}\n"
-                )
-            if association_id not in self._command_output_items:
-                cursor = self._insert_bounded_command_output(
-                    cursor,
-                    "[No command output was observed; the command may have produced none "
-                    "or output may be unavailable]\n",
-                )
-            exit_code = details.get("exit_code")
-            duration_ms = details.get("duration_ms")
-            result = _safe_text(activity.get("status"), 128) or "completed"
-            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
-                result += f" · exit {exit_code}"
-            if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
-                result += f" · {duration_ms} ms"
-            cursor = self._insert_bounded_command_output(cursor, f"\n[{result}]\n")
-            self._command_output_item_id = None
-        self.command_output_text.setTextCursor(cursor)
-        self.command_output_text.ensureCursorVisible()
-
-    def _insert_bounded_command_output(self, cursor: QTextCursor, text: str) -> QTextCursor:
-        current = self.command_output_text.toPlainText()
-        prefix = "[Older command output omitted]\n"
-        available = _MAX_COMMAND_OUTPUT_CHARS - len(text) - len(prefix)
-        if len(current) + len(text) > _MAX_COMMAND_OUTPUT_CHARS:
-            retained = current[-max(0, available) :] if available > 0 else ""
-            self.command_output_text.setPlainText(prefix + retained)
-            cursor = self.command_output_text.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text)
-        return cursor
-
     def set_empty_state(self, text: str) -> None:
         self.state_label.setText(text)
         self.last_turn_label.clear()
@@ -520,13 +439,11 @@ class ActivityPane(QWidget):
         self._state_section.hide()
         self.process_monitor.reset()
         self.activity_list.clear()
-        self.command_output_text.clear()
-        self._command_output_item_id = None
+        self.command_output.clear()
+        self._thread_id = None
         self._activity_ids.clear()
         self._command_output_activity_ids.clear()
         self._command_output_activity_order.clear()
-        self._command_output_items.clear()
-        self._command_output_item_order.clear()
 
     def set_loading_state(self, text: str) -> None:
         self.set_empty_state(text)

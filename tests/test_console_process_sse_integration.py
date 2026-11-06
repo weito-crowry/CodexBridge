@@ -193,10 +193,12 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
         for batch in inspected
         for command in batch
     )
-    output_text = pane.command_output_text.toPlainText()
-    assert f"[Command {second_item_id} · App Server process id: 8648]" in output_text
-    assert "LIVE_24 output line" in output_text
-    assert "[Output for command unknown]" not in output_text
+    output_panel = pane.command_output.panels[("thread-73", "turn-73", second_item_id)]
+    assert "Second live PowerShell command" in output_panel.metadata_label.text()
+    assert "Success" in output_panel.toggle_button.text()
+    output_panel.toggle_button.click()
+    assert "App Server process id: 8648" in output_panel.metadata_label.text()
+    assert output_panel.output_text.toPlainText() == "LIVE_24 output line\n"
 
     unattributed = _parse(
         _activity(
@@ -209,10 +211,10 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
         )
     )
     pane.append_activity(unattributed)
-    assert (
-        "[Unattributed command output (missing item id)]" in pane.command_output_text.toPlainText()
-    )
-    assert "orphan output stays unattributed" in pane.command_output_text.toPlainText()
+    unidentified = list(pane.command_output.panels.values())[-1]
+    assert "Unidentified" in unidentified.toggle_button.text()
+    unidentified.toggle_button.click()
+    assert unidentified.output_text.toPlainText() == "orphan output stays unattributed"
     assert monitor.record_count == 2
 
     monitor.shutdown()

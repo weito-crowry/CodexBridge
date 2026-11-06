@@ -455,10 +455,11 @@ def test_missing_output_item_id_is_labeled_unattributed() -> None:
         }
     )
 
-    output = pane.command_output_text.toPlainText()
-    assert "[Unattributed command output (missing item id)]" in output
-    assert "[Output for command item-known]" not in output
-    assert "orphan output" in output
+    known, unknown = pane.command_output.panels.values()
+    unknown.toggle_button.click()
+    assert "Unidentified" in unknown.toggle_button.text()
+    assert known.output_text.toPlainText() == ""
+    assert unknown.output_text.toPlainText() == "orphan output"
 
 
 def test_activity_pane_snapshot_rehydrates_and_error_keeps_process_records() -> None:
