@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..tunnel_profile import TunnelProfileError
+from .tunnel_profile_job import TunnelProfileJob
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -75,23 +76,34 @@ def set_tunnel_bridge_ready(window: MainWindow, ready: bool) -> None:
             window._tunnel_resolution_error = None
         window._update_tunnel_client_status()
         profile_settings, profile_dir, profile_name, executable, generate_profile = profile_request
-        try:
-            generate_profile(
+        generation = window._bridge_generation
+
+        def generate() -> object:
+            return generate_profile(
                 profile_settings,
                 profile_dir=profile_dir,
                 profile_name=profile_name,
                 client_executable=executable,
             )
-        except TunnelProfileError as exc:
-            window._tunnel_profile_status = "failed"
+
+        def completed(error: TunnelProfileError | None) -> None:
+            if window._closing or generation != window._bridge_generation:
+                return
+            window._tunnel_profile_status = "failed" if error is not None else "passed"
             window._tunnel_profile_skip_reason = ""
-            window._tunnel_resolution_error = _safe_tunnel_profile_error(exc)
+            if error is not None:
+                window._tunnel_resolution_error = _safe_tunnel_profile_error(error)
             window._update_tunnel_client_status()
-            window._tunnel.set_bridge_ready(False)
-            return
-        window._tunnel_profile_status = "passed"
-        window._tunnel_profile_skip_reason = ""
-        window._update_tunnel_client_status()
+            ready = (
+                window._health_ok
+                and window._bridge_ready
+                and window._app_server_ready
+                and not window._bridge_transition
+                and not window._bridge_stop_confirmation.active
+            )
+            window._tunnel.set_bridge_ready(ready and error is None)
+
+        TunnelProfileJob(generate, completed, parent=window).start()
 
     window._tunnel.set_bridge_ready(window._tunnel_profile_status == "passed")
 
