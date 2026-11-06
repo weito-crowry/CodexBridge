@@ -10,6 +10,7 @@ from threading import Event, get_ident
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from codex_bridge import external_sessions
 from codex_bridge.console import external_running_threads
 
 
@@ -129,7 +130,7 @@ def test_initial_scan_parses_only_metadata_and_relevant_event_rows(
     path.write_bytes(
         _record(_metadata(project)) + filler * 2_000 + _record(_event("task_started", "turn-a"))
     )
-    real_loads = external_running_threads.json.loads
+    real_loads = external_sessions.json.loads
     parsed_lines = 0
 
     def count_json_loads(value: object, *args: object, **kwargs: object):
@@ -137,7 +138,7 @@ def test_initial_scan_parses_only_metadata_and_relevant_event_rows(
         parsed_lines += 1
         return real_loads(value, *args, **kwargs)
 
-    monkeypatch.setattr(external_running_threads.json, "loads", count_json_loads)
+    monkeypatch.setattr(external_sessions.json, "loads", count_json_loads)
 
     assert set(scanner.scan()) == {THREAD_A}
     assert parsed_lines < 10

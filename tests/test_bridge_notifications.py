@@ -778,6 +778,13 @@ async def test_status_for_unknown_thread_returns_not_loaded_without_state_creati
 
     assert result == {
         "thread_id": "unknown-thread",
+        "current_execution": {
+            "state": "unknown",
+            "evidence": "inferred",
+            "source": "rollout_unmatched_start",
+            "observed_at": None,
+            "reason": "execution_unconfirmed",
+        },
         "turn_id": None,
         "thread_metadata": {
             "model_provider": None,

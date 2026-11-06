@@ -174,6 +174,10 @@ class PersistedTurnReader:
     def __init__(self) -> None:
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
+    def cached(self, thread_id: str) -> dict[str, Any] | None:
+        cached = self._cache.get(thread_id)
+        return dict(cached[1]) if cached else None
+
     async def read(
         self,
         thread_id: str,

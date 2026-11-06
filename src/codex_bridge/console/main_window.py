@@ -726,6 +726,9 @@ class MainWindow(QMainWindow):
     def _apply_global_activity(self, generation: int, payload: object) -> None:
         if self._closing or generation != self._global_stream_generation:
             return
+        if isinstance(payload, Mapping) and payload.get("type") == "external_threads":
+            self._apply_external_running_threads(payload.get("threads", {}))
+            return
         self._update_thread_status_from_activity(payload)
         self._notification_controller.handle_activity(payload)
 
@@ -755,6 +758,8 @@ class MainWindow(QMainWindow):
             self._global_stream_retries = 0
             self._global_stream_retry_timer.stop()
         elif state == "disconnected" and not self._closing:
+            if self._external_thread_monitor is None:
+                self._apply_external_running_threads({})
             delay_ms = min(
                 self._global_stream_retry_initial_ms * (2**self._global_stream_retries),
                 self._global_stream_retry_max_ms,

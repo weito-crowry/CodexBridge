@@ -96,6 +96,15 @@ class ApiResultDispatcher:
             return
         if key == "threads":
             if isinstance(payload, Mapping) and isinstance(payload.get("threads"), list):
+                external = payload.get("external_threads")
+                if isinstance(external, list):
+                    window._apply_external_running_threads(
+                        {
+                            row["id"]: row
+                            for row in external
+                            if isinstance(row, Mapping) and isinstance(row.get("id"), str)
+                        }
+                    )
                 threads = [thread for thread in payload["threads"] if isinstance(thread, Mapping)]
                 thread_ids = {
                     thread_id

@@ -41,6 +41,7 @@ from .models import (
 from .paths import AllowedPathPolicy
 from .setup_capabilities import normalize_capabilities
 from .state import StateStore
+from .thread_observations import ThreadObservations
 from .thread_titles import derive_thread_title, normalize_explicit_title
 from .turn_input import build_turn_input
 from .turn_outcome import PersistedTurnReader, TurnOutcomeHints
@@ -342,6 +343,9 @@ class Bridge:
         self._approval_lock = asyncio.Lock()
         self._turn_outcomes = TurnOutcomeHints()
         self._persisted_reader = PersistedTurnReader()
+        self.observations = ThreadObservations(
+            state, self._activities, self._turn_outcomes, self._persisted_reader
+        )
 
     @staticmethod
     def _activity_status(value: object) -> ActivityStatus:
@@ -927,11 +931,13 @@ class Bridge:
             title = _usable_local_display_title(local_titles.get(row_id), row.get("preview"))
             if title is not None:
                 row["name"] = title
-        return {
-            "threads": visible,
-            "next_cursor": response.get("nextCursor"),
-            "backwards_cursor": response.get("backwardsCursor"),
-        }
+        return self.observations.attach_list(
+            {
+                "threads": visible,
+                "next_cursor": response.get("nextCursor"),
+                "backwards_cursor": response.get("backwardsCursor"),
+            }
+        )
 
     async def rename_thread(
         self,
@@ -1474,22 +1480,8 @@ class Bridge:
             latest = self._activities.latest(thread_id, selected_turn_id)
             result["latest_activity"] = latest.to_dict() if latest is not None else None
             result["recent_activities"] = [activity.to_dict() for activity in recent]
-        # last_turn always describes the latest known turn, even when turn_id selects history.
-        last_id = self._state.latest_known_turn(thread_id)
-        if last_id is None:
-            result["last_turn"] = await self._persisted_last_turn(thread_id)
-            last_id = self._state.latest_known_turn(thread_id)
-        if last_id is not None:
-            last_activity = self._activities.latest(thread_id, last_id)
-            result["last_turn"] = self._turn_outcomes.live(
-                self._public_snapshot(thread_id, last_id),
-                last_activity.timestamp if last_activity is not None else None,
-            )
-        result["needs_attention"] = result["last_turn"]["needs_attention"]
-        return result
-
-    async def _persisted_last_turn(self, thread_id: str) -> dict[str, Any]:
-        return await self._persisted_reader.read(
+        return await self.observations.status(
+            result,
             thread_id,
             self._history_metadata,
             self._legacy_history_response,

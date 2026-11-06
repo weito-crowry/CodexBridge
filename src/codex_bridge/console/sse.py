@@ -139,6 +139,8 @@ def _bounded_string(value: object, limit: int) -> str | None:
 
 def parse_activity_event(event: SseEvent) -> dict[str, object] | None:
     """Return only a bounded safe Activity shape from one SSE event."""
+    if event.event == "external_threads":
+        return _parse_external_snapshot(event.data)
     if event.event != "activity":
         return None
     try:
@@ -221,4 +223,34 @@ def parse_activity_event(event: SseEvent) -> dict[str, object] | None:
         "status": status,
         "summary": summary,
         "details": safe_details,
+    }
+
+
+def _parse_external_snapshot(data: str) -> dict[str, object] | None:
+    try:
+        payload = json.loads(data)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("threads"), dict):
+        return None
+    rows = {}
+    if payload.get("state") == "ready":
+        for thread_id, row in payload["threads"].items():
+            if not isinstance(row, dict) or row.get("id") != thread_id:
+                continue
+            if (
+                _bounded_string(thread_id, 512) is None
+                or _bounded_string(row.get("cwd"), 4096) is None
+            ):
+                continue
+            safe = {"id": thread_id, "cwd": row["cwd"]}
+            originator = _bounded_string(row.get("originator"), 512)
+            if originator is not None:
+                safe["originator"] = originator
+            rows[thread_id] = safe
+    return {
+        "type": "external_threads",
+        "state": payload.get("state"),
+        "observed_at": _bounded_string(payload.get("observed_at"), 128),
+        "threads": rows,
     }

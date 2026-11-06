@@ -214,6 +214,8 @@ not supported. CodexBridge does not synchronize project files between machines.
 | `CODEX_BRIDGE_ALLOWED_ORIGINS` | SDK loopback defaults | Exact browser Origin allowlist. |
 | `CODEX_BRIDGE_CODEX_EXECUTABLE` | resolver | Explicit Codex executable name or path. |
 | `CODEX_BRIDGE_CONTROL_TOKEN` | unset | Per-launch Console control token; never persisted. |
+| `CODEX_BRIDGE_LAN_ENABLED` | `false` | Explicit LAN MCP access; use `bridge.lan_enabled` in managed TOML. |
+| `CODEX_BRIDGE_MCP_TOKEN` | unset | Environment-only LAN MCP Bearer token, 32–256 URL-safe ASCII characters. |
 | `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | resolver | Explicit tunnel client path. |
 | `CODEX_BRIDGE_TUNNEL_PROFILE` | `codex-bridge` | Existing tunnel profile name. |
 | `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `50` | Default `codex_wait` long-poll duration. |
@@ -290,6 +292,86 @@ $env:CODEX_BRIDGE_ALLOWED_ORIGINS = 'https://your-chat-origin.example.com'
 
 Use only the real host and origin values from your deployment. Do not commit tunnel hostnames,
 tokens, credentials, or identities.
+
+### Authenticated LAN MCP / Chrome extensions
+
+LAN access reuses the existing Streamable HTTP `/mcp` endpoint and configured `bridge.port`.
+The UI API stays on loopback at `console.ui_port`. There is no active-threads REST endpoint.
+Default loopback configuration remains unchanged. To opt in, adapt these non-secret settings:
+
+```toml
+[bridge]
+host = "0.0.0.0" # or this PC's LAN IP
+lan_enabled = true
+# Keep your existing port and allowed_roots values.
+allowed_hosts = ["192.168.1.10:*", "127.0.0.1:*", "localhost:*", "[::1]:*"]
+allowed_origins = ["chrome-extension://REPLACE_WITH_EXTENSION_ID"]
+```
+
+Keep any existing Tunnel Host/Origin entries in these lists. Supply `CODEX_BRIDGE_MCP_TOKEN`
+to the Bridge process environment (and the Console parent environment when Console launches it).
+LAN enablement without a token is rejected; secrets are excluded from configuration repr, HTTP
+errors, and request-observation logs. Each non-loopback request requires `Authorization: Bearer
+<token>`; missing, malformed, duplicate, or incorrect credentials receive HTTP 401 with
+`WWW-Authenticate: Bearer`. A token grants the existing MCP catalog, including explicit operations;
+the existing allowed-root and tool boundaries still apply. HTTP does not encrypt the token.
+
+Actual loopback socket peers remain exempt for existing local clients and the local Tunnel
+forwarder. The Tunnel retains responsibility for its own remote authentication. Forwarded headers
+do not grant this exemption: the bundled Uvicorn runner uses `proxy_headers=False`. Custom ASGI
+hosting must likewise preserve the actual socket peer rather than overwrite it from forwarded
+headers. Host and Origin validation still runs after authentication. CORS allows only exact
+configured origins, GET/POST/DELETE, and the MCP/authentication headers; it exposes
+`Mcp-Session-Id` and `Mcp-Protocol-Version`. No wildcard origin is introduced. OPTIONS preflight
+needs no token, but cannot perform MCP operations.
+
+ChatPanelPlus should connect from its Manifest V3 background service worker, with the actual
+LAN host in `host_permissions` (for example `http://192.168.1.10/*`) and the runtime endpoint URL
+`http://192.168.1.10:<bridge.port>/mcp`. Content-script requests have different cross-origin
+restrictions. See Chrome's [network-request documentation](https://developer.chrome.com/docs/extensions/develop/concepts/network-requests)
+and [service-worker lifecycle](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle).
+The client must handle JSON and SSE responses, negotiate `initialize`, send
+`notifications/initialized`, then use `tools/list` and `tools/call`. Preserve the returned session
+ID when present and the negotiated protocol-version header on subsequent requests. Pass the
+Bearer token on POST/GET/DELETE, and allowlist the extension's exact Origin if Chrome sends one.
+The local protocol tests exercised a Chrome-extension Origin, Authorization, CORS preflight,
+session headers, and protocol negotiation; an actual Chrome extension and a separate LAN PC have
+not been tested. Browser host-permission grants and any browser/OS local-network restrictions
+remain manual verification items. No ChatPanelPlus files are changed here.
+
+When a session expires, returns 404, or the service worker/Bridge restarts, initialize a fresh MCP
+session before further calls. A client may refresh observations; it must never replay a previous
+start/continue/steer operation automatically. Monitoring and session initialization do not create
+Codex turns. `codex_start` and `codex_continue` use the existing paths only for an explicit user
+instruction. Automatic reconnect logic for a Chrome extension is outside this repository.
+
+`codex_threads` keeps its existing pagination and adds `current_execution`, cached `last_turn`,
+and `needs_attention` to each row. `external_threads` additionally lists allowed-root external
+unmatched-start estimates that may be absent from the current App Server page;
+`external_execution` gives scanner state (`initializing`, `ready`, `stale`, `unavailable`), source,
+and observation time. Managed active/approval/input states take precedence. External estimates
+use `state=estimated_running`, `evidence=inferred`, `source=rollout_unmatched_start`, and
+`reason=unmatched_start_not_liveness`; they do not prove process liveness. No estimate means
+`unknown`, including initial scan, stale/unavailable observation, and `not_loaded`. The unresolved
+#111 restart-detection report remains unresolved; this API exposes the existing heuristic.
+
+`codex_status(thread_id)` returns the same separate `current_execution` plus #124 `last_turn`
+and attention fields. An external estimate can coexist with an older persisted terminal result.
+List calls do not read every thread's history: unobserved `last_turn` is `unknown`; request an
+individual status to populate its cached persisted outcome. Read the final assistant answer from
+`codex_threads(thread_id, include_history=true)` within the existing history availability limits.
+The last-turn observation time describes its evidence, not guaranteed current external activity.
+
+One Bridge-owned scanner reuses the existing incremental JSONL parser. Console's normal entry
+does not start another scanner. The existing global UI SSE stream sends the initial cached
+snapshot, then changes with up to one second of delivery delay after a scan. The scanner's
+one-second interval plus this check can yield approximately two seconds plus scan time from a
+log event to display; cold initial scans can take longer. Existing ten-second thread polling
+provides a snapshot fallback without extra history reads. SSE reconnect sends the cache again;
+disconnect clears Console's external estimate overlay. With Bridge unreachable, the Console
+does not scan independently or claim current external execution. A cache older than five seconds
+is marked stale and its estimates are withheld until a completed scan. The optional injected Qt
+monitor remains available for existing tests/standalone callers.
 
 ## Native MCP tools
 
