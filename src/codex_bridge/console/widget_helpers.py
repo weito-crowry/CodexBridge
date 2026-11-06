@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QApplication
 
 
-def _safe_text(value: object, limit: int = 16_384) -> str:
+def _safe_text(value: object, limit: int | None = 16_384) -> str:
     return value[:limit] if isinstance(value, str) else ""
 
 

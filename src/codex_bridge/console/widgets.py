@@ -215,7 +215,7 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
             item_id,
             "User",
             "User",
-            _safe_text(item.get("text")),
+            _safe_text(item.get("text"), limit=None),
             None,
             (),
             images=_safe_local_image_paths(item.get("images")),
@@ -227,16 +227,16 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
                 item_id,
                 "Commentary",
                 "Commentary",
-                _safe_text(item.get("text")),
+                _safe_text(item.get("text"), limit=None),
                 None,
                 (),
             )
         return TimelineEntry(
-            turn_id, item_id, "Agent", "Agent", _safe_text(item.get("text")), None, ()
+            turn_id, item_id, "Agent", "Agent", _safe_text(item.get("text"), limit=None), None, ()
         )
     if item_type == "plan":
         return TimelineEntry(
-            turn_id, item_id, "Plan", "Plan", _safe_text(item.get("text")), None, ()
+            turn_id, item_id, "Plan", "Plan", _safe_text(item.get("text"), limit=None), None, ()
         )
     if item_type == "commandExecution":
         details: list[str] = []

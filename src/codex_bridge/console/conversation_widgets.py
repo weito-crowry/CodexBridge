@@ -35,6 +35,9 @@ _SAFE_MARKDOWN_FEATURES = (
     QTextDocument.MarkdownFeature.MarkdownDialectGitHub
     | QTextDocument.MarkdownFeature.MarkdownNoHTML
 )
+# Qt 6.8+ forwards MarkdownFeatures to its MD4C parser, whose
+# MD_FLAG_HARD_SOFT_BREAKS is 0x8000 (not named in Qt's public enum).
+_MARKDOWN_HARD_SOFT_BREAKS = QTextDocument.MarkdownFeature(0x8000)
 _STATUS_LABELS = {
     "in_progress": "Running",
     "completed": "Completed",
@@ -92,7 +95,26 @@ class ConversationTextBody(QTextBrowser):
     @staticmethod
     def _set_document_text(document: QTextDocument, text: str, markdown: bool) -> None:
         if markdown:
-            document.setMarkdown(text, _SAFE_MARKDOWN_FEATURES)
+            paragraphs = QTextDocument()
+            paragraphs.setMarkdown(text, _SAFE_MARKDOWN_FEATURES)
+            document.setMarkdown(text, _SAFE_MARKDOWN_FEATURES | _MARKDOWN_HARD_SOFT_BREAKS)
+            # Qt imports hard breaks as new blocks. Only the newly preserved
+            # soft breaks must become inline line separators, so paragraphs
+            # keep their margins and list continuations do not add bullets.
+            # The two parses differ only by space vs. block separator; use Qt
+            # character positions so non-BMP text also keeps matching offsets.
+            soft_breaks: list[int] = []
+            block = document.begin().next()
+            while block.isValid():
+                position = block.position() - 1
+                if paragraphs.characterAt(position) == " ":
+                    soft_breaks.append(position)
+                block = block.next()
+            for position in reversed(soft_breaks):
+                cursor = QTextCursor(document)
+                cursor.setPosition(position)
+                cursor.deleteChar()
+                cursor.insertText("\u2028")
             block = document.begin()
             while block.isValid():
                 block_format = block.blockFormat()
