@@ -148,6 +148,13 @@ async def test_real_mcp_sessions_read_history_and_reinitialize_without_turn_repl
 ):
     bridge, app_server, state = make_bridge(tmp_path)
     app_server.thread_cwds["desktop"] = str(tmp_path)
+    rollout_path = tmp_path / "rollout.jsonl"
+    rollout_path.write_text(
+        '{"type":"event_msg","timestamp":"2026-11-05T11:01:00Z",'
+        '"payload":{"type":"task_completed","turn_id":"last"}}\n',
+        encoding="utf-8",
+    )
+    app_server.thread_paths["desktop"] = str(rollout_path)
     app_server.thread_list = [{"id": "desktop", "cwd": str(tmp_path), "name": "Desktop"}]
     app_server.thread_histories["desktop"] = [
         {
@@ -207,9 +214,28 @@ async def test_real_mcp_sessions_read_history_and_reinitialize_without_turn_repl
                         result = await session.call_tool("codex_threads", {})
                         assert not result.is_error
                         assert result.structured_content["threads"][0]["id"] == "desktop"
-                        status = await session.call_tool("codex_status", {"thread_id": "desktop"})
+                        original_request = app_server.request
+
+                        async def history_unavailable(method, params, _request=original_request):
+                            if method == "thread/read" and params.get("includeTurns") is True:
+                                raise RuntimeError("history unavailable")
+                            return await _request(method, params)
+
+                        app_server.request = history_unavailable
+                        try:
+                            status = await session.call_tool(
+                                "codex_status", {"thread_id": "desktop"}
+                            )
+                        finally:
+                            app_server.request = original_request
                         assert status.structured_content["state"] == "not_loaded"
-                        assert status.structured_content["last_turn"]["status"] == "completed"
+                        last_turn = status.structured_content["last_turn"]
+                        assert last_turn["turn_id"] == "last"
+                        assert last_turn["status"] == "completed"
+                        assert last_turn["reason"] == "completed"
+                        assert last_turn["evidence"] == "persisted"
+                        assert last_turn["observed_at"] == "2026-11-05T11:01:00Z"
+                        assert status.structured_content["needs_attention"] is False
                         assert status.structured_content["current_execution"]["state"] == "unknown"
                         probe = await session.call_tool("mcp_request_headers_probe", {})
                         assert probe.structured_content["protocol_version_matches_context"] is True

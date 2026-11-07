@@ -103,7 +103,9 @@ async def test_live_stop_retry_and_disconnect_are_distinct(allowed_dir):
 
 
 @pytest.mark.asyncio
-async def test_rollout_recovers_terminal_if_history_read_unavailable(allowed_dir):
+async def test_rollout_recovers_completed_alias_if_history_read_unavailable(
+    allowed_dir, monkeypatch
+):
     bridge, app, _ = make_bridge(allowed_dir)
     path = allowed_dir / "rollout.jsonl"
     path.write_text(
@@ -118,11 +120,7 @@ async def test_rollout_recovers_terminal_if_history_read_unavailable(allowed_dir
                 {
                     "type": "event_msg",
                     "timestamp": "2026-11-05T11:01:00Z",
-                    "payload": {
-                        "type": "turn_aborted",
-                        "turn_id": "last",
-                        "reason": "user_requested",
-                    },
+                    "payload": {"type": "task_completed", "turn_id": "last"},
                 },
             ]
         )
@@ -131,10 +129,246 @@ async def test_rollout_recovers_terminal_if_history_read_unavailable(allowed_dir
     )
     app.thread_cwds["saved"] = str(allowed_dir)
     app.thread_paths["saved"] = str(path)
+
+    original_request = app.request
+
+    async def history_unavailable(method, params):
+        if method == "thread/read" and params.get("includeTurns") is True:
+            raise RuntimeError("history unavailable")
+        return await original_request(method, params)
+
+    monkeypatch.setattr(app, "request", history_unavailable)
     result = await bridge.status("saved")
-    assert result["last_turn"]["status"] == "interrupted"
-    assert result["last_turn"]["reason"] == "user_stop"
+    assert result["state"] == "not_loaded"
+    assert result["last_turn"]["turn_id"] == "last"
+    assert result["last_turn"]["status"] == "completed"
+    assert result["last_turn"]["reason"] == "completed"
+    assert result["last_turn"]["evidence"] == "persisted"
+    assert result["last_turn"]["observed_at"] == "2026-11-05T11:01:00Z"
     assert result["needs_attention"] is False
+    assert set(app.methods) == {"thread/read"}
+    assert "turn/start" not in app.methods
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_status"),
+    [
+        ("task_complete", "completed"),
+        ("task_completed", "completed"),
+        ("turn_complete", "completed"),
+        ("turn_completed", "completed"),
+        ("task_failed", "failed"),
+        ("turn_failed", "failed"),
+        ("turn_aborted", "interrupted"),
+        ("turn_interrupted", "interrupted"),
+    ],
+)
+def test_rollout_recognizes_external_session_terminal_aliases(
+    tmp_path, event_type, expected_status
+):
+    from codex_bridge.external_sessions import _event_data
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    record = {
+        "type": "event_msg",
+        "timestamp": "2026-11-05T11:01:00Z",
+        "payload": {"type": event_type, "turn_id": "last"},
+    }
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] == "last"
+    assert result["status"] == expected_status
+    assert result["evidence"] == "persisted"
+    assert result["observed_at"] == "2026-11-05T11:01:00Z"
+    assert result["needs_attention"] is (expected_status != "completed")
+    assert _event_data(json.dumps(record).encode("utf-8")) == (event_type, "last")
+
+
+@pytest.mark.parametrize(
+    ("location", "identifier"),
+    [
+        ("payload", "turn_id"),
+        ("record", "turn_id"),
+        ("payload", "turnId"),
+        ("record", "turnId"),
+    ],
+)
+def test_rollout_reads_supported_turn_id_spellings(tmp_path, location, identifier):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    start = {
+        "type": "event_msg",
+        "payload": {"type": "turn_started", "turn_id": "known"},
+    }
+    terminal = {"type": "event_msg", "payload": {"type": "turn_completed"}}
+    (terminal[location] if location == "payload" else terminal)[identifier] = "known"
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in (start, terminal)), encoding="utf-8"
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] == "known"
+    assert result["status"] == "completed"
+
+
+def test_rollout_applies_idless_terminal_only_to_observed_latest_turn(tmp_path):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        json.dumps({"type": "event_msg", "payload": {"type": "turn_started", "turn_id": "known"}})
+        + "\n"
+        + json.dumps({"type": "event_msg", "payload": {"type": "turn_completed"}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] == "known"
+    assert result["status"] == "completed"
+
+
+def test_rollout_never_fabricates_id_for_idless_terminal_without_start(tmp_path):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        json.dumps({"type": "event_msg", "payload": {"type": "turn_completed"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] is None
+    assert result["status"] == "completed"
+
+
+def test_rollout_keeps_explicit_user_stop_distinct_from_abnormal_interruption(tmp_path):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in (
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "turn_started", "turn_id": "stopped"},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "turn_aborted",
+                        "turn_id": "stopped",
+                        "reason": "user_requested",
+                    },
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] == "stopped"
+    assert result["status"] == "interrupted"
+    assert result["reason"] == "user_stop"
+    assert result["category"] == "stopped"
+    assert result["needs_attention"] is False
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_turn_id", "expected_status", "expected_reason"),
+    [
+        (
+            [
+                ("turn_started", "A"),
+                ("turn_completed", "A"),
+                ("turn_started", "B"),
+                ("turn_interrupted", "B"),
+            ],
+            "B",
+            "interrupted",
+            "unknown",
+        ),
+        (
+            [
+                ("turn_started", "A"),
+                ("turn_started", "B"),
+                ("turn_failed", "A"),
+                ("turn_completed", "B"),
+            ],
+            "B",
+            "completed",
+            "completed",
+        ),
+        (
+            [("turn_completed", "A"), ("turn_started", "B")],
+            "B",
+            "unknown",
+            "unconfirmed_execution",
+        ),
+    ],
+)
+def test_rollout_keeps_latest_turn_across_multiple_events(
+    tmp_path, events, expected_turn_id, expected_status, expected_reason
+):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"type": "event_msg", "payload": {"type": event, "turn_id": turn_id}}) + "\n"
+            for event, turn_id in events
+        ),
+        encoding="utf-8",
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] == expected_turn_id
+    assert result["status"] == expected_status
+    assert result["reason"] == expected_reason
+
+
+def test_rollout_ignores_malformed_records_and_unwritten_final_line(tmp_path):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    valid = json.dumps(
+        {"type": "event_msg", "payload": {"type": "turn_complete", "turn_id": "known"}}
+    ).encode("utf-8")
+    partial = json.dumps(
+        {"type": "event_msg", "payload": {"type": "turn_failed", "turn_id": "late"}}
+    ).encode("utf-8")
+    path = tmp_path / "rollout.jsonl"
+    path.write_bytes(
+        b'{"type":"event_msg","payload":\n'
+        + b"[]\n"
+        + b'{"type":"event_msg","payload":[]}\n'
+        + b'{"type":"event_msg","payload":{"type":[]}}\n'
+        + b'{"type":"event_msg","payload":{"type":"unknown"}}\n'
+        + valid
+        + b"\n"
+        + partial
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert result is not None
+    assert result["turn_id"] == "known"
+    assert result["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -206,23 +440,48 @@ async def test_malformed_persisted_status_is_unknown(allowed_dir):
 
 
 @pytest.mark.asyncio
-async def test_status_route_exposes_persisted_result_without_turn_write(allowed_dir):
+async def test_status_route_exposes_rollout_fallback_without_turn_write(allowed_dir, monkeypatch):
     from codex_bridge.activity import ActivityStore
     from codex_bridge.ui_api import create_ui_app
     from tests.test_ui_api import _json_response, _request, _route, config
 
     bridge, app, _ = make_bridge(allowed_dir)
+    path = allowed_dir / "rollout.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-11-05T11:01:00Z",
+                "payload": {"type": "task_completed", "turn_id": "last"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     app.thread_cwds["t"] = str(allowed_dir)
-    app.thread_histories["t"] = [{"id": "last", "status": "interrupted"}]
+    app.thread_paths["t"] = str(path)
+    original_request = app.request
+
+    async def history_unavailable(method, params):
+        if method == "thread/read" and params.get("includeTurns") is True:
+            raise RuntimeError("history unavailable")
+        return await original_request(method, params)
+
+    monkeypatch.setattr(app, "request", history_unavailable)
     ui = create_ui_app(bridge, ActivityStore(), config(allowed_dir))
     response = await _route(ui, "/ui-api/threads/{thread_id}/status").endpoint(
         _request("/ui-api/threads/t/status", path_params={"thread_id": "t"})
     )
     payload = await _json_response(response)
     assert payload["state"] == "not_loaded"
-    assert payload["last_turn"]["status"] == "interrupted"
-    assert payload["needs_attention"] is True
+    assert payload["last_turn"]["turn_id"] == "last"
+    assert payload["last_turn"]["status"] == "completed"
+    assert payload["last_turn"]["reason"] == "completed"
+    assert payload["last_turn"]["evidence"] == "persisted"
+    assert payload["last_turn"]["observed_at"] == "2026-11-05T11:01:00Z"
+    assert payload["needs_attention"] is False
     assert set(app.methods) == {"thread/read"}
+    assert "turn/start" not in app.methods
 
 
 @pytest.mark.asyncio

@@ -92,7 +92,10 @@ def read_rollout_outcome(path: object) -> dict[str, Any] | None:
         "task_started": "in_progress",
         "turn_started": "in_progress",
         "task_complete": "completed",
+        "task_completed": "completed",
+        "task_failed": "failed",
         "turn_complete": "completed",
+        "turn_completed": "completed",
         "turn_aborted": "interrupted",
         "turn_interrupted": "interrupted",
         "turn_failed": "failed",
@@ -113,9 +116,13 @@ def read_rollout_outcome(path: object) -> dict[str, Any] | None:
                     continue
                 if payload["type"] not in kinds:
                     continue
-                turn_id = payload.get("turn_id")
+                turn_id = payload.get("turn_id", record.get("turn_id"))
+                if not isinstance(turn_id, str) or not turn_id:
+                    turn_id = payload.get("turnId", record.get("turnId"))
+                if not isinstance(turn_id, str) or not turn_id:
+                    turn_id = None
                 kind = payload["type"]
-                if not isinstance(turn_id, str):
+                if turn_id is None:
                     turn_id = latest["turn_id"] if latest is not None else None
                 # A delayed terminal for an older turn must not replace the newest start.
                 if (
