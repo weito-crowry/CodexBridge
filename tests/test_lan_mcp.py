@@ -151,7 +151,7 @@ async def test_real_mcp_sessions_read_history_and_reinitialize_without_turn_repl
     rollout_path = tmp_path / "rollout.jsonl"
     rollout_path.write_text(
         '{"type":"event_msg","timestamp":"2026-11-05T11:01:00Z",'
-        '"payload":{"type":"task_completed","turn_id":"last"}}\n',
+        '"payload":{"type":"task_completed"}}\n',
         encoding="utf-8",
     )
     app_server.thread_paths["desktop"] = str(rollout_path)
@@ -230,11 +230,11 @@ async def test_real_mcp_sessions_read_history_and_reinitialize_without_turn_repl
                             app_server.request = original_request
                         assert status.structured_content["state"] == "not_loaded"
                         last_turn = status.structured_content["last_turn"]
-                        assert last_turn["turn_id"] == "last"
-                        assert last_turn["status"] == "completed"
-                        assert last_turn["reason"] == "completed"
+                        assert last_turn["turn_id"] is None
+                        assert last_turn["status"] == "unknown"
+                        assert last_turn["reason"] == "history_unavailable"
                         assert last_turn["evidence"] == "persisted"
-                        assert last_turn["observed_at"] == "2026-11-05T11:01:00Z"
+                        assert last_turn["observed_at"] is None
                         assert status.structured_content["needs_attention"] is False
                         assert status.structured_content["current_execution"]["state"] == "unknown"
                         probe = await session.call_tool("mcp_request_headers_probe", {})

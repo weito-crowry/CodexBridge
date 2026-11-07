@@ -84,6 +84,19 @@ def persisted_turn(turn: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _event_turn_id(payload: dict[str, Any], record: dict[str, Any]) -> str | None:
+    for source, key in (
+        (payload, "turn_id"),
+        (payload, "turnId"),
+        (record, "turn_id"),
+        (record, "turnId"),
+    ):
+        turn_id = source.get(key)
+        if isinstance(turn_id, str) and turn_id.strip():
+            return turn_id
+    return None
+
+
 def read_rollout_outcome(path: object) -> dict[str, Any] | None:
     if not isinstance(path, str):
         return None
@@ -100,6 +113,7 @@ def read_rollout_outcome(path: object) -> dict[str, Any] | None:
         "turn_interrupted": "interrupted",
         "turn_failed": "failed",
     }
+    latest_turn_id: str | None = None
     try:
         with Path(path).open("rb") as stream:
             for line in stream:
@@ -116,21 +130,18 @@ def read_rollout_outcome(path: object) -> dict[str, Any] | None:
                     continue
                 if payload["type"] not in kinds:
                     continue
-                turn_id = payload.get("turn_id", record.get("turn_id"))
-                if not isinstance(turn_id, str) or not turn_id:
-                    turn_id = payload.get("turnId", record.get("turnId"))
-                if not isinstance(turn_id, str) or not turn_id:
-                    turn_id = None
+                turn_id = _event_turn_id(payload, record)
                 kind = payload["type"]
-                if turn_id is None:
-                    turn_id = latest["turn_id"] if latest is not None else None
+                is_start = kind in {"task_started", "turn_started"}
+                if turn_id is None and not is_start:
+                    if latest_turn_id is None:
+                        continue
+                    turn_id = latest_turn_id
                 # A delayed terminal for an older turn must not replace the newest start.
-                if (
-                    latest
-                    and kind not in {"task_started", "turn_started"}
-                    and (turn_id != latest["turn_id"])
-                ):
+                if not is_start and latest_turn_id is not None and turn_id != latest_turn_id:
                     continue
+                if turn_id is not None and (is_start or latest_turn_id is None):
+                    latest_turn_id = turn_id
                 latest = observation(
                     turn_id,
                     kinds[kind],
