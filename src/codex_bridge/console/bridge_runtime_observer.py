@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..tunnel_profile import TunnelProfileError
@@ -47,8 +50,31 @@ def _safe_tunnel_profile_error(error: TunnelProfileError) -> str:
     return tr("Managed Tunnel profile generation or doctor validation failed")
 
 
+class TunnelProfileInstallGate:
+    def __init__(self, generation: int) -> None:
+        self._generation = generation
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def advance_generation(self) -> int:
+        with self._lock:
+            self._generation += 1
+            return self._generation
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def install_if_current(self, generation: int, staged_path: Path, target_path: Path) -> bool:
+        with self._lock:
+            if self._closed or generation != self._generation:
+                return False
+            os.replace(staged_path, target_path)
+            return True
+
+
 def advance_bridge_generation(window: MainWindow) -> None:
-    window._bridge_generation += 1
+    window._bridge_generation = window._bridge_runtime_observer.advance_generation()
     if window._managed_tunnel_profile is None:
         return
     window._managed_tunnel_profile_attempted_generation = None
@@ -78,6 +104,10 @@ def set_tunnel_bridge_ready(window: MainWindow, ready: bool) -> None:
         window._update_tunnel_client_status()
         profile_settings, profile_dir, profile_name, executable, generate_profile = profile_request
         generation = window._bridge_generation
+        install_gate = window._bridge_runtime_observer
+
+        def install_if_current(staged: Path, target: Path) -> bool:
+            return install_gate.install_profile_if_current(generation, staged, target)
 
         def generate() -> object:
             return generate_profile(
@@ -85,6 +115,7 @@ def set_tunnel_bridge_ready(window: MainWindow, ready: bool) -> None:
                 profile_dir=profile_dir,
                 profile_name=profile_name,
                 client_executable=executable,
+                install_if_current=install_if_current,
             )
 
         def completed(error: TunnelProfileError | None) -> None:
@@ -113,6 +144,18 @@ class BridgeRuntimeObserver:
     def __init__(self, window: MainWindow) -> None:
         self._window = window
         self._bridge_loss_count = 0
+        self._profile_install_gate = TunnelProfileInstallGate(window._bridge_generation)
+
+    def advance_generation(self) -> int:
+        return self._profile_install_gate.advance_generation()
+
+    def close(self) -> None:
+        self._profile_install_gate.close()
+
+    def install_profile_if_current(
+        self, generation: int, staged_path: Path, target_path: Path
+    ) -> bool:
+        return self._profile_install_gate.install_if_current(generation, staged_path, target_path)
 
     @property
     def loss_count(self) -> int:

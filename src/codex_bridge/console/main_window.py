@@ -1414,6 +1414,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._bridge_runtime_observer.close()
         self._global_stream_retry_timer.stop()
         self._stop_external_thread_monitor()
         self._composer_controller.set_control_available(False)

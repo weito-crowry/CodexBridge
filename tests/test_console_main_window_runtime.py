@@ -201,16 +201,17 @@ def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch)
     _report_bridge_ready(client)
     _wait_for_profile(window)
 
-    assert generator_calls == [
-        (
-            profile_settings,
-            {
-                "profile_dir": profile_path.parent,
-                "profile_name": "tunnel-profile",
-                "client_executable": "C:/tools/tunnel-client.exe",
-            },
-        )
-    ]
+    assert len(generator_calls) == 1
+    generated_profile, generate_kwargs = generator_calls[0]
+    assert generated_profile is profile_settings
+    assert {
+        key: value for key, value in generate_kwargs.items() if key != "install_if_current"
+    } == {
+        "profile_dir": profile_path.parent,
+        "profile_name": "tunnel-profile",
+        "client_executable": "C:/tools/tunnel-client.exe",
+    }
+    assert callable(generate_kwargs["install_if_current"])
     assert events.index(("generate",)) < events.index(("supervisor_ready", True))
     assert supervisor_options[0]["profile_file"] == str(profile_path)
     assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
