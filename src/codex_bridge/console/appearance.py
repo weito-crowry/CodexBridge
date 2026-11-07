@@ -8,6 +8,8 @@ from PySide6.QtCore import QObject, QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMenu, QToolButton
 
+from .i18n import tr
+
 if TYPE_CHECKING:
     from .main_window import MainWindow
 
@@ -350,7 +352,7 @@ class AppearanceController(QObject):
         group.setExclusive(True)
         actions: dict[str, QAction] = {}
         for mode in self.modes:
-            action = QAction(mode, menu)
+            action = QAction(tr(mode), menu)
             action.setCheckable(True)
             group.addAction(action)
             menu.addAction(action)

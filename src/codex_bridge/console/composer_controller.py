@@ -17,6 +17,7 @@ from .history_metadata import (
     summarize_turn_access_metadata,
     summarize_turn_model_metadata,
 )
+from .i18n import tr
 
 if TYPE_CHECKING:
     from .api_client import ApiClient
@@ -451,7 +452,7 @@ class ComposerController(QObject):
             thread = self._thread_for_id(thread_id)
             self._widget.set_cwd_options(self._allowed_roots, None)
             if thread_id is None:
-                self._widget.set_target("スレッドを選択するか、新しいスレッドを開始してください")
+                self._widget.set_target(tr("Select a thread or start a new thread"))
                 self._widget.set_readonly_metadata(None, None, None)
             else:
                 self._widget.set_target(self._existing_target_text(thread_id, thread))
@@ -487,7 +488,7 @@ class ComposerController(QObject):
                     self._widget.set_readonly_metadata(None, None, None)
         message, is_error = self._status_messages.get(self._current_draft_key, ("", False))
         if not message and not self._control_available:
-            message = "Console管理Bridgeに接続するとSend／Stopを利用できます"
+            message = tr("Connect to a Console-managed Bridge to use Send / Stop")
         self._widget.set_status(message, error=is_error)
 
     def _thread_for_id(self, thread_id: str | None) -> Mapping[str, object] | None:
@@ -499,15 +500,15 @@ class ComposerController(QObject):
 
     @staticmethod
     def _new_target_text(cwd: str | None) -> str:
-        return f"New thread draft · CWD: {cwd or '未選択'}"
+        return tr("New thread draft · CWD: {p0}", p0=cwd or tr("Not selected"))
 
     @staticmethod
     def _existing_target_text(thread_id: str, thread: Mapping[str, object] | None) -> str:
         name = thread.get("name") if thread is not None else None
         cwd = thread.get("cwd") if thread is not None else None
-        display_name = name if isinstance(name, str) and name.strip() else "Untitled thread"
-        project = cwd if isinstance(cwd, str) and cwd.strip() else "Project: Unknown"
-        return f"Thread: {display_name} · {project} · ID {thread_id[:8]}…"
+        display_name = name if isinstance(name, str) and name.strip() else tr("Untitled thread")
+        project = cwd if isinstance(cwd, str) and cwd.strip() else tr("Project: Unknown")
+        return tr("Thread: {p0} · {p1} · ID {p2}…", p0=display_name, p1=project, p2=thread_id[:8])
 
     def _set_status(self, text: str, *, error: bool = False) -> None:
         self._status_messages[self._current_draft_key] = (text, error)
@@ -561,17 +562,17 @@ class ComposerController(QObject):
         if not self._widget.send_button.isEnabled():
             prompt = self._widget.prompt_text
             if len(prompt) > _MAX_PROMPT_CHARS:
-                self._set_status("入力は32,000文字以内にしてください", error=True)
+                self._set_status(tr("Enter no more than 32,000 characters"), error=True)
             elif not prompt.strip():
-                self._set_status("メッセージを入力してください")
+                self._set_status(tr("Enter a message"))
             elif self._is_new_draft and self._current_cwd is None:
-                self._set_status("新しいスレッドのCWDを選択してください", error=True)
+                self._set_status(tr("Select a CWD for the new thread"), error=True)
             return False
 
         options = self._draft_options.get(self._current_draft_key, DraftOptions())
         if self._is_new_draft and options.access == "danger-full-access":
             if not self._confirm_full_access():
-                self._set_status("Full Accessを確認してから送信してください")
+                self._set_status(tr("Confirm Full Access before sending"))
                 return False
         request_id = str(uuid4())
         key = f"composer:send:{request_id}"
@@ -606,18 +607,18 @@ class ComposerController(QObject):
         token = getattr(self._window, "_control_token", None)
         post = getattr(self._client, "post_control_json", None)
         if not isinstance(token, str) or not token or not callable(post):
-            self._set_status("Console管理Bridgeへの接続がありません", error=True)
+            self._set_status(tr("No connection to a Console-managed Bridge"), error=True)
             self._update_controls()
             return False
         self._send_contexts[key] = context
         self._active_send_key = key
-        self._set_status("送信中…")
+        self._set_status(tr("Sending…"))
         self._update_controls()
         if not post(path, payload, token, key=key):
             if key in self._send_contexts:
                 self._send_contexts.pop(key, None)
                 self._active_send_key = None
-                self._set_status("送信要求を開始できませんでした", error=True)
+                self._set_status(tr("Could not start the send request"), error=True)
                 self._update_controls()
                 return False
             return True
@@ -645,7 +646,7 @@ class ComposerController(QObject):
         )
         self._stop_contexts[key] = context
         self._active_stop_key = key
-        self._set_status("Stop要求を送信中…")
+        self._set_status(tr("Sending Stop request…"))
         self._update_controls()
         if not post(path, {"client_request_id": request_id}, token, key=key):
             if key in self._stop_contexts:
@@ -654,9 +655,7 @@ class ComposerController(QObject):
                 if self._current_thread_id == thread_id and not self._is_new_draft:
                     self._stop_target = None
                     self._stop_waiting_for_status = None
-                    self._set_status(
-                        "Stop結果を確認できません。Statusを更新してください", error=True
-                    )
+                    self._set_status(tr("Stop result is unknown. Refresh Status"), error=True)
                     self._update_controls()
                 self._request_status(thread_id, confirms_stop=True)
                 return False
@@ -666,8 +665,8 @@ class ComposerController(QObject):
     def _ask_full_access(self) -> bool:
         answer = QMessageBox.question(
             self._widget,
-            "Full Accessの確認",
-            "この新規スレッドをFull Accessで開始します。続行しますか？",
+            tr("Confirm Full Access"),
+            tr("Start this new thread with Full Access. Continue?"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -695,7 +694,7 @@ class ComposerController(QObject):
             self._capabilities_key = None
             self._capabilities_available = False
             self._models.clear()
-            self._set_status("Model catalog unavailable; using Default")
+            self._set_status(tr("Model catalog unavailable; using Default"))
             self._render()
             self._update_controls()
             return
@@ -714,7 +713,7 @@ class ComposerController(QObject):
                 self._stop_waiting_for_status = None
                 self._set_status_for_key(
                     f"thread:{stop_context.thread_id}",
-                    "Stop結果を確認できません。Statusを更新しました",
+                    tr("Stop result is unknown. Status refreshed"),
                     error=True,
                 )
             self._request_status(stop_context.thread_id, confirms_stop=True)
@@ -752,12 +751,10 @@ class ComposerController(QObject):
                 self._pending_create_selection = (thread_id, context.draft_key)
                 self._pending_create_notice_shown = False
             self._set_status_for_key(
-                context.draft_key, "新しいスレッドを作成しました。Threadsを更新しています"
+                context.draft_key, tr("New thread created. Refreshing Threads")
             )
         elif self._current_draft_key == context.draft_key:
-            self._set_status_for_key(
-                context.draft_key, "送信を受け付けました。Turnの状態を確認しています"
-            )
+            self._set_status_for_key(context.draft_key, tr("Send accepted. Checking turn status"))
         self._refresh_threads()
         if context.thread_id is not None:
             if getattr(self._window, "_selected_thread_id", None) == context.thread_id:
@@ -777,35 +774,35 @@ class ComposerController(QObject):
             if self._current_thread_id == context.thread_id and not self._is_new_draft:
                 self._stop_target = None
                 self._stop_waiting_for_status = None
-                self._set_status("Stop結果を確認できません。Statusを更新しています", error=True)
+                self._set_status(tr("Stop result is unknown. Refreshing Status"), error=True)
             self._request_status(context.thread_id, confirms_stop=True)
             self._update_controls()
             return
         if getattr(self._window, "_selected_thread_id", None) == context.thread_id:
             if self._current_thread_id == context.thread_id and not self._is_new_draft:
                 self._stop_waiting_for_status = (context.thread_id, context.turn_id)
-                self._set_status("Stop要求を受け付けました。Turnの状態を確認しています")
+                self._set_status(tr("Stop request accepted. Checking turn status"))
             self._request_selected_status()
         self._request_status(context.thread_id, confirms_stop=True)
         self._update_controls()
 
     def _handle_send_failure(self, context: SendContext, category: str) -> None:
         validation_messages = {
-            "malformed_attachment_list": "添付ファイルの選択を確認して、もう一度お試しください",
-            "too_many_attachments": "添付ファイルを8個以内にしてください",
-            "attachment_not_absolute": "許可されたフォルダーからファイルを選び直してください",
-            "attachment_missing_or_unavailable": "存在するファイルを選び直してください",
-            "attachment_not_regular_file": "フォルダーではなくファイルを選んでください",
-            "attachment_outside_allowed_root": "許可されたフォルダー内のファイルを選んでください",
-            "duplicate_attachment": "添付ファイルの重複を削除してください",
-            "attachment_too_large": "サイズの小さいファイルを選んでください",
-            "invalid_image_signature": "有効なPNGまたはJPEG画像を選んでください",
-            "total_attachment_size_exceeded": "添付を減らすか、小さいファイルを選んでください",
-            "cwd_not_absolute": "絶対パスの作業フォルダーを選んでください",
-            "cwd_parent_traversal": "親フォルダーへの移動を含まない作業フォルダーを選んでください",
-            "cwd_missing_or_unavailable": "存在する作業フォルダーを選んでください",
-            "cwd_not_directory": "ファイルではなく作業フォルダーを選んでください",
-            "cwd_outside_allowed_root": "許可されたフォルダー内の作業フォルダーを選んでください",
+            "malformed_attachment_list": tr("Check the selected attachments and try again"),
+            "too_many_attachments": tr("Select no more than 8 attachments"),
+            "attachment_not_absolute": tr("Select files again from an allowed folder"),
+            "attachment_missing_or_unavailable": tr("Select an existing file"),
+            "attachment_not_regular_file": tr("Select a file instead of a folder"),
+            "attachment_outside_allowed_root": tr("Select a file inside an allowed folder"),
+            "duplicate_attachment": tr("Remove duplicate attachments"),
+            "attachment_too_large": tr("Select a smaller file"),
+            "invalid_image_signature": tr("Select a valid PNG or JPEG image"),
+            "total_attachment_size_exceeded": tr("Remove attachments or select smaller files"),
+            "cwd_not_absolute": tr("Select a working folder using an absolute path"),
+            "cwd_parent_traversal": tr("Select a working folder without parent traversal"),
+            "cwd_missing_or_unavailable": tr("Select an existing working folder"),
+            "cwd_not_directory": tr("Select a working folder instead of a file"),
+            "cwd_outside_allowed_root": tr("Select a working folder inside an allowed folder"),
         }
         uncertain = category not in {
             "http_400",
@@ -815,16 +812,14 @@ class ComposerController(QObject):
         }
         if uncertain:
             self._unknown_sends[context.draft_key] = context
-            text = "送信結果が不明です。Threadsを更新し、履歴とActivityで実行結果を確認してください"
+            text = tr("Send result is unknown. Refresh Threads and check history and Activity")
         else:
             text = validation_messages.get(category) or {
-                "http_400": (
-                    "APIが送信内容を受け付けませんでした。入力、添付ファイル、CWDを確認してください"
-                ),
+                "http_400": (tr("The API rejected the request. Check input, attachments and CWD")),
                 "http_403": (
-                    "Control APIの認証が拒否されました。Console管理Bridgeを確認してください"
+                    tr("Control API authentication rejected. Check the Console-managed Bridge")
                 ),
-                "request_error": "送信要求を作成できませんでした。入力内容を確認してください",
+                "request_error": tr("Could not create the send request. Check the input"),
             }.get(category, "送信要求に失敗しました")
         self._set_status_for_key(context.draft_key, text, error=True)
         self._refresh_threads()
@@ -883,7 +878,7 @@ class ComposerController(QObject):
                 if request.confirms_stop:
                     self._stop_waiting_for_status = None
                     self._set_status(
-                        "Stop結果を確認できません。ThreadsとActivityを確認してください",
+                        tr("Stop result is unknown. Check Threads and Activity"),
                         error=True,
                     )
                 self._update_controls()
@@ -979,13 +974,11 @@ class ComposerController(QObject):
             else:
                 self._stop_target = None
             if pending:
-                self._set_status(
-                    "承認またはユーザー入力が必要です。Activityペインを確認してください"
-                )
+                self._set_status(tr("Approval or input required. Check the Activity pane"))
             elif state == "in_progress":
-                self._set_status("Turnを実行中です")
+                self._set_status(tr("Turn is running"))
             elif state in _TERMINAL_STATES:
-                self._set_status("Turnの終了を確認しました")
+                self._set_status(tr("Turn has ended"))
             else:
                 self._set_status("")
             self._render()
@@ -1017,7 +1010,7 @@ class ComposerController(QObject):
                     self._stop_waiting_for_status = None
             self._awaiting_turns.pop(thread_id, None)
             if self._stop_target is not None:
-                self._set_status("Turnを実行中です")
+                self._set_status(tr("Turn is running"))
         elif (
             activity_type in {"turn_completed", "turn_failed", "turn_interrupted"}
             and isinstance(status, str)
@@ -1042,7 +1035,7 @@ class ComposerController(QObject):
             self._stop_waiting_for_status = None
             if self._awaiting_turns.get(thread_id) == turn_id:
                 self._awaiting_turns.pop(thread_id, None)
-            self._set_status("Turnの終了を確認しました")
+            self._set_status(tr("Turn has ended"))
         elif (
             activity_type in {"approval_requested", "user_input_requested"}
             and status == "requested"
@@ -1054,7 +1047,7 @@ class ComposerController(QObject):
                 True,
             )
             self._stop_target = None
-            self._set_status("承認またはユーザー入力が必要です。Activityペインを確認してください")
+            self._set_status(tr("Approval or input required. Check the Activity pane"))
         self._update_controls()
 
     def _refresh_threads(self) -> None:
@@ -1106,7 +1099,7 @@ class ComposerController(QObject):
         elif not self._pending_create_notice_shown:
             self._pending_create_notice_shown = True
             self._set_status(
-                "スレッドを一覧で確認できません。ThreadsのRefreshを実行してください",
+                tr("Thread not found in the list. Refresh Threads"),
                 error=True,
             )
         self._update_controls()

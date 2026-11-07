@@ -53,3 +53,22 @@ def isolated_qsettings_store(tmp_path: Path):
     )
     yield
     QSettings.setDefaultFormat(previous_format)
+
+
+@pytest.fixture(autouse=True)
+def console_english_baseline(request, isolated_qsettings_store):
+    """Keep legacy UI assertions independent of the host language; i18n tests own theirs."""
+    if (
+        not request.node.path.name.startswith("test_console_")
+        or request.node.path.name == "test_console_i18n.py"
+    ):
+        yield
+        return
+    from codex_bridge.console.i18n import initialize_language
+
+    settings = QSettings("CodexBridge", "Console")
+    settings.setValue("language", "en")
+    initialize_language(settings)
+    yield
+    settings.setValue("language", "en")
+    initialize_language(settings)

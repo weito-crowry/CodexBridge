@@ -24,6 +24,7 @@ from tests.console_main_window_test_support import (
 def _settings(path: Path) -> QSettings:
     settings = QSettings(str(path), QSettings.Format.IniFormat)
     settings.setFallbacksEnabled(False)
+    settings.setValue("language", "en")
     return settings
 
 

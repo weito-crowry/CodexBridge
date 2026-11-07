@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import tr
+
 _MAX_COMMANDS = 100
 _MAX_CHARS = 256_000
 _MAX_BLOCKS = 2_000
@@ -141,44 +143,44 @@ class CommandOutputPanel(QWidget):
     def refresh_labels(self) -> None:
         status = self.status.casefold().replace("_", "")
         if status in {"interrupted", "cancelled", "canceled", "aborted"}:
-            label = "Interrupted"
+            label = tr("Interrupted")
         elif status in {"failed", "error", "declined"} or (
             self.exit_code is not None and self.exit_code != 0
         ):
-            label = "Failed"
+            label = tr("Failed")
         elif status in {"completed", "success", "succeeded"}:
-            label = "Success"
+            label = tr("Success")
         elif status in {"started", "inprogress", "running"}:
             label = "Running"
         else:
-            label = "Unknown"
-        command = self.command or "Command metadata not received"
+            label = tr("Unknown")
+        command = self.command or tr("Command metadata not received")
         if self.unidentified:
-            command = "Unidentified command (missing item id)"
+            command = tr("Unidentified command (missing item id)")
         header = [label]
         if self.exit_code is not None:
-            header.append(f"exit {self.exit_code}")
+            header.append(tr("exit {p0}", p0=self.exit_code))
         if self.duration_ms is not None:
             header.append(f"{self.duration_ms} ms")
         self.toggle_button.set_header(command[:160], " · ".join(header))
-        metadata = [f"Thread / turn / item: {' / '.join(self.key)}", self.command]
+        metadata = [tr("Thread / turn / item: {p0}", p0=" / ".join(self.key)), self.command]
         if self.process_id:
-            metadata.append(f"App Server process id: {self.process_id}")
+            metadata.append(tr("App Server process id: {p0}", p0=self.process_id))
         if self.cwd:
-            metadata.append(f"cwd: {self.cwd}")
+            metadata.append(tr("cwd: {p0}", p0=self.cwd))
         self.metadata_label.setText("\n".join(part for part in metadata if part))
         self.toggle_button.setToolTip(self.metadata_label.text())
         notes = []
         if not self.output_observed:
-            notes.append("Output not observed; it may be unavailable or not yet produced.")
+            notes.append(tr("Output not observed; it may be unavailable or not yet produced."))
         elif not self.output and not self.omitted:
-            notes.append("Empty output received.")
+            notes.append(tr("Empty output received."))
         if self.recovered:
-            notes.append("Final output recovered from the completed App Server item.")
+            notes.append(tr("Final output recovered from the completed App Server item."))
         if self.truncated:
-            notes.append("Output delta truncated to its most recent 2000 characters.")
+            notes.append(tr("Output delta truncated to its most recent 2000 characters."))
         if self.omitted:
-            notes.append("Older command output omitted (display retention limit).")
+            notes.append(tr("Older command output omitted (display retention limit)."))
         self.note_label.setText("\n".join(notes))
         self.note_label.setVisible(bool(notes))
 
@@ -256,7 +258,7 @@ class CommandOutputWidget(QScrollArea):
         self.retention_label.setTextFormat(Qt.TextFormat.PlainText)
         self.retention_label.setWordWrap(True)
         self.retention_label.hide()
-        self.empty_label = QLabel("No command output deltas observed.")
+        self.empty_label = QLabel(tr("No command output deltas observed."))
         self.empty_label.setWordWrap(True)
         content = QWidget()
         self._layout = QVBoxLayout(content)
@@ -295,7 +297,7 @@ class CommandOutputWidget(QScrollArea):
             old.hide()
             old.deleteLater()
             self.retention_label.setText(
-                "Older command panels omitted (100 command display limit)."
+                tr("Older command panels omitted (100 command display limit).")
             )
             self.retention_label.show()
         self._limit_output()

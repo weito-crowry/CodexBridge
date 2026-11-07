@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..attachment_policy import MAX_IMAGE_FILE_BYTES, MAX_OTHER_FILE_BYTES, MAX_TOTAL_BYTES
+from .i18n import tr
 
 _MAX_ATTACHMENTS = 8
 _CHIP_LABEL_WIDTH = 180
@@ -139,8 +140,8 @@ class _AttachmentChip(QFrame):
         self.remove_button = QToolButton(self)
         self.remove_button.setObjectName("composerAttachmentRemove")
         self.remove_button.setText("×")
-        self.remove_button.setToolTip("下書きから削除")
-        self.remove_button.setAccessibleName(f"{name}を添付から削除")
+        self.remove_button.setToolTip(tr("Remove from draft"))
+        self.remove_button.setAccessibleName(tr("Remove {p0} from attachments", p0=name))
         self.remove_button.clicked.connect(lambda: self.remove_requested.emit(path))
         layout.addWidget(self.name_label)
         layout.addWidget(self.remove_button)
@@ -170,8 +171,8 @@ class ComposerAttachmentBar(QWidget):
 
         self.add_button = QPushButton("+")
         self.add_button.setObjectName("composerAttachmentAdd")
-        self.add_button.setToolTip("ローカルファイルを添付")
-        self.add_button.setAccessibleName("ファイルを添付")
+        self.add_button.setToolTip(tr("Attach local files"))
+        self.add_button.setAccessibleName(tr("Attach files"))
         self.add_button.clicked.connect(self._open_file_dialog)
 
         self.scroll_area = QScrollArea(self)
@@ -245,15 +246,15 @@ class ComposerAttachmentBar(QWidget):
             is_image = candidate.suffix.casefold() in _IMAGE_SUFFIXES
             file_limit = MAX_IMAGE_FILE_BYTES if is_image else MAX_OTHER_FILE_BYTES
             file_limit_message = (
-                "画像添付は20 MiB以下にしてください"
+                tr("Images must be 20 MiB or smaller")
                 if is_image
-                else "その他の添付は50 MiB以下にしてください"
+                else tr("Other attachments must be 50 MiB or smaller")
             )
             if candidate_stat.st_size > file_limit:
                 size_errors.append(file_limit_message)
                 continue
             if total_size + candidate_stat.st_size > MAX_TOTAL_BYTES:
-                size_errors.append("添付ファイルの合計は100 MiB以下にしてください")
+                size_errors.append(tr("Total attachment size must be 100 MiB or smaller"))
                 continue
             if external:
                 try:
@@ -264,14 +265,14 @@ class ComposerAttachmentBar(QWidget):
                 except (OSError, RuntimeError, ValueError) as exc:
                     message = str(exc)
                     if message in {
-                        "画像添付は20 MiB以下にしてください",
-                        "その他の添付は50 MiB以下にしてください",
-                        "添付ファイルの合計は100 MiB以下にしてください",
+                        tr("Images must be 20 MiB or smaller"),
+                        tr("Other attachments must be 50 MiB or smaller"),
+                        tr("Total attachment size must be 100 MiB or smaller"),
                     }:
                         size_errors.append(message)
                         continue
                     invalid = True
-                    stage_errors.append(f"添付ファイルをステージングできません: {message}")
+                    stage_errors.append(tr("Could not stage the attachment: {p0}", p0=message))
                     continue
             normalized = os.path.normcase(canonical)
             if normalized in seen:
@@ -299,16 +300,16 @@ class ComposerAttachmentBar(QWidget):
                 if stage_errors:
                     messages.extend(stage_errors)
                 else:
-                    messages.append("存在しないファイルまたはフォルダは添付できません")
+                    messages.append(tr("Missing files and folders cannot be attached"))
             if duplicate:
-                messages.append("同じファイルは重複して添付できません")
+                messages.append(tr("The same file cannot be attached twice"))
             if overflow:
-                messages.append("添付は最大8件です")
+                messages.append(tr("Attach up to 8 files"))
             messages.extend(dict.fromkeys(size_errors))
-            self.validation_notice.emit("。".join(messages))
+            self.validation_notice.emit(tr(". ").join(messages))
         if staged and not messages:
             self.validation_notice.emit(
-                "許可されたフォルダーへコピーしました: " + "、".join(staged)
+                tr("Copied to an allowed folder: {p0}", p0=tr(", ").join(staged))
             )
 
     def _is_under_allowed_root(self, path: str) -> bool:
@@ -326,25 +327,25 @@ class ComposerAttachmentBar(QWidget):
         image = source.suffix.casefold() in _IMAGE_SUFFIXES
         file_limit = MAX_IMAGE_FILE_BYTES if image else MAX_OTHER_FILE_BYTES
         file_limit_message = (
-            "画像添付は20 MiB以下にしてください"
+            tr("Images must be 20 MiB or smaller")
             if image
-            else "その他の添付は50 MiB以下にしてください"
+            else tr("Other attachments must be 50 MiB or smaller")
         )
         source_size = source.stat().st_size
         if source_size > file_limit:
             raise ValueError(file_limit_message)
         total_limit = MAX_TOTAL_BYTES - existing_total_bytes
         if total_limit < 0 or source_size > total_limit:
-            raise ValueError("添付ファイルの合計は100 MiB以下にしてください")
+            raise ValueError(tr("Total attachment size must be 100 MiB or smaller"))
         copy_limit = min(file_limit, total_limit)
         over_limit_message = (
             file_limit_message
             if file_limit <= total_limit
-            else "添付ファイルの合計は100 MiB以下にしてください"
+            else tr("Total attachment size must be 100 MiB or smaller")
         )
         roots = tuple(Path(value).resolve(strict=True) for value in self._allowed_roots)
         if not roots or any(not root.is_dir() for root in roots):
-            raise ValueError("allowed root is unavailable")
+            raise ValueError(tr("allowed root is unavailable"))
         staging = (
             Path(self._staging_directory)
             if self._staging_directory is not None
@@ -361,7 +362,7 @@ class ComposerAttachmentBar(QWidget):
             except ValueError:
                 continue
         if not allowed:
-            raise ValueError("staging directory is outside allowed roots")
+            raise ValueError(tr("staging directory is outside allowed roots"))
         staging.mkdir(parents=True, exist_ok=True)
         canonical_staging = staging.resolve(strict=True)
         canonical_target = os.path.normcase(os.fspath(canonical_staging))
@@ -370,7 +371,7 @@ class ComposerAttachmentBar(QWidget):
             == os.path.normcase(os.fspath(root))
             for root in roots
         ):
-            raise ValueError("staging directory escaped the allowed root")
+            raise ValueError(tr("staging directory escaped the allowed root"))
 
         descriptor, temporary_name = tempfile.mkstemp(prefix=".incoming-", dir=canonical_staging)
         temporary = Path(temporary_name)
@@ -405,10 +406,14 @@ class ComposerAttachmentBar(QWidget):
     def _open_file_dialog(self) -> None:
         remaining = _MAX_ATTACHMENTS - len(self._attachments)
         if remaining <= 0:
-            self.validation_notice.emit("添付は最大8件です")
+            self.validation_notice.emit(tr("Attach up to 8 files"))
             return
         paths, _selected_filter = QFileDialog.getOpenFileNames(
-            self, "ファイルを添付", "", "すべてのファイル (*)"
+            self,
+            tr("Attach files"),
+            "",
+            tr("All files (*)"),
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         self.add_paths(paths)
 

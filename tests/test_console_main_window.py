@@ -791,7 +791,7 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     )
 
     active_item = _thread_item(window, "thread-a")
-    assert active_item.text(0) == "New \u30b9\u30ec\u30c3\u30c9"
+    assert active_item.text(0) == "New thread"
     assert not active_item.icon(0).isNull()
     active_weight = active_item.font(0).weight()
 

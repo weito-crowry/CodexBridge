@@ -91,7 +91,7 @@ def test_external_running_section_recovers_on_restart_without_creating_a_thread(
             if not http_before_scan:
                 client.result("threads", server_threads)
             assert _rows(window).count(THREAD_ID) == 2
-            assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "現在処理中"
+            assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "Currently running"
 
             # The HTTP page can temporarily omit an external candidate without
             # deleting the scanner-owned row in either section.
@@ -126,7 +126,7 @@ def test_external_running_section_recovers_on_restart_without_creating_a_thread(
         _wait_for(app, lambda: bool(snapshots))
         assert snapshots[-1] == {}
         assert _rows(window) == [THREAD_ID]
-        assert window.thread_pane.list_widget.topLevelItem(0).text(0) != "現在処理中"
+        assert window.thread_pane.list_widget.topLevelItem(0).text(0) != "Currently running"
         assert client.json_posts == []
     finally:
         window.close()

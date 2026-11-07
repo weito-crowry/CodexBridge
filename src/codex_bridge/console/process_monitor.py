@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import tr
 from .process_inspection import (
     CommandDescriptor,
     CommandKey,
@@ -67,7 +68,7 @@ class _InspectionTask(QRunnable):
             error = None
         except Exception:
             result = None
-            error = "Process inspection failed"
+            error = tr("Process inspection failed")
         self.signals.finished.emit(self.generation, self.token, result, error)
 
 
@@ -100,13 +101,13 @@ class ProcessMonitorWidget(QWidget):
 
         self.toggle_button = QToolButton()
         self.toggle_button.setObjectName("processMonitorToggle")
-        self.toggle_button.setText("Processes (read-only)")
+        self.toggle_button.setText(tr("Processes (read-only)"))
         self.toggle_button.setCheckable(True)
         self.toggle_button.setChecked(False)
         self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.toggle_button.setArrowType(Qt.ArrowType.RightArrow)
         self.toggle_button.toggled.connect(self._set_expanded)
-        self.refresh_button = QPushButton("Refresh processes")
+        self.refresh_button = QPushButton(tr("Refresh processes"))
         self.refresh_button.setObjectName("refreshProcesses")
         self.refresh_button.clicked.connect(self.refresh_processes)
         header = QHBoxLayout()
@@ -122,7 +123,7 @@ class ProcessMonitorWidget(QWidget):
         self.process_text.setMaximumBlockCount(1_500)
         self.process_text.setMinimumHeight(64)
         self.process_text.setMaximumHeight(132)
-        self.process_text.setPlaceholderText("No observed command process details.")
+        self.process_text.setPlaceholderText(tr("No observed command process details."))
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(2)
@@ -150,7 +151,7 @@ class ProcessMonitorWidget(QWidget):
             application.aboutToQuit.connect(self.shutdown)
 
         if self._platform_name != "win32":
-            self.process_text.setPlainText("Windows only")
+            self.process_text.setPlainText(tr("Windows only"))
             self.refresh_button.setEnabled(False)
 
     @property
@@ -230,8 +231,8 @@ class ProcessMonitorWidget(QWidget):
         self._evidence = ProcessEvidence(app_server_os_pid=pid)
         self._last_result = None
         self._refresh_pending = bool(self._records)
-        self.process_status_label.setText("App Server process changed; refreshing…")
-        self.process_text.setPlainText("Previous process observations cleared.")
+        self.process_status_label.setText(tr("App Server process changed; refreshing…"))
+        self.process_text.setPlainText(tr("Previous process observations cleared."))
         if self._records:
             self.refresh_processes()
 
@@ -252,7 +253,7 @@ class ProcessMonitorWidget(QWidget):
         if self._closed or self._platform_name != "win32":
             return
         if not self._records:
-            self.process_text.setPlainText("No command start events observed for this thread.")
+            self.process_text.setPlainText(tr("No command start events observed for this thread."))
             return
         if not self.isVisible():
             self._refresh_pending = True
@@ -316,7 +317,7 @@ class ProcessMonitorWidget(QWidget):
         cancelled = threading.Event()
         self._active_token = token
         self._active_cancel = cancelled
-        self.process_status_label.setText("Refreshing processes…")
+        self.process_status_label.setText(tr("Refreshing processes…"))
         task = _InspectionTask(
             self._inspector,
             tuple(self._records.values()),
@@ -353,40 +354,48 @@ class ProcessMonitorWidget(QWidget):
     def _render_result(self, result: InspectionResult) -> None:
         self._last_result = result
         if not result.supported:
-            message = result.message or "Windows only"
+            message = tr(result.message) if result.message else tr("Windows only")
             self.process_status_label.setText(message)
             self.process_text.setPlainText(message)
             return
         if result.message:
-            self.process_status_label.setText(result.message)
+            self.process_status_label.setText(tr(result.message))
         else:
             self.process_status_label.setText(
-                "Observed locally; process details stay in this Console."
+                tr("Observed locally; process details stay in this Console.")
             )
         lines: list[str] = []
         for state in result.commands:
             command = state.command
             lines.extend(
                 (
-                    f"Command: {command.summary or 'Unknown'}",
-                    f"Thread / turn / item: {command.key.thread_id} / {command.key.turn_id} / "
-                    f"{command.key.item_id}",
-                    f"Command status: {_display(command.command_status)}"
-                    + (f" · exit {command.exit_code}" if command.exit_code is not None else ""),
-                    f"Started: {_time_text(command.started_at_seconds)}",
-                    f"Ended: {_time_text(command.completed_at_seconds)}",
-                    f"App Server ID: {_display(command.app_server_process_id)}",
-                    f"OS process: {state.root_status}",
+                    tr("Command: {p0}", p0=command.summary or tr("Unknown")),
+                    tr(
+                        "Thread / turn / item: {p0} / {p1} / {p2}",
+                        p0=command.key.thread_id,
+                        p1=command.key.turn_id,
+                        p2=command.key.item_id,
+                    ),
+                    tr("Command status: {p0}", p0=tr(_display(command.command_status)))
+                    + (
+                        tr(" · exit {p0}", p0=command.exit_code)
+                        if command.exit_code is not None
+                        else ""
+                    ),
+                    tr("Started: {p0}", p0=_time_text(command.started_at_seconds)),
+                    tr("Ended: {p0}", p0=_time_text(command.completed_at_seconds)),
+                    tr("App Server ID: {p0}", p0=_display(command.app_server_process_id)),
+                    tr("OS process: {p0}", p0=tr(state.root_status)),
                 )
             )
             if state.root is not None:
                 lines.extend(_process_lines(state.root, prefix="  "))
             for child in state.children:
-                lines.append(f"  Related process: {child.state}")
+                lines.append(tr("  Related process: {p0}", p0=tr(child.state)))
                 lines.extend(_process_lines(child, prefix="    "))
             lines.append("")
         if not lines:
-            lines.append("No command process records to inspect.")
+            lines.append(tr("No command process records to inspect."))
         self.process_text.setPlainText("\n".join(lines).rstrip())
 
     def _sync_timer(self) -> None:
@@ -514,25 +523,29 @@ def _string(value: object) -> str:
 
 
 def _display(value: str | None) -> str:
-    return value if value else "Unknown"
+    return value if value else tr("Unknown")
 
 
 def _time_text(value: float | None) -> str:
     if value is None:
-        return "Unknown"
+        return tr("Unknown")
     try:
         return datetime.fromtimestamp(value, tz=UTC).isoformat(timespec="seconds")
     except (OverflowError, OSError, ValueError):
-        return "Unknown"
+        return tr("Unknown")
 
 
 def _process_lines(process: ProcessView, *, prefix: str) -> list[str]:
     return [
         f"{prefix}Windows PID: {process.pid}",
-        f"{prefix}Name: {_display(process.name)}",
-        f"{prefix}Executable: {_display(process.executable)}",
-        f"{prefix}Created: {_time_text(process.create_time)}",
-        f"{prefix}Command line: {_display(process.command_line)}",
-        f"{prefix}Parent PID: {_display(str(process.ppid) if process.ppid is not None else None)}",
-        f"{prefix}Process status: {_display(process.status)}",
+        tr("{p0}Name: {p1}", p0=prefix, p1=_display(process.name)),
+        tr("{p0}Executable: {p1}", p0=prefix, p1=_display(process.executable)),
+        tr("{p0}Created: {p1}", p0=prefix, p1=_time_text(process.create_time)),
+        tr("{p0}Command line: {p1}", p0=prefix, p1=_display(process.command_line)),
+        tr(
+            "{p0}Parent PID: {p1}",
+            p0=prefix,
+            p1=_display(str(process.ppid) if process.ppid is not None else None),
+        ),
+        tr("{p0}Process status: {p1}", p0=prefix, p1=tr(_display(process.status))),
     ]

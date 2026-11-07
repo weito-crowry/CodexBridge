@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import tr
 from .widget_helpers import CopyMessageButton
 
 if TYPE_CHECKING:
@@ -159,7 +160,7 @@ class ConversationTextBody(QTextBrowser):
 def _status_label(status: str | None) -> str:
     if status is None:
         return ""
-    return _STATUS_LABELS.get(status, status)
+    return tr(_STATUS_LABELS[status]) if status in _STATUS_LABELS else status
 
 
 def _short_summary(text: str) -> str:
@@ -225,7 +226,9 @@ def build_image_attachment_row(paths: tuple[str, ...], parent: QWidget) -> QWidg
                     if not image.isNull():
                         preview = QLabel(attachment)
                         preview.setObjectName("conversationImagePreview")
-                        preview.setAccessibleName(f"Image preview: {image_path.name[:160]}")
+                        preview.setAccessibleName(
+                            tr("Image preview: {p0}", p0=image_path.name[:160])
+                        )
                         preview.setAlignment(
                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                         )
@@ -236,10 +239,10 @@ def build_image_attachment_row(paths: tuple[str, ...], parent: QWidget) -> QWidg
 
         open_button = QToolButton(attachment)
         open_button.setObjectName("conversationImageOpenButton")
-        file_name = image_path.name[:160] or "Open image"
+        file_name = image_path.name[:160] or tr("Open image")
         open_button.setText(file_name)
-        open_button.setAccessibleName(f"Open image: {file_name}")
-        open_button.setToolTip("Open local image file")
+        open_button.setAccessibleName(tr("Open image: {p0}", p0=file_name))
+        open_button.setToolTip(tr("Open local image file"))
         open_button.clicked.connect(
             lambda _checked=False, path=str(image_path): _open_local_image(path)
         )
@@ -331,7 +334,7 @@ def build_conversation_row(
     layout.addWidget(metadata_label)
 
     if entry.body or entry.details:
-        disclosure = QPushButton("Hide details" if expanded else "Show details")
+        disclosure = QPushButton(tr("Hide details") if expanded else tr("Show details"))
         disclosure.setObjectName("conversationDisclosure")
         disclosure.setCheckable(True)
         disclosure.setChecked(expanded)
@@ -363,7 +366,7 @@ def build_conversation_row(
 
         def set_expanded(value: bool) -> None:
             details.setVisible(value)
-            disclosure.setText("Hide details" if value else "Show details")
+            disclosure.setText(tr("Hide details") if value else tr("Show details"))
             on_expanded_changed(value)
 
         disclosure.toggled.connect(set_expanded)

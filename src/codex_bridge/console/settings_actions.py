@@ -10,6 +10,8 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QMenu, QMessageBox, QToolButton
 
 from .config import ConsoleConfig, ConsoleConfigurationError
+from .configuration_error_presentation import format_configuration_error
+from .i18n import install_language_menu, tr
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -25,18 +27,21 @@ class SettingsActionController:
         window._appearance_menu = appearance_menu or QMenu(window.settings_button)
         menu = QMenu(window.settings_button)
         window._settings_actions = {
-            "Open settings file": menu.addAction("Open settings file", window._open_settings_file),
-            "Reload settings": menu.addAction("Reload settings", window._reload_configuration),
+            "Open settings file": menu.addAction(
+                tr("Open settings file"), window._open_settings_file
+            ),
+            "Reload settings": menu.addAction(tr("Reload settings"), window._reload_configuration),
             "Open settings folder": menu.addAction(
-                "Open settings folder", window._open_settings_folder
+                tr("Open settings folder"), window._open_settings_folder
             ),
         }
+        install_language_menu(menu, window._appearance_settings)
         menu.addSeparator()
-        appearance_menu_item = menu.addMenu("Appearance")
+        appearance_menu_item = menu.addMenu(tr("Appearance"))
         appearance_menu_item.addActions(window._appearance_menu.actions())
         menu.addSeparator()
         window._apply_pending_settings_action = menu.addAction(
-            "Restart Console to apply pending settings…",
+            tr("Restart Console to apply pending settings…"),
             window._apply_pending_configuration,
         )
         window._apply_pending_settings_action.setEnabled(False)
@@ -54,7 +59,7 @@ class SettingsActionController:
         path = self.active_config_path()
         if path is None:
             QMessageBox.warning(
-                self._window, "Settings", "The active configuration file is unavailable."
+                self._window, tr("Settings"), tr("The active configuration file is unavailable.")
             )
             return
         try:
@@ -63,14 +68,14 @@ class SettingsActionController:
             opened = False
         if not opened:
             QMessageBox.warning(
-                self._window, "Settings", "Could not open the active configuration file."
+                self._window, tr("Settings"), tr("Could not open the active configuration file.")
             )
 
     def open_settings_folder(self) -> None:
         path = self.active_config_path()
         if path is None:
             QMessageBox.warning(
-                self._window, "Settings", "The active configuration folder is unavailable."
+                self._window, tr("Settings"), tr("The active configuration folder is unavailable.")
             )
             return
         try:
@@ -79,23 +84,26 @@ class SettingsActionController:
             opened = False
         if not opened:
             QMessageBox.warning(
-                self._window, "Settings", "Could not open the active configuration folder."
+                self._window, tr("Settings"), tr("Could not open the active configuration folder.")
             )
 
     def settings_change_names(self, candidate: ConsoleConfig) -> tuple[str, ...]:
         window = self._window
         display_names = {
-            "allowed_roots": "Allowed roots",
-            "attachment_staging_directory": "Attachment staging directory",
-            "codex_executable": "Codex executable",
-            "config_mode": "Configuration source mode",
-            "config_path": "Configuration source path",
-            "port": "Console UI port",
-            "tunnel_executable": "Tunnel executable",
-            "tunnel_profile": "Tunnel profile",
-            "tunnel_profile_dir": "Tunnel profile directory",
-            "tunnel_profile_file": "Generated Tunnel profile path",
-            "tunnel_profile_settings": "Tunnel connection settings",
+            "host": tr("Host"),
+            "codex_executable_source": tr("Codex Executable Source"),
+            "tunnel_executable_source": tr("Tunnel Executable Source"),
+            "allowed_roots": tr("Allowed roots"),
+            "attachment_staging_directory": tr("Attachment staging directory"),
+            "codex_executable": tr("Codex executable"),
+            "config_mode": tr("Configuration source mode"),
+            "config_path": tr("Configuration source path"),
+            "port": tr("Console UI port"),
+            "tunnel_executable": tr("Tunnel executable"),
+            "tunnel_profile": tr("Tunnel profile"),
+            "tunnel_profile_dir": tr("Tunnel profile directory"),
+            "tunnel_profile_file": tr("Generated Tunnel profile path"),
+            "tunnel_profile_settings": tr("Tunnel connection settings"),
         }
         changed: list[str] = []
         for item in dataclass_fields(window._config):
@@ -111,9 +119,9 @@ class SettingsActionController:
         try:
             candidate = ConsoleConfig.from_sources(**explicit_overrides)
         except ConsoleConfigurationError as exc:
-            QMessageBox.warning(window, "Settings", str(exc))
+            QMessageBox.warning(window, tr("Settings"), format_configuration_error(str(exc)))
             window.bottom_status_label.setText(
-                "Settings reload failed; current settings remain active"
+                tr("Settings reload failed; current settings remain active")
             )
             return
 
@@ -123,28 +131,30 @@ class SettingsActionController:
         if changed:
             changed_text = ", ".join(changed)
             window.config_status_label.setText(
-                f"Config: {candidate.config_mode} · {len(changed)} pending restart"
+                tr("Config: {p0} · {p1} pending restart", p0=candidate.config_mode, p1=len(changed))
             )
             window.config_status_label.setToolTip(
-                f"Validated pending changes: {changed_text}. Restart Console to apply."
+                tr("Validated pending changes: {p0}. Restart Console to apply.", p0=changed_text)
             )
-            message = (
-                f"Settings reloaded and validated. Pending changes: {changed_text}. "
-                "Restart Console to apply them. Bridge and Tunnel were not restarted."
+            message = tr(
+                "Settings reloaded and validated. Pending changes: {p0}. Restart Console "
+                "to apply them. Bridge and Tunnel were not restarted.",
+                p0=changed_text,
             )
             window.bottom_status_label.setText(
-                "Settings reloaded; restart required to apply changes"
+                tr("Settings reloaded; restart required to apply changes")
             )
         else:
             window.config_status_label.setText(
-                f"Config: {candidate.config_mode} · roots {candidate.roots_count}"
+                tr("Config: {p0} · roots {p1}", p0=candidate.config_mode, p1=candidate.roots_count)
             )
             window.config_status_label.setToolTip(
-                candidate.roots_error or "Allowed roots are ready; settings are current"
+                format_configuration_error(candidate.roots_error or "")
+                or tr("Allowed roots are ready; settings are current")
             )
-            message = "Settings reloaded and validated. No restart is required."
-            window.bottom_status_label.setText("Settings reloaded")
-        QMessageBox.information(window, "Settings reloaded", message)
+            message = tr("Settings reloaded and validated. No restart is required.")
+            window.bottom_status_label.setText(tr("Settings reloaded"))
+        QMessageBox.information(window, tr("Settings reloaded"), message)
 
     def apply_pending_configuration(self) -> None:
         window = self._window
@@ -152,14 +162,17 @@ class SettingsActionController:
             return
         answer = QMessageBox.question(
             window,
-            "Restart Console to apply settings",
-            "This closes Console and stops its managed Bridge and Tunnel so the validated "
-            "settings can load. Active Codex work may be interrupted. Continue?",
+            tr("Restart Console to apply settings"),
+            tr(
+                "This closes Console and stops its managed Bridge and Tunnel so the "
+                "validated settings can load. Active Codex work may be interrupted. "
+                "Continue?"
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         window._restart_after_settings_apply = True
-        window.bottom_status_label.setText("Applying settings and restarting Console…")
+        window.bottom_status_label.setText(tr("Applying settings and restarting Console…"))
         window._begin_exit()

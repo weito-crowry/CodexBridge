@@ -763,8 +763,8 @@ def test_forecast_uses_current_history_independently_of_chart_dates(tmp_path: Pa
     window = UsageHistoryWindow(database, now=lambda: float(now))
     assert window.forecast_period_combo.currentData() == 3
     assert window.forecasts["five_hour"].rate_points_per_hour == pytest.approx(20 / 3)
-    assert "推定" in window.forecast_labels["five_hour"].text()
-    assert "次回リセット 不明" in window.forecast_labels["five_hour"].text()
+    assert "estimate" in window.forecast_labels["five_hour"].text()
+    assert "Next reset Unknown" in window.forecast_labels["five_hour"].text()
     window._set_range(now - 86400, now - 43200)
     window.forecast_period_combo.setCurrentIndex(0)
     assert window.forecasts["five_hour"].rate_points_per_hour == 4
@@ -787,11 +787,14 @@ def test_forecast_reads_each_live_reset_label_and_hides_dates_after_reset(tmp_pa
     )
     window = UsageHistoryWindow(database, now=lambda: float(now), usage_provider=lambda: live)
     assert window.forecasts["five_hour"].status == "reset_before_exhaustion"
-    assert "次回リセットまでの枯渇は予測されない" in window.forecast_labels["five_hour"].text()
-    assert "推定枯渇" not in window.forecast_labels["five_hour"].text()
+    assert (
+        "No exhaustion predicted before the next reset"
+        in window.forecast_labels["five_hour"].text()
+    )
+    assert "Estimated exhaustion" not in window.forecast_labels["five_hour"].text()
     assert window.forecasts["weekly"].status == "estimated"
-    assert "推定枯渇" in window.forecast_labels["weekly"].text()
-    assert "観測" in window.forecast_labels["weekly"].text()
+    assert "Estimated exhaustion" in window.forecast_labels["weekly"].text()
+    assert "observed" in window.forecast_labels["weekly"].text()
     window.close()
 
 
@@ -807,7 +810,7 @@ def test_forecast_treats_non_timestamp_reset_labels_as_unknown(tmp_path: Path) -
         database, now=lambda: float(now), usage_provider=lambda: _usage(30, 30)
     )
     assert window.forecasts["five_hour"].next_reset_epoch is None
-    assert "次回リセット 不明" in window.forecast_labels["five_hour"].text()
+    assert "Next reset Unknown" in window.forecast_labels["five_hour"].text()
     window.close()
 
 
@@ -828,6 +831,6 @@ def test_forecast_clears_estimates_on_database_failure(tmp_path: Path, monkeypat
     monkeypatch.setattr("codex_bridge.console.usage_history_window.get_usage_samples", failed)
     assert not window.refresh()
     assert not window.forecasts
-    assert "算出不可" in window.forecast_labels["five_hour"].text()
-    assert "推定枯渇" not in window.forecast_labels["five_hour"].text()
+    assert "Unavailable" in window.forecast_labels["five_hour"].text()
+    assert "Estimated exhaustion" not in window.forecast_labels["five_hour"].text()
     window.close()

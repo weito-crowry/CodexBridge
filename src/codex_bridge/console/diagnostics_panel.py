@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .i18n import tr
+
 if TYPE_CHECKING:
     from .main_window import MainWindow
 
@@ -16,7 +18,9 @@ class DiagnosticsPanelController:
     def _set_diagnostics_visible(self, visible: bool) -> None:
         window = self._window
         window.diagnostics_pane.setVisible(visible)
-        window.diagnostics_toggle_button.setText("Hide Diagnostics" if visible else "Diagnostics")
+        window.diagnostics_toggle_button.setText(
+            tr("Hide Diagnostics") if visible else tr("Diagnostics")
+        )
         if visible:
             window.diagnostics_text.clear()
             window._diagnostics_reader.reset()

@@ -129,9 +129,9 @@ def test_presentation_rounds_estimates_and_explains_the_observation_rules():
     result = forecast([(-3600, 36, 80), (-1800, 30, 79), (0, 23, 78)], window="five_hour")
     text = format_usage_forecast(result, label="5h", lookback_hours=3)
     assert "13.0pt/h" in text
-    assert "約1時間45分" in text
-    assert "直近3時間のペースが継続した場合" in text
-    assert "次回リセット 不明" in text
+    assert "about 1h 45m" in text
+    assert "if the pace over the last 3 hours continues" in text
+    assert "Next reset Unknown" in text
 
 
 def test_zero_observation_before_current_reset_is_not_current_exhaustion():

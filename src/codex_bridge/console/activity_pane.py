@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from .command_output import CommandOutputWidget
+from .i18n import tr
 from .process_monitor import ProcessMonitorWidget
 
 _EFFECTIVE_SANDBOX_MODES = {
@@ -37,8 +38,8 @@ def activity_row(activity: Mapping[str, object]) -> str:
     timestamp = _safe_text(activity.get("timestamp"), 128)
     activity_type = _safe_text(activity.get("type"), 128)
     activity_type = {
-        "agent_commentary": "Commentary",
-        "agent_message": "Agent",
+        "agent_commentary": tr("Commentary"),
+        "agent_message": tr("Agent"),
     }.get(activity_type, activity_type)
     status = _safe_text(activity.get("status"), 128)
     summary = _safe_text(activity.get("summary"), 2_000)
@@ -47,13 +48,13 @@ def activity_row(activity: Mapping[str, object]) -> str:
     if isinstance(details, Mapping):
         exit_code = details.get("exit_code")
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
-            parts.append(f"exit {exit_code}")
+            parts.append(tr("exit {p0}", p0=exit_code))
         process_id = details.get("process_id")
         if isinstance(process_id, str):
-            parts.append(f"App Server process id {process_id[:512]}")
+            parts.append(tr("App Server process id {p0}", p0=process_id[:512]))
         cwd = details.get("cwd")
         if isinstance(cwd, str):
-            parts.append(f"cwd: {cwd[:4_096]}")
+            parts.append(tr("cwd: {p0}", p0=cwd[:4096]))
         duration_ms = details.get("duration_ms")
         if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
             parts.append(f"{duration_ms} ms")
@@ -61,7 +62,7 @@ def activity_row(activity: Mapping[str, object]) -> str:
         if isinstance(paths, list):
             safe_paths = [path for path in paths[:100] if isinstance(path, str)]
             if safe_paths:
-                parts.append("paths: " + ", ".join(safe_paths))
+                parts.append(tr("paths: ") + ", ".join(safe_paths))
         decision = details.get("decision")
         if isinstance(decision, str):
             parts.append(decision[:256])
@@ -79,17 +80,17 @@ class ActivityPane(QWidget):
         process_monitor: ProcessMonitorWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.state_label = QLabel("not_loaded")
+        self.state_label = QLabel(tr("not_loaded"))
         self.state_label.setWordWrap(True)
         self.last_turn_label = QLabel("")
         self.last_turn_label.setTextFormat(Qt.TextFormat.PlainText)
         self.last_turn_label.setWordWrap(True)
-        state_header = QLabel("Current state")
-        self.sandbox_mode_label = QLabel("Sandbox: Unknown")
+        state_header = QLabel(tr("Current state"))
+        self.sandbox_mode_label = QLabel(tr("Sandbox: Unknown"))
         self.sandbox_mode_label.setObjectName("effectiveSandboxMode")
-        self.approval_policy_label = QLabel("Approval policy: Unknown")
+        self.approval_policy_label = QLabel(tr("Approval policy: Unknown"))
         self.approval_policy_label.setObjectName("effectiveApprovalPolicy")
-        self.approvals_reviewer_label = QLabel("Approvals reviewer: Unknown")
+        self.approvals_reviewer_label = QLabel(tr("Approvals reviewer: Unknown"))
         self.approvals_reviewer_label.setObjectName("effectiveApprovalsReviewer")
         self._effective_access_section = QWidget()
         self._effective_access_section.setObjectName("effectiveThreadAccess")
@@ -107,7 +108,7 @@ class ActivityPane(QWidget):
         self._sandbox_mode_default_font = QFont(self.sandbox_mode_label.font())
         self.pending_label = QLabel("")
         self.pending_label.setWordWrap(True)
-        self._pending_header = QLabel("Pending request")
+        self._pending_header = QLabel(tr("Pending request"))
         self.approval_details_label = QLabel("")
         self.approval_details_label.setObjectName("approvalDetails")
         self.approval_details_label.setWordWrap(True)
@@ -120,10 +121,10 @@ class ActivityPane(QWidget):
         self.approval_buttons: dict[str, QPushButton] = {}
         button_layout = QGridLayout()
         for label, decision, name in (
-            ("Allow once", "accept", "allowOnce"),
-            ("Allow for session", "acceptForSession", "allowForSession"),
-            ("Decline", "decline", "decline"),
-            ("Cancel", "cancel", "cancel"),
+            (tr("Allow once"), "accept", "allowOnce"),
+            (tr("Allow for session"), "acceptForSession", "allowForSession"),
+            (tr("Decline"), "decline", "decline"),
+            (tr("Cancel"), "cancel", "cancel"),
         ):
             button = QPushButton(label)
             button.setObjectName(name)
@@ -165,9 +166,9 @@ class ActivityPane(QWidget):
         self._state_section.hide()
         self.activity_list = QListWidget()
         self.activity_list.setObjectName("activityList")
-        self._activity_header = QLabel("Recent activities")
+        self._activity_header = QLabel(tr("Recent activities"))
         self._activity_header.setObjectName("recentActivitiesHeader")
-        self.command_output_header = QLabel("Read-only command output")
+        self.command_output_header = QLabel(tr("Read-only command output"))
         self.command_output_header.setObjectName("commandOutputHeader")
         self.command_output = CommandOutputWidget()
         self.process_monitor = process_monitor or ProcessMonitorWidget()
@@ -194,14 +195,18 @@ class ActivityPane(QWidget):
         ):
             return
         state = _safe_text(snapshot.get("state"), 128) or "not_loaded"
-        self.state_label.setText(state)
+        self.state_label.setText(tr(state))
         last = snapshot.get("last_turn")
         if isinstance(last, Mapping):
-            attention = " · 要確認" if last.get("needs_attention") else ""
+            attention = tr(" · attention required") if last.get("needs_attention") else ""
             self.last_turn_label.setText(
-                f"Last turn: {_safe_text(last.get('status'), 32)}{attention}"
-                f" · {_safe_text(last.get('reason'), 64)}"
-                f" · {_safe_text(last.get('evidence'), 16)}"
+                tr(
+                    "Last turn: {p0}{p1} · {p2} · {p3}",
+                    p0=tr(_safe_text(last.get("status"), 32)),
+                    p1=attention,
+                    p2=_safe_text(last.get("reason"), 64),
+                    p3=_safe_text(last.get("evidence"), 16),
+                )
             )
         else:
             self.last_turn_label.clear()
@@ -211,7 +216,9 @@ class ActivityPane(QWidget):
         if isinstance(pending, Mapping):
             self._pending_header.show()
             self.pending_label.show()
-            pending_label = "Approval required" if state == "needs_approval" else "Input required"
+            pending_label = (
+                tr("Approval required") if state == "needs_approval" else tr("Input required")
+            )
             label = pending_label
             summary = _safe_text(pending.get("summary"), 2_000) or _safe_text(
                 pending.get("reason"), 2_000
@@ -288,7 +295,7 @@ class ActivityPane(QWidget):
     def set_approval_busy(self, busy: bool) -> None:
         self._approval_busy = busy
         if busy:
-            self._approval_feedback.setText("Resolving approval…")
+            self._approval_feedback.setText(tr("Resolving approval…"))
             self._approval_feedback.show()
         self._sync_approval_controls()
 
@@ -299,7 +306,7 @@ class ActivityPane(QWidget):
     def mark_approval_resolved(self) -> None:
         self._approval_resolved = True
         self._approval_busy = False
-        self._approval_feedback.setText("Approval resolved. Refreshing status…")
+        self._approval_feedback.setText(tr("Approval resolved. Refreshing status…"))
         self._approval_feedback.show()
         self._sync_approval_controls()
 
@@ -314,7 +321,7 @@ class ActivityPane(QWidget):
                 and not self._approval_resolved
             )
         self.approval_control_message.setText(
-            "Resolve from MCP client; Console control is unavailable for this Bridge."
+            tr("Resolve from MCP client; Console control is unavailable for this Bridge.")
         )
         self.approval_control_message.setVisible(active and not self._control_available)
 
@@ -331,37 +338,37 @@ class ActivityPane(QWidget):
     def _approval_details(pending: Mapping[str, object], snapshot: Mapping[str, object]) -> str:
         method = pending.get("method")
         titles = {
-            "item/commandExecution/requestApproval": "Command approval",
-            "item/fileChange/requestApproval": "File change approval",
-            "item/permissions/requestApproval": "Permission approval",
+            "item/commandExecution/requestApproval": tr("Command approval"),
+            "item/fileChange/requestApproval": tr("File change approval"),
+            "item/permissions/requestApproval": tr("Permission approval"),
         }
-        parts = [titles.get(method if isinstance(method, str) else "", "Approval request")]
-        for key, label in (("thread_id", "Thread"), ("turn_id", "Turn")):
+        parts = [titles.get(method if isinstance(method, str) else "", tr("Approval request"))]
+        for key, label in (("thread_id", tr("Thread")), ("turn_id", tr("Turn"))):
             value = _safe_text(pending.get(key), 512)
             if value:
                 parts.append(f"{label}: {value}")
         summary = _safe_text(pending.get("summary"), 2_000)
         if summary:
-            parts.append(f"Summary / command: {summary}")
+            parts.append(tr("Summary / command: {p0}", p0=summary))
 
         if method == "item/fileChange/requestApproval":
             diff = _safe_text(snapshot.get("current_diff"), 16_000)
             if diff:
-                parts.append(f"Current diff:\n{diff}")
+                parts.append(tr("Current diff:\n{p0}", p0=diff))
         elif method == "item/permissions/requestApproval":
             permission = pending.get("permission")
             if isinstance(permission, Mapping):
                 reason = _safe_text(permission.get("reason"), 2_000)
                 cwd = _safe_text(permission.get("cwd"), 2_000)
                 if reason:
-                    parts.append(f"Reason: {reason}")
+                    parts.append(tr("Reason: {p0}", p0=reason))
                 if cwd:
-                    parts.append(f"Working directory: {cwd}")
+                    parts.append(tr("Working directory: {p0}", p0=cwd))
                 requested = permission.get("requested_permissions")
                 if isinstance(requested, Mapping):
                     for key, label in (
-                        ("fileSystem", "Requested filesystem permissions"),
-                        ("network", "Requested network permissions"),
+                        ("fileSystem", tr("Requested filesystem permissions")),
+                        ("network", tr("Requested network permissions")),
                     ):
                         if key in requested:
                             rendered = json.dumps(
@@ -372,7 +379,7 @@ class ActivityPane(QWidget):
                 if isinstance(scopes, list):
                     safe_scopes = [scope for scope in scopes if scope in {"turn", "session"}]
                     if safe_scopes:
-                        parts.append(f"Allowed scopes: {', '.join(safe_scopes)}")
+                        parts.append(tr("Allowed scopes: {p0}", p0=", ".join(safe_scopes)))
         return "\n".join(parts)[:8_000]
 
     def merge_activities(self, recent: object) -> None:
@@ -423,7 +430,7 @@ class ActivityPane(QWidget):
         self.state_label.setText(text)
         self.last_turn_label.clear()
         self._set_pending_request_state("")
-        self._set_effective_access_unavailable("Unknown")
+        self._set_effective_access_unavailable(tr("Unknown"))
         self.pending_label.clear()
         self._has_approval = False
         self._pending_approval_id = None
@@ -452,7 +459,7 @@ class ActivityPane(QWidget):
     def set_error(self, text: str) -> None:
         self.process_monitor.set_app_server_os_pid(None)
         self.state_label.setText(text)
-        self._set_effective_access_unavailable("Unavailable")
+        self._set_effective_access_unavailable(tr("Unavailable"))
         self.pending_label.clear()
         self._pending_header.hide()
         self.pending_label.hide()
@@ -473,7 +480,9 @@ class ActivityPane(QWidget):
         )
 
         if sandbox_mode == "danger-full-access":
-            self.sandbox_mode_label.setText("Sandbox: WARNING — Full Access (danger-full-access)")
+            self.sandbox_mode_label.setText(
+                tr("Sandbox: WARNING — Full Access (danger-full-access)")
+            )
             palette = QPalette(self.sandbox_mode_label.palette())
             palette.setColor(
                 QPalette.ColorRole.WindowText,
@@ -484,18 +493,18 @@ class ActivityPane(QWidget):
             font.setBold(True)
             self.sandbox_mode_label.setFont(font)
         else:
-            self.sandbox_mode_label.setText(f"Sandbox: {sandbox_mode}")
+            self.sandbox_mode_label.setText(tr("Sandbox: {p0}", p0=sandbox_mode))
             self.sandbox_mode_label.setPalette(QPalette())
             self.sandbox_mode_label.setFont(self._sandbox_mode_default_font)
-        self.approval_policy_label.setText(f"Approval policy: {approval_policy}")
-        self.approvals_reviewer_label.setText(f"Approvals reviewer: {approvals_reviewer}")
+        self.approval_policy_label.setText(tr("Approval policy: {p0}", p0=approval_policy))
+        self.approvals_reviewer_label.setText(tr("Approvals reviewer: {p0}", p0=approvals_reviewer))
 
     @staticmethod
     def _effective_metadata_value(
         metadata: object, key: str, allowed_values: Collection[str]
     ) -> str:
         if not isinstance(metadata, Mapping):
-            return "Unknown"
+            return tr("Unknown")
         value = metadata.get(key)
         if (
             not isinstance(value, str)
@@ -503,12 +512,12 @@ class ActivityPane(QWidget):
             or len(value) > 128
             or value not in allowed_values
         ):
-            return "Unknown"
+            return tr("Unknown")
         return value
 
     def _set_effective_access_unavailable(self, value: str) -> None:
-        self.sandbox_mode_label.setText(f"Sandbox: {value}")
+        self.sandbox_mode_label.setText(tr("Sandbox: {p0}", p0=value))
         self.sandbox_mode_label.setPalette(QPalette())
         self.sandbox_mode_label.setFont(self._sandbox_mode_default_font)
-        self.approval_policy_label.setText(f"Approval policy: {value}")
-        self.approvals_reviewer_label.setText(f"Approvals reviewer: {value}")
+        self.approval_policy_label.setText(tr("Approval policy: {p0}", p0=value))
+        self.approvals_reviewer_label.setText(tr("Approvals reviewer: {p0}", p0=value))

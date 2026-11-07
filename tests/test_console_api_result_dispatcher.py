@@ -180,14 +180,14 @@ def test_external_running_thread_survives_http_thread_refresh() -> None:
     managed_item = next(
         item for item in thread_items if item.data(0, Qt.ItemDataRole.UserRole) == "managed"
     )
-    assert external_item.toolTip(0) == "external-not-loaded\n推定実行中"
+    assert external_item.toolTip(0) == "external-not-loaded\nLikely running"
     assert _icon_contains_color(external_item, QColor("#d93025"))
     interrupted_item = next(
         item
         for item in thread_items
         if item.data(0, Qt.ItemDataRole.UserRole) == "external-interrupted"
     )
-    assert interrupted_item.toolTip(0) == "external-interrupted\n推定実行中"
+    assert interrupted_item.toolTip(0) == "external-interrupted\nLikely running"
     assert _icon_contains_color(interrupted_item, QColor("#d93025"))
     assert managed_item.foreground(0).color() == window.thread_pane.list_widget.palette().color(
         QPalette.ColorRole.Link
@@ -277,7 +277,7 @@ def test_http_codexbridge_originator_suppresses_external_overlay_but_keeps_statu
         assert by_id[thread_id].toolTip(0) == thread_id
         assert by_id[thread_id].foreground(0).color() != QColor("#d93025")
     running_section = window.thread_pane.list_widget.topLevelItem(0)
-    assert running_section.text(0) == "現在処理中"
+    assert running_section.text(0) == "Currently running"
     assert [
         item.data(0, Qt.ItemDataRole.UserRole)
         for item in _children(running_section)
@@ -336,7 +336,7 @@ def test_empty_http_thread_refresh_keeps_external_running_thread_visible() -> No
         if item.data(0, Qt.ItemDataRole.UserRole) == thread_id
     ]
     assert len(visible_items) == 2
-    assert all(item.toolTip(0) == f"{thread_id}\n推定実行中" for item in visible_items)
+    assert all(item.toolTip(0) == f"{thread_id}\nLikely running" for item in visible_items)
     window.close()
 
 
@@ -361,7 +361,7 @@ def test_main_window_applies_external_monitor_updates_and_stops_on_exit() -> Non
     assert not external_item.icon(0).isNull()
     assert _icon_contains_color(external_item, QColor("#d93025"))
     assert external_item.foreground(0).color() == QColor("#d93025")
-    assert external_item.toolTip(0) == f"{thread_id}\n推定実行中"
+    assert external_item.toolTip(0) == f"{thread_id}\nLikely running"
     window.thread_pane.thread_selected.emit(thread_id)
     assert window._selected_thread_id == thread_id
     assert any(path == f"/ui-api/threads/{thread_id}" for _key, path, _query in client.requests)

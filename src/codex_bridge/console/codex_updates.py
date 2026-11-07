@@ -10,6 +10,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QProcess, Signal
 
 from . import codex_resolver
+from .i18n import tr
 
 CodexResolution = codex_resolver.CodexResolution
 
@@ -75,10 +76,10 @@ class CodexUpdateInfo:
     @property
     def display_status(self) -> str:
         if self.update_available:
-            return "Update available"
+            return tr("Update available")
         if self.latest_version is not None and self.check_status == "ok":
-            return "Up to date"
-        return "Unavailable"
+            return tr("Up to date")
+        return tr("Unavailable")
 
 
 def parse_codex_update_info(payload: object, *, current_version: str) -> CodexUpdateInfo:
@@ -214,10 +215,10 @@ class CodexUpdateProbe(QObject):
                 if not isinstance(payload, Mapping):
                     raise ValueError
             except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
-                self.check_failed.emit("Codex update check failed")
+                self.check_failed.emit(tr("Codex update check failed"))
             else:
                 if not self._has_updates_status(payload):
-                    self.check_failed.emit("Codex update check failed")
+                    self.check_failed.emit(tr("Codex update check failed"))
                 else:
                     self.check_succeeded.emit(payload)
         elif operation == "update" and exit_code == 0:
@@ -248,6 +249,6 @@ class CodexUpdateProbe(QObject):
 
     def _emit_failure(self, operation: str | None) -> None:
         if operation == "check":
-            self.check_failed.emit("Codex update check failed")
+            self.check_failed.emit(tr("Codex update check failed"))
         elif operation == "update":
-            self.update_failed.emit("Codex update failed")
+            self.update_failed.emit(tr("Codex update failed"))

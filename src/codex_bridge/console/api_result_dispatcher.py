@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
+from .api_error_presentation import format_api_error
 from .history_timeline import ACTIVE_TURN_STATES
+from .i18n import tr
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -47,7 +49,7 @@ class ApiResultDispatcher:
             window._health_observed = True
             window._health_ok = isinstance(payload, Mapping) and payload.get("status") == "ok"
             if window._health_ok:
-                window.bottom_status_label.setText("Bridge reachable")
+                window.bottom_status_label.setText(tr("Bridge reachable"))
             window._apply_runtime_observation()
             window._sync_overall_status()
             window._sync_empty_state()
@@ -61,17 +63,19 @@ class ApiResultDispatcher:
                 window._bridge_ready = bridge in {"ready", "connected"}
                 window._app_server_ready = app_server in {"ready", "connected"}
                 window.bridge_status_label.setText(
-                    "Bridge: connected" if window._bridge_ready else "Bridge: disconnected"
+                    tr("Bridge: connected") if window._bridge_ready else tr("Bridge: disconnected")
                 )
                 window.app_server_status_label.setText(
-                    "App Server: ready" if window._app_server_ready else "App Server: failed"
+                    tr("App Server: ready")
+                    if window._app_server_ready
+                    else tr("App Server: failed")
                 )
                 window._apply_runtime_observation()
             else:
                 window._bridge_ready = False
                 window._app_server_ready = False
-                window.bridge_status_label.setText("Bridge: disconnected")
-                window.app_server_status_label.setText("App Server: failed")
+                window.bridge_status_label.setText(tr("Bridge: disconnected"))
+                window.app_server_status_label.setText(tr("App Server: failed"))
                 window._apply_runtime_observation()
             window._record_bridge_status_observation(
                 window._bridge_ready and window._app_server_ready
@@ -138,7 +142,7 @@ class ApiResultDispatcher:
                     project_names=self._read_project_names(),
                 )
                 if not threads and window.thread_pane.thread_count == 0:
-                    window.thread_pane.set_empty_state("No threads found.")
+                    window.thread_pane.set_empty_state(tr("No threads found."))
                 window._sync_empty_state()
             return
 
@@ -202,13 +206,13 @@ class ApiResultDispatcher:
             if key == "health":
                 window._health_observed = True
                 window._health_ok = False
-                window.bridge_status_label.setText("Bridge: disconnected")
+                window.bridge_status_label.setText(tr("Bridge: disconnected"))
                 window._bridge_stop_confirmation.observe_health(False)
             else:
                 window._status_observed = True
                 window._bridge_ready = False
                 window._app_server_ready = False
-                window.app_server_status_label.setText("App Server: failed")
+                window.app_server_status_label.setText(tr("App Server: failed"))
                 window._bridge_stop_confirmation.observe_status(False)
             window._maybe_finish_stop_confirmation()
             return
@@ -221,9 +225,9 @@ class ApiResultDispatcher:
                 window._bridge_ready = False
                 window._app_server_ready = False
                 window._invalidate_usage_sequence()
-            window.bridge_status_label.setText("Bridge: disconnected")
-            window.app_server_status_label.setText("App Server: failed")
-            window.bottom_status_label.setText(message)
+            window.bridge_status_label.setText(tr("Bridge: disconnected"))
+            window.app_server_status_label.setText(tr("App Server: failed"))
+            window.bottom_status_label.setText(format_api_error(message))
             window._apply_runtime_observation()
             if key == "bridge-status":
                 window._record_bridge_status_observation(False)
@@ -240,10 +244,10 @@ class ApiResultDispatcher:
         live_refresh = suffix.startswith("history:")
         if live_refresh:
             suffix = suffix.removeprefix("history:")
-        window.bottom_status_label.setText(message)
+        window.bottom_status_label.setText(format_api_error(message))
         if suffix in {"items", "turns"} or suffix.startswith("older:"):
             if not live_refresh:
-                window.history_pane.set_error(message)
+                window.history_pane.set_error(format_api_error(message))
         if suffix == "status":
             window._history_stream.status_request_failed(message)
         window._finish_selected_history_request(key)

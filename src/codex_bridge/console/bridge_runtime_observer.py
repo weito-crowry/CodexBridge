@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..tunnel_profile import TunnelProfileError
+from .i18n import tr
 from .tunnel_profile_job import TunnelProfileJob
 
 if TYPE_CHECKING:
@@ -37,13 +38,13 @@ _SAFE_TUNNEL_PROFILE_ERRORS = frozenset(
 def _safe_tunnel_profile_error(error: TunnelProfileError) -> str:
     message = str(error)
     if message in _SAFE_TUNNEL_PROFILE_ERRORS:
-        return message
+        return tr(message)
     prefix = "Tunnel client rejected the staged profile (exit code "
     if message.startswith(prefix) and message.endswith(")"):
         exit_code = message[len(prefix) : -1]
         if exit_code.isdecimal():
-            return message
-    return "Managed Tunnel profile generation or doctor validation failed"
+            return tr("Tunnel client rejected the staged profile (exit code {p0})", p0=exit_code)
+    return tr("Managed Tunnel profile generation or doctor validation failed")
 
 
 def advance_bridge_generation(window: MainWindow) -> None:
@@ -52,7 +53,7 @@ def advance_bridge_generation(window: MainWindow) -> None:
         return
     window._managed_tunnel_profile_attempted_generation = None
     window._tunnel_profile_status = "not_run"
-    window._tunnel_profile_skip_reason = "Waiting for Bridge and App Server readiness"
+    window._tunnel_profile_skip_reason = tr("Waiting for Bridge and App Server readiness")
     if window._tunnel_resolution_status == "passed":
         window._tunnel_resolution_error = None
     window._update_tunnel_client_status()
@@ -146,7 +147,9 @@ class BridgeRuntimeObserver:
             if window._detached_launch_started:
                 window._launch_in_progress = False
                 window.readiness_timer.stop()
-                window._set_runtime_state("console_started", label="Runtime: started by Console")
+                window._set_runtime_state(
+                    "console_started", label=tr("Runtime: started by Console")
+                )
                 window._restore_restarted_tunnel()
             else:
                 window._set_runtime_state("external")
@@ -155,12 +158,12 @@ class BridgeRuntimeObserver:
             if not window._launch_in_progress and window._runtime_state != "launch_timed_out":
                 window._set_runtime_state(
                     "console_started_unreachable",
-                    label="Runtime: started by Console (not reachable)",
+                    label=tr("Runtime: started by Console (not reachable)"),
                 )
         elif window._bridge_seen_ready:
             window._set_runtime_state(
                 "external_unreachable",
-                label="Runtime: external (not reachable)",
+                label=tr("Runtime: external (not reachable)"),
             )
         else:
             window._set_runtime_state("unavailable")

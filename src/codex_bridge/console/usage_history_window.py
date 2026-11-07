@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from .appearance import AppearanceTheme, stylesheet_for_theme, system_appearance_theme
+from .i18n import tr
 from .usage import CodexUsage
 from .usage_forecast import (
     FORECAST_LOOKBACK_HOURS,
@@ -79,9 +80,9 @@ _PRESETS = (("24 hours", 1), ("7 days", 7), ("1 month", 30), ("1 year", 365))
 def format_sample_tooltip(sample: UsageHistorySample) -> str:
     lines = [datetime.fromtimestamp(sample.captured_at_epoch).strftime("%Y/%m/%d %H:%M:%S")]
     if sample.five_hour_remaining is not None:
-        lines.append(f"5h remaining: {sample.five_hour_remaining}%")
+        lines.append(tr("5h remaining: {p0}%", p0=sample.five_hour_remaining))
     if sample.weekly_remaining is not None:
-        lines.append(f"Weekly remaining: {sample.weekly_remaining}%")
+        lines.append(tr("Weekly remaining: {p0}%", p0=sample.weekly_remaining))
     return "\n".join(lines)
 
 
@@ -89,11 +90,11 @@ def format_reset_tooltip(event: UsageHistoryEvent) -> str:
     increase = event.current_weekly_remaining - event.previous_weekly_remaining
     return "\n".join(
         (
-            "Weekly reset candidate",
+            tr("Weekly reset candidate"),
             datetime.fromtimestamp(event.occurred_at_epoch).strftime("%Y/%m/%d %H:%M:%S"),
             f"{event.previous_weekly_remaining}% → {event.current_weekly_remaining}%",
             f"+{increase} pt",
-            "Candidate inferred from an observed weekly quota increase.",
+            tr("Candidate inferred from an observed weekly quota increase."),
         )
     )
 
@@ -169,7 +170,7 @@ class UsageHistoryWindow(QMainWindow):
         self._auto_refresh_timer.setInterval(_AUTO_REFRESH_INTERVAL_MS)
         self._auto_refresh_timer.timeout.connect(lambda: self.refresh(rolling=True))
 
-        self.setWindowTitle("Usage History · CodexBridge Console")
+        self.setWindowTitle(tr("Usage History · CodexBridge Console"))
         self.setMinimumSize(900, 580)
         self._build_ui()
         self._restore_geometry()
@@ -188,17 +189,17 @@ class UsageHistoryWindow(QMainWindow):
         layout.setSpacing(12)
 
         heading = QHBoxLayout()
-        title = QLabel("Usage History")
+        title = QLabel(tr("Usage History"))
         title_font = title.font()
         title_font.setPointSize(title_font.pointSize() + 5)
         title_font.setWeight(QFont.Weight.DemiBold)
         title.setFont(title_font)
         heading.addWidget(title)
         heading.addStretch(1)
-        self.live_label = QLabel("● Live")
+        self.live_label = QLabel(tr("● Live"))
         self.live_label.setObjectName("usageHistoryLive")
         heading.addWidget(self.live_label)
-        self.updated_label = QLabel("Updated —")
+        self.updated_label = QLabel(tr("Updated —"))
         self.updated_label.setObjectName("usageHistoryUpdated")
         heading.addWidget(self.updated_label)
         layout.addLayout(heading)
@@ -211,7 +212,7 @@ class UsageHistoryWindow(QMainWindow):
         preset_labels = tuple(label for label, _days in _PRESETS) + ("Custom",)
         for label in preset_labels:
             button = QToolButton(self)
-            button.setText(label)
+            button.setText(tr(label))
             button.setCheckable(True)
             button.setObjectName(self.preset_object_names[label])
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -229,22 +230,23 @@ class UsageHistoryWindow(QMainWindow):
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
-        controls.addWidget(QLabel("Start"))
+        controls.addWidget(QLabel(tr("Start")))
         self.start_edit = self._new_datetime_edit("usageHistoryStart")
         controls.addWidget(self.start_edit)
-        controls.addWidget(QLabel("End"))
+        controls.addWidget(QLabel(tr("End")))
         self.end_edit = self._new_datetime_edit("usageHistoryEnd")
         controls.addWidget(self.end_edit)
         controls.addSpacing(8)
-        controls.addWidget(QLabel("Axis"))
+        controls.addWidget(QLabel(tr("Axis")))
         self.axis_mode_combo = QComboBox(self)
         self.axis_mode_combo.setObjectName("usageHistoryAxisMode")
-        self.axis_mode_combo.addItems(("Auto", "Date", "Time"))
+        for mode in ("Auto", "Date", "Time"):
+            self.axis_mode_combo.addItem(tr(mode), mode)
         controls.addWidget(self.axis_mode_combo)
         controls.addStretch(1)
-        self.refresh_button = QPushButton("Refresh", self)
+        self.refresh_button = QPushButton(tr("Refresh"), self)
         self.refresh_button.setObjectName("usageHistoryRefresh")
-        self.export_button = QPushButton("Export CSV", self)
+        self.export_button = QPushButton(tr("Export CSV"), self)
         self.export_button.setObjectName("usageHistoryExport")
         controls.addWidget(self.refresh_button)
         controls.addWidget(self.export_button)
@@ -270,7 +272,7 @@ class UsageHistoryWindow(QMainWindow):
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(12, 8, 12, 8)
             card_layout.setSpacing(3)
-            caption = QLabel(key, card)
+            caption = QLabel(tr(key), card)
             caption.setObjectName("usageHistoryMetricCaption")
             value = QLabel("—", card)
             value.setObjectName("usageHistoryMetricValue")
@@ -285,15 +287,18 @@ class UsageHistoryWindow(QMainWindow):
         layout.addLayout(summary)
 
         forecast_heading = QHBoxLayout()
-        forecast_heading.addWidget(QLabel("枯渇予測（参考）"))
+        forecast_heading.addWidget(QLabel(tr("Exhaustion forecast (reference)")))
         self.forecast_period_combo = QComboBox(self)
         self.forecast_period_combo.setObjectName("usageForecastPeriod")
         for hours in FORECAST_LOOKBACK_HOURS:
-            self.forecast_period_combo.addItem(f"直近{hours}時間", hours)
+            self.forecast_period_combo.addItem(tr("Last {p0} hours", p0=hours), hours)
         self.forecast_period_combo.setCurrentIndex(1)
         self.forecast_period_combo.setToolTip(
-            "グラフ期間とは独立した直近の観測を使用。3点以上・15分以上の観測が必要。"
-            "最新観測が5分を超える場合は算出不可。"
+            tr(
+                "Uses recent observations independently of the chart period. Requires 3 "
+                "samples over at least 15 minutes; unavailable if the latest sample is "
+                "over 5 minutes old."
+            )
         )
         self.forecast_period_combo.currentIndexChanged.connect(lambda _index: self.refresh())
         forecast_heading.addWidget(self.forecast_period_combo)
@@ -311,11 +316,11 @@ class UsageHistoryWindow(QMainWindow):
 
         self.chart, self.time_axis, self.percent_axis = self._create_chart()
         self.five_hour_series = QLineSeries(self.chart)
-        self.five_hour_series.setName("5h remaining")
+        self.five_hour_series.setName(tr("5h remaining"))
         self.weekly_series = QLineSeries(self.chart)
-        self.weekly_series.setName("Weekly remaining")
+        self.weekly_series.setName(tr("Weekly remaining"))
         self.reset_series = QScatterSeries(self.chart)
-        self.reset_series.setName("Reset candidate")
+        self.reset_series.setName(tr("Reset candidate"))
         self.reset_series.setMarkerSize(12)
         self.chart.addSeries(self.five_hour_series)
         self.chart.addSeries(self.weekly_series)
@@ -339,17 +344,17 @@ class UsageHistoryWindow(QMainWindow):
         chart_content_layout = QVBoxLayout(self.chart_content)
         chart_content_layout.setContentsMargins(0, 0, 0, 0)
         chart_content_layout.setSpacing(6)
-        self.empty_state_label = self._state_label("No usage data for the selected period.")
+        self.empty_state_label = self._state_label(tr("No usage data for the selected period."))
         self.empty_state_label.setVisible(False)
         chart_content_layout.addWidget(self.empty_state_label)
         chart_content_layout.addWidget(self.chart_view, 1)
         self.chart_stack.addWidget(self.chart_content)
-        self.error_state_label = self._state_label("Usage history unavailable.")
+        self.error_state_label = self._state_label(tr("Usage history unavailable."))
         self.chart_stack.addWidget(self.error_state_label)
         layout.addWidget(self.chart_stack, 1)
 
         history_heading = QHBoxLayout()
-        history_title = QLabel("Reset history")
+        history_title = QLabel(tr("Reset history"))
         history_font = history_title.font()
         history_font.setWeight(QFont.Weight.DemiBold)
         history_title.setFont(history_font)
@@ -553,7 +558,7 @@ class UsageHistoryWindow(QMainWindow):
     def _update_axis_format(self, _mode: str | None = None) -> None:
         if not hasattr(self, "time_axis"):
             return
-        mode = self.axis_mode_combo.currentText() if hasattr(self, "axis_mode_combo") else "Auto"
+        mode = self.axis_mode_combo.currentData() if hasattr(self, "axis_mode_combo") else "Auto"
         duration = (
             abs(
                 self.end_edit.dateTime().toSecsSinceEpoch()
@@ -582,7 +587,7 @@ class UsageHistoryWindow(QMainWindow):
         start = self.start_edit.dateTime().toSecsSinceEpoch()
         end = self.end_edit.dateTime().toSecsSinceEpoch()
         if start > end:
-            self.range_error_label.setText("Start must be earlier than or equal to End.")
+            self.range_error_label.setText(tr("Start must be earlier than or equal to End."))
             self.range_error_label.setVisible(True)
             return False
         self.range_error_label.setVisible(False)
@@ -611,13 +616,13 @@ class UsageHistoryWindow(QMainWindow):
         except (OSError, sqlite3.Error):
             self.forecasts.clear()
             for label in self.forecast_labels.values():
-                label.setText("算出不可: Usage Historyを読み取れません。")
+                label.setText(tr("Unavailable: could not read Usage History."))
             self._display_samples = []
             self._events = []
             self._clear_chart()
             self._set_summary(None, None, 0)
             self.reset_history_list.clear()
-            self.reset_history_list.addItem("Usage history unavailable.")
+            self.reset_history_list.addItem(tr("Usage history unavailable."))
             self.history_count_label.setText("—")
             self.chart_stack.setCurrentWidget(self.error_state_label)
             return False
@@ -631,7 +636,10 @@ class UsageHistoryWindow(QMainWindow):
         self.empty_state_label.setVisible(not samples)
         self.chart_stack.setCurrentWidget(self.chart_content)
         self.updated_label.setText(
-            f"Updated {datetime.fromtimestamp(self._now()).astimezone().strftime('%H:%M')}"
+            tr(
+                "Updated {p0}",
+                p0=datetime.fromtimestamp(self._now()).astimezone().strftime("%H:%M"),
+            )
         )
         return True
 
@@ -641,7 +649,7 @@ class UsageHistoryWindow(QMainWindow):
         usage = self._usage_provider()
         keys: tuple[UsageForecastWindow, ...] = ("five_hour", "weekly")
         for key in keys:
-            label = "5h" if key == "five_hour" else "週間"
+            label = tr("5h") if key == "five_hour" else tr("Weekly")
             window = usage.five_hour if key == "five_hour" else usage.weekly
             forecast = estimate_exhaustion(
                 samples,
@@ -707,28 +715,33 @@ class UsageHistoryWindow(QMainWindow):
         self.reset_history_list.clear()
         self.history_count_label.setText(str(len(events)))
         if not events:
-            self.reset_history_list.addItem("No reset candidates in this period.")
+            self.reset_history_list.addItem(tr("No reset candidates in this period."))
             return
         for event in events:
             timestamp = datetime.fromtimestamp(event.occurred_at_epoch).strftime("%Y/%m/%d %H:%M")
             self.reset_history_list.addItem(
-                f"{timestamp}    Weekly    {event.previous_weekly_remaining}% → "
-                f"{event.current_weekly_remaining}%"
+                tr(
+                    "{p0}    Weekly    {p1}% → {p2}%",
+                    p0=timestamp,
+                    p1=event.previous_weekly_remaining,
+                    p2=event.current_weekly_remaining,
+                )
             )
 
     def _export_csv(self) -> None:
         path_text, _selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Export Usage History",
+            tr("Export Usage History"),
             "usage-history.csv",
-            "CSV files (*.csv)",
+            tr("CSV files (*.csv)"),
+            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path_text:
             return
         start = self.start_edit.dateTime().toSecsSinceEpoch()
         end = self.end_edit.dateTime().toSecsSinceEpoch()
         if start > end:
-            self.range_error_label.setText("Start must be earlier than or equal to End.")
+            self.range_error_label.setText(tr("Start must be earlier than or equal to End."))
             self.range_error_label.setVisible(True)
             return
         try:
@@ -739,7 +752,9 @@ class UsageHistoryWindow(QMainWindow):
                 database_path=self._database_path,
             )
         except (OSError, sqlite3.Error) as exc:
-            QMessageBox.warning(self, "Export failed", f"Could not export usage history: {exc}")
+            QMessageBox.warning(
+                self, tr("Export failed"), tr("Could not export usage history: {p0}", p0=exc)
+            )
 
     def _restore_geometry(self) -> None:
         self.resize(1_040, 700)

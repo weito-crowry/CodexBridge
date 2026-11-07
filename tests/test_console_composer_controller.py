@@ -355,7 +355,7 @@ def test_created_thread_is_selected_only_after_list_contains_it_and_draft_stays_
 
     assert window._selected_thread_id is None
     assert widget.is_new_draft
-    assert "一覧で確認できません" in widget.status_label.text()
+    assert "Thread not found in the list" in widget.status_label.text()
     assert window.refreshes == 1
 
     window.thread_pane.set_threads(
@@ -438,7 +438,7 @@ def test_unavailable_bridge_disables_send_and_unknown_result_keeps_prompt(tmp_pa
     client.fail(key, "http_409")
 
     assert widget.prompt_text == "preserve this prompt"
-    assert "結果" in widget.status_label.text()
+    assert "result" in widget.status_label.text()
     assert not widget.send_button.isEnabled()
     assert len(client.post_calls) == 1
     assert (
@@ -504,7 +504,7 @@ def test_stop_uses_status_confirmed_thread_turn_and_waits_for_status_after_succe
 
     assert not widget.stop_button.isHidden()
     assert not widget.stop_button.isEnabled()
-    assert "状態を確認" in widget.status_label.text()
+    assert "Checking turn status" in widget.status_label.text()
     assert any("thread-a/status" in call[0] for call in client.get_json_calls)
 
     client.json_succeeded.emit(
@@ -635,7 +635,7 @@ def test_late_turn_a_completion_does_not_replace_running_turn_b(
     assert controller._current_state == ("completed", "turn-b", False)
     assert controller._stop_target is None
     assert widget.stop_button.isHidden()
-    assert "終了を確認" in widget.status_label.text()
+    assert "Turn has ended" in widget.status_label.text()
 
 
 @pytest.mark.parametrize(

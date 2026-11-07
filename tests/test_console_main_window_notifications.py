@@ -50,6 +50,8 @@ def _window(
     settings: QSettings | None = None,
     tray: FakeTray | None = None,
 ) -> MainWindow:
+    if settings is not None:
+        settings.setValue("language", "en")
     return MainWindow(
         _config(),
         api_client=client,
@@ -182,7 +184,7 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
 
     assert window._thread_turn_statuses["thread-b"] == "in_progress"
     running_section = window.thread_pane.list_widget.topLevelItem(0)
-    assert running_section.text(0) == "現在処理中"
+    assert running_section.text(0) == "Currently running"
     assert running_section.child(0).child(0).data(0, Qt.ItemDataRole.UserRole) == "thread-b"
     thread_b = next(
         child
@@ -247,7 +249,7 @@ def test_failed_and_interrupted_turns_leave_the_running_aggregate() -> None:
                 "details": {},
             },
         )
-        assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "現在処理中"
+        assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "Currently running"
         client.global_activity(
             generation,
             {

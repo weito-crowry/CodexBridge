@@ -5,6 +5,8 @@ from collections.abc import Callable
 from PySide6.QtCore import QSize, QTimer
 from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
+from .i18n import tr
+
 
 def _safe_text(value: object, limit: int | None = 16_384) -> str:
     return value[:limit] if isinstance(value, str) else ""
@@ -52,9 +54,9 @@ class CopyMessageButton(QPushButton):
     def _reset_feedback(self) -> None:
         self._reset_timer.stop()
         self._feedback_size = None
-        self.setText(self.tr("Copy"))
-        self.setAccessibleName(self.tr("Copy"))
-        self.setToolTip(self.tr("Copy message"))
+        self.setText(self.tr(tr("Copy")))
+        self.setAccessibleName(self.tr(tr("Copy")))
+        self.setToolTip(self.tr(tr("Copy message")))
 
     def _copy(self) -> None:
         try:
@@ -67,6 +69,6 @@ class CopyMessageButton(QPushButton):
         if self._feedback_size is None:
             self._feedback_size = super().sizeHint()
         self.setText("✓")
-        self.setAccessibleName(self.tr("Copied"))
-        self.setToolTip(self.tr("Copied"))
+        self.setAccessibleName(self.tr(tr("Copied")))
+        self.setToolTip(self.tr(tr("Copied")))
         self._reset_timer.start()

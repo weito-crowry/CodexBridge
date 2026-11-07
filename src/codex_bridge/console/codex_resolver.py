@@ -18,6 +18,7 @@ from ..codex_resolver import (
 from ..codex_resolver import (
     enumerate_candidates as _enumerate_candidates,
 )
+from .i18n import tr
 
 _MAX_PROBE_OUTPUT = 4 * 1024
 _VERSION_PATTERN = re.compile(r"^codex-cli\s+(\S+)$")
@@ -53,14 +54,14 @@ def parse_codex_version(output: bytes) -> str:
     """Parse one bounded `codex-cli <version>` line without exposing raw output."""
 
     if len(output) > _MAX_PROBE_OUTPUT:
-        raise ValueError("Codex version output is too large")
+        raise ValueError(tr("Codex version output is too large"))
     try:
         text = output.decode("utf-8").strip()
     except UnicodeDecodeError as exc:
-        raise ValueError("Codex version output is invalid") from exc
+        raise ValueError(tr("Codex version output is invalid")) from exc
     match = _VERSION_PATTERN.fullmatch(text)
     if match is None:
-        raise ValueError("Codex version output is invalid")
+        raise ValueError(tr("Codex version output is invalid"))
     return match.group(1)
 
 
@@ -225,4 +226,4 @@ class CodexVersionProbe(QObject):
 
     def _fail(self) -> None:
         self._finished = True
-        self.failed.emit("Codex version could not be verified")
+        self.failed.emit(tr("Codex version could not be verified"))

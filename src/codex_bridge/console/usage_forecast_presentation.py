@@ -4,17 +4,20 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from .i18n import tr
 from .usage import UsageWindow
 from .usage_forecast import ForecastStatus, UsageForecast
 
 _REASON_TEXT = {
-    ForecastStatus.INSUFFICIENT_DATA: "データ不足（異なる分の観測が3点必要）",
-    ForecastStatus.SHORT_OBSERVATION: "観測時間が短い（15分以上必要）",
-    ForecastStatus.MISSING_DATA: "欠損値後のデータ不足",
-    ForecastStatus.STALE_DATA: "最新の観測が古い（5分超）",
-    ForecastStatus.FLAT: "残量が横ばい",
-    ForecastStatus.REMAINING_INCREASED: "残量増加後のデータ不足",
-    ForecastStatus.RESET_BOUNDARY: "リセット後のデータ不足",
+    ForecastStatus.INSUFFICIENT_DATA: (
+        "Insufficient data (3 observations in different minutes required)"
+    ),
+    ForecastStatus.SHORT_OBSERVATION: "Short observation period (at least 15 minutes required)",
+    ForecastStatus.MISSING_DATA: "Insufficient data after a missing value",
+    ForecastStatus.STALE_DATA: "Latest observation is stale (over 5 minutes)",
+    ForecastStatus.FLAT: "Remaining quota is flat",
+    ForecastStatus.REMAINING_INCREASED: "Insufficient data after a quota increase",
+    ForecastStatus.RESET_BOUNDARY: "Insufficient data after reset",
 }
 
 
@@ -29,34 +32,46 @@ def reset_epoch(window: UsageWindow | None) -> float | None:
 
 
 def format_usage_forecast(forecast: UsageForecast, *, label: str, lookback_hours: int) -> str:
-    remaining = "不明" if forecast.remaining_percent is None else f"{forecast.remaining_percent}%"
+    remaining = (
+        tr("Unknown") if forecast.remaining_percent is None else f"{forecast.remaining_percent}%"
+    )
     observed = (
-        "不明"
+        tr("Unknown")
         if forecast.observed_at_epoch is None
         else datetime.fromtimestamp(forecast.observed_at_epoch).strftime("%Y/%m/%d %H:%M")
     )
     reset = (
-        "不明"
+        tr("Unknown")
         if forecast.next_reset_epoch is None
         else datetime.fromtimestamp(forecast.next_reset_epoch).strftime("%Y/%m/%d %H:%M")
     )
-    parts = [f"{label}: 残量 {remaining}（観測 {observed}）"]
+    parts = [tr("{p0}: remaining {p1} (observed {p2})", p0=label, p1=remaining, p2=observed)]
     if forecast.rate_points_per_hour is not None:
         rate = forecast.rate_points_per_hour
-        rate_text = "0.1未満" if rate < 0.1 else f"{rate:.1f}"
-        parts.append(f"直近{lookback_hours}時間の減少 約{rate_text}pt/h")
+        rate_text = tr("below 0.1") if rate < 0.1 else f"{rate:.1f}"
+        parts.append(
+            tr("Decrease over the last {p0} hours: about {p1}pt/h", p0=lookback_hours, p1=rate_text)
+        )
     if forecast.status == ForecastStatus.EMPTY:
-        parts.append("残量0%")
+        parts.append(tr("0% remaining"))
     elif forecast.status == ForecastStatus.RESET_BEFORE_EXHAUSTION:
-        parts.append("次回リセットまでの枯渇は予測されない")
+        parts.append(tr("No exhaustion predicted before the next reset"))
     elif forecast.hours_remaining is not None and forecast.exhaustion_epoch is not None:
         # Minute-resolution, integer percentages do not justify precise seconds.
         minutes = max(0, round(forecast.hours_remaining * 60 / 5) * 5)
-        parts.append(f"推定残り（観測時点から）約{minutes // 60}時間{minutes % 60:02d}分")
+        parts.append(
+            tr(
+                "Estimated time remaining from observation: about {p0}h {p1:02d}m",
+                p0=minutes // 60,
+                p1=minutes % 60,
+            )
+        )
         exhaustion = datetime.fromtimestamp(round(forecast.exhaustion_epoch / 300) * 300)
-        parts.append(f"推定枯渇 {exhaustion:%Y/%m/%d %H:%M}頃")
+        parts.append(tr("Estimated exhaustion around {p0:%Y/%m/%d %H:%M}", p0=exhaustion))
     else:
-        parts.append(f"算出不可: {_REASON_TEXT[forecast.status]}")
-    parts.append(f"次回リセット {reset}")
-    parts.append(f"参考推定: 直近{lookback_hours}時間のペースが継続した場合")
+        parts.append(tr("Unavailable: {p0}", p0=tr(_REASON_TEXT[forecast.status])))
+    parts.append(tr("Next reset {p0}", p0=reset))
+    parts.append(
+        tr("Reference estimate: if the pace over the last {p0} hours continues", p0=lookback_hours)
+    )
     return " / ".join(parts)

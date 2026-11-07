@@ -83,9 +83,9 @@ def test_thread_list_uses_names_only_and_preserves_thread_identity() -> None:
 
     assert [item.text(0) for item in _thread_items(pane)] == [
         "Named thread",
-        "New スレッド",
-        "New スレッド",
-        "New スレッド",
+        "New thread",
+        "New thread",
+        "New thread",
     ]
     assert all("Preview text" not in item.text(0) for item in _thread_items(pane))
     for index, thread_id in enumerate(("named", "missing", "empty", "invalid")):
@@ -335,7 +335,7 @@ def test_managed_runtime_statuses_override_external_estimates_without_originator
         )
 
     running_section = pane.list_widget.topLevelItem(0)
-    assert running_section.text(0) == "現在処理中"
+    assert running_section.text(0) == "Currently running"
     running_ids: list[str] = []
 
     def collect_running_ids(item: QTreeWidgetItem) -> None:
@@ -350,7 +350,7 @@ def test_managed_runtime_statuses_override_external_estimates_without_originator
 
     not_loaded = _thread_item(pane, "not-loaded")
     assert _icon_contains_color(not_loaded, QColor("#d93025"))
-    assert not_loaded.toolTip(0) == "not-loaded\n推定実行中"
+    assert not_loaded.toolTip(0) == "not-loaded\nLikely running"
 
 
 def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp_path) -> None:
@@ -391,7 +391,7 @@ def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp
     waiting = _thread_item(pane, "waiting")
     idle = _thread_item(pane, "idle")
     running = pane.list_widget.topLevelItem(0)
-    assert running.text(0) == "現在処理中"
+    assert running.text(0) == "Currently running"
     assert pane.thread_count == 5
     assert managed.text(0) == "Managed"
     assert not managed.icon(0).isNull()
@@ -402,7 +402,7 @@ def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp
     assert not external.icon(0).isNull()
     assert _icon_contains_color(external, QColor("#d93025"))
     assert external.foreground(0).color() == QColor("#d93025")
-    assert external.toolTip(0) == "shared\n推定実行中"
+    assert external.toolTip(0) == "shared\nLikely running"
     for external_copy in [
         item for item in _thread_items(pane) if item.data(0, Qt.ItemDataRole.UserRole) == "shared"
     ]:
@@ -410,7 +410,7 @@ def test_external_running_threads_overlay_without_replacing_managed_statuses(tmp
         assert not external_copy.icon(0).isNull()
         assert _icon_contains_color(external_copy, QColor("#d93025"))
         assert external_copy.foreground(0).color() == QColor("#d93025")
-        assert external_copy.toolTip(0) == "shared\n推定実行中"
+        assert external_copy.toolTip(0) == "shared\nLikely running"
     assert omitted.text(0) == "outside-api-limit"
     assert not omitted.icon(0).isNull()
     assert _icon_contains_color(omitted, QColor("#d93025"))
@@ -487,7 +487,7 @@ def test_thread_status_refresh_preserves_selection_groups_expansion_rows_and_scr
     assert not pane.list_widget.topLevelItem(0).isExpanded()
     assert pane.list_widget.topLevelItem(1).childCount() == 20
     assert scroll.value() == previous_scroll
-    assert _thread_item(pane, "second-10").text(0) == "\u23f8 New スレッド"
+    assert _thread_item(pane, "second-10").text(0) == "⏸ New thread"
     pane.close()
 
 
@@ -553,7 +553,7 @@ def test_running_threads_are_aggregated_by_project_and_remain_in_project_lists(
     )
 
     running = pane.list_widget.topLevelItem(0)
-    assert running.text(0) == "現在処理中"
+    assert running.text(0) == "Currently running"
     assert [running.child(index).text(0) for index in range(running.childCount())] == [
         "first-project",
         "second-project",
@@ -600,7 +600,7 @@ def test_running_copy_selection_is_preserved_and_terminal_state_removes_only_agg
     pane.list_widget.itemClicked.emit(running_item, 0)
     assert selected == ["running"]
     assert pane.list_widget.currentItem().data(0, Qt.ItemDataRole.UserRole) == "running"
-    assert pane.list_widget.currentItem().parent().parent().text(0) == "現在処理中"
+    assert pane.list_widget.currentItem().parent().parent().text(0) == "Currently running"
 
     pane.list_widget.setCurrentItem(project_item)
     pane.list_widget.itemClicked.emit(project_item, 0)
@@ -684,7 +684,7 @@ def test_running_project_collapse_survives_status_refresh_and_other_project_chan
     running_section = pane.list_widget.topLevelItem(0)
     first_running = running_section.child(0)
     second_running = running_section.child(1)
-    assert running_section.text(0) == "現在処理中"
+    assert running_section.text(0) == "Currently running"
     assert first_running.isExpanded()
     assert second_running.isExpanded()
 
@@ -883,7 +883,7 @@ def test_collapsed_groups_stay_collapsed_across_refresh_and_active_rerender(tmp_
     pane.set_active_thread_ids({"b"})
     assert not pane.list_widget.topLevelItem(0).isExpanded()
     active = _thread_item(pane, "b")
-    assert active.text(0) == "New スレッド"
+    assert active.text(0) == "New thread"
     assert not active.icon(0).isNull()
     pane.list_widget.topLevelItem(0).setExpanded(True)
     assert pane.list_widget.topLevelItem(0).isExpanded()

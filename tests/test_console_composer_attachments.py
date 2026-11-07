@@ -176,8 +176,8 @@ def test_allowed_root_selection_rejects_oversized_file_and_keeps_existing_draft(
 
     assert widget.attachments == (str(existing.resolve()),)
     assert widget.prompt_text == "keep this draft"
-    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
-    assert notices[-1] == "その他の添付は50 MiB以下にしてください"
+    assert widget.status_label.text() == "Other attachments must be 50 MiB or smaller"
+    assert notices[-1] == "Other attachments must be 50 MiB or smaller"
 
 
 def test_external_oversized_file_is_rejected_before_staging(tmp_path: Path, monkeypatch) -> None:
@@ -194,8 +194,8 @@ def test_external_oversized_file_is_rejected_before_staging(tmp_path: Path, monk
     widget.add_attachments([str(external)])
 
     assert widget.attachments == ()
-    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
-    assert notices[-1] == "その他の添付は50 MiB以下にしてください"
+    assert widget.status_label.text() == "Other attachments must be 50 MiB or smaller"
+    assert notices[-1] == "Other attachments must be 50 MiB or smaller"
     assert not (allowed / ".codexbridge-staging").exists()
     assert external.read_bytes() == b"1234"
 
@@ -222,7 +222,7 @@ def test_external_copy_success_does_not_hide_another_candidate_size_error(
     assert Path(widget.attachments[0]).name == valid.name
     assert (staging / valid.name).read_bytes() == b"123"
     assert not (staging / oversized.name).exists()
-    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
+    assert widget.status_label.text() == "Other attachments must be 50 MiB or smaller"
 
 
 @pytest.mark.parametrize("suffix", [".png", ".jpg", ".jpeg"])
@@ -249,8 +249,8 @@ def test_image_size_limit_is_inclusive_in_both_locations(
 
     assert len(widget.attachments) == 1
     assert Path(widget.attachments[0]).name == accepted.name
-    assert widget.status_label.text() == "画像添付は20 MiB以下にしてください"
-    assert notices[-1] == "画像添付は20 MiB以下にしてください"
+    assert widget.status_label.text() == "Images must be 20 MiB or smaller"
+    assert notices[-1] == "Images must be 20 MiB or smaller"
     if external:
         assert not (allowed / ".codexbridge-staging" / rejected.name).exists()
 
@@ -278,8 +278,8 @@ def test_other_file_size_limit_is_inclusive_in_both_locations(
 
     assert len(widget.attachments) == 1
     assert Path(widget.attachments[0]).name == accepted.name
-    assert widget.status_label.text() == "その他の添付は50 MiB以下にしてください"
-    assert notices[-1] == "その他の添付は50 MiB以下にしてください"
+    assert widget.status_label.text() == "Other attachments must be 50 MiB or smaller"
+    assert notices[-1] == "Other attachments must be 50 MiB or smaller"
     if external:
         assert not (allowed / ".codexbridge-staging" / rejected.name).exists()
 
@@ -315,7 +315,7 @@ def test_aggregate_size_limit_includes_existing_and_same_batch_candidates(
 
     assert widget.attachments == tuple(expected)
     assert widget.prompt_text == "preserve draft"
-    assert widget.status_label.text() == "添付ファイルの合計は100 MiB以下にしてください"
+    assert widget.status_label.text() == "Total attachment size must be 100 MiB or smaller"
 
 
 def test_allowed_root_batch_keeps_valid_candidate_when_later_file_exceeds_total(
@@ -339,8 +339,8 @@ def test_allowed_root_batch_keeps_valid_candidate_when_later_file_exceeds_total(
 
     assert widget.attachments == (str(valid.resolve()),)
     assert widget.prompt_text == "draft stays"
-    assert widget.status_label.text() == "添付ファイルの合計は100 MiB以下にしてください"
-    assert notices[-1] == "添付ファイルの合計は100 MiB以下にしてください"
+    assert widget.status_label.text() == "Total attachment size must be 100 MiB or smaller"
+    assert notices[-1] == "Total attachment size must be 100 MiB or smaller"
 
 
 def test_external_staging_enforces_aggregate_attachment_size(tmp_path: Path, monkeypatch) -> None:
@@ -417,7 +417,7 @@ def test_file_selection_rejects_missing_directories_duplicates_and_extra_files(
     )
 
     assert widget.attachments == tuple(str(path.resolve()) for path in files[:8])
-    assert "8" in widget.status_label.text() or "上限" in widget.status_label.text()
+    assert "8" in widget.status_label.text() or "up to" in widget.status_label.text()
     assert all(path.exists() for path in files)
 
 
@@ -613,5 +613,5 @@ def test_out_of_root_attachment_failure_shows_specific_guidance_and_keeps_draft(
 
     assert widget.prompt_text == "keep this"
     assert widget.attachments == (str(allowed / ".codexbridge-staging" / path.name),)
-    assert "許可されたフォルダー内" in widget.status_label.text()
+    assert "inside an allowed folder" in widget.status_label.text()
     assert "outside.txt" not in widget.status_label.text()
