@@ -69,7 +69,6 @@ from .history_requests import (
     HistoryRequestCoordinator,
 )
 from .history_stream import (
-    TERMINAL_TURN_STATES,
     HistoryStreamContext,
     HistoryStreamCoordinator,
 )
@@ -80,9 +79,15 @@ from .notification_controller import NotificationController, NotificationSetting
 from .project_folder_actions import ProjectFolderActionsController
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
-from .runtime_ui import RuntimeUiPresenter
+from .runtime_ui import _RUNTIME_LABELS, RuntimeUiPresenter
 from .settings_actions import SettingsActionController
 from .thread_interactions import ThreadInteractionController
+from .thread_state_observations import (
+    classify_activity_thread_status,
+)
+from .thread_state_observations import (
+    observe_runtime_thread_status as _runtime_thread_status_observation,
+)
 from .timer_bootstrap import build_console_timers
 from .tray_controller import TrayController
 from .tunnel_resolver import TunnelResolutionError
@@ -110,45 +115,6 @@ from .widgets import (
 )
 
 _EXIT_TIMEOUT_SECONDS = 12.0
-
-
-def _runtime_thread_status_observation(thread: Mapping[str, object]) -> tuple[bool, str | None]:
-    status = thread.get("runtime_status")
-    if not isinstance(status, Mapping):
-        return False, None
-    status_type = status.get("type")
-    if not isinstance(status_type, str):
-        return False, None
-    if status_type in {"notLoaded", "idle", "systemError"}:
-        return True, None
-    if status_type != "active":
-        return False, None
-    active_flags = status.get("active_flags")
-    if not isinstance(active_flags, list) or any(
-        not isinstance(flag, str) for flag in active_flags
-    ):
-        return False, None
-    if not active_flags:
-        return True, "in_progress"
-    if active_flags == ["waitingOnApproval"]:
-        return True, "needs_approval"
-    if active_flags == ["waitingOnUserInput"]:
-        return True, "needs_input"
-    return True, "waiting"
-
-
-_RUNTIME_LABELS = {
-    "unavailable": "Runtime: unavailable",
-    "external": "Runtime: external",
-    "launching": "Runtime: launching",
-    "launch_failed": "Runtime: launch failed",
-    "launch_timed_out": "Runtime: launch timed out",
-    "stopping": "Runtime: stopping",
-    "restarting": "Runtime: restarting",
-    "stopped": "Runtime: stopped",
-    "control_failed": "Runtime: control failed",
-    "stop_timed_out": "Runtime: stop timed out",
-}
 
 
 class MainWindow(QMainWindow):
@@ -740,23 +706,11 @@ class MainWindow(QMainWindow):
         self._notification_controller.handle_activity(payload)
 
     def _update_thread_status_from_activity(self, payload: object) -> None:
-        if not isinstance(payload, Mapping):
+        observation = classify_activity_thread_status(payload)
+        if observation is None:
             return
-        thread_id = payload.get("thread_id")
-        activity_type = payload.get("type")
-        status = payload.get("status")
-        if not isinstance(thread_id, str) or not isinstance(activity_type, str):
-            return
-        if activity_type == "approval_requested" and status == "requested":
-            self._update_thread_activity(thread_id, "needs_approval")
-        elif activity_type == "user_input_requested" and status == "requested":
-            self._update_thread_activity(thread_id, "needs_input")
-        elif activity_type == "turn_started" and status in ACTIVE_TURN_STATES:
-            self._update_thread_activity(thread_id, status)
-        elif activity_type in {"turn_completed", "turn_failed", "turn_interrupted", "error"} and (
-            status in TERMINAL_TURN_STATES
-        ):
-            self._update_thread_activity(thread_id, status)
+        thread_id, status = observation
+        self._update_thread_activity(thread_id, status)
 
     def _apply_global_stream_state(self, generation: int, state: str) -> None:
         if generation != self._global_stream_generation:

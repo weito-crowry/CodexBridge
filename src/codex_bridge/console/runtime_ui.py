@@ -8,6 +8,20 @@ if TYPE_CHECKING:
     from .main_window import MainWindow
 
 
+_RUNTIME_LABELS = {
+    "unavailable": "Runtime: unavailable",
+    "external": "Runtime: external",
+    "launching": "Runtime: launching",
+    "launch_failed": "Runtime: launch failed",
+    "launch_timed_out": "Runtime: launch timed out",
+    "stopping": "Runtime: stopping",
+    "restarting": "Runtime: restarting",
+    "stopped": "Runtime: stopped",
+    "control_failed": "Runtime: control failed",
+    "stop_timed_out": "Runtime: stop timed out",
+}
+
+
 class RuntimeUiPresenter:
     def __init__(self, window: MainWindow) -> None:
         self._window = window

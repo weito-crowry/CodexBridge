@@ -366,7 +366,7 @@ def test_display_maps_and_configuration_templates_have_catalog_entries():
     root = Path(i18n.__file__).parent
     catalog = json.loads((root / "locales" / "ja-JP.json").read_text(encoding="utf-8"))
     for filename, name in [
-        ("main_window.py", "_RUNTIME_LABELS"),
+        ("runtime_ui.py", "_RUNTIME_LABELS"),
         ("tunnel_supervisor.py", "_STATE_LABELS"),
         ("conversation_widgets.py", "_STATUS_LABELS"),
         ("usage_forecast_presentation.py", "_REASON_TEXT"),
