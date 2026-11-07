@@ -118,6 +118,8 @@ class NotificationController:
         )
 
         if activity_type in {"turn_completed", "turn_failed", "turn_interrupted"}:
+            if details.get("reason") == "connection_lost":
+                return False
             expected_status = {
                 "turn_completed": "completed",
                 "turn_failed": "failed",
@@ -135,7 +137,7 @@ class NotificationController:
                 "turn_failed": tr("Turn failed"),
                 "turn_interrupted": tr("Turn interrupted"),
             }[activity_type]
-            return self._notify(("turn", thread_id, turn_id, activity_type), title, body)
+            return self._notify(("turn", thread_id, turn_id), title, body)
 
         request_types = {
             "approval_requested": ("notifications/approval_enabled", tr("Approval required")),

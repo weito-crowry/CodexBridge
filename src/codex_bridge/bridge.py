@@ -861,6 +861,7 @@ class Bridge:
                 type="turn_failed",
                 status="failed",
                 summary=error_summary or "App Server failure",
+                details={"reason": "connection_lost"},
             )
             self._record_activity(
                 thread_id=thread_id,

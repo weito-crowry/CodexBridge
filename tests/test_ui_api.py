@@ -460,6 +460,35 @@ async def test_sse_thread_filter_only_delivers_selected_thread(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_sse_subscribe_does_not_replay_historical_notification_activities(tmp_path) -> None:
+    bridge = FakeBridge()
+    activities = ActivityStore()
+    activities.add(
+        thread_id="thread-1", turn_id="old-turn", type="turn_completed", status="completed"
+    )
+    activities.add(
+        thread_id="thread-1",
+        turn_id="old-turn",
+        type="approval_requested",
+        status="requested",
+        details={"request_id": "old-request"},
+    )
+    app = create_ui_app(bridge, activities, config(tmp_path))
+    response = await _route(app, "/ui-api/events").endpoint(_request("/ui-api/events"))
+    next_chunk = asyncio.create_task(response.body_iterator.__anext__())
+    await asyncio.sleep(0)
+    activities.add(
+        thread_id="thread-2", turn_id="live-turn", type="turn_completed", status="completed"
+    )
+    chunk = await asyncio.wait_for(next_chunk, timeout=0.1)
+    await response.body_iterator.aclose()
+
+    assert b"live-turn" in chunk
+    assert b"old-turn" not in chunk
+    assert b"old-request" not in chunk
+
+
+@pytest.mark.asyncio
 async def test_ui_status_reports_failed_app_server_without_diagnostics(tmp_path) -> None:
     bridge = FakeBridge()
     bridge.app_server_ready = False
