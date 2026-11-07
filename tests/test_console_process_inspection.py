@@ -873,9 +873,14 @@ def test_root_candidate_probe_limit_never_claims_a_unique_match() -> None:
     assert sum(pid != 220132 for pid in psutil.process_calls) <= 100
 
 
-def test_absolute_powershell_path_and_quoting_are_matched() -> None:
+@pytest.mark.parametrize("executable", [_POWERSHELL_EXE, r"C:\Windows\System32\pwsh.exe"])
+def test_absolute_powershell_path_and_quoting_are_matched(executable: str) -> None:
     psutil = _anchored_processes()
-    summary = f'"{_POWERSHELL_EXE}" -NoProfile -Command "{_POWERSHELL_SCRIPT}"'
+    shell = psutil.processes[197728]
+    assert isinstance(shell, _Process)
+    shell.exe_value = executable
+    shell.cmdline_value = [executable, "-NoProfile", "-Command", _POWERSHELL_SCRIPT]
+    summary = f'"{executable}" -NoProfile -Command "{_POWERSHELL_SCRIPT}"'
 
     result = inspect_command_processes(
         (_command("65448", summary=summary),),
@@ -888,6 +893,22 @@ def test_absolute_powershell_path_and_quoting_are_matched() -> None:
     assert result.commands[0].root_status == "Running"
     assert result.commands[0].root is not None
     assert result.commands[0].root.pid == 197728
+
+
+def test_absolute_command_path_with_matching_basename_but_wrong_directory_is_not_linked() -> None:
+    psutil = _anchored_processes()
+    summary = f'"C:\\Unrelated\\pwsh.exe" -NoProfile -Command "{_POWERSHELL_SCRIPT}"'
+
+    result = inspect_command_processes(
+        (_command("65448", summary=summary),),
+        ProcessEvidence(app_server_os_pid=220132),
+        psutil_module=psutil,
+        platform_name="win32",
+        observed_at=1_001.0,
+    )
+
+    assert result.commands[0].root_status == "Unverified: no matching Codex child"
+    assert result.commands[0].root is None
 
 
 def test_candidate_access_denied_or_gone_is_unverified_not_exited() -> None:

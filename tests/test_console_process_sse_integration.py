@@ -4,6 +4,7 @@ import json
 import time
 from typing import Any
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from codex_bridge.activity import Activity
@@ -69,7 +70,13 @@ def _wait(application: QApplication, predicate: object, timeout: float = 2.0) ->
     return bool(check())
 
 
-def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
+@pytest.mark.parametrize(
+    ("terminal_status", "exit_code", "output_label"),
+    [("completed", 0, "Success"), ("failed", 7, "Failed"), ("interrupted", 1, "Interrupted")],
+)
+def test_sse_command_item_id_reaches_live_process_monitor_and_output(
+    terminal_status: str, exit_code: int, output_label: str
+) -> None:
     application = _application()
     inspected: list[tuple[Any, ...]] = []
 
@@ -143,9 +150,9 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
             "live-second-complete",
             second_item_id,
             "command_completed",
-            "completed",
+            terminal_status,
             "Second live PowerShell command",
-            {"process_id": "8648", "exit_code": 0, "completed_at_ms": 1_792_670_580_000},
+            {"process_id": "8648", "exit_code": exit_code, "completed_at_ms": 1_792_670_580_000},
         )
     )
     pane.append_activity(complete)
@@ -159,7 +166,7 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
             and command.key.turn_id == "turn-73"
             and command.key.item_id == second_item_id
             and command.app_server_process_id == "8648"
-            and command.exit_code == 0
+            and command.exit_code == exit_code
             for batch in inspected
             for command in batch
         )
@@ -173,7 +180,10 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
             ),
             "",
         )
-        return "Command status: completed · exit 0" in second_command_block.splitlines()
+        return (
+            f"Command status: {terminal_status} · exit {exit_code}"
+            in second_command_block.splitlines()
+        )
 
     assert _wait(
         application,
@@ -189,13 +199,13 @@ def test_sse_command_item_id_reaches_live_process_monitor_and_output() -> None:
         and command.key.thread_id == "thread-73"
         and command.key.turn_id == "turn-73"
         and command.app_server_process_id == "8648"
-        and command.exit_code == 0
+        and command.exit_code == exit_code
         for batch in inspected
         for command in batch
     )
     output_panel = pane.command_output.panels[("thread-73", "turn-73", second_item_id)]
     assert "Second live PowerShell command" in output_panel.metadata_label.text()
-    assert "Success" in output_panel.toggle_button.text()
+    assert output_label in output_panel.toggle_button.text()
     output_panel.toggle_button.click()
     assert "App Server process id: 8648" in output_panel.metadata_label.text()
     assert output_panel.output_text.toPlainText() == "LIVE_24 output line\n"

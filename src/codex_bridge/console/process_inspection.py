@@ -710,7 +710,9 @@ def _may_be_command_shell(summary: str, process_name: str | None) -> bool:
     token, _remainder = _split_command_prefix(summary)
     name = ntpath.basename(process_name).casefold()
     if _explicit_executable_token(token):
-        return _executable_token_matches(token, process_name)
+        # Enumeration provides only a name here. Validate the full path later,
+        # once the candidate's executable and argv have been read.
+        return _executable_token_matches(ntpath.basename(token), name)
     return name in {
         "pwsh.exe",
         "powershell.exe",
