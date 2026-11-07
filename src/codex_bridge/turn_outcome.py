@@ -114,6 +114,7 @@ def read_rollout_outcome(path: object) -> dict[str, Any] | None:
         "turn_failed": "failed",
     }
     latest_turn_id: str | None = None
+    anonymous_start = False
     try:
         with Path(path).open("rb") as stream:
             for line in stream:
@@ -133,10 +134,19 @@ def read_rollout_outcome(path: object) -> dict[str, Any] | None:
                 turn_id = _event_turn_id(payload, record)
                 kind = payload["type"]
                 is_start = kind in {"task_started", "turn_started"}
+                if is_start and turn_id is None:
+                    latest_turn_id = None
+                    anonymous_start = True
+                    latest = observation(None, "in_progress", observed_at=record.get("timestamp"))
+                    continue
+                if is_start:
+                    anonymous_start = False
                 if turn_id is None and not is_start:
-                    if latest_turn_id is None:
+                    if latest_turn_id is None or anonymous_start:
                         continue
                     turn_id = latest_turn_id
+                if anonymous_start and not is_start:
+                    continue
                 # A delayed terminal for an older turn must not replace the newest start.
                 if not is_start and latest_turn_id is not None and turn_id != latest_turn_id:
                     continue

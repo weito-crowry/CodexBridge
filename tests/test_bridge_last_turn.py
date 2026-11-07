@@ -346,6 +346,68 @@ def test_rollout_ignores_idless_terminal_after_idless_start(tmp_path):
     assert result["reason"] == "unconfirmed_execution"
 
 
+@pytest.mark.parametrize(
+    ("events", "expected_id", "expected_status"),
+    [
+        (
+            [("turn_started", "A"), ("turn_started", None), ("turn_completed", None)],
+            None,
+            "unknown",
+        ),
+        ([("turn_started", "A"), ("turn_started", None), ("turn_completed", "A")], None, "unknown"),
+        (
+            [
+                ("turn_started", "A"),
+                ("turn_started", None),
+                ("turn_started", "B"),
+                ("turn_completed", "B"),
+            ],
+            "B",
+            "completed",
+        ),
+        (
+            [
+                ("turn_started", "A"),
+                ("turn_started", None),
+                ("turn_started", "B"),
+                ("turn_completed", None),
+            ],
+            "B",
+            "completed",
+        ),
+        ([("turn_completed", "A")], "A", "completed"),
+        ([("turn_completed", None)], None, None),
+        ([("turn_started", None), ("turn_completed", None)], None, "unknown"),
+    ],
+)
+def test_rollout_anonymous_start_invalidates_prior_turn_association(
+    tmp_path, events, expected_id, expected_status
+):
+    from codex_bridge.turn_outcome import read_rollout_outcome
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {"type": event, **({"turn_id": turn_id} if turn_id else {})},
+                }
+            )
+            + "\n"
+            for event, turn_id in events
+        ),
+        encoding="utf-8",
+    )
+
+    result = read_rollout_outcome(str(path))
+
+    assert (result["turn_id"] if result else None) == expected_id
+    assert (result["status"] if result else None) == expected_status
+    if expected_status == "unknown":
+        assert result["reason"] == "unconfirmed_execution"
+
+
 def test_rollout_keeps_explicit_user_stop_distinct_from_abnormal_interruption(tmp_path):
     from codex_bridge.turn_outcome import read_rollout_outcome
 
