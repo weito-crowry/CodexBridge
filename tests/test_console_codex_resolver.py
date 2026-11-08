@@ -472,3 +472,42 @@ def test_version_probe_timeout_aborts_only_probe_process() -> None:
 
     assert process.killed
     assert failures == ["Codex version could not be verified"]
+    assert probe.diagnostic is not None
+    assert probe.diagnostic.reason == "timeout"
+
+
+def test_diagnostic_precedes_failed_and_preserves_last_candidate_failure() -> None:
+    _application()
+    process = FakeProcess()
+    probe = CodexVersionProbe(
+        [CodexCandidate("codex", "path")],
+        platform="win32",
+        process_factory=lambda _parent: process,
+    )
+    events: list[str] = []
+    probe.diagnosticChanged.connect(lambda _diagnostic: events.append("diagnostic"))
+    probe.failed.connect(lambda _message: events.append("failed"))
+
+    probe.start()
+    process.exit_code = 7
+    process.finished.emit(7, 0)
+
+    assert events == ["diagnostic", "failed"]
+    assert probe.diagnostic is not None
+    assert probe.diagnostic.reason == "nonzero_exit"
+    assert probe.diagnostic.exit_code == 7
+    assert probe.diagnostic.candidate_path == "codex"
+
+
+def test_no_candidate_is_distinct_from_candidate_validation_failure() -> None:
+    _application()
+    probe = CodexVersionProbe([])
+    events: list[object] = []
+    probe.diagnosticChanged.connect(events.append)
+    probe.failed.connect(lambda _message: events.append("failed"))
+
+    probe.start()
+
+    assert len(events) == 2
+    assert events[0].reason == "no_candidate"
+    assert events[1] == "failed"

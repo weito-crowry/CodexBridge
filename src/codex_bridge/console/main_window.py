@@ -51,6 +51,7 @@ from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
 from .bridge_transition import BridgeTransitionContext, BridgeTransitionCoordinator
 from .bulk_thread_naming import BulkThreadNamingController
 from .codex_links import open_codex_uri
+from .codex_probe_controller import CodexProbeController
 from .codex_resolver import (
     CodexResolution,
     CodexResolutionError,
@@ -283,6 +284,7 @@ class MainWindow(QMainWindow):
         self._usage_snapshot_store = UsageSnapshotStore(self)
         self._usage_requests = UsageRequestCoordinator(self)
         self._codex_resolution: CodexResolution | None = None
+        self._codex_probe_controller = CodexProbeController(self)
         self._bridge_seen_ready = False
         self._health_observed = False
         self._status_observed = False
@@ -621,8 +623,7 @@ class MainWindow(QMainWindow):
         self.history_pane.older_requested.connect(self.load_older)
 
     def _connect_runtime(self) -> None:
-        self._codex_probe.resolved.connect(self._apply_codex_resolution)
-        self._codex_probe.failed.connect(self._apply_codex_probe_error)
+        self._codex_probe_controller.attach(self._codex_probe)
         self._codex_update_probe.check_succeeded.connect(self._apply_codex_update_check)
         self._codex_update_probe.check_failed.connect(self._apply_codex_update_check_error)
         self._codex_update_probe.update_succeeded.connect(self._apply_codex_update_success)
@@ -851,18 +852,14 @@ class MainWindow(QMainWindow):
         self.codex_status_label.setText(
             tr("Codex: {p0} · {p1}", p0=resolution.version, p1=resolution.source)
         )
+        self.codex_status_label.setToolTip("")
         self._update_start_button()
         self._sync_codex_update_controls()
         self._schedule_codex_update_auto_check()
         self._maybe_auto_start_bridge()
 
     def _apply_codex_probe_error(self, _message: str) -> None:
-        if self._closing:
-            return
-        self._codex_resolution = None
-        self.codex_status_label.setText(tr("Codex: not found"))
-        self._update_start_button()
-        self._sync_codex_update_controls()
+        self._codex_probe_controller.apply_failure()
 
     def _sync_codex_update_controls(self) -> None:
         self._codex_update_controller.sync_codex_update_controls()
@@ -1038,7 +1035,7 @@ class MainWindow(QMainWindow):
         self._bridge_managed_retry_coordinator.maybe_auto_start_bridge()
 
     def _retry_now(self) -> None:
-        self._bridge_lifecycle_controller.retry_now()
+        self._codex_probe_controller.retry_now(self._bridge_lifecycle_controller.retry_now)
 
     def _restart_codexbridge(self) -> None:
         self._restart_bridge()

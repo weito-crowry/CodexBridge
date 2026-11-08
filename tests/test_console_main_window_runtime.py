@@ -125,6 +125,31 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     window.close()
 
 
+def test_retry_now_reprobes_after_initial_codex_failure(monkeypatch) -> None:
+    _application()
+    original = FakeCodexProbe()
+    retry = FakeCodexProbe()
+    client = FakeClient()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=original,
+        tray_available=False,
+    )
+    monkeypatch.setattr(window, "_new_codex_probe", lambda: retry)
+    original.failure()
+    assert window.codex_status_label.text() == "Codex: not found"
+
+    window._retry_now()
+    window._retry_now()
+    original.result(CodexResolution("stale.exe", "0", "path"))
+    retry.result(CodexResolution("fresh.exe", "1.2.3", "path"))
+
+    assert retry.starts == 1
+    assert window.codex_status_label.text() == "Codex: 1.2.3 · path"
+    window.close()
+
+
 def test_managed_config_path_is_passed_to_bridge_launcher() -> None:
     _application()
     config = ConsoleConfig(
