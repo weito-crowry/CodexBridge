@@ -437,6 +437,21 @@ async def test_sse_streams_only_safe_activity_and_closes_subscription(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_sse_stream_ends_when_activity_store_closes_subscriptions(tmp_path) -> None:
+    activities = ActivityStore()
+    app = create_ui_app(FakeBridge(), activities, config(tmp_path))
+    response = await _route(app, "/ui-api/events").endpoint(_request("/ui-api/events"))
+    next_chunk = asyncio.create_task(response.body_iterator.__anext__())
+    await asyncio.sleep(0)
+
+    activities.close_subscriptions()
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(next_chunk, timeout=0.1)
+    assert not activities._subscribers
+
+
+@pytest.mark.asyncio
 async def test_sse_thread_filter_only_delivers_selected_thread(tmp_path) -> None:
     bridge = FakeBridge()
     activities = ActivityStore()

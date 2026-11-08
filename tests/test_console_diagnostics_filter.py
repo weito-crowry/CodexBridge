@@ -29,20 +29,27 @@ def test_filters_keep_hidden_history_and_clear_it() -> None:
     rows = [
         "[Bridge] structured",
         "[Console] console",
-        "[Bridge stdout] out",
-        "[Bridge stderr] err",
+        "[Bridge stdout] 2026-11-09T12:34:56.789+09:00 INFO uvicorn.error out",
+        "[Bridge stderr] 2026-11-09T12:34:57.789+09:00 ERROR uvicorn.error err",
     ]
     window._append_diagnostics_lines(rows)
     assert window.diagnostics_text.toPlainText().splitlines() == rows
 
     window.diagnostics_filter_buttons["stdout"].click()
     assert window.diagnostics_text.toPlainText() == rows[2]
-    window._append_diagnostics_lines(["[Bridge stderr] hidden"])
+    window._append_diagnostics_lines(
+        ["[Bridge stderr] 2026-11-09T12:34:58.789+09:00 WARNING uvicorn.error hidden"]
+    )
     assert window.diagnostics_text.toPlainText() == rows[2]
     window.diagnostics_filter_buttons["stderr"].click()
-    assert window.diagnostics_text.toPlainText().splitlines() == [rows[3], "[Bridge stderr] hidden"]
+    assert window.diagnostics_text.toPlainText().splitlines() == [
+        rows[3],
+        "[Bridge stderr] 2026-11-09T12:34:58.789+09:00 WARNING uvicorn.error hidden",
+    ]
     window.diagnostics_filter_buttons["All"].click()
-    assert window.diagnostics_text.toPlainText().splitlines() == rows + ["[Bridge stderr] hidden"]
+    assert window.diagnostics_text.toPlainText().splitlines() == rows + [
+        "[Bridge stderr] 2026-11-09T12:34:58.789+09:00 WARNING uvicorn.error hidden"
+    ]
 
     window.diagnostics_filter_buttons["stdout"].click()
     window.diagnostics_clear_button.click()
@@ -55,7 +62,7 @@ def test_filters_keep_hidden_history_and_clear_it() -> None:
 
 def test_stderr_colors_only_prefix_and_copy_stays_plain_text() -> None:
     window = _window()
-    row = "[Bridge stderr] message body"
+    row = "[Bridge stderr] 2026-11-09T12:34:56.789+09:00 ERROR uvicorn.error message body"
     window._append_diagnostics_lines([row])
     widget = window.diagnostics_text
     assert widget.toPlainText() == row

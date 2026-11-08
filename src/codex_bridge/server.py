@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from importlib.resources import files as package_files
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
@@ -31,7 +31,7 @@ from .file_tools import FileTools
 from .git_tools import git_diff as run_git_diff
 from .git_tools import git_status as run_git_status
 from .lan_auth import LanMcpAuthMiddleware
-from .logging_utils import log_event
+from .logging_utils import configure_logging, log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
 from .models import ApprovalDecision, ApprovalsReviewer, SandboxMode
@@ -72,13 +72,16 @@ class BridgeRuntime:
         log_event("bridge.start")
 
     async def shutdown(self) -> None:
+        self.activity_store.close_subscriptions()
         if self.external_monitor is not None:
             await self.external_monitor.close()
         await self.bridge.interrupt_active_turns(
             wait_seconds=min(0.5, self.config.shutdown_grace_seconds)
         )
-        await self.ui_server.shutdown(min(0.5, self.config.shutdown_grace_seconds))
-        await self.app_server.shutdown(self.config.shutdown_grace_seconds)
+        try:
+            await self.ui_server.shutdown(self.config.shutdown_grace_seconds)
+        finally:
+            await self.app_server.shutdown(self.config.shutdown_grace_seconds)
         log_event("bridge.shutdown")
 
 
@@ -133,6 +136,7 @@ def build_runtime(
     ui_server = LocalUiServer(
         create_ui_app(bridge, activity_store, config, shutdown_callback=shutdown_callback),
         config.ui_port,
+        graceful_shutdown_timeout=config.shutdown_grace_seconds,
     )
     return BridgeRuntime(
         bridge=bridge,
@@ -844,6 +848,7 @@ def create_app(
 async def run_server(config: BridgeConfig) -> None:
     import uvicorn
 
+    configure_logging()
     config = prepare_config(config)
     controller = UvicornShutdownController()
     app = create_app(config, shutdown_callback=controller.request_shutdown)
@@ -853,6 +858,8 @@ async def run_server(config: BridgeConfig) -> None:
             host=config.host,
             port=config.port,
             proxy_headers=False,
+            timeout_graceful_shutdown=cast(Any, config.shutdown_grace_seconds),
+            log_config=None,
         )
     )
     controller.bind(server)

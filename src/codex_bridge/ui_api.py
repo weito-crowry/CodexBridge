@@ -372,11 +372,13 @@ def create_ui_app(
                             yield f"event: external_threads\ndata: {payload}\n\n".encode()
                     try:
                         activity = await asyncio.wait_for(
-                            subscription.get(), timeout=1.0 if observations else 15.0
+                            subscription.get_or_closed(), timeout=1.0 if observations else 15.0
                         )
                     except TimeoutError:
                         yield b": keepalive\n\n"
                     else:
+                        if activity is None:
+                            return
                         yield _sse_event(activity)
             finally:
                 subscription.close()

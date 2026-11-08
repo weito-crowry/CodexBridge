@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger("codex_bridge")
@@ -36,8 +37,23 @@ _SAFE_FIELDS = {
 _SAFE_CONTROL_REASONS = frozenset({"control_api"})
 
 
+class _IsoTimestampFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        del datefmt
+        return (
+            datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds")
+        )
+
+
 def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    formatter = _IsoTimestampFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    if not root_logger.handlers:
+        root_logger.addHandler(logging.StreamHandler())
+    for handler in root_logger.handlers:
+        handler.setFormatter(formatter)
+    logging.captureWarnings(True)
 
 
 def log_event(event: str, **fields: Any) -> None:

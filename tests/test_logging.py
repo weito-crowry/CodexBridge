@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
+from datetime import datetime
 
 from codex_bridge.logging_utils import log_event, log_thread_started
 
@@ -85,3 +87,35 @@ def test_smoke_requires_explicit_opt_in() -> None:
     )
 
     assert result.returncode == 0
+
+
+def test_configured_python_and_warning_logs_have_actual_iso_timestamps() -> None:
+    code = (
+        "import logging, warnings; "
+        "from codex_bridge.logging_utils import configure_logging; "
+        "configure_logging(); "
+        "logging.getLogger('codex_bridge').error('bridge failure'); "
+        "logging.getLogger('uvicorn.error').error('uvicorn failure'); "
+        "warnings.warn('bridge warning', RuntimeWarning)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    lines = [line for line in result.stderr.splitlines() if line]
+    assert len(lines) == 3
+    assert " ERROR codex_bridge bridge failure" in lines[0]
+    assert " ERROR uvicorn.error uvicorn failure" in lines[1]
+    assert " WARNING py.warnings " in lines[2]
+    for line in lines:
+        timestamp = line.split(" ", maxsplit=1)[0]
+        parsed = datetime.fromisoformat(timestamp)
+        assert parsed.tzinfo is not None
+        assert re.match(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$",
+            timestamp,
+        )

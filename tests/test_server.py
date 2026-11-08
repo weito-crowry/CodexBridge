@@ -8,6 +8,7 @@ from typing import Any
 
 import anyio
 import pytest
+import uvicorn
 from mcp import ClientSession, MCPError, types
 from mcp.server.lowlevel import Server as LowLevelServer
 from mcp.server.mcpserver import Context
@@ -164,6 +165,44 @@ def test_prepare_config_keeps_cli_codex_before_process_environment(tmp_path, mon
     prepared = prepare_config(settings)
 
     assert prepared.codex_executable == str(cli_executable)
+
+
+@pytest.mark.asyncio
+async def test_run_server_uses_configured_graceful_timeout_and_shared_log_format(
+    tmp_path, monkeypatch
+) -> None:
+    settings = config(tmp_path)
+    captured: dict[str, Any] = {}
+
+    class FakeServer:
+        def __init__(self, uvicorn_config: uvicorn.Config) -> None:
+            self.config = uvicorn_config
+            self.should_exit = False
+
+        async def serve(self) -> None:
+            return None
+
+    monkeypatch.setattr(server_module, "prepare_config", lambda value: value)
+    monkeypatch.setattr(
+        server_module,
+        "create_app",
+        lambda _config, shutdown_callback: captured.setdefault("callback", shutdown_callback),
+    )
+    monkeypatch.setattr(server_module, "configure_logging", lambda: None, raising=False)
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    original_init = uvicorn.Config.__init__
+
+    def capture_config(self: uvicorn.Config, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        captured["config"] = self
+
+    monkeypatch.setattr(uvicorn.Config, "__init__", capture_config)
+
+    await server_module.run_server(settings)
+
+    config_used = captured["config"]
+    assert config_used.timeout_graceful_shutdown == settings.shutdown_grace_seconds
+    assert config_used.log_config is None
 
 
 def test_server_registers_nineteen_native_tools_plus_local_probe_tools(tmp_path) -> None:

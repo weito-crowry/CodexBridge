@@ -70,12 +70,20 @@ class ActivitySubscription:
     def __init__(self, store: ActivityStore, thread_id: str | None) -> None:
         self._store = store
         self._thread_id = thread_id
-        self._queue: asyncio.Queue[Activity] = asyncio.Queue(maxsize=100)
+        self._queue: asyncio.Queue[Activity | None] = asyncio.Queue(maxsize=100)
         self._closed = False
 
     async def get(self) -> Activity:
         if self._closed:
             raise RuntimeError("activity subscription is closed")
+        activity = await self._queue.get()
+        if activity is None:
+            raise RuntimeError("activity subscription is closed")
+        return activity
+
+    async def get_or_closed(self) -> Activity | None:
+        if self._closed and self._queue.empty():
+            return None
         return await self._queue.get()
 
     def _publish(self, activity: Activity) -> None:
@@ -95,6 +103,12 @@ class ActivitySubscription:
         if self._closed:
             return
         self._closed = True
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._queue.put_nowait(None)
         self._store._unsubscribe(self)
 
 
@@ -167,14 +181,24 @@ class ActivityStore:
     def __init__(self) -> None:
         self._activities: dict[str, deque[Activity]] = {}
         self._subscribers: set[ActivitySubscription] = set()
+        self._subscriptions_closed = False
 
     def subscribe(self, thread_id: str | None = None) -> ActivitySubscription:
         subscription = ActivitySubscription(self, thread_id)
-        self._subscribers.add(subscription)
+        if self._subscriptions_closed:
+            subscription.close()
+        else:
+            self._subscribers.add(subscription)
         return subscription
 
     def _unsubscribe(self, subscription: ActivitySubscription) -> None:
         self._subscribers.discard(subscription)
+
+    def close_subscriptions(self) -> None:
+        """Wake active streams and stop accepting subscriptions during shutdown."""
+        self._subscriptions_closed = True
+        for subscription in tuple(self._subscribers):
+            subscription.close()
 
     def add(
         self,

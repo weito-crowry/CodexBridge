@@ -157,11 +157,18 @@ def test_runtime_stdout_has_source_prefix_and_safe_utf8_replacement(tmp_path) ->
 
 def test_runtime_stderr_has_source_prefix(tmp_path) -> None:
     path = tmp_path / "bridge-runtime-stderr.log"
-    path.write_text("warning: example\n", encoding="utf-8")
+    path.write_text(
+        "2026-11-09T12:34:56.789+09:00 WARNING uvicorn.error example\n"
+        "legacy warning without timestamp\n",
+        encoding="utf-8",
+    )
     reader = _reader(path, structured=False)
     reader.sources = (DiagnosticSource("Bridge stderr", path, False),)
 
-    assert _drain(reader) == ["[Bridge stderr] warning: example"]
+    assert _drain(reader) == [
+        "[Bridge stderr] 2026-11-09T12:34:56.789+09:00 WARNING uvicorn.error example",
+        "[Bridge stderr] legacy warning without timestamp",
+    ]
 
 
 def test_runtime_line_display_is_bounded(tmp_path) -> None:
