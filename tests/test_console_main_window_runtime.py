@@ -125,28 +125,30 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     window.close()
 
 
-def test_retry_now_reprobes_after_initial_codex_failure(monkeypatch) -> None:
+def test_retry_now_while_reprobe_runs_keeps_exactly_one_managed_launch(monkeypatch) -> None:
     _application()
-    original = FakeCodexProbe()
+    initial = FakeCodexProbe()
     retry = FakeCodexProbe()
     client = FakeClient()
+    launcher = FakeLauncher()
     window = MainWindow(
         _config(),
         api_client=client,
-        codex_probe=original,
+        codex_probe=initial,
+        runtime_launcher=launcher,
         tray_available=False,
     )
     monkeypatch.setattr(window, "_new_codex_probe", lambda: retry)
-    original.failure()
-    assert window.codex_status_label.text() == "Codex: not found"
+    initial.failure()
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
 
     window._retry_now()
     window._retry_now()
-    original.result(CodexResolution("stale.exe", "0", "path"))
-    retry.result(CodexResolution("fresh.exe", "1.2.3", "path"))
+    retry.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
 
     assert retry.starts == 1
-    assert window.codex_status_label.text() == "Codex: 1.2.3 · path"
+    assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
     window.close()
 
 
@@ -385,6 +387,7 @@ def test_retry_now_retries_failed_managed_tunnel_profile_generation_once(
         runtime_launcher=FakeLauncher(),
         tray_available=False,
     )
+    window._codex_probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
 
     _report_bridge_ready(client)
     _wait_for_profile(window)
@@ -1003,12 +1006,15 @@ def test_retry_now_routes_to_bridge_when_bridge_unavailable() -> None:
 def test_retry_now_routes_to_tunnel_when_bridge_ready_but_tunnel_unavailable() -> None:
     _application()
     tunnel = LifecycleTunnel("failed")
+    probe = FakeCodexProbe()
     window = MainWindow(
         _config(),
         api_client=FakeClient(),
+        codex_probe=probe,
         tunnel_supervisor=tunnel,
         tray_available=False,
     )
+    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     _set_ready_components(window, tunnel_state="failed")
     window._runtime_state = "external"
     window._sync_overall_status()

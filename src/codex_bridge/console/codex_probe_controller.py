@@ -17,11 +17,13 @@ class CodexProbeController:
         self._generation = 0
         self._active: Any | None = None
         self._initial_failed = False
+        self._probing = False
 
     def attach(self, probe: Any) -> None:
         self._generation += 1
         generation = self._generation
         self._active = probe
+        self._probing = True
         probe.resolved.connect(lambda value: self._resolved(probe, generation, value))
         probe.failed.connect(lambda message: self._failed(probe, generation, message))
         if hasattr(probe, "diagnosticChanged"):
@@ -33,10 +35,10 @@ class CodexProbeController:
         window = self._window
         if window._closing:
             return
-        if window._codex_resolution is not None or not self._initial_failed:
+        if window._codex_resolution is not None:
             retry_existing()
             return
-        if self._active is not None and not getattr(self._active, "_finished", True):
+        if self._probing or not self._initial_failed:
             return
         probe = window._new_codex_probe()
         window._codex_probe = probe
@@ -53,10 +55,12 @@ class CodexProbeController:
 
     def _resolved(self, probe: Any, generation: int, value: object) -> None:
         if self._is_current(probe, generation):
+            self._probing = False
             self._window._apply_codex_resolution(value)  # type: ignore[arg-type]
 
     def _failed(self, probe: Any, generation: int, message: str) -> None:
         if self._is_current(probe, generation):
+            self._probing = False
             self._initial_failed = True
             del message
             self.apply_failure()
