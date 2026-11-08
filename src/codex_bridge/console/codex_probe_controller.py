@@ -35,7 +35,8 @@ class CodexProbeController:
         window = self._window
         if window._closing:
             return
-        if window._codex_resolution is not None:
+        bridge_ready = window._health_ok and window._bridge_ready and window._app_server_ready
+        if window._codex_resolution is not None or bridge_ready:
             retry_existing()
             return
         if self._probing or not self._initial_failed:

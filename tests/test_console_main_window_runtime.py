@@ -387,8 +387,6 @@ def test_retry_now_retries_failed_managed_tunnel_profile_generation_once(
         runtime_launcher=FakeLauncher(),
         tray_available=False,
     )
-    window._codex_probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
-
     _report_bridge_ready(client)
     _wait_for_profile(window)
     _report_bridge_ready(client)
@@ -1014,7 +1012,6 @@ def test_retry_now_routes_to_tunnel_when_bridge_ready_but_tunnel_unavailable() -
         tunnel_supervisor=tunnel,
         tray_available=False,
     )
-    probe.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
     _set_ready_components(window, tunnel_state="failed")
     window._runtime_state = "external"
     window._sync_overall_status()
