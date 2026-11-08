@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -79,17 +78,16 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.codex_update_banner_label = QLabel("")
     window.codex_update_banner_label.setVisible(False)
     window.status_button = QPushButton(tr("Status"))
-    window.settings_button = QToolButton()
-    window.settings_button.setText("⚙")
-    window.settings_button.setAccessibleName(tr("Settings"))
-    window.settings_button.setToolTip(tr("Settings"))
-    window.settings_button.setObjectName("settingsButton")
-    window.settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-    window.appearance_button = window.settings_button
-    window.notification_settings_button = QToolButton()
-    window.notification_settings_button.setText(tr("Notifications"))
-    window.notification_settings_button.setObjectName("notificationSettingsButton")
-    window.notification_settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+    menu_bar = window.menuBar()
+    window.file_menu = menu_bar.addMenu(tr("File"))
+    exit_action = window.file_menu.addAction(tr("Exit"))
+    exit_action.triggered.connect(lambda _checked=False: window._begin_exit())
+    window.view_menu = menu_bar.addMenu(tr("View"))
+    status_action = window.view_menu.addAction(tr("Status"))
+    status_action.triggered.connect(lambda _checked=False: window._show_status())
+    diagnostics_action = window.view_menu.addAction(tr("Diagnostics"))
+    diagnostics_action.triggered.connect(lambda _checked=False: window.toggle_diagnostics())
+    window.settings_menu = menu_bar.addMenu(tr("Settings"))
     window.diagnostics_toggle_button = QPushButton(tr("Diagnostics"))
     window.diagnostics_clear_button = QPushButton(tr("Clear"))
     window.retry_now_button = QPushButton(tr("Retry now"))
@@ -227,8 +225,6 @@ def build_main_window_ui(window: MainWindow) -> None:
     status_bar.addWidget(window.codex_update_banner_label)
     status_bar.addWidget(window.usage_status_label)
     status_bar.addWidget(window.status_button)
-    status_bar.addWidget(window.settings_button)
-    status_bar.addWidget(window.notification_settings_button)
 
     window.thread_pane = ThreadListPane()
     window.history_pane = HistoryPane()

@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, QSettings, Qt, QTimer
 from PySide6.QtCore import Signal as QtSignal
 from PySide6.QtGui import QPalette
 
+from codex_bridge.console.i18n import tr
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.notification_controller import NotificationSettingsDialog
 from tests.console_main_window_test_support import (
@@ -169,7 +170,12 @@ def test_notification_click_preserves_selected_thread_and_does_not_submit_action
         settings_dialog.accept()
 
     QTimer.singleShot(0, accept_settings_dialog)
-    window.notification_settings_button.click()
+    notification_settings_action = next(
+        action
+        for action in window.settings_menu.actions()
+        if action.text() == tr("Notification settings")
+    )
+    notification_settings_action.trigger()
     assert settings.value("notifications/completion_mode") == "off"
     assert settings.value("notifications/approval_enabled") is False
     assert settings.value("notifications/user_input_enabled") is True

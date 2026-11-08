@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Literal
 
 from PySide6.QtCore import QObject, QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QPalette
-from PySide6.QtWidgets import QApplication, QMenu, QToolButton
+from PySide6.QtWidgets import QApplication, QMenu
 
 from .i18n import tr
 
@@ -250,7 +250,6 @@ def stylesheet_for_theme(theme: AppearanceTheme) -> str:
             text-align: left;
         }}
         QPushButton#showUsageHistory:hover {{ color: {selection}; }}
-        QToolButton#settingsButton {{ padding: 3px 7px; }}
         QLabel#usageHistoryMetricCaption {{ color: {muted}; }}
         QLabel#usageHistoryMetricValue {{ color: {text}; }}
         QLabel#usageHistoryUpdated, QLabel#usageHistoryState {{ color: {muted}; }}
@@ -285,6 +284,10 @@ def stylesheet_for_theme(theme: AppearanceTheme) -> str:
         QComboBox::drop-down, QDateTimeEdit::drop-down {{
             border-left: 1px solid {border}; width: 20px;
         }}
+        QMenuBar {{ background-color: {surface}; color: {text}; }}
+        QMenuBar::item {{ background: transparent; padding: 4px 8px; }}
+        QMenuBar::item:selected {{ background-color: {hover}; }}
+        QMenuBar::item:pressed {{ background-color: {selection}; color: {selection_text}; }}
         QMenu {{ background-color: {surface}; color: {text}; border: 1px solid {border}; }}
         QMenu::item {{ padding: 5px 24px 5px 8px; }}
         QMenu::item:selected {{ background-color: {selection}; color: {selection_text}; }}
@@ -346,8 +349,8 @@ class AppearanceController(QObject):
         return _DARK if scheme == Qt.ColorScheme.Dark else _LIGHT
 
     def _build_menu(self) -> None:
-        button = self._window.appearance_button
-        menu = QMenu(button)
+        window = self._window
+        menu = QMenu(window)
         group = QActionGroup(self)
         group.setExclusive(True)
         actions: dict[str, QAction] = {}
@@ -360,9 +363,8 @@ class AppearanceController(QObject):
                 lambda checked=False, selected=mode: self.set_mode(selected) if checked else None
             )
             actions[mode] = action
-        button.setMenu(menu)
-        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._window._appearance_actions = actions
+        window._appearance_menu = menu
+        window._appearance_actions = actions
         self._update_menu_checks()
 
     def _update_menu_checks(self) -> None:

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QMenu, QMessageBox, QToolButton
+from PySide6.QtWidgets import QMessageBox
 
 from .config import ConsoleConfig, ConsoleConfigurationError
 from .configuration_error_presentation import format_configuration_error
@@ -23,9 +23,10 @@ class SettingsActionController:
 
     def install_settings_menu(self) -> None:
         window = self._window
-        appearance_menu = window.appearance_button.menu()
-        window._appearance_menu = appearance_menu or QMenu(window.settings_button)
-        menu = QMenu(window.settings_button)
+        menu = window.settings_menu
+        pending_action = getattr(window, "_apply_pending_settings_action", None)
+        pending_enabled = pending_action.isEnabled() if pending_action is not None else False
+        menu.clear()
         window._settings_actions = {
             "Open settings file": menu.addAction(
                 tr("Open settings file"), window._open_settings_file
@@ -44,10 +45,8 @@ class SettingsActionController:
             tr("Restart Console to apply pending settings…"),
             window._apply_pending_configuration,
         )
-        window._apply_pending_settings_action.setEnabled(False)
-        window.settings_button.setMenu(menu)
-        window.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        window.settings_menu = menu
+        window._apply_pending_settings_action.setEnabled(pending_enabled)
+        menu.addAction(tr("Notification settings"), window._show_notification_settings)
 
     def active_config_path(self) -> Path | None:
         path = self._window._config.config_path

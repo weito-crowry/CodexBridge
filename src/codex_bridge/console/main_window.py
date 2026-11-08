@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QSystemTrayIcon,
-    QToolButton,
     QWidget,
 )
 from PySide6.QtWidgets import QMessageBox as QMessageBox
@@ -153,6 +152,9 @@ class MainWindow(QMainWindow):
     usage_status_label: UsageShortcutLabel
     codex_update_banner_label: QLabel
     status_button: QPushButton
+    file_menu: QMenu
+    view_menu: QMenu
+    settings_menu: QMenu
     diagnostics_toggle_button: QPushButton
     diagnostics_clear_button: QPushButton
     diagnostics_filter_buttons: dict[str, QPushButton]
@@ -176,13 +178,9 @@ class MainWindow(QMainWindow):
     status_refresh_button: QPushButton
     status_close_button: QPushButton
     status_dialog: QDialog
-    appearance_button: QToolButton
-    settings_button: QToolButton
-    settings_menu: QMenu
     _appearance_menu: QMenu
     _settings_actions: dict[str, QAction]
     _apply_pending_settings_action: QAction
-    notification_settings_button: QToolButton
     _appearance_actions: dict[str, QAction]
     _appearance_controller: AppearanceController
     _appearance_settings: QSettings
@@ -642,7 +640,6 @@ class MainWindow(QMainWindow):
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
         self.status_button.clicked.connect(self._show_status)
-        self.notification_settings_button.clicked.connect(self._show_notification_settings)
         self.usage_status_label.activated.connect(self._create_or_show_usage_history_window)
         self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
         self.status_refresh_button.clicked.connect(self._refresh_status)

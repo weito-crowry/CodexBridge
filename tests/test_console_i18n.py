@@ -78,6 +78,9 @@ def test_major_qt_surfaces_and_raw_data(tmp_path: Path, selected: str, theme: st
     history = UsageHistoryWindow(tmp_path / "usage.sqlite3", settings=settings)
     notifications = NotificationSettingsDialog(settings)
     try:
+        assert [action.text() for action in window.menuBar().actions()] == (
+            ["ファイル", "表示", "設定"] if selected == "ja-JP" else ["File", "View", "Settings"]
+        )
         assert window.status_button.text() == ("状態" if selected == "ja-JP" else "Status")
         assert window._settings_actions["Open settings file"].text() == tr("Open settings file")
         assert window.composer_widget.send_button.text() == (

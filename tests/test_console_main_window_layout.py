@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QMenuBar
+
 from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.main_window import MainWindow
 from tests.test_console_main_window import (
@@ -30,6 +32,12 @@ def test_main_window_delegates_ui_construction_to_layout_builder(monkeypatch) ->
     try:
         assert calls == [window]
         assert window.status_dialog.parent() is window
+        assert isinstance(window.menuBar(), QMenuBar)
+        assert [action.text() for action in window.menuBar().actions()] == [
+            "File",
+            "View",
+            "Settings",
+        ]
         assert window.splitter.count() == 3
         assert window.advanced_controls.isHidden()
     finally:
