@@ -1169,8 +1169,16 @@ class MainWindow(QMainWindow):
     def _apply_runtime_observation(self) -> None:
         self._bridge_runtime_observer.apply_runtime_observation()
 
-    def _record_bridge_status_observation(self, available: bool) -> None:
-        self._bridge_runtime_observer.record_bridge_status_observation(available)
+    def _record_bridge_status_observation(
+        self,
+        available: bool,
+        *,
+        reason: str = "bridge_unavailable",
+    ) -> None:
+        self._bridge_runtime_observer.record_bridge_status_observation(
+            available,
+            reason=reason,
+        )
 
     def _recover_bridge_after_loss(self) -> None:
         self._bridge_runtime_observer.recover_bridge_after_loss()

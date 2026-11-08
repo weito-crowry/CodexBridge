@@ -20,6 +20,7 @@ from .bridge import ApprovalConflictError, Bridge, BridgeError
 from .config import BridgeConfig
 from .history import HistoryValidationError, project_thread_metadata, validate_cursor
 from .jsonrpc import JsonRpcClosedError
+from .logging_utils import log_event
 from .models import ApprovalDecision, RequestId
 from .paths import PathPolicyError
 from .thread_titles import normalize_explicit_title
@@ -391,6 +392,7 @@ def create_ui_app(
             return JSONResponse({"error": "forbidden"}, status_code=403)
 
         assert shutdown_callback is not None
+        log_event("bridge.control.shutdown.requested", reason="control_api")
 
         async def run_shutdown() -> None:
             result = shutdown_callback()

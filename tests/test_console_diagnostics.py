@@ -86,6 +86,51 @@ def test_console_observability_jsonl_uses_console_source_label(tmp_path) -> None
     assert _drain(reader) == ["2026-09-30T06:00:08Z [Console] tunnel.start"]
 
 
+def test_bridge_status_observability_fields_display_without_unlisted_data(tmp_path) -> None:
+    path = tmp_path / "console-observability.jsonl"
+    fields = {
+        "event": "bridge.status.unavailable",
+        "consecutive_failures": 1,
+        "health_ok": True,
+        "bridge_ready": True,
+        "app_server_ready": False,
+        "managed": True,
+        "bridge_pid": 4321,
+        "prompt": "must-not-display",
+    }
+    records = [
+        {
+            "timestamp": "2026-11-08T06:00:00Z",
+            "reason": "app_server_unavailable",
+            **fields,
+        },
+        {
+            "timestamp": "2026-11-08T06:00:01Z",
+            "reason": "private-token",
+            **fields,
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    reader = _reader(path, structured=True)
+    reader.sources = (DiagnosticSource("Console", path, True),)
+
+    lines = _drain(reader)
+
+    assert lines == [
+        "2026-11-08T06:00:00Z [Console] bridge.status.unavailable "
+        "reason=app_server_unavailable consecutive_failures=1 health_ok=true "
+        "bridge_ready=true app_server_ready=false managed=true bridge_pid=4321",
+        "2026-11-08T06:00:01Z [Console] bridge.status.unavailable "
+        "consecutive_failures=1 health_ok=true bridge_ready=true app_server_ready=false "
+        "managed=true bridge_pid=4321",
+    ]
+    assert "must-not-display" not in "\n".join(lines)
+    assert "private-token" not in "\n".join(lines)
+
+
 def test_malformed_json_is_skipped_and_reader_continues(tmp_path) -> None:
     path = tmp_path / "bridge-observability.jsonl"
     path.write_text(

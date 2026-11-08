@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..observability import get_observer
 from ..tunnel_profile import TunnelProfileError
 from .i18n import tr
 from .tunnel_profile_job import TunnelProfileJob
@@ -144,6 +145,7 @@ class BridgeRuntimeObserver:
     def __init__(self, window: MainWindow) -> None:
         self._window = window
         self._bridge_loss_count = 0
+        self._bridge_loss_reason = "bridge_unavailable"
         self._profile_install_gate = TunnelProfileInstallGate(window._bridge_generation)
 
     def advance_generation(self) -> int:
@@ -163,6 +165,27 @@ class BridgeRuntimeObserver:
 
     def reset_loss_count(self) -> None:
         self._bridge_loss_count = 0
+
+    def _log_status_event(
+        self,
+        event: str,
+        *,
+        reason: str,
+        consecutive_failures: int,
+    ) -> None:
+        window = self._window
+        get_observer().bridge_status_observation(
+            event,
+            reason=reason,
+            consecutive_failures=consecutive_failures,
+            health_ok=bool(window._health_ok),
+            bridge_ready=bool(window._bridge_ready),
+            app_server_ready=bool(window._app_server_ready),
+            managed=bool(window._detached_launch_started),
+            bridge_pid=(
+                getattr(window, "_detached_pid", None) if window._detached_launch_started else None
+            ),
+        )
 
     def apply_runtime_observation(self) -> None:
         window = self._window
@@ -212,11 +235,36 @@ class BridgeRuntimeObserver:
             window._set_runtime_state("unavailable")
         window._maybe_auto_start_bridge()
 
-    def record_bridge_status_observation(self, available: bool) -> None:
+    def record_bridge_status_observation(
+        self,
+        available: bool,
+        *,
+        reason: str = "bridge_unavailable",
+    ) -> None:
         if available:
+            if self._bridge_loss_count:
+                self._log_status_event(
+                    "bridge.status.recovered",
+                    reason="status_recovered",
+                    consecutive_failures=self._bridge_loss_count,
+                )
             self.reset_loss_count()
+            self._bridge_loss_reason = "bridge_unavailable"
             return
         self._bridge_loss_count += 1
+        self._bridge_loss_reason = reason
+        if self._bridge_loss_count == 1:
+            self._log_status_event(
+                "bridge.status.unavailable",
+                reason=reason,
+                consecutive_failures=self._bridge_loss_count,
+            )
+        elif self._bridge_loss_count == _BRIDGE_LOSS_THRESHOLD:
+            self._log_status_event(
+                "bridge.status.threshold_reached",
+                reason=reason,
+                consecutive_failures=self._bridge_loss_count,
+            )
         window = self._window
         if (
             self._bridge_loss_count < _BRIDGE_LOSS_THRESHOLD
@@ -232,6 +280,11 @@ class BridgeRuntimeObserver:
         self._bridge_loss_count = _BRIDGE_LOSS_THRESHOLD
         if window._detached_launch_started and window._control_token is not None:
             window._bridge_managed_retry_coordinator.activate()
+            self._log_status_event(
+                "bridge.restart.requested",
+                reason=self._bridge_loss_reason,
+                consecutive_failures=self._bridge_loss_count,
+            )
             window._begin_bridge_transition(
                 "restart", tunnel_running=window._tunnel_owned_running()
             )

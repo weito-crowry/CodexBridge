@@ -78,7 +78,10 @@ class ApiResultDispatcher:
                 window.app_server_status_label.setText(tr("App Server: failed"))
                 window._apply_runtime_observation()
             window._record_bridge_status_observation(
-                window._bridge_ready and window._app_server_ready
+                window._bridge_ready and window._app_server_ready,
+                reason=(
+                    "bridge_unavailable" if not window._bridge_ready else "app_server_unavailable"
+                ),
             )
             ready = window._usage_ready
             if ready and not was_ready:
@@ -230,7 +233,10 @@ class ApiResultDispatcher:
             window.bottom_status_label.setText(format_api_error(message))
             window._apply_runtime_observation()
             if key == "bridge-status":
-                window._record_bridge_status_observation(False)
+                window._record_bridge_status_observation(
+                    False,
+                    reason="status_request_failed",
+                )
             window._sync_overall_status()
             window._sync_empty_state()
             return

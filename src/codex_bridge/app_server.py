@@ -71,6 +71,8 @@ class AppServerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._failed = False
         self._failure: str | None = None
+        self._stderr_line_count = 0
+        self._stderr_had_output = False
 
     def set_handlers(
         self,
@@ -113,6 +115,8 @@ class AppServerClient:
         if self._process is not None:
             raise RuntimeError("previous App Server process is still running")
         self._process = await self._process_factory(self._executable, "app-server", "--stdio")
+        self._stderr_line_count = 0
+        self._stderr_had_output = False
         if (
             self._process.stdin is None
             or self._process.stdout is None
@@ -157,9 +161,26 @@ class AppServerClient:
                 return
             self._failed = True
             self._failure = str(exc)[:2_000]
-            log_event("protocol.error", error_type=type(exc).__name__)
-            if self._process is not None and self._process.returncode not in (None, 0):
-                log_event("subprocess.abnormal_exit", exit_code=self._process.returncode)
+            process = self._process
+            fields: dict[str, str | int | bool] = {
+                "error_type": type(exc).__name__,
+                "stderr_line_count": self._stderr_line_count,
+                "stderr_had_output": self._stderr_had_output,
+            }
+            if process is not None:
+                fields["process_alive"] = process.returncode is None
+                process_id = getattr(process, "pid", None)
+                if (
+                    isinstance(process_id, int)
+                    and not isinstance(process_id, bool)
+                    and 1 <= process_id <= 4_294_967_295
+                ):
+                    fields["process_id"] = process_id
+                if process.returncode is not None:
+                    fields["exit_code"] = process.returncode
+            log_event("protocol.error", **fields)
+            if process is not None and process.returncode not in (None, 0):
+                log_event("subprocess.abnormal_exit", exit_code=process.returncode)
             if self._on_failure is not None:
                 result = self._on_failure(self._failure)
                 if inspect.isawaitable(result):
@@ -171,6 +192,8 @@ class AppServerClient:
             line = await self._process.stderr.readline()
             if not line:
                 return
+            self._stderr_line_count += 1
+            self._stderr_had_output = True
             logger.debug("App Server emitted diagnostic stderr")
 
     async def request(self, method: str, params: JsonObject) -> JsonObject:

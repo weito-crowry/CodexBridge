@@ -76,6 +76,29 @@ def test_main_window_json_methods_delegate_to_dispatcher(monkeypatch) -> None:
     window.close()
 
 
+def test_dispatcher_labels_bridge_status_loss_reasons(monkeypatch) -> None:
+    _application()
+    client = FakeClient()
+    window = _window(client)
+    observations: list[tuple[bool, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_record_bridge_status_observation",
+        lambda available, *, reason: observations.append((available, reason)),
+    )
+
+    window._api_result_dispatcher.apply_result(
+        "bridge-status", {"bridge": "ready", "app_server": "failed"}
+    )
+    window._api_result_dispatcher.apply_error("bridge-status", "status unavailable")
+
+    assert observations == [
+        (False, "app_server_unavailable"),
+        (False, "status_request_failed"),
+    ]
+    window.close()
+
+
 def test_dispatcher_uses_main_window_project_name_callback(monkeypatch, tmp_path) -> None:
     _application()
     client = FakeClient()
