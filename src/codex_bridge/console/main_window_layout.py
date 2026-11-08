@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QFormLayout,
     QGroupBox,
@@ -264,6 +265,17 @@ def build_main_window_ui(window: MainWindow) -> None:
     window.diagnostics_title_label = QLabel(tr("Diagnostics"))
     diagnostics_header.addWidget(window.diagnostics_title_label)
     diagnostics_header.addStretch(1)
+    window.diagnostics_filter_buttons = {}
+    window.diagnostics_filter_group = QButtonGroup(window.diagnostics_pane)
+    window.diagnostics_filter_group.setExclusive(True)
+    for key, filter_label in (("All", tr("All")), ("stdout", "stdout"), ("stderr", "stderr")):
+        button = QPushButton(filter_label)
+        button.setCheckable(True)
+        button.setProperty("diagnosticsFilter", key)
+        window.diagnostics_filter_group.addButton(button)
+        diagnostics_header.addWidget(button)
+        window.diagnostics_filter_buttons[key] = button
+    window.diagnostics_filter_buttons["All"].setChecked(True)
     diagnostics_header.addWidget(window.diagnostics_clear_button)
     diagnostics_layout.addLayout(diagnostics_header)
     window.diagnostics_text = QPlainTextEdit()
@@ -274,7 +286,11 @@ def build_main_window_ui(window: MainWindow) -> None:
     diagnostics_layout.addWidget(window.diagnostics_text)
     window.diagnostics_pane.setVisible(False)
     window.diagnostics_toggle_button.clicked.connect(lambda: window.toggle_diagnostics())
-    window.diagnostics_clear_button.clicked.connect(window.diagnostics_text.clear)
+    window.diagnostics_clear_button.clicked.connect(lambda: window._diagnostics_panel.clear())
+    for key, button in window.diagnostics_filter_buttons.items():
+        button.clicked.connect(
+            lambda checked, selected=key: window._diagnostics_panel.set_filter(selected)
+        )
 
     window.bottom_status_label = QLabel(tr("Starting…"))
     window.bottom_status_label.setObjectName("bottomStatus")

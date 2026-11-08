@@ -23,6 +23,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QInputDialog,
     QLabel,
@@ -154,6 +155,8 @@ class MainWindow(QMainWindow):
     status_button: QPushButton
     diagnostics_toggle_button: QPushButton
     diagnostics_clear_button: QPushButton
+    diagnostics_filter_buttons: dict[str, QPushButton]
+    diagnostics_filter_group: QButtonGroup
     retry_now_button: QPushButton
     restart_codexbridge_button: QPushButton
     advanced_toggle_button: QPushButton
