@@ -87,3 +87,42 @@ def test_reopen_keeps_filter_and_history_is_bounded() -> None:
     assert window.diagnostics_text.blockCount() == 2000
     assert "line-0" not in window.diagnostics_text.toPlainText()
     window.close()
+
+
+def test_stderr_view_clears_when_its_history_is_evicted() -> None:
+    window = _window()
+    window._append_diagnostics_lines(["[Bridge stderr] oldest"])
+    window.diagnostics_filter_buttons["stderr"].click()
+    window._append_diagnostics_lines([f"[Bridge stdout] out-{i}" for i in range(2000)])
+    assert window.diagnostics_text.toPlainText() == ""
+    window.diagnostics_filter_buttons["All"].click()
+    assert window.diagnostics_text.blockCount() == 2000
+    assert "oldest" not in window.diagnostics_text.toPlainText()
+    window.close()
+
+
+def test_stdout_view_clears_when_its_history_is_evicted() -> None:
+    window = _window()
+    window._append_diagnostics_lines(["[Bridge stdout] oldest"])
+    window.diagnostics_filter_buttons["stdout"].click()
+    window._append_diagnostics_lines([f"[Bridge stderr] err-{i}" for i in range(2000)])
+    assert window.diagnostics_text.toPlainText() == ""
+    window.diagnostics_filter_buttons["All"].click()
+    assert window.diagnostics_text.blockCount() == 2000
+    assert "oldest" not in window.diagnostics_text.toPlainText()
+    window.close()
+
+
+def test_unrelated_eviction_keeps_matching_view_and_scroll() -> None:
+    window = _window()
+    window._append_diagnostics_lines([f"[Bridge stdout] out-{i}" for i in range(1999)])
+    window._append_diagnostics_lines(["[Bridge stderr] retained"])
+    window.diagnostics_filter_buttons["stderr"].click()
+    text = window.diagnostics_text.toPlainText()
+    scrollbar = window.diagnostics_text.verticalScrollBar()
+    position = scrollbar.value()
+    window._append_diagnostics_lines(["[Bridge stdout] newest"])
+    assert window.diagnostics_text.toPlainText() == text
+    assert "retained" in window.diagnostics_text.toPlainText()
+    assert scrollbar.value() == position
+    window.close()

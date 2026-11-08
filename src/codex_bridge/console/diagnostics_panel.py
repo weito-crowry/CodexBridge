@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from itertools import islice
 from typing import TYPE_CHECKING
 
 from PySide6.QtGui import QColor, QPalette, QTextCharFormat, QTextCursor
@@ -54,7 +55,23 @@ class DiagnosticsPanelController:
     def _append_diagnostics_lines(self, lines: list[str]) -> None:
         if not lines:
             return
+        maxlen = self._history.maxlen or 2000
+        evicted_count = max(0, len(self._history) + len(lines) - maxlen)
+        relevant_eviction = False
+        if evicted_count:
+            old_count = len(self._history)
+            relevant_eviction = any(
+                self._matches_filter(line)
+                for line in islice(self._history, min(evicted_count, old_count))
+            )
+            if not relevant_eviction and evicted_count > old_count:
+                relevant_eviction = any(
+                    self._matches_filter(line) for line in islice(lines, evicted_count - old_count)
+                )
         self._history.extend(lines)
+        if relevant_eviction and self._filter != "All":
+            self._render_history()
+            return
         visible = self._filtered(lines)
         if not visible:
             return
@@ -66,6 +83,13 @@ class DiagnosticsPanelController:
         if self._filter == "stderr":
             return [line for line in lines if line.startswith("[Bridge stderr]")]
         return list(lines)
+
+    def _matches_filter(self, line: str) -> bool:
+        if self._filter == "stdout":
+            return line.startswith("[Bridge stdout]")
+        if self._filter == "stderr":
+            return line.startswith("[Bridge stderr]")
+        return True
 
     def _render_history(self) -> None:
         self._window.diagnostics_text.clear()
