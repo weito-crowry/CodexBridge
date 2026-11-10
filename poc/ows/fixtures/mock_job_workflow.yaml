@@ -1,0 +1,40 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-mock-job-dataflow
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+input:
+  from: '${ {values: .values} }'
+output:
+  as: '${ {job_ids: [.jobs[].job_id], request_keys: [.jobs[].request_key], result_values: .result_values, last_job_id: $context.last_job_id} }'
+do:
+  - prepare:
+      set:
+        values: '${ .values }'
+      export:
+        as: '${ {started: true, count: (.values | length)} }'
+  - jobs:
+      for:
+        in: '${ .values }'
+        each: item
+        at: index
+      do:
+        - start:
+            input:
+              from: '${ {value: $item, index: $index} }'
+            call: mock-job
+            with:
+              operation: process
+              payload: '${ .value }'
+              duration_ms: 20
+            output:
+              as: '${ {job_id: .job_id, request_key: .request_key, status: .status, result: .result} }'
+            export:
+              as: '${ {last_job_id: $output.job_id, last_index: $input.index} }'
+  - summarize:
+      set:
+        jobs: '${ map({job_id, request_key, status, result}) }'
+        result_values: '${ map(.result.payload) }'

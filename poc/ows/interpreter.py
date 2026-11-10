@@ -8,10 +8,11 @@ from typing import Any
 
 import jq
 import yaml
+from job_adapter import JobRequestError, validate_mock_job_request
 from jsonschema import Draft202012Validator
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema" / "workflow.yaml"
-SUPPORTED_TASKS = frozenset({"do", "set", "switch", "for"})
+SUPPORTED_TASKS = frozenset({"do", "set", "switch", "for", "call"})
 SUPPORTED_DIRECTIVES = frozenset({"continue", "exit"})
 _JQ_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -180,6 +181,15 @@ def _validate_task_list(tasks: Any, scope_path: str, jq_variables: frozenset[str
                 "output",
                 "export",
             }
+        elif operation == "call":
+            unsupported = set(task_spec) - {
+                "then",
+                "call",
+                "with",
+                "input",
+                "output",
+                "export",
+            }
         if unsupported:
             key = sorted(unsupported)[0]
             raise OwsError(f"unsupported task key '{key}' on '{task_name}'")
@@ -237,7 +247,10 @@ def _validate_task_list(tasks: Any, scope_path: str, jq_variables: frozenset[str
 
 def _task_action(task_name: str, task_spec: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     action_keys = set(task_spec) - {"then", "input", "output", "export"}
-    if "for" in action_keys:
+    if "call" in action_keys:
+        operation = "call"
+        action = {"call": task_spec["call"], "with": task_spec.get("with")}
+    elif "for" in action_keys:
         operation = "for"
         action = {key: task_spec[key] for key in ("for", "do") if key in task_spec}
     elif "do" in action_keys:
@@ -266,6 +279,41 @@ def _validate_action(
     task_path: str,
     jq_variables: frozenset[str],
 ) -> None:
+    if operation == "call":
+        target = action["call"]
+        if target != "mock-job":
+            raise OwsError(f"unsupported call target {target!r}; only 'mock-job' is allowed")
+        arguments = action.get("with")
+        if not isinstance(arguments, dict):
+            raise OwsError("mock-job with must be an argument map")
+        allowed = {"operation", "payload", "duration_ms"}
+        unsupported = set(arguments) - allowed
+        if unsupported:
+            key = sorted(unsupported)[0]
+            raise OwsError(f"unsupported mock-job argument '{key}'")
+        if set(arguments) != allowed:
+            missing = sorted(allowed - set(arguments))[0]
+            raise OwsError(f"mock-job requires argument '{missing}'")
+        if arguments["operation"] != "process":
+            raise OwsError("mock-job operation must be 'process'")
+        duration = arguments["duration_ms"]
+        if isinstance(duration, str):
+            expression = _optional_expression(duration, f"{task_path}.with.duration_ms")
+            if expression is None:
+                raise OwsError("mock-job duration_ms must be an integer expression or literal")
+            _compile_jq(
+                expression,
+                f"{task_path}.with.duration_ms",
+                jq_variables.union({"context", "input"}),
+            )
+        elif type(duration) is not int or not 0 <= duration <= 2000:
+            raise OwsError("mock-job duration_ms must be an integer from 0 to 2000")
+        _validate_set_value(
+            arguments["payload"],
+            f"{task_path}.with.payload",
+            jq_variables.union({"context", "input"}),
+        )
+        return
     if operation == "set":
         value = action["set"]
         if not isinstance(value, (dict, str)):
@@ -512,7 +560,21 @@ def compute_task_action(
             if condition:
                 return {"__ows_control__": case_spec["then"]}
         return {"__ows_control__": default or "continue"}
+    if operation == "call":
+        raise OwsError("call requires the mock-job DBOS adapter")
     raise OwsError(f"unsupported task '{operation}'")
+
+
+def compute_mock_job_request(
+    task_spec: Mapping[str, Any],
+    input_data: Any,
+    variables: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        evaluated = _evaluate_set_value(task_spec["with"], input_data, variables)
+        return validate_mock_job_request(evaluated)
+    except JobRequestError as error:
+        raise OwsError(str(error)) from error
 
 
 class Interpreter:

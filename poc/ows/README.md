@@ -10,15 +10,15 @@ Windows上で、OWS DSL v1.0.3の限定subsetをPython Interpreterで実行し�
 - [v1.0.3 dsl-reference.md](https://raw.githubusercontent.com/open-workflow-specification/specification/v1.0.3/dsl-reference.md)
 - [v1.0.3 schema/workflow.yaml](https://raw.githubusercontent.com/open-workflow-specification/specification/v1.0.3/schema/workflow.yaml)
 
-公式schemaは上記tagから取得して[`schema/workflow.yaml`](schema/workflow.yaml)に固定しました。取得元URLは`https://raw.githubusercontent.com/open-workflow-specification/specification/v1.0.3/schema/workflow.yaml`、SHA-256は`df3326da907e17e743e9d9e888839481d1557abdf91c592e74f27506ff523f0b`です。`yaml.safe_load`で読み、`jsonschema.Draft202012Validator`で公式schemaを検査します。workflow fixtureと復旧fixtureはこの公式schemaを通ります。
+公式schemaは上記tagから取得して[`schema/workflow.yaml`](schema/workflow.yaml)に固定しました。取得元URLは`https://raw.githubusercontent.com/open-workflow-specification/specification/v1.0.3/schema/workflow.yaml`、SHA-256は`df3326da907e17e743e9d9e888839481d1557abdf91c592e74f27506ff523f0b`です。`yaml.safe_load`で読み、`jsonschema.Draft202012Validator`で公式schemaを検査します。標準workflow、データフロー、復旧、`mock-job`の各fixtureはこの公式schemaを通ります。
 
-検査は二段階です。まずPoC subsetの静的検査で未対応task/属性/flowを拒否し、続いて公式schemaで構造を検査します。公式schema合格は、このPoCが全OWS意味論を実装したことを意味しません。例えば公式schemaに適合する`call`や`try`も、subset検査で実行前に拒否します。
+検査は二段階です。まずPoC subsetの静的検査で未対応task/属性/flowを拒否し、続いて公式schemaで構造を検査します。公式schema合格は、このPoCが全OWS意味論を実装したことを意味しません。subsetが実行できる`call`は`mock-job`だけです。HTTP、MCP、他の関数名は実行前に拒否し、`try`など未実装taskも拒否します。
 
 ## Interpreter subset
 
 `document.dsl`は文字列`'1.0.3'`に限定します。`evaluate.language=jq`と`evaluate.mode=strict`を明示し、`${ ... }`だけをjq式として本物の`jq` packageに渡します。通常文字列は評価しません。`for.each`と`for.at`の値は`jq.compile(..., args=...)`で`$item`、`$index`等へJSON値として束縛します。
 
-対応するtaskは`do`、`set`、`switch`、`for`です。
+対応するtaskは`do`、`set`、`switch`、`for`と限定された`call: mock-job`です。
 
 - `do`は順次実行し、各taskの出力を次taskの入力にします。入れ子`do`は入れ子scopeで実行します。
 - `set`はmapまたは式の値をそのまま次taskへ渡します。辞書を暗黙mergeしません。
@@ -36,15 +36,27 @@ taskでは`input.from`をraw task inputに適用してからtask本体を実行�
 
 v1.0.3の`dsl.md`はstrict式の`${...}`、jq言語、式失敗の扱いを定めていますが、jq filterが返す0件/1件/複数件streamの値への正規化は明記していません。このPoCでは曖昧さをPython式等で隠さず、テストで固定したローカル規則として0件=`null`、1件=その値、複数件=JSON配列を使います。
 
-未対応構文・属性はfail-fastです。input/output/exportのschema設定、`input.from`/`output.as`/`export.as`のobject形式、`if`、`for.while`、`try`、`fork`、`call`、`listen`、`emit`、`run`、`wait`、`raise`、DSL内HTTP/MCP、任意script、top-level `use`/`schedule`等は実行しません。未対応の追加キーや型もsubset検査で拒否します。
+未対応構文・属性はfail-fastです。input/output/exportのschema設定、`input.from`/`output.as`/`export.as`のobject形式、`if`、`for.while`、`try`、`fork`、`listen`、`emit`、`run`、`wait`、`raise`、DSL内HTTP/MCP、任意script、top-level `use`/`schedule`等は実行しません。未対応の追加キーや型もsubset検査で拒否します。
+
+### `mock-job` call とdurable Job Adapter
+
+[`fixtures/mock_job_workflow.yaml`](fixtures/mock_job_workflow.yaml)はOWS v1.0.3公式schema-valid fixtureです。`call: mock-job`と`with`引数mapを使い、`set`、loop、`output.as`、`export.as`をつないでjob IDとresultを次taskへ渡します。loop iteration indexを含むtask identityは異なるrequest keyになります。
+
+`with`は`operation: process`、JSON値の`payload`、整数`duration_ms`（0～2000）のみ許可します。キー追加、不正型、他operation、範囲外durationは拒否します。payloadやデータフローは本物のjq expressionをstrict modeで評価し、素のJSON値はそのまま渡します。Python `eval`や任意commandの実行はありません。DBOS step runnerなしでInterpreterを直接使ってcallすると、副作用前にadapter未接続エラーになります。
+
+各Phase 4B runは`.state/phase4b-runs/run-<uuid>/`を作り、DBOS system DB `dbos.sqlite`とは別の`jobs.sqlite`にjob台帳を保存します。ledgerは`request_key = workflow_id + deterministic task identity`をuniqueにし、`BEGIN IMMEDIATE` transactionで同key・同digestの再送を既存jobへ照合します。同key・異digestはfail-closedです。状態、canonical request digest、進捗、result/error、dispatch回数、service実行回数を記録します。
+
+固定処理だけを行うmock serviceをDBOS workerと別の子Python processとして起動します。serviceは`QUEUED` jobを1回claimし、進捗と完了receiptをledgerへ記録します。`mock_failure: true` payloadは試験用に決定的`FAILED`を返します。FAILED receiptはDBOS stepをERRORにし、自動再送しません。bounded poll timeoutではjobをcancel扱いにせず、ledger状態を残してDBOS stepをtimeout ERRORにします。ledger状態を照合できない場合はadapter-owned `NEEDS_RECONCILIATION` markerで止め、自動再送しません。このmarkerはDBOSのworkflow statusではありません。
+
+Phase 4Bのstep内bounded pollingはPoC限定です。実Codex接続時には長時間MCP呼び出しをDBOS step内で待たせず、非同期start/status/event連携に置き換える必要があります。このPoCは実Codex、MCP、HTTPを呼びません。
 
 ## DBOS checkpointと復旧
 
-CLI実行ごとに`.state/runs/run-<uuid>/`を作り、workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。
+通常CLI runは`.state/runs/run-<uuid>/`、`mock-job` runは`.state/phase4b-runs/run-<uuid>/`を作り、workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。Phase 4B runには加えて`jobs.sqlite`、service/worker identity、service/worker logs、heartbeat、recovery evidenceを保存します。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。
 
 各named taskのDBOS stepはtask scope pathをidentityとして登録します。loop pathには0始まりのiteration indexを含めます。step checkpointにはraw task action結果に加えてtask名・identity・task kind・DSL hash、変換済みtask inputのSHA-256、runtime variables（contextとloop変数を含む）のSHA-256を保存し、replay時に現在値と照合します。不一致やdigestのない旧形式checkpointはfail-closedします。`do`親taskと`for`親taskにも既存のnamed checkpointを使い、新しいcheckpoint段階は追加しません。input/output/export変換はcheckpointの外で純粋に再計算し、context更新もworkflow replayで同じexport式を再適用します。これにより完了stepのactionは再実行せずに、変換済み出力とcontextを再構成します。復旧fixtureは既存の最終結果`{"final":2}`を保ったまま、export済みcontextから結果を作ります。復旧実験のtask JSONL、heartbeat、marker gateは実験を可視化するためのローカル制御記録で、OWS taskの外部副作用ではありません。
 
-start workerは`DBOS.start_workflow()`からIDを得た直後、manifestをatomic replaceで更新します。実験はstart workerを自分の`subprocess.Popen`で起動し、2つ目のtaskがgateで待機中にそのPopenだけをkill・waitします。heartbeatはworker内`os.getpid()`を記録し、kill前の更新、kill後0.5秒超の静止、SQLiteの`PENDING`/完了step数を確認した後にmarkerを作ります。その後`cli.py resume`を実行し、同じworkflow IDが`SUCCESS`となることを確認します。
+start workerは`DBOS.start_workflow()`からIDを得た直後、manifestをatomic replaceで更新します。Phase 4B recovery driverはworkerとserviceを別々の`subprocess.Popen`で起動し、run-dir、argv、実PID、Popenとの親子関係、creation time、実Python image pathを照合します。Windowsのprocess handle APIで実child PIDだけを終了し、redirector stubの孤児化は成功扱いしません。serviceはworker停止をまたいで動かし続け、worker heartbeat停止とjob完了後・DBOS step checkpoint確定前の障害窓を確認してから同じworkflow IDを復旧します。回復run内ではjob ID/request keyと1行のledgerを厳密比較し、baselineとの結果は実行固有識別子を除いたstatus/resultで比較します。完了済call stepのreplayでadapter dispatchも増えないことを確認します。
 
 `start_workflow()`がIDを返した直後からmanifestをatomic更新するまでの短いクラッシュ窓は残ります。この窓でworkerが終了するとCLIからIDを知る証跡がまだありません。これはPhase3 PoCの残存制限です。
 
@@ -68,6 +80,19 @@ CLIはworkflow ID、run directory、最終result、definition/input hashをJSON�
 & .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py status --run-dir <run-directory>
 ```
 
+Phase 4Bの通常mock runとcrash recoveryは次のコマンドで実行できます。Recovery driverはbaseline resultをJSON fileから読み、PowerShell経由で長いJSON引数を渡しません。
+
+```powershell
+$normal = & .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
+  --workflow .\poc\ows\fixtures\mock_job_recovery_workflow.yaml `
+  --input-json '{"payload":{"value":42},"duration_ms":250}' | ConvertFrom-Json
+
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\phase4b_recovery_test.py `
+  --normal-result-path "$($normal.run_dir)\result.json"
+```
+
+Recovery evidenceは新しい`.state/phase4b-runs/run-<uuid>/phase4b-recovery-evidence.json`にあります。Pytestではnormal/recovery比較に加えFAILED receiptとbounded timeoutのDBOS状態も検証します。
+
 ## 検証
 
 ```powershell
@@ -77,4 +102,4 @@ CLIはworkflow ID、run directory、最終result、definition/input hashをJSON�
 & .\poc\ows\.venv\Scripts\python.exe -m compileall -q .\poc\ows
 ```
 
-RecoveryのJSON証跡は`.state/test-recovery/`およびdriver指定のstate directoryに保存され、完了stepの実処理開始回数、Popen PID/worker PID、heartbeat静止区間、workflow status、operation checkpoint、最終resultを含みます。
+RecoveryのJSON証跡は各`.state/phase4b-runs/run-<uuid>/`に保存され、実Popen/worker/service PID、identity照合、heartbeat停止/継続、checkpoint barrier、workflow status、job ID/request key、ledger行数と実行回数、semantic result比較を含みます。

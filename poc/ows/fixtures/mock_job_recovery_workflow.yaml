@@ -1,0 +1,17 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-mock-job-recovery
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+do:
+  - process:
+      call: mock-job
+      with:
+        operation: process
+        payload: '${ .payload }'
+        duration_ms: '${ .duration_ms }'
+  - finish:
+      set: '${ . }'

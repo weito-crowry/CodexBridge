@@ -17,10 +17,13 @@ from dbos import DBOS, DBOSConfig
 from interpreter import (
     Interpreter,
     OwsError,
+    compute_mock_job_request,
     compute_task_action,
     parse_workflow_text,
     validate_workflow,
 )
+from job_adapter import DurableJobAdapter, submit_and_wait
+from process_identity import get_process_identity
 from sqlalchemy.engine import URL
 
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
@@ -205,7 +208,45 @@ def _run_task_step(
     input_sha256 = sha256_json(input_data)
     context_sha256 = sha256_json(variables.get("context"))
     variables_sha256 = sha256_json(variables)
-    result = compute_task_action(operation, task_spec, input_data, variables)
+    if operation == "call":
+        request = compute_mock_job_request(task_spec, input_data, variables)
+        workflow_id = DBOS.workflow_id
+        if not isinstance(workflow_id, str) or not workflow_id:
+            raise OwsError("mock-job adapter requires an active DBOS workflow")
+        adapter = DurableJobAdapter(event_path.parent / "jobs.sqlite")
+        timeout_seconds = control.get("mock_job_timeout_seconds", 10.0)
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise OwsError("mock_job_timeout_seconds must be numeric")
+        result = submit_and_wait(
+            adapter,
+            workflow_id,
+            identity,
+            request,
+            timeout_seconds=float(timeout_seconds),
+        )
+        if control.get("gate_after_job_identity") == identity:
+            marker_value = control.get("post_job_continue_marker")
+            if not isinstance(marker_value, str):
+                raise OwsError("post-job test gate requires a continue marker path")
+            _append_event(
+                event_path,
+                {
+                    "event": "job_succeeded_before_checkpoint",
+                    "identity": identity,
+                    "job_id": result["job_id"],
+                    "request_key": result["request_key"],
+                    "pid": os.getpid(),
+                    "timestamp_utc": datetime.now(UTC).isoformat(),
+                },
+            )
+            marker = Path(marker_value)
+            deadline = time.monotonic() + float(control.get("gate_timeout_seconds", 90))
+            while not marker.is_file():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("post-job test gate timed out before DBOS checkpoint")
+                time.sleep(0.05)
+    else:
+        result = compute_task_action(operation, task_spec, input_data, variables)
     _append_event(
         event_path,
         {
@@ -321,6 +362,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("start", "recover"), required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--startup-file", type=Path)
     return parser.parse_args()
 
 
@@ -328,10 +370,36 @@ def main() -> int:
     args = _parse_args()
     run_dir = args.run_dir.resolve()
     manifest, definition_text, input_data = load_run_request(run_dir)
+    startup_override = args.startup_file.resolve() if args.startup_file is not None else None
+    if startup_override is not None:
+        try:
+            startup_override.relative_to(run_dir)
+        except ValueError as error:
+            raise OwsError("--startup-file must be inside the run directory") from error
     database_path = run_dir / "dbos.sqlite"
     control = manifest.get("control", {})
     if not isinstance(control, dict):
         raise OwsError("manifest control must be an object")
+
+    worker_identity = get_process_identity(os.getpid())
+    if worker_identity is None or not worker_identity["active"]:
+        raise OwsError("DBOS worker could not confirm its Windows process identity")
+    identity_record = {
+        "mode": args.mode,
+        "pid": worker_identity["pid"],
+        "parent_pid": worker_identity["parent_pid"],
+        "run_dir": str(run_dir),
+        "argv": sys.argv,
+        "creation_time_100ns": worker_identity["creation_time_100ns"],
+        "image_path": worker_identity["image_path"],
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+    }
+    identity_path = (
+        startup_override.with_suffix(".identity.json")
+        if startup_override is not None
+        else run_dir / f"{args.mode}-worker-identity.json"
+    )
+    _write_json(identity_path, identity_record)
 
     DBOS(config=_dbos_config(database_path))
     heartbeat_stop: threading.Event | None = None
@@ -367,14 +435,10 @@ def main() -> int:
                 raise OwsError("recover mode requires the persisted workflow_id")
             startup_path = run_dir / "recovery-worker.json"
 
+        startup_path = startup_override if startup_override is not None else startup_path
         _write_json(
             startup_path,
-            {
-                "mode": args.mode,
-                "pid": os.getpid(),
-                "workflow_id": workflow_id,
-                "timestamp_utc": datetime.now(UTC).isoformat(),
-            },
+            {**identity_record, "workflow_id": workflow_id},
         )
 
         if args.mode == "start":

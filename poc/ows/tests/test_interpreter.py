@@ -10,6 +10,7 @@ from interpreter import (
     OwsError,
     evaluate_jq,
     load_workflow,
+    parse_workflow_text,
     validate_official_schema,
     validate_workflow,
 )
@@ -42,6 +43,15 @@ def test_fixture_parses_and_passes_official_schema() -> None:
     definition = load_workflow(FIXTURE)
     validate_workflow(definition)
     assert definition["document"]["dsl"] == "1.0.3"
+
+
+def test_mock_job_fixture_is_official_schema_valid_but_standalone_call_has_no_adapter() -> None:
+    fixture = OWS_DIR / "fixtures" / "mock_job_workflow.yaml"
+    definition = parse_workflow_text(fixture.read_text(encoding="utf-8"))
+    validate_official_schema(definition)
+
+    with pytest.raises(OwsError, match="call requires the mock-job DBOS adapter"):
+        Interpreter(definition).run({"values": [3, 5]})
 
 
 def test_nested_do_set_dataflow_switch_and_for_output() -> None:
@@ -153,26 +163,34 @@ def test_rejects_non_103_dsl_version(dsl_version: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "task",
+    ("task", "message"),
     [
-        {
-            "invoke": {
-                "call": "http",
-                "with": {"method": "get", "endpoint": "https://example.invalid"},
-            }
-        },
-        {
-            "recover": {
-                "try": [{"attempt": {"set": {"ok": True}}}],
-                "catch": {"do": [{"fallback": {"set": {"ok": False}}}]},
-            }
-        },
+        (
+            {
+                "invoke": {
+                    "call": "http",
+                    "with": {"method": "get", "endpoint": "https://example.invalid"},
+                }
+            },
+            "unsupported call target",
+        ),
+        (
+            {
+                "recover": {
+                    "try": [{"attempt": {"set": {"ok": True}}}],
+                    "catch": {"do": [{"fallback": {"set": {"ok": False}}}]},
+                }
+            },
+            "unsupported task",
+        ),
     ],
 )
-def test_schema_valid_call_and_try_are_rejected_by_subset(task: dict[str, Any]) -> None:
+def test_schema_valid_call_and_try_are_rejected_by_subset(
+    task: dict[str, Any], message: str
+) -> None:
     definition = minimal(task)
     validate_official_schema(definition)
-    with pytest.raises(OwsError, match="unsupported task"):
+    with pytest.raises(OwsError, match=message):
         Interpreter(definition)
 
 

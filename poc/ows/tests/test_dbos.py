@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,183 @@ def test_cli_replays_dataflow_transformations_around_dbos_checkpoints() -> None:
         ).fetchall()
     assert len(steps) == 2
     assert all(completed_at is not None for _, completed_at in steps)
+
+
+def test_mock_job_fixture_uses_durable_jobs_and_preserves_loop_dataflow() -> None:
+    output = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        str(OWS_DIR / "fixtures" / "mock_job_workflow.yaml"),
+        "--input-json",
+        '{"values":[3,5]}',
+    )
+    run_dir = Path(output["run_dir"])
+    assert run_dir.parent == STATE_DIR / "phase4b-runs"
+    assert run_dir.name.startswith("run-")
+    assert output["result"]["result_values"] == [3, 5]
+    assert output["result"]["job_ids"][-1] == output["result"]["last_job_id"]
+
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        jobs = connection.execute(
+            "SELECT job_id, request_key, workflow_id, task_identity, state, "
+            "dispatch_count, service_execution_count, result_json, progress_json "
+            "FROM jobs ORDER BY task_identity"
+        ).fetchall()
+    assert len(jobs) == 2
+    assert len({row[0] for row in jobs}) == 2
+    assert len({row[1] for row in jobs}) == 2
+    assert all(row[2] == output["workflow_id"] for row in jobs)
+    assert [row[3] for row in jobs] == [
+        "do[1].jobs.iteration[0].do[0].start",
+        "do[1].jobs.iteration[1].do[0].start",
+    ]
+    assert all(row[4:7] == ("SUCCEEDED", 1, 1) for row in jobs)
+    assert [json.loads(row[7])["payload"] for row in jobs] == [3, 5]
+    assert all(json.loads(row[8])["percent"] == 100 for row in jobs)
+
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?",
+            (output["workflow_id"],),
+        ).fetchone()
+    assert status == ("SUCCESS",)
+
+
+def test_mock_job_survives_worker_kill_and_completed_checkpoint_replay() -> None:
+    input_json = '{"payload":{"value":42},"duration_ms":250}'
+    normal = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        str(OWS_DIR / "fixtures" / "mock_job_recovery_workflow.yaml"),
+        "--input-json",
+        input_json,
+    )
+    output = _invoke(
+        str(OWS_DIR / "phase4b_recovery_test.py"),
+        "--normal-result-path",
+        str(Path(normal["run_dir"]) / "result.json"),
+        timeout=240,
+    )
+    assert output["result"] == "PASS"
+    assert output["service_survived_initial_worker_kill"] is True
+    assert (
+        output["service_heartbeats_after_worker_kill"] > output["service_heartbeats_at_worker_kill"]
+    )
+    assert output["checkpoint_absent_at_first_barrier"] is True
+    assert output["checkpoint_absent_after_worker_kill"] is True
+    assert output["job_state_before_checkpoint"] == "SUCCEEDED"
+    assert output["initial_worker_parent_pid"] == output["initial_popen_pid"]
+    assert output["recovery_worker_parent_pid"] == output["recovery_popen_pid"]
+    assert output["final_worker_parent_pid"] == output["final_popen_pid"]
+    assert output["initial_worker_pid"] != output["recovery_worker_pid"]
+    assert output["recovery_worker_pid"] != output["final_worker_pid"]
+    assert output["heartbeat_updates_at_kill"] >= 2
+    assert output["heartbeat_updates_at_kill"] >= output["heartbeat_updates_before_kill"]
+    assert output["heartbeat_updates_after_kill"] == output["heartbeat_updates_at_kill"]
+    assert output["heartbeat_pid_matches_worker"] is True
+    assert output["service_execution_count"] == 1
+    assert output["job_dispatch_count_after_checkpoint_replay"] == 2
+    assert output["ledger_row_count"] == 1
+    assert output["request_key_stable_across_recovery"] is True
+    assert output["call_step_starts"] == 2
+    assert output["call_step_completions"] == 1
+    assert output["final_status"] == "SUCCESS"
+    assert output["workflow_count"] == 1
+    assert output["normal_workflow_id"] != output["workflow_id"]
+    assert output["result_matches_uninterrupted_semantics"] is True
+
+
+def _run_mock_job_outcome(
+    *, payload: Any, timeout_seconds: float, start_service: bool
+) -> tuple[Path, subprocess.CompletedProcess[str]]:
+    import cli
+
+    run_dir = cli._new_run(
+        OWS_DIR / "fixtures" / "mock_job_recovery_workflow.yaml",
+        json.dumps({"payload": payload, "duration_ms": 0}, separators=(",", ":")),
+        10_000,
+    )
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["control"] = {"mock_job_timeout_seconds": timeout_seconds}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    from job_service import start_mock_job_service
+
+    service = start_mock_job_service(run_dir) if start_service else None
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(OWS_DIR / "worker.py"),
+                "--mode",
+                "start",
+                "--run-dir",
+                str(run_dir),
+                "--timeout-seconds",
+                "20",
+            ],
+            cwd=OWS_DIR.parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+    finally:
+        if service is not None:
+            assert service.stop() == 0
+    assert time.monotonic() - started < 20
+    return run_dir, completed
+
+
+def test_mock_service_failure_persists_failed_receipt_and_dbos_error() -> None:
+    run_dir, completed = _run_mock_job_outcome(
+        payload={"mock_failure": True}, timeout_seconds=5, start_service=True
+    )
+    assert completed.returncode != 0
+    startup = json.loads((run_dir / "start-worker.json").read_text(encoding="utf-8"))
+    workflow_id = startup["workflow_id"]
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?", (workflow_id,)
+        ).fetchone()
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        jobs = connection.execute(
+            "SELECT state, dispatch_count, service_execution_count, error FROM jobs"
+        ).fetchall()
+    events = [
+        json.loads(line)
+        for line in (run_dir / "job-service.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert status == ("ERROR",)
+    assert len(jobs) == 1
+    assert jobs[0][0:3] == ("FAILED", 1, 1)
+    assert jobs[0][3] == "mock service deterministic failure"
+    assert sum(event["event"] == "job_failed" for event in events) == 1
+
+
+def test_mock_job_timeout_is_bounded_without_cancel_or_redispatch() -> None:
+    run_dir, completed = _run_mock_job_outcome(
+        payload={"value": 17}, timeout_seconds=0.2, start_service=False
+    )
+    assert completed.returncode != 0
+    assert "job was not cancelled" in completed.stderr
+    startup = json.loads((run_dir / "start-worker.json").read_text(encoding="utf-8"))
+    workflow_id = startup["workflow_id"]
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?", (workflow_id,)
+        ).fetchone()
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        jobs = connection.execute(
+            "SELECT state, dispatch_count, service_execution_count, result_json FROM jobs"
+        ).fetchall()
+    assert status == ("ERROR",)
+    assert len(jobs) == 1
+    assert jobs[0] == ("QUEUED", 1, 0, None)
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from interpreter import OwsError, parse_workflow_text, validate_workflow
+from job_service import start_mock_job_service
 from worker import (
     _read_workflow_status,
     _write_json,
@@ -21,6 +22,7 @@ from worker import (
 OWS_DIR = Path(__file__).resolve().parent
 WORKER_PATH = OWS_DIR / "worker.py"
 DEFAULT_STATE_ROOT = OWS_DIR / ".state" / "runs"
+PHASE4B_STATE_ROOT = OWS_DIR / ".state" / "phase4b-runs"
 
 
 def _invoke_worker(run_dir: Path, mode: str, timeout_seconds: int) -> dict[str, Any]:
@@ -64,7 +66,8 @@ def _new_run(workflow_path: Path, input_json: str, max_tasks: int) -> Path:
     validate_workflow(definition)
     canonical_input = canonical_json(input_data)
 
-    run_dir = DEFAULT_STATE_ROOT / f"run-{uuid.uuid4().hex}"
+    state_root = PHASE4B_STATE_ROOT if _workflow_uses_mock_job(definition) else DEFAULT_STATE_ROOT
+    run_dir = state_root / f"run-{uuid.uuid4().hex}"
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "workflow.yaml").write_text(definition_text, encoding="utf-8")
     (run_dir / "input.json").write_text(canonical_input + "\n", encoding="utf-8", newline="\n")
@@ -82,11 +85,33 @@ def _new_run(workflow_path: Path, input_json: str, max_tasks: int) -> Path:
     return run_dir
 
 
+def _workflow_uses_mock_job(definition: dict[str, Any]) -> bool:
+    def has_call(tasks: list[dict[str, Any]]) -> bool:
+        for task in tasks:
+            task_spec = next(iter(task.values()))
+            if "call" in task_spec:
+                return True
+            nested = task_spec.get("do")
+            if isinstance(nested, list) and has_call(nested):
+                return True
+        return False
+
+    return has_call(definition["do"])
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_tasks < 1:
         raise OwsError("--max-tasks must be positive")
     run_dir = _new_run(args.workflow, args.input_json, args.max_tasks)
-    result_record = _invoke_worker(run_dir, "start", args.timeout_seconds)
+    manifest, definition_text, _ = load_run_request(run_dir)
+    definition = parse_workflow_text(definition_text)
+    service = start_mock_job_service(run_dir) if _workflow_uses_mock_job(definition) else None
+    try:
+        result_record = _invoke_worker(run_dir, "start", args.timeout_seconds)
+    finally:
+        service_exit_code = service.stop() if service is not None else 0
+    if service_exit_code != 0:
+        raise RuntimeError(f"mock-job service exited with {service_exit_code}")
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["workflow_id"] = result_record["workflow_id"]
@@ -107,7 +132,14 @@ def _resume(args: argparse.Namespace) -> dict[str, Any]:
     workflow_id = manifest.get("workflow_id")
     if not isinstance(workflow_id, str) or not workflow_id:
         raise OwsError("resume requires a workflow_id saved after initial start")
-    result_record = _invoke_worker(run_dir, "recover", args.timeout_seconds)
+    definition = parse_workflow_text(definition_text)
+    service = start_mock_job_service(run_dir) if _workflow_uses_mock_job(definition) else None
+    try:
+        result_record = _invoke_worker(run_dir, "recover", args.timeout_seconds)
+    finally:
+        service_exit_code = service.stop() if service is not None else 0
+    if service_exit_code != 0:
+        raise RuntimeError(f"mock-job service exited with {service_exit_code}")
     if result_record["workflow_id"] != workflow_id:
         raise OwsError("recovery result workflow_id differs from the saved ID")
     return {
