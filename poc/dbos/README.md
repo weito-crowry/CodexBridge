@@ -61,3 +61,50 @@ runディレクトリには専用DB `dbos-recovery.sqlite`、step開始ログ `s
 JSONL開始イベントの実測回数はstep1が1回、step2が2回、step3が1回です。初回workerは親のPopen PID `18880` / worker内Python PID `28736`、復旧workerはPopen PID `7116` / worker内Python PID `11668` でした。この環境では親側 `Popen.pid` と子側 `os.getpid()` の値が一致しませんでした。値の不一致を無視して成功扱いにはせず、親が保持する初回Popenに対する `kill()` と終了・回収（戻り値1）を確認し、初回worker PIDのheartbeatが0.5秒間停止したこと、marker作成前のSQLite `PENDING`・step2未完了、復旧開始までイベントが2件だけであることをそれぞれ検証しています。復旧は別のPopen・別のworker PIDで実行されました。
 
 この実測で確認したのは、SQLite checkpointを使ったDBOS workflowの再起動後の再開と、途中step2の再実行です。Codex/Gitなどの外部副作用に対する厳密な二重実行防止は未検証です。
+
+## Phase 2 外部副作用・再試行・UNKNOWN
+
+Phase 2は外部サービスを別SQLiteで模擬し、DBOSのworkflow checkpointと外部副作用が別トランザクションである障害窓を検証します。外部サービス、Codex App Server、GitHub、MCP、HTTPへ接続しません。各実行は独立した `run-<UUID>` ディレクトリに保存します。
+
+### 実行
+
+リポジトリルート `D:\CodexBridge-PoC` から各ケースを単独実行します。
+
+```powershell
+& .\poc\dbos\.venv\Scripts\python.exe .\poc\dbos\side_effect_test.py --case idempotent_recovery
+& .\poc\dbos\.venv\Scripts\python.exe .\poc\dbos\side_effect_test.py --case transient_retry
+& .\poc\dbos\.venv\Scripts\python.exe .\poc\dbos\side_effect_test.py --case unqueryable_unknown
+& .\poc\dbos\.venv\Scripts\python.exe -m pytest -q -c .\poc\dbos\pytest.ini .\poc\dbos\test_side_effects.py
+```
+
+driverはSQLiteを直接読み戻してから`PASS`を出します。pytestも各DBの行、workflow ID/status、request key、effect名/値、合計カウンタ、step entry、再試行またはUNKNOWN証跡を照合します。失敗したrunは削除せず証跡を残します。
+
+### ケースと期待値
+
+| ケース | 実験 | 期待される実測 |
+| --- | --- | --- |
+| `idempotent_recovery` | `workflow_id:charge`をkeyに外部ledgerへ1回commitし、step return前に親が初回workerをkill。再開workerは新規workflowを作らず`DBOS.launch()`だけで復旧し、同じkeyを外部ledgerから照合 | 1 workflow、初回と復旧のstep entry各1回、最終`SUCCESS`、完了step checkpoint 1件、外部effect 1件/合計41、lookup `MISS`→send `APPLIED`→lookup `HIT` |
+| `transient_retry` | 副作用前に外部SQLiteで一時障害を2回注入 | DBOS標準step retryを`max_attempts=3`で使用し、3回目に成功。step entry 3回、`TransientServiceError` 2回、外部effect 1件/合計41 |
+| `unqueryable_unknown` | 外部SQLiteへ非冪等sendを1回commitした直後、adapterの受領結果とDBOS step checkpointが未完了の状態で親が初回workerをkill | 復旧workerは外部照会・再送をせずadapterを`UNKNOWN`にし、workflowは実測どおり`ERROR`。外部send/effectは1回、step entryは2回、DBOSは失敗を`operation_outputs.error`に記録 |
+
+DBOS 3.4.0の`DBOS.step(retries_allowed=True, max_attempts=3, should_retry=...)`を使用します。再試行predicateは`TransientServiceError`だけを許可し、実測では合計3 attempt（初回を含む）でした。UNKNOWNはこのpredicateで再試行されません。ケースCの初回kill前は`PENDING`かつstep出力/error checkpointなしです。復旧workerがUNKNOWNを検出して例外にした後、DBOSはその失敗をerror checkpointとして保存し、workflow statusは`ERROR`になりました。
+
+### 証跡と制限
+
+既定の保存先は `poc/dbos/.state/phase2-runs/run-<UUID>/` です。pytest実行も `.state/phase2-pytest-<case>/run-<UUID>/` の下に保存し、既存`.gitignore`で除外されます。runごとにworkflow DB `workflow.sqlite`と架空外部サービスDB `fake-external.sqlite`は別ファイルです。ケースCだけadapterの`adapter-state.sqlite`も追加します。JSONL `worker-events.jsonl`はworker内のstep entry、intent、error、UNKNOWN拒否を記録し、初回・復旧workerのheartbeat、worker stdout/stderr、`before-kill.json`、`before-recovery.json`、`final-evidence.json`、`result.json`を同じrunに保存します。
+
+親は自分の`subprocess.Popen`で起動した子にだけ`Popen.kill()`し、waitで回収します。kill点は外部DBのeffect/合計とDBOSの`PENDING`・未checkpoint、ケースCではadapterのintent・receiptなしを確認して決めます。終了後は子のheartbeatが停止したことを確認します。親Popen PIDとworkerのPython PIDの一致は前提にせず、両方の値を記録します。タイムアウト時も親が所有する子だけをfinallyで回収します。
+
+ケースCではworker/adaptorは外部DBを監査照会に使いません。pytest/driverが子worker終了後に外部SQLiteを監査し、effect 1件とsend 1回を確認します。ケースAは外部ledger lookupとrequest keyの一意制約で重複副作用を防ぎます。このPoCが示すのは当該fake service契約での回復・限定再試行・UNKNOWN停止であり、任意の外部サービスに対するExactly-once保証ではありません。実Codex接続は行いません。
+
+### 2026-11-10 実測
+
+3ケースをdriverから個別に実行し、各SQLiteとJSONLを読み戻しました。
+
+| ケース | run / workflow ID | DBOS結果・step entry | retry / UNKNOWN | 外部SQLite |
+| --- | --- | --- | --- | --- |
+| `idempotent_recovery` | `run-323ff1ea88fd4b2f8587ca8d435026c1` / `01a1c47d-5c23-754f-8d84-4ff979b26fc6` | 1 workflow、初回`PENDING`・step未checkpointから復旧、最終`SUCCESS`、entry 2回 | retry 0。親が初回子をkill/waitしheartbeat停止を確認。復旧側の新規workflow開始なし | request key `01a1c47d-5c23-754f-8d84-4ff979b26fc6:charge`、effect 1件、合計41。lookup `MISS`、send `APPLIED`、復旧lookup `HIT` |
+| `transient_retry` | `run-021c8a7b71d34bc39f3c2d4e6436b324` / `01a1c47d-7c85-77f2-8041-5371baf65bb6` | 1 workflow、最終`SUCCESS`、entry 3回 | `TransientServiceError` 2回、3回目成功。retry 2 | effect 1件、合計41。外部call結果は`TRANSIENT_ERROR`, `TRANSIENT_ERROR`, `APPLIED` |
+| `unqueryable_unknown` | `run-b1fede46a7cf4f5e9f13f6512a571089` / `01a1c47d-8fbd-7039-99be-83419a47d236` | 1 workflow、初回`PENDING`・step未checkpointから復旧、最終`ERROR`、entry 2回 | retry 0。adapterは`UNKNOWN`、証跡`dispatch intent exists without a local receipt; no retry`。workerの再送/照会なし | 監査専用readbackでsend/effect各1回、合計41。外部callは初回`send_unqueryable`のみ |
+
+3 runともPopen PIDとworker内Python PIDは不一致でした。driverは一致を仮定せず、自分が所有するPopenへのkill/waitとheartbeat停止で初回子の終了を確認しました。各runの詳細は `poc/dbos/.state/phase2-runs/<run>/` にあります。
