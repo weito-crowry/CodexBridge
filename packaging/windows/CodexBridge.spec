@@ -1,16 +1,26 @@
 from pathlib import Path
 
+from PySide6.QtCore import QLibraryInfo
+
 ROOT = Path(SPECPATH).resolve().parents[1]
 SOURCE = ROOT / "src"
 ENTRY = ROOT / "packaging" / "windows" / "codexbridge_entry.py"
 ICON = SOURCE / "codex_bridge" / "assets" / "codexbridge_icon_256.ico"
+LOCALES = SOURCE / "codex_bridge" / "console" / "locales"
 SETUP_APP = SOURCE / "codex_bridge" / "assets" / "codexbridge_setup_app.html"
+
+QT_BASE_JA = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)) / "qtbase_ja.qm"
 
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(SOURCE)],
     binaries=[],
-    datas=[(str(ICON), "codex_bridge/assets"), (str(SETUP_APP), "codex_bridge/assets")],
+    datas=[
+        (str(ICON), "codex_bridge/assets"),
+        (str(SETUP_APP), "codex_bridge/assets"),
+        (str(LOCALES), "codex_bridge/console/locales"),
+        (str(QT_BASE_JA), "PySide6/translations"),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

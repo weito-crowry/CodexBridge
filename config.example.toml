@@ -4,6 +4,11 @@
 [bridge]
 host = "127.0.0.1"
 port = 8000
+# Optional authenticated LAN access to this same /mcp endpoint (no second listener).
+# Set lan_enabled = true, bind host to the LAN IP or "0.0.0.0", and explicitly list
+# LAN + existing localhost/Tunnel hosts and exact Chrome extension origins below.
+# Supply CODEX_BRIDGE_MCP_TOKEN in the process environment; never put it in TOML.
+# lan_enabled = false
 allowed_roots = ["C:\\path\\to\\allowed"]
 # allowed_hosts = ["127.0.0.1", "localhost"]
 # allowed_origins = ["http://127.0.0.1:8000"]

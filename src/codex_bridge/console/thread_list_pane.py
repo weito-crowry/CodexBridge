@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from .bulk_thread_naming import build_thread_list_header, loaded_untitled_thread_rows
 from .external_running_threads import is_codexbridge_originator
+from .i18n import tr
 from .project_names import normalize_cwd
 from .widget_helpers import _safe_text, copy_to_clipboard
 
@@ -55,11 +56,11 @@ def _thread_status_marker(status: str | None) -> str:
 
 def _thread_status_label(status: str) -> str:
     return {
-        "in_progress": "Running",
-        "needs_approval": "Waiting for approval",
-        "needs_input": "Waiting for input",
-        "needs_user_input": "Waiting for input",
-        "waiting": "Waiting",
+        "in_progress": tr("Running"),
+        "needs_approval": tr("Waiting for approval"),
+        "needs_input": tr("Waiting for input"),
+        "needs_user_input": tr("Waiting for input"),
+        "waiting": tr("Waiting"),
     }.get(status, status)
 
 
@@ -88,6 +89,7 @@ class ThreadListPane(QWidget):
         self._external_running_threads: dict[str, dict[str, object]] = {}
         self._active_thread_ids: set[str] = set()
         self._thread_statuses: dict[str, str] = {}
+        self._last_turns: dict[str, Mapping[str, object]] = {}
         self._has_thread_statuses = False
         self._project_names: dict[str, str] = {}
         self._collapsed_group_keys: set[str] = set()
@@ -101,10 +103,10 @@ class ThreadListPane(QWidget):
         self._spinner_timer = QTimer(self)
         self._spinner_timer.setInterval(_SPINNER_INTERVAL_MS)
         self._spinner_timer.timeout.connect(self._advance_running_spinner)
-        title = QLabel("Threads")
-        self.refresh_button = QPushButton("Refresh")
+        title = QLabel(tr("Threads"))
+        self.refresh_button = QPushButton(tr("Refresh"))
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Filter threads")
+        self.filter_edit.setPlaceholderText(tr("Filter threads"))
         self.list_widget = QTreeWidget()
         self.list_widget.setObjectName("threadList")
         self.list_widget.setHeaderHidden(True)
@@ -298,6 +300,11 @@ class ThreadListPane(QWidget):
         self._has_thread_statuses = True
         self._render()
 
+    def set_last_turn(self, thread_id: str, outcome: Mapping[str, object]) -> None:
+        if self._last_turns.get(thread_id) != outcome:
+            self._last_turns[thread_id] = dict(outcome)
+            self._render()
+
     @property
     def thread_count(self) -> int:
         return len(self._threads)
@@ -341,7 +348,7 @@ class ThreadListPane(QWidget):
                 basename = (
                     os.path.basename(os.path.normpath(group_cwd)) or group_cwd
                     if group_cwd is not None
-                    else "Other"
+                    else tr("Other")
                 )
                 if isinstance(friendly_name, str) and friendly_name.strip():
                     friendly_name = friendly_name.strip()
@@ -397,7 +404,7 @@ class ThreadListPane(QWidget):
                     thread_id = thread.get("id")
                     if not isinstance(thread_id, str):
                         continue
-                    title = _safe_text(thread.get("name")) or "New スレッド"
+                    title = _safe_text(thread.get("name")) or tr("New thread")
                     status = self._thread_statuses.get(thread_id)
                     external_running = self._is_external_running_candidate(thread_id)
                     managed_running = status == "in_progress" or (
@@ -410,6 +417,22 @@ class ThreadListPane(QWidget):
                     item = QTreeWidgetItem([f"{status_marker}{title}" if status_marker else title])
                     item.setData(0, Qt.ItemDataRole.UserRole, thread_id)
                     item.setToolTip(0, thread_id)
+                    last = self._last_turns.get(thread_id)
+                    if marker_kind is None and status not in _MANAGED_RUNTIME_STATUSES and last:
+                        label = {
+                            "completed": tr("Completed"),
+                            "failed": tr("Failed"),
+                            "interrupted": tr("Interrupted"),
+                            "unknown": tr("Unknown"),
+                        }.get(str(last.get("status")), "")
+                        if label:
+                            attention = (
+                                tr(" · attention required") if last.get("needs_attention") else ""
+                            )
+                            item.setText(0, f"{title} [{label}{attention}]")
+                            item.setToolTip(
+                                0, f"{thread_id}\n{last.get('reason')} · {last.get('evidence')}"
+                            )
                     if marker_kind is not None:
                         color = self._running_marker_color(marker_kind)
                         icon = self._running_spinner_icon(color, self._spinner_angle)
@@ -424,7 +447,7 @@ class ThreadListPane(QWidget):
                         item.setFont(0, font)
                         item.setForeground(0, QBrush(color))
                     if marker_kind == "external":
-                        item.setToolTip(0, f"{thread_id}\n推定実行中")
+                        item.setToolTip(0, tr("{p0}\nLikely running", p0=thread_id))
                     elif status_marker:
                         font = QFont(item.font(0))
                         font.setWeight(QFont.Weight.DemiBold)
@@ -469,7 +492,7 @@ class ThreadListPane(QWidget):
                 if matching_threads
             ]
             if matching_running_groups:
-                running_section = QTreeWidgetItem(["現在処理中"])
+                running_section = QTreeWidgetItem([tr("Currently running")])
                 running_section.setData(0, Qt.ItemDataRole.UserRole, None)
                 running_section.setData(0, self._RUNNING_SECTION_ROLE, True)
                 self.list_widget.addTopLevelItem(running_section)
@@ -583,18 +606,21 @@ class ThreadListPane(QWidget):
         if thread is None:
             return None
         lines = [
-            f"Name: {_safe_text(thread.get('name')) or 'New スレッド'}",
-            f"Thread ID: {thread_id}",
+            tr("Name: {p0}", p0=_safe_text(thread.get("name")) or tr("New thread")),
+            tr("Thread ID: {p0}", p0=thread_id),
         ]
         cwd = self._cached_cwd(thread.get("cwd"))
         if cwd is not None:
-            lines.append(f"CWD: {cwd}")
+            lines.append(tr("CWD: {p0}", p0=cwd))
         status = self._thread_statuses.get(thread_id)
         if status is not None:
-            lines.append(f"Turn status: {_thread_status_label(status)}")
+            lines.append(tr("Turn status: {p0}", p0=_thread_status_label(status)))
         elif not self._has_thread_statuses:
             lines.append(
-                f"Status: {'active' if thread_id in self._active_thread_ids else 'inactive'}"
+                tr(
+                    "Status: {p0}",
+                    p0="active" if thread_id in self._active_thread_ids else "inactive",
+                )
             )
         return "\n".join(lines)
 
@@ -623,30 +649,30 @@ class ThreadListPane(QWidget):
             return None
         menu = QMenu(self)
 
-        rename_action = menu.addAction("名前を変更...")
+        rename_action = menu.addAction(tr("Rename…"))
         rename_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self.thread_rename_requested.emit(thread_id)
         )
-        open_codex_action = menu.addAction("Open in Codex App")
+        open_codex_action = menu.addAction(tr("Open in Codex App"))
         open_codex_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self.thread_open_requested.emit(thread_id)
         )
-        copy_id_action = menu.addAction("スレッドIDをコピー")
+        copy_id_action = menu.addAction(tr("Copy thread ID"))
         copy_id_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self._copy_text(thread_id)
         )
-        copy_info_action = menu.addAction("スレッド情報をコピー")
+        copy_info_action = menu.addAction(tr("Copy thread information"))
         copy_info_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self._copy_text(
                 self._thread_info_text(thread_id) or ""
             )
         )
-        copy_content_action = menu.addAction("Copy thread content")
+        copy_content_action = menu.addAction(tr("Copy thread content"))
         copy_content_action.triggered.connect(
             lambda _checked=False, thread_id=thread_id: self.thread_copy_requested.emit(thread_id)
         )
         menu.addSeparator()
-        open_cwd_action = menu.addAction("作業フォルダを開く")
+        open_cwd_action = menu.addAction(tr("Open working folder"))
         thread = self._thread_for_id(thread_id)
         open_cwd_action.setEnabled(
             self._openable_cwd(thread.get("cwd") if thread is not None else None) is not None
@@ -669,21 +695,21 @@ class ThreadListPane(QWidget):
         menu = QMenu(self)
         openable = self._openable_cwd(cwd) is not None
 
-        new_thread_action = menu.addAction("新規スレッドを開始...")
+        new_thread_action = menu.addAction(tr("Start a new thread…"))
         new_thread_action.setEnabled(openable)
         new_thread_action.triggered.connect(
             lambda _checked=False, cwd=cwd: self.new_thread_for_folder_requested.emit(cwd)
         )
         menu.addSeparator()
 
-        explorer_action = menu.addAction("エクスプローラーで開く")
+        explorer_action = menu.addAction(tr("Open in Explorer"))
         explorer_action.setEnabled(openable)
         explorer_action.triggered.connect(
             lambda _checked=False, cwd=cwd: self.folder_explorer_requested.emit(cwd)
         )
-        copy_path_action = menu.addAction("フォルダパスをコピー")
+        copy_path_action = menu.addAction(tr("Copy folder path"))
         copy_path_action.triggered.connect(lambda _checked=False, cwd=cwd: self._copy_text(cwd))
-        terminal_action = menu.addAction("ターミナルで開く")
+        terminal_action = menu.addAction(tr("Open in Terminal"))
         terminal_action.setEnabled(openable)
         terminal_action.triggered.connect(
             lambda _checked=False, cwd=cwd: self.folder_terminal_requested.emit(cwd)

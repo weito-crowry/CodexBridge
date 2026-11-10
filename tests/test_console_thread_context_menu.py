@@ -47,7 +47,7 @@ def test_running_section_parent_is_not_treated_as_project_context_menu(tmp_path)
     running_project = running_section.child(0)
     existing_project = pane.list_widget.topLevelItem(1)
 
-    assert running_section.text(0) == "現在処理中"
+    assert running_section.text(0) == "Currently running"
     assert pane._context_menu_for_item(running_section) is None
     assert pane._context_menu_for_item(running_project) is None
     assert pane._context_menu_for_item(existing_project) is not None
@@ -85,13 +85,13 @@ def test_thread_context_menu_uses_right_clicked_thread_for_all_actions(
     actions = menu.actions()
 
     assert [action.text() for action in actions] == [
-        "名前を変更...",
+        "Rename…",
         "Open in Codex App",
-        "スレッドIDをコピー",
-        "スレッド情報をコピー",
+        "Copy thread ID",
+        "Copy thread information",
         "Copy thread content",
         "",
-        "作業フォルダを開く",
+        "Open working folder",
     ]
     actions[0].trigger()
     assert renamed == ["target"]
@@ -123,7 +123,7 @@ def test_thread_context_menu_disables_folder_action_without_valid_cwd(tmp_path) 
 
     menu = pane._context_menu_for_item(_thread_item(pane, "target"))
 
-    assert menu.actions()[-1].text() == "作業フォルダを開く"
+    assert menu.actions()[-1].text() == "Open working folder"
     assert not menu.actions()[-1].isEnabled()
 
 
@@ -184,11 +184,11 @@ def test_project_parent_context_menu_uses_group_path_and_keeps_action_order(
 
     assert menu is not None
     assert [action.text() for action in menu.actions()] == [
-        "新規スレッドを開始...",
+        "Start a new thread…",
         "",
-        "エクスプローラーで開く",
-        "フォルダパスをコピー",
-        "ターミナルで開く",
+        "Open in Explorer",
+        "Copy folder path",
+        "Open in Terminal",
     ]
     new_drafts: list[str] = []
     explorer_paths: list[str] = []

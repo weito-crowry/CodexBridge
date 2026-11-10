@@ -870,7 +870,7 @@ def test_unloaded_thread_composer_uses_loaded_history_in_either_arrival_order(
     assert widget.model_combo.itemText(0) == "Model: gpt-5.6-sol"
     assert widget.effort_combo.itemText(0) == "Effort: xhigh"
     assert widget.access_combo.itemText(0) == "Access: Unknown"
-    assert "読み込んだ履歴" in widget.model_combo.toolTip()
+    assert "loaded history" in widget.model_combo.toolTip()
     assert "turn-1" in widget.effort_combo.toolTip()
     assert len(client.requests) == request_count
     assert client.json_posts == []

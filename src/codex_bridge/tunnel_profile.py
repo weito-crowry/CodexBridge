@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
@@ -176,11 +176,13 @@ def generate_tunnel_profile(
     profile_dir: str | os.PathLike[str],
     profile_name: str,
     client_executable: str | os.PathLike[str],
-) -> TunnelProfileResult:
+    install_if_current: Callable[[Path, Path], bool] | None = None,
+) -> TunnelProfileResult | None:
     """Validate and atomically install a v1 YAML profile with the Tunnel client.
 
     Mapping inputs are rendered as JSON, which is a valid YAML 1.2 document.
-    The caller supplies secret references; this function never resolves them.
+    The caller supplies secret references; this function never resolves them. When
+    `install_if_current` declines installation, return None and clean up the staged file.
     """
     if _PROFILE_NAME.fullmatch(profile_name) is None or profile_name in {".", ".."}:
         raise TunnelProfileError("Tunnel profile name is invalid")
@@ -237,9 +239,15 @@ def generate_tunnel_profile(
             )
 
         try:
-            os.replace(temp_path, target)
+            if install_if_current is None:
+                os.replace(temp_path, target)
+                installed = True
+            else:
+                installed = install_if_current(temp_path, target)
         except OSError as exc:
             raise TunnelProfileError("Tunnel profile could not be atomically installed") from exc
+        if not installed:
+            return None
         temp_path = None
         return TunnelProfileResult(path=target, profile_name=profile_name)
     except TunnelProfileError:

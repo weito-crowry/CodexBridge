@@ -24,10 +24,39 @@ _ALLOWED_FIELDS = (
     "exception_type",
     "cancelled",
     "exit_code",
+    "reason",
+    "consecutive_failures",
+    "health_ok",
+    "bridge_ready",
+    "app_server_ready",
+    "managed",
+    "bridge_pid",
+    "process_id",
+    "process_alive",
+    "stderr_had_output",
+    "stderr_line_count",
 )
 _SAFE_EVENT = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[A-Za-z0-9:.+_-]{1,40}\Z")
 _SAFE_BARE_VALUE = re.compile(r"[A-Za-z0-9_.:/+-]{1,128}\Z")
+_SAFE_REASONS = frozenset(
+    {
+        "readiness",
+        "explicit_start",
+        "retry_now",
+        "restart",
+        "recovery_timeout",
+        "unexpected_exit",
+        "process_error",
+        "start_failed",
+        "explicit_stop",
+        "close",
+        "app_server_unavailable",
+        "bridge_unavailable",
+        "status_request_failed",
+        "status_recovered",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +286,8 @@ class DiagnosticsReader:
 
     @staticmethod
     def _safe_field_value(key: str, value: object) -> str | None:
+        if key == "reason":
+            return value if isinstance(value, str) and value in _SAFE_REASONS else None
         if key in {"method", "path", "protocol_version", "exception_type"}:
             if not isinstance(value, str) or len(value) > 128:
                 return None
@@ -265,13 +296,36 @@ class DiagnosticsReader:
             if _SAFE_BARE_VALUE.fullmatch(value):
                 return value
             return json.dumps(value, ensure_ascii=True)
-        if key in {"status", "exit_code"}:
-            return str(value) if isinstance(value, int) and not isinstance(value, bool) else None
+        if key in {
+            "status",
+            "exit_code",
+            "consecutive_failures",
+            "bridge_pid",
+            "process_id",
+            "stderr_line_count",
+        }:
+            if not isinstance(value, int) or isinstance(value, bool):
+                return None
+            if key in {"consecutive_failures", "bridge_pid", "process_id"} and not (
+                1 <= value <= 4_294_967_295
+            ):
+                return None
+            if key == "stderr_line_count" and not 0 <= value <= 2_147_483_647:
+                return None
+            return str(value)
         if key == "duration_ms":
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 return None
             numeric = float(value)
             return f"{numeric:.3f}".rstrip("0").rstrip(".") if math.isfinite(numeric) else None
-        if key == "cancelled":
+        if key in {
+            "cancelled",
+            "health_ok",
+            "bridge_ready",
+            "app_server_ready",
+            "managed",
+            "process_alive",
+            "stderr_had_output",
+        }:
             return str(value).lower() if isinstance(value, bool) else None
         return None

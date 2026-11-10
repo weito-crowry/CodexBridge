@@ -186,3 +186,37 @@ def test_status_opens_and_usage_history_reports_read_failure(
         is window._usage_history_window.error_state_label
     )
     window.close()
+
+
+def test_history_forecast_uses_updated_main_window_reset_without_reopening(tmp_path: Path) -> None:
+    from datetime import datetime
+    from time import time
+
+    from codex_bridge.console.usage import CodexUsage, UsageWindow
+    from codex_bridge.console.usage_history import record_usage_sample
+
+    _application()
+    database = tmp_path / "usage-history.sqlite3"
+    now = time()
+    for offset, value in [(-3600, 40), (-1800, 35), (0, 30)]:
+        record_usage_sample(
+            CodexUsage(UsageWindow(300, value, "unavailable")),
+            captured_at_epoch=now + offset,
+            database_path=database,
+        )
+    window = _usage_window(FakeClient(), database)
+    window._create_or_show_usage_history_window()
+    history = window._usage_history_window
+    assert history is not None
+    assert history.forecasts["five_hour"].next_reset_epoch is None
+    reset = datetime.fromtimestamp(now + 7200).strftime("%Y-%m-%d %H:%M:%S")
+    window._apply_usage(
+        {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300, "usedPercent": 70, "resetsAt": reset}
+            }
+        }
+    )
+    history.refresh()
+    assert history.forecasts["five_hour"].status == "reset_before_exhaustion"
+    window.close()

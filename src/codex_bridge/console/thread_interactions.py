@@ -7,6 +7,7 @@ from urllib.parse import quote
 from PySide6.QtWidgets import QInputDialog, QLineEdit
 
 from .codex_links import codex_thread_uri
+from .i18n import tr
 from .widgets import TimelineEntry, format_thread_content, timeline_entries
 
 if TYPE_CHECKING:
@@ -29,8 +30,8 @@ class ThreadInteractionController:
         window = self._window
         name, accepted = (get_text or QInputDialog.getText)(
             window,
-            "名前を変更",
-            "名前:",
+            tr("Rename"),
+            tr("Name:"),
             QLineEdit.EchoMode.Normal,
             window.thread_pane.thread_name(thread_id),
         )
@@ -62,8 +63,10 @@ class ThreadInteractionController:
             opened = False
         if not opened:
             window.bottom_status_label.setText(
-                "Could not open thread in Codex App. "
-                "Check that the codex:// URI handler is available."
+                tr(
+                    "Could not open thread in Codex App. Check that the codex:// URI handler "
+                    "is available."
+                )
             )
 
     def _copy_thread_content(self, thread_id: str) -> None:
@@ -90,7 +93,7 @@ class ThreadInteractionController:
         key: str,
         payload: object,
         *,
-        copy_to_clipboard: Callable[[str], None],
+        copy_to_clipboard: Callable[[str], object],
     ) -> None:
         pending = self._pending_thread_copies.get(key)
         if pending is None or not isinstance(payload, Mapping):
@@ -153,11 +156,11 @@ class ThreadInteractionController:
         window._client.stop_stream()
         window.selected_status_timer.stop()
         if thread_id is None:
-            window.stream_status_label.setText("Stream: idle")
+            window.stream_status_label.setText(tr("Stream: idle"))
             window._sync_empty_state()
             return
-        window.history_pane.set_empty_state("Loading history…")
-        window.activity_pane.set_loading_state("Loading activity…")
+        window.history_pane.set_empty_state(tr("Loading history…"))
+        window.activity_pane.set_loading_state(tr("Loading activity…"))
         window.selected_status_timer.start()
         self._request_snapshot(generation)
 

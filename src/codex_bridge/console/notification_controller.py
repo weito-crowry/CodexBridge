@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import tr
+
 _COMPLETION_MODES = frozenset({"always", "inactive", "off"})
 _MAX_SEEN = 2_048
 _MAX_NOTIFICATION_TEXT = 240
@@ -111,9 +113,13 @@ class NotificationController:
             return False
         if not isinstance(turn_id, str) or not turn_id:
             return False
-        body = _bounded_text(activity.get("summary"), "Open CodexBridge Console to view details")
+        body = _bounded_text(
+            activity.get("summary"), tr("Open CodexBridge Console to view details")
+        )
 
         if activity_type in {"turn_completed", "turn_failed", "turn_interrupted"}:
+            if details.get("reason") == "connection_lost":
+                return False
             expected_status = {
                 "turn_completed": "completed",
                 "turn_failed": "failed",
@@ -127,15 +133,15 @@ class NotificationController:
             if mode == "off" or (mode == "inactive" and self._is_window_active()):
                 return False
             title = {
-                "turn_completed": "Turn completed",
-                "turn_failed": "Turn failed",
-                "turn_interrupted": "Turn interrupted",
+                "turn_completed": tr("Turn completed"),
+                "turn_failed": tr("Turn failed"),
+                "turn_interrupted": tr("Turn interrupted"),
             }[activity_type]
-            return self._notify(("turn", thread_id, turn_id, activity_type), title, body)
+            return self._notify(("turn", thread_id, turn_id), title, body)
 
         request_types = {
-            "approval_requested": ("notifications/approval_enabled", "Approval required"),
-            "user_input_requested": ("notifications/user_input_enabled", "Input required"),
+            "approval_requested": ("notifications/approval_enabled", tr("Approval required")),
+            "user_input_requested": ("notifications/user_input_enabled", tr("Input required")),
         }
         request = request_types.get(activity_type)
         if request is None or status != "requested":
@@ -159,24 +165,26 @@ class NotificationSettingsDialog(QDialog):
     def __init__(self, settings: SettingsLike, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._settings = settings
-        self.setWindowTitle("Notification settings")
+        self.setWindowTitle(tr("Notification settings"))
         self.completion_mode = QComboBox(self)
-        self.completion_mode.addItem("Always", "always")
-        self.completion_mode.addItem("When Console is inactive", "inactive")
-        self.completion_mode.addItem("Off", "off")
-        self.approval_enabled = QCheckBox("Approval requests", self)
-        self.user_input_enabled = QCheckBox("User input requests", self)
-        self.sound_enabled = QCheckBox("Play an extra beep when showing a notification", self)
+        self.completion_mode.addItem(tr("Always"), "always")
+        self.completion_mode.addItem(tr("When Console is inactive"), "inactive")
+        self.completion_mode.addItem(tr("Off"), "off")
+        self.approval_enabled = QCheckBox(tr("Approval requests"), self)
+        self.user_input_enabled = QCheckBox(tr("User input requests"), self)
+        self.sound_enabled = QCheckBox(tr("Play an extra beep when showing a notification"), self)
         self.os_sound_note = QLabel(self)
         if sys.platform == "win32":
             self.sound_enabled.setEnabled(False)
             self.os_sound_note.setText(
-                "Windows controls native notification sound and quiet hours; Console does not "
-                "override them."
+                tr(
+                    "Windows controls native notification sound and quiet hours; Console does"
+                    " not override them."
+                )
             )
         else:
             self.os_sound_note.setText(
-                "The extra beep is separate from any sound played by native notifications."
+                tr("The extra beep is separate from any sound played by native notifications.")
             )
 
         stored_mode = settings.value("notifications/completion_mode", "always")
@@ -191,7 +199,7 @@ class NotificationSettingsDialog(QDialog):
         self.sound_enabled.setChecked(_setting_bool(settings, "notifications/sound_enabled", False))
 
         form = QFormLayout()
-        form.addRow("Turn completion", self.completion_mode)
+        form.addRow(tr("Turn completion"), self.completion_mode)
         form.addRow(self.approval_enabled)
         form.addRow(self.user_input_enabled)
         form.addRow(self.sound_enabled)

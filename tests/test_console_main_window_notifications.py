@@ -3,26 +3,30 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+import pytest
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer
+from PySide6.QtCore import Signal as QtSignal
 from PySide6.QtGui import QPalette
 
+from codex_bridge.console.i18n import tr
 from codex_bridge.console.main_window import MainWindow
 from codex_bridge.console.notification_controller import NotificationSettingsDialog
 from tests.console_main_window_test_support import (
     FakeClient,
     FakeCodexProbe,
     FakeCodexUpdateProbe,
-    Signal,
     StableTunnel,
     _application,
     _config,
 )
 
 
-class FakeTray:
+class FakeTray(QObject):
+    activated = QtSignal(object)
+    messageClicked = QtSignal()
+
     def __init__(self) -> None:
-        self.activated = Signal()
-        self.messageClicked = Signal()
+        super().__init__()
         self.messages: list[tuple[str, str]] = []
 
     def setIcon(self, _icon: object) -> None:
@@ -49,7 +53,10 @@ def _window(
     *,
     settings: QSettings | None = None,
     tray: FakeTray | None = None,
+    language: str = "en",
 ) -> MainWindow:
+    if settings is not None:
+        settings.setValue("language", language)
     return MainWindow(
         _config(),
         api_client=client,
@@ -103,16 +110,24 @@ def test_global_live_notifications_deduplicate_and_retries_back_off_until_connec
     settings.clear()
 
 
-def test_notification_click_shows_console_without_routing_to_latest_thread_and_settings_persists(
+@pytest.mark.parametrize("language", ["en", "ja-JP"])
+@pytest.mark.parametrize("notification_count", [1, 2])
+def test_notification_click_preserves_selected_thread_and_does_not_submit_actions(
     tmp_path: Path,
+    language: str,
+    notification_count: int,
 ) -> None:
     _application()
     client = FakeClient()
     tray = FakeTray()
     settings = QSettings(str(tmp_path / "console.ini"), QSettings.Format.IniFormat)
-    window = _window(client, settings=settings, tray=tray)
+    window = _window(client, settings=settings, tray=tray, language=language)
+    raw_title = "Settings Turn completed 日本語 {thread_id}"
+    client.result("threads", {"threads": [{"id": "selected-thread", "name": raw_title}]})
     window.select_thread("selected-thread")
-    for thread_id, request_id in (("thread-a", "request-a"), ("thread-b", "request-b")):
+    for thread_id, request_id in (("thread-a", "request-a"), ("thread-b", "request-b"))[
+        :notification_count
+    ]:
         client.global_activity(
             window._global_stream_generation,
             {
@@ -129,8 +144,15 @@ def test_notification_click_shows_console_without_routing_to_latest_thread_and_s
     tray.messageClicked.emit()
     assert window._selected_thread_id == "selected-thread"
     assert window.isVisible()
-    assert len(tray.messages) == 2
+    title_items = window.thread_pane.list_widget.findItems(
+        raw_title, Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive
+    )
+    assert len(title_items) == 1
+    assert title_items[0].data(0, Qt.ItemDataRole.UserRole) == "selected-thread"
+    assert len(tray.messages) == notification_count
     assert not client.approval_requests
+    assert not client.json_posts
+    assert not client.control_requests
 
     def accept_settings_dialog() -> None:
         children = window.findChildren(NotificationSettingsDialog)
@@ -148,11 +170,36 @@ def test_notification_click_shows_console_without_routing_to_latest_thread_and_s
         settings_dialog.accept()
 
     QTimer.singleShot(0, accept_settings_dialog)
-    window.notification_settings_button.click()
+    notification_settings_action = next(
+        action
+        for action in window.settings_menu.actions()
+        if action.text() == tr("Notification settings")
+    )
+    notification_settings_action.trigger()
     assert settings.value("notifications/completion_mode") == "off"
     assert settings.value("notifications/approval_enabled") is False
     assert settings.value("notifications/user_input_enabled") is True
     assert settings.value("notifications/sound_enabled") is (sys.platform != "win32")
+    for kind, status, details in (
+        ("turn_completed", "completed", {}),
+        ("approval_requested", "requested", {"request_id": "disabled-approval"}),
+    ):
+        client.global_activity(
+            window._global_stream_generation,
+            {
+                "thread_id": "thread-c",
+                "turn_id": "turn-c",
+                "type": kind,
+                "status": status,
+                "summary": "Settings take effect immediately",
+                "details": details,
+            },
+        )
+    assert len(tray.messages) == notification_count
+    assert not client.approval_requests
+    assert not client.json_posts
+    assert not client.control_requests
+    window._begin_exit()
     window.close()
 
 
@@ -182,7 +229,7 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
 
     assert window._thread_turn_statuses["thread-b"] == "in_progress"
     running_section = window.thread_pane.list_widget.topLevelItem(0)
-    assert running_section.text(0) == "現在処理中"
+    assert running_section.text(0) == "Currently running"
     assert running_section.child(0).child(0).data(0, Qt.ItemDataRole.UserRole) == "thread-b"
     thread_b = next(
         child
@@ -226,6 +273,57 @@ def test_global_activity_updates_status_for_unselected_thread() -> None:
     window.close()
 
 
+def test_status_history_does_not_notify_or_consume_live_terminal_after_reconnect(
+    tmp_path: Path,
+) -> None:
+    _application()
+    client = FakeClient()
+    tray = FakeTray()
+    settings = QSettings(str(tmp_path / "console.ini"), QSettings.Format.IniFormat)
+    window = _window(client, settings=settings, tray=tray)
+    window.select_thread("thread-a")
+    historical = {
+        "thread_id": "thread-a",
+        "turn_id": "turn-a",
+        "type": "turn_failed",
+        "status": "failed",
+        "summary": "transport closed",
+        "details": {"reason": "connection_lost"},
+    }
+    snapshot = {
+        "thread_id": "thread-a",
+        "turn_id": "turn-a",
+        "state": "failed",
+        "last_turn": {"status": "unknown", "reason": "connection_lost"},
+        "recent_activities": [historical],
+    }
+    window._apply_status(snapshot)
+    assert tray.messages == []
+
+    client.global_activity(window._global_stream_generation, historical)
+    assert tray.messages == []
+    completed = {
+        **historical,
+        "type": "turn_completed",
+        "status": "completed",
+        "summary": "Turn completed",
+        "details": {},
+    }
+    client.global_activity(window._global_stream_generation, completed)
+    assert tray.messages == [("Turn completed", "Turn completed")]
+    window._apply_global_stream_state(window._global_stream_generation, "disconnected")
+    window._apply_global_stream_state(window._global_stream_generation, "connected")
+    window._apply_status({**snapshot, "recent_activities": [completed]})
+    client.activity(window._selection_generation, completed)
+    client.global_activity(window._global_stream_generation, completed)
+    assert tray.messages == [("Turn completed", "Turn completed")]
+    assert not client.json_posts
+    assert not client.approval_requests
+    assert not client.control_requests
+    window._begin_exit()
+    window.close()
+
+
 def test_failed_and_interrupted_turns_leave_the_running_aggregate() -> None:
     _application()
     client = FakeClient()
@@ -247,7 +345,7 @@ def test_failed_and_interrupted_turns_leave_the_running_aggregate() -> None:
                 "details": {},
             },
         )
-        assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "現在処理中"
+        assert window.thread_pane.list_widget.topLevelItem(0).text(0) == "Currently running"
         client.global_activity(
             generation,
             {

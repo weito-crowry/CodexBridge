@@ -34,9 +34,10 @@ from PySide6.QtWidgets import (
 from .activity_pane import ActivityPane as ActivityPane
 from .activity_pane import activity_row as activity_row
 from .conversation_widgets import build_conversation_row, build_image_attachment_row
+from .i18n import tr
 from .thread_list_pane import ThreadListPane as ThreadListPane
 from .usage import CodexUsageSnapshot, format_codex_usage_snapshot
-from .widget_helpers import _safe_text
+from .widget_helpers import CopyMessageButton, _safe_text
 from .widget_helpers import copy_to_clipboard as copy_to_clipboard
 
 
@@ -82,6 +83,15 @@ def _safe_status(value: object) -> str | None:
 
 _MAX_EPOCH_MILLISECONDS = 253_402_300_799_999
 _TERMINAL_ITEM_STATUSES = {"completed", "failed", "interrupted", "error"}
+_MESSAGES_EXECUTION_KINDS = {
+    "Command",
+    "MCP",
+    "Dynamic tool",
+    "Function",
+    "Collaboration",
+    "Sub-agent",
+}
+_MESSAGES_EXECUTION_DETAILS_LABEL = "Show execution details"
 _EFFECTIVE_SANDBOX_MODES = {
     "danger-full-access",
     "external-sandbox",
@@ -123,7 +133,7 @@ def format_history_timing(started_at_ms: object, completed_at_ms: object) -> str
             return "—"
         return value.strftime("%m/%d %H:%M:%S" if show_date else "%H:%M:%S")
 
-    return f"Start {format_one(started)} · End {format_one(completed)}"
+    return tr("Start {p0} · End {p1}", p0=format_one(started), p1=format_one(completed))
 
 
 def _item_is_running(entry: TimelineEntry) -> bool:
@@ -171,10 +181,10 @@ class _HistoryRunningSpinner(QWidget):
 
 def _model_summary(metadata: Mapping[str, object] | None) -> str:
     if not isinstance(metadata, Mapping):
-        return "Model: unavailable"
+        return tr("Model: unavailable")
     raw_candidates = metadata.get("model_candidates")
     if not isinstance(raw_candidates, list):
-        return "Model: unavailable"
+        return tr("Model: unavailable")
     candidates: list[str] = []
     for raw_candidate in raw_candidates:
         if not isinstance(raw_candidate, Mapping):
@@ -189,16 +199,16 @@ def _model_summary(metadata: Mapping[str, object] | None) -> str:
         candidates.append(rendered)
     status = metadata.get("model_resolution_status")
     if status == "unavailable" or not candidates:
-        return "Model: unavailable"
-    label = "Models" if status == "multiple" or len(candidates) > 1 else "Model"
+        return tr("Model: unavailable")
+    label = tr("Models") if status == "multiple" or len(candidates) > 1 else tr("Model")
     return f"{label}: {' / '.join(candidates)}"
 
 
 def _turn_header(status: object, metadata: Mapping[str, object] | None) -> str:
-    parts = ["Turn"]
+    parts = [tr("Turn")]
     safe_status = _safe_status(status)
     if safe_status:
-        parts.append(safe_status)
+        parts.append(tr(safe_status))
     parts.append(_model_summary(metadata))
     return " · ".join(parts)
 
@@ -214,8 +224,8 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
             turn_id,
             item_id,
             "User",
-            "User",
-            _safe_text(item.get("text")),
+            tr("User"),
+            _safe_text(item.get("text"), limit=None),
             None,
             (),
             images=_safe_local_image_paths(item.get("images")),
@@ -226,23 +236,29 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
                 turn_id,
                 item_id,
                 "Commentary",
-                "Commentary",
-                _safe_text(item.get("text")),
+                tr("Commentary"),
+                _safe_text(item.get("text"), limit=None),
                 None,
                 (),
             )
         return TimelineEntry(
-            turn_id, item_id, "Agent", "Agent", _safe_text(item.get("text")), None, ()
+            turn_id,
+            item_id,
+            "Agent",
+            tr("Agent"),
+            _safe_text(item.get("text"), limit=None),
+            None,
+            (),
         )
     if item_type == "plan":
         return TimelineEntry(
-            turn_id, item_id, "Plan", "Plan", _safe_text(item.get("text")), None, ()
+            turn_id, item_id, "Plan", tr("Plan"), _safe_text(item.get("text"), limit=None), None, ()
         )
     if item_type == "commandExecution":
         details: list[str] = []
         exit_code = item.get("exit_code")
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
-            details.append(f"exit {exit_code}")
+            details.append(tr("exit {p0}", p0=exit_code))
         duration = item.get("duration_ms")
         if isinstance(duration, int) and not isinstance(duration, bool):
             details.append(f"{duration}ms")
@@ -250,7 +266,7 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
             turn_id,
             item_id,
             "Command",
-            "Command",
+            tr("Command"),
             _safe_text(item.get("command")),
             status,
             tuple(details),
@@ -262,45 +278,47 @@ def _entry(turn_id: str, item: Mapping[str, Any]) -> TimelineEntry | None:
             if isinstance(paths, list)
             else ()
         )
-        return TimelineEntry(turn_id, item_id, "Files", "Files", "\n".join(safe_paths), status, ())
+        return TimelineEntry(
+            turn_id, item_id, "Files", tr("Files"), "\n".join(safe_paths), status, ()
+        )
     if item_type == "mcpToolCall":
         server = _safe_text(item.get("server"), 512)
         tool = _safe_text(item.get("tool"), 512)
         return TimelineEntry(
-            turn_id, item_id, "MCP", "MCP", f"{server} / {tool}".strip(" /"), status, ()
+            turn_id, item_id, "MCP", tr("MCP"), f"{server} / {tool}".strip(" /"), status, ()
         )
     if item_type == "dynamicToolCall":
         namespace = _safe_text(item.get("namespace"), 512)
         tool = _safe_text(item.get("tool"), 512)
         tool_details: tuple[str, ...] = (namespace,) if namespace else ()
         return TimelineEntry(
-            turn_id, item_id, "Dynamic tool", "Dynamic tool", tool, status, tool_details
+            turn_id, item_id, "Dynamic tool", tr("Dynamic tool"), tool, status, tool_details
         )
     if item_type == "functionCallOutput":
         name = _safe_text(item.get("name"), 512) or _safe_text(item.get("namespace"), 512)
-        return TimelineEntry(turn_id, item_id, "Function", "Function", name, None, ())
+        return TimelineEntry(turn_id, item_id, "Function", tr("Function"), name, None, ())
     if item_type == "collabAgentToolCall":
         return TimelineEntry(
             turn_id,
             item_id,
             "Collaboration",
-            "Collaboration",
+            tr("Collaboration"),
             _safe_text(item.get("tool")),
             status,
             (),
         )
     if item_type == "subAgentActivity":
         return TimelineEntry(
-            turn_id, item_id, "Sub-agent", "Sub-agent", _safe_text(item.get("kind")), None, ()
+            turn_id, item_id, "Sub-agent", tr("Sub-agent"), _safe_text(item.get("kind")), None, ()
         )
     if item_type == "imageView":
         return TimelineEntry(
-            turn_id, item_id, "Image", "Image", _safe_text(item.get("path")), None, ()
+            turn_id, item_id, "Image", tr("Image"), _safe_text(item.get("path")), None, ()
         )
     if item_type in {"contextCompaction", "context_compaction"}:
-        return TimelineEntry(turn_id, item_id, "Context", "Context", "Compaction", None, ())
+        return TimelineEntry(turn_id, item_id, "Context", tr("Context"), tr("Compaction"), None, ())
     if item_type in {"enteredReviewMode", "exitedReviewMode"}:
-        return TimelineEntry(turn_id, item_id, "Review", "Review", item_type, None, ())
+        return TimelineEntry(turn_id, item_id, "Review", tr("Review"), item_type, None, ())
     return None
 
 
@@ -411,13 +429,13 @@ class HistoryPane(QWidget):
         self._activity_splitter_sizes: list[int] | None = None
         self._activity_visible = True
         self._pending_request_label = ""
-        self.conversation_mode_button = QPushButton("Conversation")
+        self.conversation_mode_button = QPushButton(tr("Conversation"))
         self.conversation_mode_button.setObjectName("historyModeButton")
         self.conversation_mode_button.setCheckable(True)
-        self.details_mode_button = QPushButton("Details")
+        self.details_mode_button = QPushButton(tr("Details"))
         self.details_mode_button.setObjectName("historyModeButton")
         self.details_mode_button.setCheckable(True)
-        self.messages_mode_button = QPushButton("Messages")
+        self.messages_mode_button = QPushButton(tr("Messages"))
         self.messages_mode_button.setObjectName("historyModeButton")
         self.messages_mode_button.setCheckable(True)
         mode_group = QButtonGroup(self)
@@ -429,7 +447,12 @@ class HistoryPane(QWidget):
         self.conversation_mode_button.clicked.connect(lambda: self.set_mode("Conversation"))
         self.details_mode_button.clicked.connect(lambda: self.set_mode("Details"))
         self.messages_mode_button.clicked.connect(lambda: self.set_mode("Messages"))
-        self.activity_toggle_button = QPushButton("Hide Activity")
+        self.execution_details_button = QPushButton(tr(_MESSAGES_EXECUTION_DETAILS_LABEL))
+        self.execution_details_button.setObjectName("messagesExecutionDetailsButton")
+        self.execution_details_button.setCheckable(True)
+        self.execution_details_button.toggled.connect(self._execution_details_toggled)
+        self.execution_details_button.hide()
+        self.activity_toggle_button = QPushButton(tr("Hide Activity"))
         self.activity_toggle_button.setObjectName("activityVisibilityButton")
         self.activity_toggle_button.clicked.connect(self.activity_visibility_requested.emit)
         self.pending_notice_label = QLabel("")
@@ -446,10 +469,10 @@ class HistoryPane(QWidget):
         mode_bar.addWidget(self.messages_mode_button)
         mode_bar.addStretch(1)
         mode_bar.addWidget(self.activity_toggle_button)
-        self.load_older_button = QPushButton("Load older")
+        self.load_older_button = QPushButton(tr("Load older"))
         self.load_older_button.clicked.connect(self.older_requested.emit)
         self.load_older_button.hide()
-        self._empty_label = QLabel("Select a thread to view history.")
+        self._empty_label = QLabel(tr("Select a thread to view history."))
         self._empty_label.setWordWrap(True)
         self._content = _HistoryContent()
         self._content_layout = QVBoxLayout(self._content)
@@ -478,6 +501,7 @@ class HistoryPane(QWidget):
         scrollbar.sliderReleased.connect(self._on_slider_released)
         layout = QVBoxLayout(self)
         layout.addLayout(mode_bar)
+        layout.addWidget(self.execution_details_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.pending_notice_label)
         layout.addWidget(self.load_older_button)
         layout.addWidget(self._empty_label)
@@ -492,19 +516,31 @@ class HistoryPane(QWidget):
             raise ValueError(f"Unsupported history mode: {mode}")
         if mode == self._mode:
             return
+        self._mode = mode
+        self.conversation_mode_button.setChecked(mode == "Conversation")
+        self.details_mode_button.setChecked(mode == "Details")
+        self.messages_mode_button.setChecked(mode == "Messages")
+        self.execution_details_button.setVisible(mode == "Messages")
+        self._refresh_history_view(rebuild_rows=True)
+
+    def _execution_details_toggled(self, checked: bool) -> None:
+        del checked
+        if self._mode == "Messages":
+            self._refresh_history_view(rebuild_rows=False)
+
+    def _refresh_history_view(self, *, rebuild_rows: bool) -> None:
         scrollbar = self._scroll.verticalScrollBar()
         old_value = scrollbar.value()
         old_maximum = scrollbar.maximum()
         should_follow = self._follow_newest and not self._user_scrolling
         self._mode_scroll_anchor = None if should_follow else self._visible_scroll_anchor()
-        self._mode = mode
-        self.conversation_mode_button.setChecked(mode == "Conversation")
-        self.details_mode_button.setChecked(mode == "Details")
-        self.messages_mode_button.setChecked(mode == "Messages")
         self._render_generation += 1
         generation = self._render_generation
         self._scroll_update_pending = True
-        self._render_timeline_rows(tuple(self._timeline_rows))
+        if rebuild_rows:
+            self._render_timeline_rows(tuple(self._timeline_rows))
+        else:
+            self._update_mode_visibility()
         has_entries = self._has_visible_timeline_entries()
         self._empty_label.setVisible(not has_entries)
         self._scroll.setVisible(has_entries)
@@ -527,6 +563,7 @@ class HistoryPane(QWidget):
             if (
                 widget is not None
                 and not widget.isHidden()
+                and self._row_is_visible_in_mode(row)
                 and row.kind == "card"
                 and widget.geometry().bottom() >= scroll_value
             ):
@@ -548,7 +585,7 @@ class HistoryPane(QWidget):
         self._refresh_activity_toggle_label()
 
     def _refresh_activity_toggle_label(self) -> None:
-        text = "Hide Activity" if self._activity_visible else "Show Activity"
+        text = tr("Hide Activity") if self._activity_visible else tr("Show Activity")
         self.activity_toggle_button.setText(text)
         accessible_name = (
             f"{self._pending_request_label} — {text}"
@@ -563,7 +600,7 @@ class HistoryPane(QWidget):
             not self._activity_visible and bool(self._pending_request_label)
         )
         self.activity_toggle_button.setToolTip(
-            self._pending_request_label or "Show or hide the Activity pane"
+            self._pending_request_label or tr("Show or hide the Activity pane")
         )
 
     def _clear_cards(self) -> None:
@@ -652,7 +689,13 @@ class HistoryPane(QWidget):
         return (
             row.kind == "card"
             and isinstance(row.value, TimelineEntry)
-            and row.value.kind in {"User", "Commentary", "Agent"}
+            and (
+                row.value.kind in {"User", "Commentary", "Agent"}
+                or (
+                    self.execution_details_button.isChecked()
+                    and row.value.kind in _MESSAGES_EXECUTION_KINDS
+                )
+            )
         )
 
     def _has_visible_timeline_entries(self) -> bool:
@@ -953,7 +996,7 @@ class HistoryPane(QWidget):
         layout = QVBoxLayout(card)
         header_parts = [entry.title]
         if entry.status is not None:
-            header_parts.append(entry.status)
+            header_parts.append(tr(entry.status))
         header = QHBoxLayout()
         header_label = QLabel(" · ".join(header_parts))
         header_label.setWordWrap(True)
@@ -965,11 +1008,8 @@ class HistoryPane(QWidget):
         header.addWidget(spinner)
         spinner.setVisible(_item_is_running(entry))
         if entry.kind in {"User", "Agent"}:
-            copy_button = QPushButton("Copy")
+            copy_button = CopyMessageButton(entry.body, lambda text: copy_to_clipboard(text), card)
             copy_button.setObjectName("copyMessageButton")
-            copy_button.clicked.connect(
-                lambda _checked=False, text=entry.body: copy_to_clipboard(text)
-            )
             copy_policy = copy_button.sizePolicy()
             copy_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
             copy_button.setSizePolicy(copy_policy)

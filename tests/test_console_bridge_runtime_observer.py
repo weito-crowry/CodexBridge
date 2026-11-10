@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from codex_bridge.console import bridge_runtime_observer as observer_module
 from codex_bridge.console.bridge_managed_retry import BridgeManagedRetryCoordinator
 from codex_bridge.console.bridge_runtime_observer import BridgeRuntimeObserver
 
@@ -119,6 +120,16 @@ class _Window:
 
     def _update_start_button(self) -> None:
         self.trace.append(("update_start_button",))
+
+
+class _NullObservability:
+    def bridge_status_observation(self, event: str, **fields: object) -> None:
+        del event, fields
+
+
+@pytest.fixture(autouse=True)
+def _isolate_observability(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(observer_module, "get_observer", _NullObservability)
 
 
 def _ready_window(*, detached: bool) -> _Window:
@@ -244,6 +255,50 @@ def test_one_loss_waits_and_second_owned_loss_starts_restart_transition() -> Non
     assert window.trace == [("begin_transition", "restart", True)]
 
 
+def test_bridge_status_loss_logs_first_threshold_restart_and_recovery(monkeypatch) -> None:
+    records: list[tuple[str, dict[str, object]]] = []
+
+    class RecordingObserver:
+        def bridge_status_observation(self, event: str, **fields: object) -> None:
+            records.append((event, fields))
+
+    monkeypatch.setattr(observer_module, "get_observer", lambda: RecordingObserver())
+    window = _Window()
+    window._health_ok = True
+    window._bridge_ready = True
+    window._app_server_ready = False
+    window._detached_launch_started = True
+    window._detached_pid = 4312
+    window._control_token = "control-token"
+    observer = BridgeRuntimeObserver(window)
+
+    observer.record_bridge_status_observation(False, reason="app_server_unavailable")
+    observer.record_bridge_status_observation(False, reason="app_server_unavailable")
+    window._app_server_ready = True
+    observer.record_bridge_status_observation(True)
+
+    assert [event for event, _fields in records] == [
+        "bridge.status.unavailable",
+        "bridge.status.threshold_reached",
+        "bridge.restart.requested",
+        "bridge.status.recovered",
+    ]
+    assert records[0][1] == {
+        "reason": "app_server_unavailable",
+        "consecutive_failures": 1,
+        "health_ok": True,
+        "bridge_ready": True,
+        "app_server_ready": False,
+        "managed": True,
+        "bridge_pid": 4312,
+    }
+    assert records[1][1]["consecutive_failures"] == 2
+    assert records[2][1]["reason"] == "app_server_unavailable"
+    assert records[3][1]["reason"] == "status_recovered"
+    assert records[3][1]["consecutive_failures"] == 2
+    assert window.trace == [("begin_transition", "restart", True)]
+
+
 def test_successful_status_observation_resets_loss_count() -> None:
     window = _Window()
     observer = BridgeRuntimeObserver(window)
@@ -260,6 +315,7 @@ def test_two_external_losses_reset_seen_ready_and_keep_auto_start() -> None:
     window = _Window()
     window._bridge_seen_ready = True
     observer = BridgeRuntimeObserver(window)
+    window._bridge_runtime_observer = observer
 
     observer.record_bridge_status_observation(False)
     observer.record_bridge_status_observation(False)

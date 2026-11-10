@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from .i18n import tr
+
 _MAX_TOOLTIP_TURNS = 8
 _MAX_TOOLTIP_CHARS = 1200
 _MAX_TOOLTIP_VALUE_CHARS = 96
@@ -187,7 +189,7 @@ def summarize_turn_access_metadata(
 
 def _single_observed_value(values: set[str]) -> str | None:
     if len(values) > 1:
-        return "Multiple"
+        return tr("Multiple")
     return next(iter(values), None)
 
 
@@ -201,12 +203,12 @@ def _single_line(value: object) -> str | None:
 def _history_tooltip(
     records: list[tuple[str, str, tuple[tuple[str, str | None], ...]]], *, partial: bool
 ) -> str:
-    lines = ["読み込んだ履歴から観測した情報です。現在の設定とは限りません。"]
+    lines = [tr("Observed in loaded history; may differ from current settings.")]
     if partial:
-        lines.append("一部のturnまたはeffort情報を取得できませんでした。")
+        lines.append(tr("Some turn or effort metadata is unavailable."))
     shown_records = list(reversed(records[-_MAX_TOOLTIP_TURNS:]))
     for turn_id, status, candidates in shown_records:
-        safe_turn_id = _single_line(turn_id) or "Unknown turn"
+        safe_turn_id = _single_line(turn_id) or tr("Unknown turn")
         safe_turn_id = _tooltip_value(safe_turn_id)
         if candidates:
             values = "; ".join(
@@ -219,10 +221,10 @@ def _history_tooltip(
             lines.append(f"{safe_turn_id} [{status}]")
     omitted = len(records) - len(shown_records)
     if omitted:
-        lines.append(f"ほか{omitted}件のturnを省略しました。")
+        lines.append(tr("{p0} more turns omitted.", p0=omitted))
     tooltip = "\n".join(lines)
     if len(tooltip) > _MAX_TOOLTIP_CHARS:
-        tooltip = tooltip[: _MAX_TOOLTIP_CHARS - 12].rstrip() + "\n…省略…"
+        tooltip = tooltip[: _MAX_TOOLTIP_CHARS - 12].rstrip() + tr("\n…omitted…")
     return tooltip
 
 
@@ -232,26 +234,26 @@ def _access_history_tooltip(
     partial: bool,
     has_observed_value: bool,
 ) -> str:
-    lines = ["履歴から観測したsandbox設定です。現在の実行権限を保証しません。"]
+    lines = [tr("Sandbox observed in history; does not guarantee current execution permissions.")]
     if partial:
         lines.append(
-            "一部のターンではAccessを取得できていません。"
+            tr("Access metadata is unavailable for some turns.")
             if has_observed_value
-            else "履歴からAccessを取得できませんでした。"
+            else tr("Access metadata is unavailable in history.")
         )
     shown_records = list(reversed(records[-_MAX_TOOLTIP_TURNS:]))
     for turn_id, status, candidates in shown_records:
-        safe_turn_id = _tooltip_value(_single_line(turn_id) or "Unknown turn")
+        safe_turn_id = _tooltip_value(_single_line(turn_id) or tr("Unknown turn"))
         if candidates:
             lines.append(f"{safe_turn_id} [{status}]: {'; '.join(candidates[:6])}")
         else:
             lines.append(f"{safe_turn_id} [{status}]")
     omitted = len(records) - len(shown_records)
     if omitted:
-        lines.append(f"ほか{omitted}件のturnを省略しました。")
+        lines.append(tr("{p0} more turns omitted.", p0=omitted))
     tooltip = "\n".join(lines)
     if len(tooltip) > _MAX_TOOLTIP_CHARS:
-        tooltip = tooltip[: _MAX_TOOLTIP_CHARS - 12].rstrip() + "\n…省略…"
+        tooltip = tooltip[: _MAX_TOOLTIP_CHARS - 12].rstrip() + tr("\n…omitted…")
     return tooltip
 
 
@@ -262,5 +264,5 @@ def _tooltip_value(value: str) -> str:
 
 
 def _format_tooltip_candidate(model: str, effort: str | None) -> str:
-    effort_text = _tooltip_value(effort) if effort is not None else "effort: Unknown"
+    effort_text = _tooltip_value(effort) if effort is not None else tr("effort: Unknown")
     return f"{_tooltip_value(model)} ({effort_text})"

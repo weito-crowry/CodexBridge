@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QProcess, QUrl
 from PySide6.QtGui import QDesktopServices
 
+from .i18n import tr
+
 if TYPE_CHECKING:
     from .main_window import MainWindow
 
@@ -18,7 +20,7 @@ class ProjectFolderActionsController:
         window = self._window
         folder = window.thread_pane._openable_cwd(cwd)
         if folder is None:
-            window.bottom_status_label.setText("Project folder is no longer available")
+            window.bottom_status_label.setText(tr("Project folder is no longer available"))
         return folder
 
     def new_thread_for_folder(self, cwd: str) -> None:
@@ -36,7 +38,7 @@ class ProjectFolderActionsController:
         except Exception:
             opened = False
         if not opened:
-            window.bottom_status_label.setText("Could not open project folder in Explorer")
+            window.bottom_status_label.setText(tr("Could not open project folder in Explorer"))
 
     def open_project_terminal(self, cwd: str) -> None:
         window = self._window
@@ -60,4 +62,4 @@ class ProjectFolderActionsController:
             started = bool(result[0]) if isinstance(result, tuple) and result else bool(result)
             if started:
                 return
-        window.bottom_status_label.setText("Could not open a terminal in the project folder")
+        window.bottom_status_label.setText(tr("Could not open a terminal in the project folder"))

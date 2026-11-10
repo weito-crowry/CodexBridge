@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from importlib.resources import files as package_files
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from mcp.server import MCPServer
 from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
@@ -16,6 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Mount
 
 from .activity import ActivityStore
@@ -24,11 +25,13 @@ from .bridge import Bridge, BridgeError
 from .codex_resolver import CodexResolutionError, resolve_codex_executable
 from .config import BridgeConfig, ConfigurationError, validate_allowed_roots
 from .execution_targets import ExecutionTargetRouter
+from .external_sessions import CodexSessionScanner, ExternalExecutionMonitor
 from .file_put import file_put as put_file
 from .file_tools import FileTools
 from .git_tools import git_diff as run_git_diff
 from .git_tools import git_status as run_git_status
-from .logging_utils import log_event
+from .lan_auth import LanMcpAuthMiddleware
+from .logging_utils import configure_logging, log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
 from .models import ApprovalDecision, ApprovalsReviewer, SandboxMode
@@ -55,6 +58,7 @@ class BridgeRuntime:
     activity_store: ActivityStore
     config: BridgeConfig
     ui_server: LocalUiServer
+    external_monitor: ExternalExecutionMonitor | None = None
 
     async def start(self) -> None:
         await self.app_server.start()
@@ -63,14 +67,21 @@ class BridgeRuntime:
         except BaseException:
             await self.app_server.shutdown(self.config.shutdown_grace_seconds)
             raise
+        if self.external_monitor is not None:
+            await self.external_monitor.start()
         log_event("bridge.start")
 
     async def shutdown(self) -> None:
+        self.activity_store.close_subscriptions()
+        if self.external_monitor is not None:
+            await self.external_monitor.close()
         await self.bridge.interrupt_active_turns(
             wait_seconds=min(0.5, self.config.shutdown_grace_seconds)
         )
-        await self.ui_server.shutdown(min(0.5, self.config.shutdown_grace_seconds))
-        await self.app_server.shutdown(self.config.shutdown_grace_seconds)
+        try:
+            await self.ui_server.shutdown(self.config.shutdown_grace_seconds)
+        finally:
+            await self.app_server.shutdown(self.config.shutdown_grace_seconds)
         log_event("bridge.shutdown")
 
 
@@ -114,6 +125,9 @@ def build_runtime(
         wait_default_seconds=config.wait_default_seconds,
         wait_max_seconds=config.wait_max_seconds,
     )
+    bridge.observations.external = ExternalExecutionMonitor(
+        CodexSessionScanner(allowed_roots=config.allowed_roots)
+    )
     app_server.set_handlers(
         on_notification=bridge.handle_notification,
         on_server_request=bridge.handle_server_request,
@@ -122,6 +136,7 @@ def build_runtime(
     ui_server = LocalUiServer(
         create_ui_app(bridge, activity_store, config, shutdown_callback=shutdown_callback),
         config.ui_port,
+        graceful_shutdown_timeout=config.shutdown_grace_seconds,
     )
     return BridgeRuntime(
         bridge=bridge,
@@ -129,6 +144,7 @@ def build_runtime(
         activity_store=activity_store,
         config=config,
         ui_server=ui_server,
+        external_monitor=bridge.observations.external,
     )
 
 
@@ -137,6 +153,8 @@ def _transport_security(config: BridgeConfig) -> TransportSecuritySettings | Non
         if config.host not in {"127.0.0.1", "localhost", "::1"}:
             raise ConfigurationError("non-loopback bind requires at least one allowed host")
         return None
+    if config.host not in {"127.0.0.1", "localhost", "::1"} and not config.lan_enabled:
+        raise ConfigurationError("non-loopback bind requires explicit LAN enablement")
     allowed_hosts = list(config.allowed_hosts)
     if not allowed_hosts and config.host in {"127.0.0.1", "localhost", "::1"}:
         allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
@@ -788,10 +806,33 @@ def create_app(
         finally:
             observer.server_shutdown()
 
+    middleware = [Middleware(MCPObservabilityMiddleware, observer=observer)]
+    if config.lan_enabled:
+        assert config.mcp_token is not None  # BridgeConfig validates explicit LAN configuration.
+        middleware.append(Middleware(LanMcpAuthMiddleware, token=config.mcp_token))
+        if config.allowed_origins:
+            middleware.insert(
+                1,
+                Middleware(
+                    CORSMiddleware,
+                    allow_origins=[
+                        origin for origin in config.allowed_origins if "*" not in origin
+                    ],
+                    allow_methods=["GET", "POST", "DELETE"],
+                    allow_headers=[
+                        "Authorization",
+                        "Content-Type",
+                        "Mcp-Session-Id",
+                        "Mcp-Protocol-Version",
+                        "Last-Event-ID",
+                    ],
+                    expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
+                ),
+            )
     app = Starlette(
         routes=[Mount("/", app=transport_app)],
         lifespan=lifespan,
-        middleware=[Middleware(MCPObservabilityMiddleware, observer=observer)],
+        middleware=middleware,
     )
     app.state.mcp_server = mcp
     app.state.mcp_lowlevel_server = wire_server
@@ -807,9 +848,19 @@ def create_app(
 async def run_server(config: BridgeConfig) -> None:
     import uvicorn
 
+    configure_logging()
     config = prepare_config(config)
     controller = UvicornShutdownController()
     app = create_app(config, shutdown_callback=controller.request_shutdown)
-    server = uvicorn.Server(uvicorn.Config(app, host=config.host, port=config.port))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=config.host,
+            port=config.port,
+            proxy_headers=False,
+            timeout_graceful_shutdown=cast(Any, config.shutdown_grace_seconds),
+            log_config=None,
+        )
+    )
     controller.bind(server)
     await server.serve()

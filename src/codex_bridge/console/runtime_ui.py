@@ -2,8 +2,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .i18n import tr
+
 if TYPE_CHECKING:
     from .main_window import MainWindow
+
+
+_RUNTIME_LABELS = {
+    "unavailable": "Runtime: unavailable",
+    "external": "Runtime: external",
+    "launching": "Runtime: launching",
+    "launch_failed": "Runtime: launch failed",
+    "launch_timed_out": "Runtime: launch timed out",
+    "stopping": "Runtime: stopping",
+    "restarting": "Runtime: restarting",
+    "stopped": "Runtime: stopped",
+    "control_failed": "Runtime: control failed",
+    "stop_timed_out": "Runtime: stop timed out",
+}
 
 
 class RuntimeUiPresenter:
@@ -16,9 +32,9 @@ class RuntimeUiPresenter:
         source = getattr(window._tunnel, "resolution_source", "unavailable")
         executable = getattr(window._tunnel, "executable", None)
         if version is None:
-            text = "Tunnel Client: unavailable"
+            text = tr("Tunnel Client: unavailable")
         else:
-            text = f"Tunnel Client: {version} · {source}"
+            text = tr("Tunnel Client: {p0} · {p1}", p0=version, p1=source)
         window.tunnel_client_status_label.setText(text)
         if executable is not None:
             window.tunnel_client_status_label.setToolTip(executable)
@@ -43,18 +59,18 @@ class RuntimeUiPresenter:
         validation_status = getattr(window._tunnel, "validation_status", "not_run")
         validation_detail = getattr(window._tunnel, "validation_detail", None)
         if validation_status == "not_run" and profile_status == "failed":
-            validation_detail = "Managed profile generation and doctor validation failed"
+            validation_detail = tr("Managed profile generation and doctor validation failed")
 
         return "\n".join(
             (
                 self._tunnel_stage_line(
-                    "Executable resolution", resolution_status, resolution_detail
+                    tr("Executable resolution"), resolution_status, resolution_detail
                 ),
                 self._tunnel_stage_line(
-                    "Managed profile generation and doctor", profile_status, profile_detail
+                    tr("Managed profile generation and doctor"), profile_status, profile_detail
                 ),
                 self._tunnel_stage_line(
-                    "Tunnel Supervisor validation", validation_status, validation_detail
+                    tr("Tunnel Supervisor validation"), validation_status, validation_detail
                 ),
             )
         )
@@ -62,11 +78,11 @@ class RuntimeUiPresenter:
     @staticmethod
     def _tunnel_stage_line(name: str, status: object, detail: object) -> str:
         labels = {
-            "passed": "Passed",
-            "failed": "Failed",
-            "running": "Running",
+            "passed": tr("Passed"),
+            "failed": tr("Failed"),
+            "running": tr("Running"),
         }
-        label = labels.get(status, "Not run") if isinstance(status, str) else "Not run"
+        label = labels.get(status, "Not run") if isinstance(status, str) else tr("Not run")
         line = f"{name}: {label}"
         if isinstance(detail, str) and detail:
             line += f" — {detail}"
@@ -108,10 +124,10 @@ class RuntimeUiPresenter:
             and window._app_server_ready
         ):
             window.restart_codexbridge_button.setToolTip(
-                "Disabled while the Bridge is managed externally."
+                tr("Disabled while the Bridge is managed externally.")
             )
         else:
-            window.restart_codexbridge_button.setToolTip("Restart the Console-managed Bridge.")
+            window.restart_codexbridge_button.setToolTip(tr("Restart the Console-managed Bridge."))
         for name in ("Stop Bridge", "Restart Bridge"):
             action = window._tray_actions.get(name)
             if action is not None:
@@ -137,28 +153,31 @@ class RuntimeUiPresenter:
         if not window._bridge_ready:
             location = f"{window._config.host}:{window._config.port}"
             window.history_pane.set_empty_state(
-                f"CodexBridge is not available on {location}\nStart codex-bridge and retry."
+                tr(
+                    "CodexBridge is not available on {p0}\nStart codex-bridge and retry.",
+                    p0=location,
+                )
             )
-            window.activity_pane.set_error("Bridge unavailable")
+            window.activity_pane.set_error(tr("Bridge unavailable"))
             return
         if getattr(window.thread_pane, "thread_count", 0) == 0:
-            window.history_pane.set_empty_state("No threads found.")
-            window.activity_pane.set_empty_state("No thread selected.")
+            window.history_pane.set_empty_state(tr("No threads found."))
+            window.activity_pane.set_empty_state(tr("No thread selected."))
             return
         if window._selected_thread_id is None:
-            window.history_pane.set_empty_state("Select a thread to view history.")
-            window.activity_pane.set_empty_state("Select a thread to view activity.")
+            window.history_pane.set_empty_state(tr("Select a thread to view history."))
+            window.activity_pane.set_empty_state(tr("Select a thread to view activity."))
 
     def _sync_overall_status(self) -> None:
         window = self._window
         bridge_ready = window._health_ok and window._bridge_ready and window._app_server_ready
         if bridge_ready:
             if window._tunnel_state == "ready":
-                state = "Ready"
+                state = tr("Ready")
             elif window._tunnel_state in {"checking", "starting", "running", "stopping"}:
-                state = "Starting"
+                state = tr("Starting")
             else:
-                state = "Degraded"
+                state = tr("Degraded")
         elif (
             window._launch_in_progress
             or window._bridge_transition
@@ -172,17 +191,17 @@ class RuntimeUiPresenter:
                 "console_started_unreachable",
             }
         ):
-            state = "Starting"
+            state = tr("Starting")
         elif window._bridge_start_retry_exhausted or window._runtime_state in {
             "launch_failed",
             "control_failed",
             "stop_timed_out",
         }:
-            state = "Error"
+            state = tr("Error")
         elif not window._health_observed and not window._status_observed:
-            state = "Starting"
+            state = tr("Starting")
         else:
-            state = "Error"
+            state = tr("Error")
         text = f"● {state}"
         window.overall_status_label.setText(text)
         window.overall_detail_label.setText(text)

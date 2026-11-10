@@ -38,6 +38,22 @@ _TUNNEL_REASONS = frozenset(
         "close",
     }
 )
+_BRIDGE_STATUS_EVENTS = frozenset(
+    {
+        "bridge.status.unavailable",
+        "bridge.status.threshold_reached",
+        "bridge.restart.requested",
+        "bridge.status.recovered",
+    }
+)
+_BRIDGE_STATUS_REASONS = frozenset(
+    {
+        "app_server_unavailable",
+        "bridge_unavailable",
+        "status_request_failed",
+        "status_recovered",
+    }
+)
 _ALLOWED_FIELDS = {
     "method",
     "path",
@@ -54,6 +70,12 @@ _ALLOWED_FIELDS = {
     "process_error",
     "exit_status",
     "recovery_delay_ms",
+    "consecutive_failures",
+    "health_ok",
+    "bridge_ready",
+    "app_server_ready",
+    "managed",
+    "bridge_pid",
 }
 _observer: ObservabilityLogger | None = None
 
@@ -155,6 +177,49 @@ class ObservabilityLogger:
 
     def server_shutdown(self) -> None:
         self._emit("server.shutdown")
+
+    def bridge_status_observation(
+        self,
+        event: str,
+        *,
+        reason: str,
+        consecutive_failures: int,
+        health_ok: bool,
+        bridge_ready: bool,
+        app_server_ready: bool,
+        managed: bool,
+        bridge_pid: int | None = None,
+    ) -> None:
+        if event not in _BRIDGE_STATUS_EVENTS or reason not in _BRIDGE_STATUS_REASONS:
+            return
+        if (
+            isinstance(consecutive_failures, bool)
+            or not isinstance(consecutive_failures, int)
+            or consecutive_failures < 1
+            or any(
+                not isinstance(value, bool)
+                for value in (health_ok, bridge_ready, app_server_ready, managed)
+            )
+            or (
+                bridge_pid is not None
+                and (
+                    isinstance(bridge_pid, bool)
+                    or not isinstance(bridge_pid, int)
+                    or not 1 <= bridge_pid <= 4_294_967_295
+                )
+            )
+        ):
+            return
+        self._emit(
+            event,
+            reason=reason,
+            consecutive_failures=consecutive_failures,
+            health_ok=health_ok,
+            bridge_ready=bridge_ready,
+            app_server_ready=app_server_ready,
+            managed=managed,
+            bridge_pid=bridge_pid,
+        )
 
     def mcp_request_start(
         self,
@@ -319,7 +384,14 @@ class ObservabilityLogger:
                     if not isinstance(value, str) or not _SUPERVISOR_ID_PATTERN.fullmatch(value):
                         value = None
                 elif key == "reason":
-                    if not isinstance(value, str) or value not in _TUNNEL_REASONS:
+                    allowed_reasons = (
+                        _TUNNEL_REASONS
+                        if event.startswith("tunnel.")
+                        else _BRIDGE_STATUS_REASONS
+                        if event in _BRIDGE_STATUS_EVENTS
+                        else frozenset()
+                    )
+                    if not isinstance(value, str) or value not in allowed_reasons:
                         value = None
                 elif key in {
                     "status",
@@ -327,10 +399,32 @@ class ObservabilityLogger:
                     "attempt_id",
                     "tunnel_pid",
                     "recovery_delay_ms",
+                    "consecutive_failures",
+                    "bridge_pid",
                 }:
                     if isinstance(value, bool) or not isinstance(value, int):
                         value = None
-                    elif key in {"attempt_id", "tunnel_pid", "recovery_delay_ms"} and value < 1:
+                    elif (
+                        key
+                        in {
+                            "attempt_id",
+                            "tunnel_pid",
+                            "recovery_delay_ms",
+                            "consecutive_failures",
+                            "bridge_pid",
+                        }
+                        and value < 1
+                    ):
+                        value = None
+                    elif key in {"bridge_pid", "consecutive_failures"} and value > 4_294_967_295:
+                        value = None
+                elif key in {
+                    "health_ok",
+                    "bridge_ready",
+                    "app_server_ready",
+                    "managed",
+                }:
+                    if not isinstance(value, bool):
                         value = None
                 elif key == "duration_ms":
                     if not isinstance(value, (int, float)) or isinstance(value, bool):

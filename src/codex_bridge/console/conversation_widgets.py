@@ -28,6 +28,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import tr
+from .widget_helpers import CopyMessageButton
+
 if TYPE_CHECKING:
     from .widgets import TimelineEntry
 
@@ -35,6 +38,9 @@ _SAFE_MARKDOWN_FEATURES = (
     QTextDocument.MarkdownFeature.MarkdownDialectGitHub
     | QTextDocument.MarkdownFeature.MarkdownNoHTML
 )
+# Qt 6.8+ forwards MarkdownFeatures to its MD4C parser, whose
+# MD_FLAG_HARD_SOFT_BREAKS is 0x8000 (not named in Qt's public enum).
+_MARKDOWN_HARD_SOFT_BREAKS = QTextDocument.MarkdownFeature(0x8000)
 _STATUS_LABELS = {
     "in_progress": "Running",
     "completed": "Completed",
@@ -92,7 +98,26 @@ class ConversationTextBody(QTextBrowser):
     @staticmethod
     def _set_document_text(document: QTextDocument, text: str, markdown: bool) -> None:
         if markdown:
-            document.setMarkdown(text, _SAFE_MARKDOWN_FEATURES)
+            paragraphs = QTextDocument()
+            paragraphs.setMarkdown(text, _SAFE_MARKDOWN_FEATURES)
+            document.setMarkdown(text, _SAFE_MARKDOWN_FEATURES | _MARKDOWN_HARD_SOFT_BREAKS)
+            # Qt imports hard breaks as new blocks. Only the newly preserved
+            # soft breaks must become inline line separators, so paragraphs
+            # keep their margins and list continuations do not add bullets.
+            # The two parses differ only by space vs. block separator; use Qt
+            # character positions so non-BMP text also keeps matching offsets.
+            soft_breaks: list[int] = []
+            block = document.begin().next()
+            while block.isValid():
+                position = block.position() - 1
+                if paragraphs.characterAt(position) == " ":
+                    soft_breaks.append(position)
+                block = block.next()
+            for position in reversed(soft_breaks):
+                cursor = QTextCursor(document)
+                cursor.setPosition(position)
+                cursor.deleteChar()
+                cursor.insertText("\u2028")
             block = document.begin()
             while block.isValid():
                 block_format = block.blockFormat()
@@ -135,7 +160,7 @@ class ConversationTextBody(QTextBrowser):
 def _status_label(status: str | None) -> str:
     if status is None:
         return ""
-    return _STATUS_LABELS.get(status, status)
+    return tr(_STATUS_LABELS[status]) if status in _STATUS_LABELS else status
 
 
 def _short_summary(text: str) -> str:
@@ -201,7 +226,9 @@ def build_image_attachment_row(paths: tuple[str, ...], parent: QWidget) -> QWidg
                     if not image.isNull():
                         preview = QLabel(attachment)
                         preview.setObjectName("conversationImagePreview")
-                        preview.setAccessibleName(f"Image preview: {image_path.name[:160]}")
+                        preview.setAccessibleName(
+                            tr("Image preview: {p0}", p0=image_path.name[:160])
+                        )
                         preview.setAlignment(
                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                         )
@@ -212,10 +239,10 @@ def build_image_attachment_row(paths: tuple[str, ...], parent: QWidget) -> QWidg
 
         open_button = QToolButton(attachment)
         open_button.setObjectName("conversationImageOpenButton")
-        file_name = image_path.name[:160] or "Open image"
+        file_name = image_path.name[:160] or tr("Open image")
         open_button.setText(file_name)
-        open_button.setAccessibleName(f"Open image: {file_name}")
-        open_button.setToolTip("Open local image file")
+        open_button.setAccessibleName(tr("Open image: {p0}", p0=file_name))
+        open_button.setToolTip(tr("Open local image file"))
         open_button.clicked.connect(
             lambda _checked=False, path=str(image_path): _open_local_image(path)
         )
@@ -232,7 +259,7 @@ def build_conversation_row(
     is_running: bool,
     timing: str | None,
     spinner_factory: Callable[[QWidget], QWidget],
-    copy_text: Callable[[str], None],
+    copy_text: Callable[[str], object],
     on_expanded_changed: Callable[[bool], None],
 ) -> QWidget:
     if entry.kind in _MESSAGE_OBJECT_NAMES:
@@ -250,10 +277,9 @@ def build_conversation_row(
             spinner = spinner_factory(frame)
             header.addWidget(spinner)
         if entry.kind in {"User", "Agent", "Commentary", "Plan"}:
-            button = QPushButton("Copy")
+            button = CopyMessageButton(entry.body, copy_text, frame)
             button.setObjectName("conversationCopyMessageButton")
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda _checked=False, text=entry.body: copy_text(text))
             header.addWidget(button)
         layout.addLayout(header)
         if entry.body:
@@ -308,7 +334,7 @@ def build_conversation_row(
     layout.addWidget(metadata_label)
 
     if entry.body or entry.details:
-        disclosure = QPushButton("Hide details" if expanded else "Show details")
+        disclosure = QPushButton(tr("Hide details") if expanded else tr("Show details"))
         disclosure.setObjectName("conversationDisclosure")
         disclosure.setCheckable(True)
         disclosure.setChecked(expanded)
@@ -340,7 +366,7 @@ def build_conversation_row(
 
         def set_expanded(value: bool) -> None:
             details.setVisible(value)
-            disclosure.setText("Hide details" if value else "Show details")
+            disclosure.setText(tr("Hide details") if value else tr("Show details"))
             on_expanded_changed(value)
 
         disclosure.toggled.connect(set_expanded)

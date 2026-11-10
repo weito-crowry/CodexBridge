@@ -20,6 +20,7 @@ from .bridge import ApprovalConflictError, Bridge, BridgeError
 from .config import BridgeConfig
 from .history import HistoryValidationError, project_thread_metadata, validate_cursor
 from .jsonrpc import JsonRpcClosedError
+from .logging_utils import log_event
 from .models import ApprovalDecision, RequestId
 from .paths import PathPolicyError
 from .thread_titles import normalize_explicit_title
@@ -203,7 +204,7 @@ def _safe_thread_list(result: dict[str, Any]) -> dict[str, object]:
             projected = project_thread_metadata(thread)
             if projected is not None:
                 threads.append(projected)
-    return {
+    public: dict[str, object] = {
         "threads": threads,
         "next_cursor": result.get("next_cursor")
         if isinstance(result.get("next_cursor"), str)
@@ -212,6 +213,13 @@ def _safe_thread_list(result: dict[str, Any]) -> dict[str, object]:
         if isinstance(result.get("backwards_cursor"), str)
         else None,
     }
+    if isinstance(result.get("external_threads"), list):
+        public["external_threads"] = [
+            row
+            for value in result["external_threads"]
+            if (row := project_thread_metadata(value)) is not None
+        ]
+    return public
 
 
 def _safe_thread_detail(result: dict[str, Any]) -> dict[str, object] | None:
@@ -349,13 +357,28 @@ def create_ui_app(
         subscription = activity_store.subscribe(thread_id)
 
         async def stream() -> AsyncIterator[bytes]:
+            observations = getattr(bridge, "observations", None) if thread_id is None else None
+            previous = None
             try:
                 while True:
+                    if observations is not None:
+                        snapshot = observations.external_snapshot()
+                        identity = (snapshot["state"], snapshot["threads"])
+                        if identity != previous:
+                            previous = identity
+                            payload = json.dumps(
+                                snapshot, separators=(",", ":"), ensure_ascii=False
+                            )
+                            yield f"event: external_threads\ndata: {payload}\n\n".encode()
                     try:
-                        activity = await asyncio.wait_for(subscription.get(), timeout=15.0)
+                        activity = await asyncio.wait_for(
+                            subscription.get_or_closed(), timeout=1.0 if observations else 15.0
+                        )
                     except TimeoutError:
                         yield b": keepalive\n\n"
                     else:
+                        if activity is None:
+                            return
                         yield _sse_event(activity)
             finally:
                 subscription.close()
@@ -371,6 +394,7 @@ def create_ui_app(
             return JSONResponse({"error": "forbidden"}, status_code=403)
 
         assert shutdown_callback is not None
+        log_event("bridge.control.shutdown.requested", reason="control_api")
 
         async def run_shutdown() -> None:
             result = shutdown_callback()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 
 import pytest
@@ -77,6 +78,55 @@ async def test_app_server_marks_abnormal_stdout_exit() -> None:
     await asyncio.sleep(0.05)
 
     assert client.failed is True
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_protocol_error_logs_process_status_and_stderr_counts_without_stderr_text(
+    caplog,
+) -> None:
+    caplog.set_level(logging.INFO, logger="codex_bridge")
+    factory = FakeProcessFactory()
+    factory.process.pid = 43210
+    client = AppServerClient("codex", process_factory=factory)
+    await client.start()
+
+    factory.process.stderr.feed_data(b"private App Server diagnostic\n")
+    await asyncio.sleep(0.01)
+    factory.process.returncode = 23
+    factory.process.feed_eof()
+    assert client._reader_task is not None
+    await client._reader_task
+
+    protocol_records = [
+        record.getMessage() for record in caplog.records if "protocol.error" in record.getMessage()
+    ]
+    assert protocol_records == [
+        "protocol.error error_type=JsonRpcClosedError exit_code=23 process_alive=False "
+        "process_id=43210 stderr_had_output=True stderr_line_count=1"
+    ]
+    assert "private App Server diagnostic" not in caplog.text
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_protocol_error_does_not_turn_unknown_exit_code_into_zero(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="codex_bridge")
+    factory = FakeProcessFactory()
+    factory.process.pid = 43211
+    client = AppServerClient("codex", process_factory=factory)
+    await client.start()
+    factory.process.feed_eof()
+    assert client._reader_task is not None
+    await client._reader_task
+
+    protocol_records = [
+        record.getMessage() for record in caplog.records if "protocol.error" in record.getMessage()
+    ]
+    assert protocol_records == [
+        "protocol.error error_type=JsonRpcClosedError process_alive=True process_id=43211 "
+        "stderr_had_output=False stderr_line_count=0"
+    ]
     await client.shutdown()
 
 

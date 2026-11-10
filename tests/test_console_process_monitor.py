@@ -4,8 +4,10 @@ import threading
 import time
 from typing import Any
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
+from codex_bridge.console import process_monitor
 from codex_bridge.console.activity_pane import ActivityPane
 from codex_bridge.console.process_inspection import (
     CommandDescriptor,
@@ -147,6 +149,54 @@ def test_refresh_button_and_timer_use_worker_and_manual_refresh_is_available() -
     widget.show()
     assert _wait(application, lambda: calls > calls_before_show)
     widget.shutdown()
+
+
+def test_pending_completion_refresh_waits_for_worker_to_release_pool_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = _application()
+    first_emitted = threading.Event()
+    release_first = threading.Event()
+    original_run = process_monitor._InspectionTask.run
+
+    def hold_pool_slot_after_notification(task: process_monitor._InspectionTask) -> None:
+        original_run(task)
+        if task.token == 1:
+            first_emitted.set()
+            release_first.wait(5.0)
+
+    monkeypatch.setattr(process_monitor._InspectionTask, "run", hold_pool_slot_after_notification)
+
+    def inspector(
+        commands: tuple[CommandDescriptor, ...], evidence: ProcessEvidence, cancel: object
+    ) -> InspectionResult:
+        return _result(commands[0])
+
+    widget = ProcessMonitorWidget(
+        inspector=inspector, platform_name="win32", poll_interval_ms=60_000
+    )
+    widget.show()
+    try:
+        widget.append_activity(_activity("command_started", process_id="123"))
+        widget.append_activity(
+            _activity("command_completed", process_id="123", status="interrupted", exit_code=1)
+        )
+        assert first_emitted.wait(1.0)
+        # Deliver finished and the queued refresh while run() still occupies the only slot.
+        application.processEvents()
+        application.processEvents()
+        release_first.set()
+
+        assert _wait(
+            application,
+            lambda: "Command status: interrupted · exit 1" in widget.process_text.toPlainText(),
+        )
+    finally:
+        release_first.set()
+        widget.shutdown()
+        widget._pool.waitForDone(1_000)
+        application.processEvents()
+        widget.close()
 
 
 def test_status_anchor_is_captured_for_worker_and_cleared_on_selection_reset() -> None:
@@ -405,10 +455,11 @@ def test_missing_output_item_id_is_labeled_unattributed() -> None:
         }
     )
 
-    output = pane.command_output_text.toPlainText()
-    assert "[Unattributed command output (missing item id)]" in output
-    assert "[Output for command item-known]" not in output
-    assert "orphan output" in output
+    known, unknown = pane.command_output.panels.values()
+    unknown.toggle_button.click()
+    assert "Unidentified" in unknown.toggle_button.text()
+    assert known.output_text.toPlainText() == ""
+    assert unknown.output_text.toPlainText() == "orphan output"
 
 
 def test_activity_pane_snapshot_rehydrates_and_error_keeps_process_records() -> None:

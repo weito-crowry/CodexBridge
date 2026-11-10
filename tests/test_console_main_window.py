@@ -8,9 +8,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QSplitter,
+    QWidget,
 )
 
 from codex_bridge.console import main_window as main_window_module
@@ -64,6 +66,12 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.bridge_status_label.window() is window.status_dialog
     assert window.splitter.orientation() == Qt.Orientation.Horizontal
     assert window.splitter.count() == 3
+    assert isinstance(window.menuBar(), QMenuBar)
+    assert not hasattr(window, "settings_button")
+    assert not hasattr(window, "appearance_button")
+    assert not hasattr(window, "notification_settings_button")
+    assert window.findChild(QWidget, "settingsButton") is None
+    assert window.findChild(QWidget, "notificationSettingsButton") is None
     assert window.diagnostics_pane.isHidden()
     assert not window.diagnostics_timer.isActive()
     window.close()
@@ -73,18 +81,64 @@ def test_settings_menu_contains_config_actions_and_existing_appearance_modes() -
     _application()
     window = _settings_window(_config())
 
-    actions = window.settings_button.menu().actions()
+    top_level_menus = window.menuBar().actions()
+    assert [action.text() for action in top_level_menus] == ["File", "View", "Settings"]
+    assert [action.text() for action in top_level_menus[0].menu().actions()] == ["Exit"]
+    assert [action.text() for action in top_level_menus[1].menu().actions()] == [
+        "Status",
+        "Diagnostics",
+    ]
+
+    actions = window.settings_menu.actions()
     labels = [action.text() for action in actions]
     appearance_action = next(action for action in actions if action.text() == "Appearance")
 
     assert labels[:3] == ["Open settings file", "Reload settings", "Open settings folder"]
+    assert labels[3] == "Language (restart required)"
+    assert labels[5] == "Appearance"
+    assert labels[7] == "Restart Console to apply pending settings…"
+    assert labels[-1] == "Notification settings"
     assert appearance_action.menu() is not None
     assert [action.text() for action in appearance_action.menu().actions()] == [
         "System",
         "Light",
         "Dark",
     ]
-    assert window.settings_button.toolTip() == "Settings"
+    assert window._appearance_menu.parent() is window
+    checked_modes = [
+        mode for mode, action in window._appearance_actions.items() if action.isChecked()
+    ]
+    window._apply_pending_settings_action.setEnabled(True)
+    window._install_settings_menu()
+    assert window._apply_pending_settings_action.isEnabled()
+    assert [mode for mode, action in window._appearance_actions.items() if action.isChecked()] == (
+        checked_modes
+    )
+    assert [action.text() for action in window.settings_menu.actions()] == labels
+    assert (
+        sum(action.text() == "Notification settings" for action in window.settings_menu.actions())
+        == 1
+    )
+    window.close()
+
+
+def test_native_menu_bar_actions_delegate_to_existing_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _application()
+    window = _settings_window(_config())
+    calls: list[str] = []
+    monkeypatch.setattr(window, "_begin_exit", lambda: calls.append("exit"))
+    monkeypatch.setattr(window, "_show_status", lambda: calls.append("status"))
+    monkeypatch.setattr(window, "toggle_diagnostics", lambda: calls.append("diagnostics"))
+
+    file_action = window.menuBar().actions()[0].menu().actions()[0]
+    view_actions = window.menuBar().actions()[1].menu().actions()
+    file_action.trigger()
+    view_actions[0].trigger()
+    view_actions[1].trigger()
+
+    assert calls == ["exit", "status", "diagnostics"]
     window.close()
 
 
@@ -791,7 +845,7 @@ def test_main_window_keeps_active_style_and_updates_name_on_thread_refresh() -> 
     )
 
     active_item = _thread_item(window, "thread-a")
-    assert active_item.text(0) == "New \u30b9\u30ec\u30c3\u30c9"
+    assert active_item.text(0) == "New thread"
     assert not active_item.icon(0).isNull()
     active_weight = active_item.font(0).weight()
 

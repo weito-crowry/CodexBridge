@@ -23,6 +23,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QInputDialog,
     QLabel,
@@ -33,7 +34,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QSystemTrayIcon,
-    QToolButton,
     QWidget,
 )
 from PySide6.QtWidgets import QMessageBox as QMessageBox
@@ -51,6 +51,7 @@ from .bridge_stop_confirmation import BridgeStopConfirmationCoordinator
 from .bridge_transition import BridgeTransitionContext, BridgeTransitionCoordinator
 from .bulk_thread_naming import BulkThreadNamingController
 from .codex_links import open_codex_uri
+from .codex_probe_controller import CodexProbeController
 from .codex_resolver import (
     CodexResolution,
     CodexResolutionError,
@@ -69,19 +70,25 @@ from .history_requests import (
     HistoryRequestCoordinator,
 )
 from .history_stream import (
-    TERMINAL_TURN_STATES,
     HistoryStreamContext,
     HistoryStreamCoordinator,
 )
 from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
+from .i18n import initialize_language, tr
 from .main_window_layout import build_main_window_ui
 from .notification_controller import NotificationController, NotificationSettingsDialog
 from .project_folder_actions import ProjectFolderActionsController
 from .project_names import read_local_project_names
 from .runtime_launcher import BridgeRuntimeLauncher
-from .runtime_ui import RuntimeUiPresenter
+from .runtime_ui import _RUNTIME_LABELS, RuntimeUiPresenter
 from .settings_actions import SettingsActionController
 from .thread_interactions import ThreadInteractionController
+from .thread_state_observations import (
+    classify_activity_thread_status,
+)
+from .thread_state_observations import (
+    observe_runtime_thread_status as _runtime_thread_status_observation,
+)
 from .timer_bootstrap import build_console_timers
 from .tray_controller import TrayController
 from .tunnel_resolver import TunnelResolutionError
@@ -109,45 +116,6 @@ from .widgets import (
 )
 
 _EXIT_TIMEOUT_SECONDS = 12.0
-
-
-def _runtime_thread_status_observation(thread: Mapping[str, object]) -> tuple[bool, str | None]:
-    status = thread.get("runtime_status")
-    if not isinstance(status, Mapping):
-        return False, None
-    status_type = status.get("type")
-    if not isinstance(status_type, str):
-        return False, None
-    if status_type in {"notLoaded", "idle", "systemError"}:
-        return True, None
-    if status_type != "active":
-        return False, None
-    active_flags = status.get("active_flags")
-    if not isinstance(active_flags, list) or any(
-        not isinstance(flag, str) for flag in active_flags
-    ):
-        return False, None
-    if not active_flags:
-        return True, "in_progress"
-    if active_flags == ["waitingOnApproval"]:
-        return True, "needs_approval"
-    if active_flags == ["waitingOnUserInput"]:
-        return True, "needs_input"
-    return True, "waiting"
-
-
-_RUNTIME_LABELS = {
-    "unavailable": "Runtime: unavailable",
-    "external": "Runtime: external",
-    "launching": "Runtime: launching",
-    "launch_failed": "Runtime: launch failed",
-    "launch_timed_out": "Runtime: launch timed out",
-    "stopping": "Runtime: stopping",
-    "restarting": "Runtime: restarting",
-    "stopped": "Runtime: stopped",
-    "control_failed": "Runtime: control failed",
-    "stop_timed_out": "Runtime: stop timed out",
-}
 
 
 class MainWindow(QMainWindow):
@@ -184,8 +152,13 @@ class MainWindow(QMainWindow):
     usage_status_label: UsageShortcutLabel
     codex_update_banner_label: QLabel
     status_button: QPushButton
+    file_menu: QMenu
+    view_menu: QMenu
+    settings_menu: QMenu
     diagnostics_toggle_button: QPushButton
     diagnostics_clear_button: QPushButton
+    diagnostics_filter_buttons: dict[str, QPushButton]
+    diagnostics_filter_group: QButtonGroup
     retry_now_button: QPushButton
     restart_codexbridge_button: QPushButton
     advanced_toggle_button: QPushButton
@@ -205,13 +178,9 @@ class MainWindow(QMainWindow):
     status_refresh_button: QPushButton
     status_close_button: QPushButton
     status_dialog: QDialog
-    appearance_button: QToolButton
-    settings_button: QToolButton
-    settings_menu: QMenu
     _appearance_menu: QMenu
     _settings_actions: dict[str, QAction]
     _apply_pending_settings_action: QAction
-    notification_settings_button: QToolButton
     _appearance_actions: dict[str, QAction]
     _appearance_controller: AppearanceController
     _appearance_settings: QSettings
@@ -251,6 +220,12 @@ class MainWindow(QMainWindow):
         external_thread_monitor: Any | None = None,
     ) -> None:
         super().__init__(parent)
+        appearance_settings = (
+            appearance_settings
+            if appearance_settings is not None
+            else QSettings("CodexBridge", "Console")
+        )
+        initialize_language(appearance_settings)
         self._config = config
         self._pending_config: ConsoleConfig | None = None
         self._restart_after_settings_apply = False
@@ -272,7 +247,7 @@ class MainWindow(QMainWindow):
         self._tunnel_resolution_error: str | None = None
         self._tunnel_resolution_status = "not_run"
         self._tunnel_profile_status = "not_run"
-        self._tunnel_profile_skip_reason = "Managed profile is not configured"
+        self._tunnel_profile_skip_reason = tr("Managed profile is not configured")
         self._bridge_generation = 0
         self._managed_tunnel_profile: (
             tuple[Mapping[str, object], Path, str, str, Callable[..., object]] | None
@@ -310,6 +285,7 @@ class MainWindow(QMainWindow):
         self._usage_snapshot_store = UsageSnapshotStore(self)
         self._usage_requests = UsageRequestCoordinator(self)
         self._codex_resolution: CodexResolution | None = None
+        self._codex_probe_controller = CodexProbeController(self)
         self._bridge_seen_ready = False
         self._health_observed = False
         self._status_observed = False
@@ -400,7 +376,7 @@ class MainWindow(QMainWindow):
             ),
             on_transition_started=self._on_bridge_transition_started,
             on_request_failure=lambda: self._apply_control_failure(
-                "control:shutdown", "Bridge control request failed"
+                "control:shutdown", tr("Bridge control request failed")
             ),
         )
         self._bridge_readiness = BridgeReadinessCoordinator(
@@ -552,14 +528,14 @@ class MainWindow(QMainWindow):
             candidates = ()
             self._tunnel_resolution_status = "failed"
             self._tunnel_resolution_error = (
-                str(exc)
+                tr("Configured Tunnel executable was not found")
                 if str(exc) == "Configured Tunnel executable was not found"
-                else "Configured Tunnel executable could not be resolved"
+                else tr("Configured Tunnel executable could not be resolved")
             )
         else:
             self._tunnel_resolution_status = "passed" if candidates else "failed"
             if not candidates:
-                self._tunnel_resolution_error = "Tunnel executable was not found"
+                self._tunnel_resolution_error = tr("Tunnel executable was not found")
         executable = candidates[0].path if candidates else None
         profile_file: str | None = None
         profile_settings = self._config.tunnel_profile_settings
@@ -579,9 +555,9 @@ class MainWindow(QMainWindow):
                 generate_tunnel_profile,
             )
             profile_file = os.fspath(configured_profile_path.parent / f"{profile_name}.yaml")
-            self._tunnel_profile_skip_reason = "Waiting for Bridge and App Server readiness"
+            self._tunnel_profile_skip_reason = tr("Waiting for Bridge and App Server readiness")
         elif executable is None:
-            self._tunnel_profile_skip_reason = "Executable resolution failed"
+            self._tunnel_profile_skip_reason = tr("Executable resolution failed")
         return TunnelSupervisor(
             executable=executable,
             profile=self._config.tunnel_profile,
@@ -648,8 +624,7 @@ class MainWindow(QMainWindow):
         self.history_pane.older_requested.connect(self.load_older)
 
     def _connect_runtime(self) -> None:
-        self._codex_probe.resolved.connect(self._apply_codex_resolution)
-        self._codex_probe.failed.connect(self._apply_codex_probe_error)
+        self._codex_probe_controller.attach(self._codex_probe)
         self._codex_update_probe.check_succeeded.connect(self._apply_codex_update_check)
         self._codex_update_probe.check_failed.connect(self._apply_codex_update_check_error)
         self._codex_update_probe.update_succeeded.connect(self._apply_codex_update_success)
@@ -665,7 +640,6 @@ class MainWindow(QMainWindow):
         self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
         self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
         self.status_button.clicked.connect(self._show_status)
-        self.notification_settings_button.clicked.connect(self._show_notification_settings)
         self.usage_status_label.activated.connect(self._create_or_show_usage_history_window)
         self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
         self.status_refresh_button.clicked.connect(self._refresh_status)
@@ -726,27 +700,18 @@ class MainWindow(QMainWindow):
     def _apply_global_activity(self, generation: int, payload: object) -> None:
         if self._closing or generation != self._global_stream_generation:
             return
+        if isinstance(payload, Mapping) and payload.get("type") == "external_threads":
+            self._apply_external_running_threads(payload.get("threads", {}))
+            return
         self._update_thread_status_from_activity(payload)
         self._notification_controller.handle_activity(payload)
 
     def _update_thread_status_from_activity(self, payload: object) -> None:
-        if not isinstance(payload, Mapping):
+        observation = classify_activity_thread_status(payload)
+        if observation is None:
             return
-        thread_id = payload.get("thread_id")
-        activity_type = payload.get("type")
-        status = payload.get("status")
-        if not isinstance(thread_id, str) or not isinstance(activity_type, str):
-            return
-        if activity_type == "approval_requested" and status == "requested":
-            self._update_thread_activity(thread_id, "needs_approval")
-        elif activity_type == "user_input_requested" and status == "requested":
-            self._update_thread_activity(thread_id, "needs_input")
-        elif activity_type == "turn_started" and status in ACTIVE_TURN_STATES:
-            self._update_thread_activity(thread_id, status)
-        elif activity_type in {"turn_completed", "turn_failed", "turn_interrupted", "error"} and (
-            status in TERMINAL_TURN_STATES
-        ):
-            self._update_thread_activity(thread_id, status)
+        thread_id, status = observation
+        self._update_thread_activity(thread_id, status)
 
     def _apply_global_stream_state(self, generation: int, state: str) -> None:
         if generation != self._global_stream_generation:
@@ -755,6 +720,8 @@ class MainWindow(QMainWindow):
             self._global_stream_retries = 0
             self._global_stream_retry_timer.stop()
         elif state == "disconnected" and not self._closing:
+            if self._external_thread_monitor is None:
+                self._apply_external_running_threads({})
             delay_ms = min(
                 self._global_stream_retry_initial_ms * (2**self._global_stream_retries),
                 self._global_stream_retry_max_ms,
@@ -771,6 +738,7 @@ class MainWindow(QMainWindow):
         if self._usage_history_window is None:
             self._usage_history_window = UsageHistoryWindow(
                 self._usage_history_path,
+                usage_provider=lambda: self._usage,
                 appearance=self._appearance_controller.theme,
                 settings=self._appearance_settings,
                 parent=self,
@@ -881,19 +849,17 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._codex_resolution = resolution
-        self.codex_status_label.setText(f"Codex: {resolution.version} · {resolution.source}")
+        self.codex_status_label.setText(
+            tr("Codex: {p0} · {p1}", p0=resolution.version, p1=resolution.source)
+        )
+        self.codex_status_label.setToolTip("")
         self._update_start_button()
         self._sync_codex_update_controls()
         self._schedule_codex_update_auto_check()
         self._maybe_auto_start_bridge()
 
     def _apply_codex_probe_error(self, _message: str) -> None:
-        if self._closing:
-            return
-        self._codex_resolution = None
-        self.codex_status_label.setText("Codex: not found")
-        self._update_start_button()
-        self._sync_codex_update_controls()
+        self._codex_probe_controller.apply_failure()
 
     def _sync_codex_update_controls(self) -> None:
         self._codex_update_controller.sync_codex_update_controls()
@@ -931,7 +897,14 @@ class MainWindow(QMainWindow):
 
     def _set_runtime_state(self, state: str, *, label: str | None = None) -> None:
         self._runtime_state = state
-        self.runtime_status_label.setText(label or _RUNTIME_LABELS.get(state, f"Runtime: {state}"))
+        self.runtime_status_label.setText(
+            label
+            or (
+                tr(_RUNTIME_LABELS[state])
+                if state in _RUNTIME_LABELS
+                else tr("Runtime: {p0}", p0=state)
+            )
+        )
         self._composer_controller.sync_bridge_ownership()
         self._sync_approval_controls()
         self._update_start_button()
@@ -1062,7 +1035,7 @@ class MainWindow(QMainWindow):
         self._bridge_managed_retry_coordinator.maybe_auto_start_bridge()
 
     def _retry_now(self) -> None:
-        self._bridge_lifecycle_controller.retry_now()
+        self._codex_probe_controller.retry_now(self._bridge_lifecycle_controller.retry_now)
 
     def _restart_codexbridge(self) -> None:
         self._restart_bridge()
@@ -1137,7 +1110,7 @@ class MainWindow(QMainWindow):
         if key == "control:approval" and self._approval_control_pending:
             self._approval_control_pending = False
             self.activity_pane.set_approval_busy(False)
-            self.activity_pane.set_approval_feedback("Approval sent. Refreshing status…")
+            self.activity_pane.set_approval_feedback(tr("Approval sent. Refreshing status…"))
             self._request_selected_status()
             return
         if key != "control:shutdown" or not (
@@ -1145,7 +1118,7 @@ class MainWindow(QMainWindow):
         ):
             return
         self._bridge_stop_confirmation.begin()
-        self.bottom_status_label.setText("Bridge shutdown requested")
+        self.bottom_status_label.setText(tr("Bridge shutdown requested"))
         self._request_health()
 
     def _apply_control_failure(self, key: str, message: str) -> None:
@@ -1155,11 +1128,11 @@ class MainWindow(QMainWindow):
             if "already resolved" in message.casefold():
                 self.activity_pane.mark_approval_resolved()
                 self.activity_pane.set_approval_feedback(
-                    "Approval already resolved. Refreshing status…"
+                    tr("Approval already resolved. Refreshing status…")
                 )
                 self._request_selected_status()
             else:
-                self.activity_pane.set_approval_feedback("Approval request failed")
+                self.activity_pane.set_approval_feedback(tr("Approval request failed"))
             return
         if key != "control:shutdown":
             return
@@ -1170,7 +1143,7 @@ class MainWindow(QMainWindow):
             return
         self._bridge_transition = False
         self._set_runtime_state("control_failed")
-        self.bottom_status_label.setText("Bridge control request failed")
+        self.bottom_status_label.setText(tr("Bridge control request failed"))
 
     def _maybe_finish_stop_confirmation(self) -> None:
         self._bridge_stop_confirmation.maybe_finish()
@@ -1193,8 +1166,16 @@ class MainWindow(QMainWindow):
     def _apply_runtime_observation(self) -> None:
         self._bridge_runtime_observer.apply_runtime_observation()
 
-    def _record_bridge_status_observation(self, available: bool) -> None:
-        self._bridge_runtime_observer.record_bridge_status_observation(available)
+    def _record_bridge_status_observation(
+        self,
+        available: bool,
+        *,
+        reason: str = "bridge_unavailable",
+    ) -> None:
+        self._bridge_runtime_observer.record_bridge_status_observation(
+            available,
+            reason=reason,
+        )
 
     def _recover_bridge_after_loss(self) -> None:
         self._bridge_runtime_observer.recover_bridge_after_loss()
@@ -1350,6 +1331,9 @@ class MainWindow(QMainWindow):
 
     def _apply_status(self, payload: object) -> None:
         self._history_stream.apply_status(payload)
+        if isinstance(payload, Mapping) and isinstance(last := payload.get("last_turn"), Mapping):
+            if isinstance(thread_id := payload.get("thread_id"), str):
+                self.thread_pane.set_last_turn(thread_id, last)
 
     def _set_thread_active(self, thread_id: str, active: bool) -> None:
         if active:
@@ -1417,7 +1401,7 @@ class MainWindow(QMainWindow):
             key="control:approval",
         )
         if not accepted and self._approval_control_pending:
-            self._apply_control_failure("control:approval", "Bridge control request failed")
+            self._apply_control_failure("control:approval", tr("Bridge control request failed"))
 
     def _apply_stream_state(self, generation: int, state: str) -> None:
         self._history_stream.apply_stream_state(generation, state)
@@ -1435,6 +1419,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._bridge_runtime_observer.close()
         self._global_stream_retry_timer.stop()
         self._stop_external_thread_monitor()
         self._composer_controller.set_control_available(False)
@@ -1500,7 +1485,10 @@ class MainWindow(QMainWindow):
             if not restarted:
                 QMessageBox.warning(
                     self,
-                    "Settings",
-                    "Console could not restart. Launch it again to apply the validated settings.",
+                    tr("Settings"),
+                    tr(
+                        "Console could not restart. Launch it again to apply "
+                        "the validated settings."
+                    ),
                 )
         self._quit_application()

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
+from datetime import datetime
 
 from codex_bridge.logging_utils import log_event, log_thread_started
 
@@ -47,6 +49,35 @@ def test_mcp_observability_fields_are_recorded_without_payloads(caplog) -> None:
     assert "do not log pat" not in caplog.text
 
 
+def test_shutdown_event_keeps_only_fixed_reason_and_safe_process_statistics(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="codex_bridge")
+
+    log_event(
+        "bridge.control.shutdown.requested",
+        reason="control_api",
+        process_id=4321,
+        process_alive=False,
+        stderr_had_output=True,
+        stderr_line_count=3,
+        token="private-token",
+    )
+    log_event(
+        "bridge.control.shutdown.requested",
+        reason="private-token",
+        process_id=True,
+        process_alive="private-token",
+        stderr_line_count=True,
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "bridge.control.shutdown.requested process_alive=False process_id=4321 reason=control_api "
+        "stderr_had_output=True stderr_line_count=3",
+        "bridge.control.shutdown.requested",
+    ]
+    assert "private-token" not in caplog.text
+
+
 def test_smoke_requires_explicit_opt_in() -> None:
     result = subprocess.run(
         [sys.executable, "scripts/integration_smoke.py", "--help"],
@@ -56,3 +87,35 @@ def test_smoke_requires_explicit_opt_in() -> None:
     )
 
     assert result.returncode == 0
+
+
+def test_configured_python_and_warning_logs_have_actual_iso_timestamps() -> None:
+    code = (
+        "import logging, warnings; "
+        "from codex_bridge.logging_utils import configure_logging; "
+        "configure_logging(); "
+        "logging.getLogger('codex_bridge').error('bridge failure'); "
+        "logging.getLogger('uvicorn.error').error('uvicorn failure'); "
+        "warnings.warn('bridge warning', RuntimeWarning)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    lines = [line for line in result.stderr.splitlines() if line]
+    assert len(lines) == 3
+    assert " ERROR codex_bridge bridge failure" in lines[0]
+    assert " ERROR uvicorn.error uvicorn failure" in lines[1]
+    assert " WARNING py.warnings " in lines[2]
+    for line in lines:
+        timestamp = line.split(" ", maxsplit=1)[0]
+        parsed = datetime.fromisoformat(timestamp)
+        assert parsed.tzinfo is not None
+        assert re.match(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$",
+            timestamp,
+        )

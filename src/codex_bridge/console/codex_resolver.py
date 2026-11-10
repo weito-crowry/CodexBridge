@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
@@ -18,6 +19,7 @@ from ..codex_resolver import (
 from ..codex_resolver import (
     enumerate_candidates as _enumerate_candidates,
 )
+from .i18n import tr
 
 _MAX_PROBE_OUTPUT = 4 * 1024
 _VERSION_PATTERN = re.compile(r"^codex-cli\s+(\S+)$")
@@ -53,18 +55,29 @@ def parse_codex_version(output: bytes) -> str:
     """Parse one bounded `codex-cli <version>` line without exposing raw output."""
 
     if len(output) > _MAX_PROBE_OUTPUT:
-        raise ValueError("Codex version output is too large")
+        raise ValueError(tr("Codex version output is too large"))
     try:
         text = output.decode("utf-8").strip()
     except UnicodeDecodeError as exc:
-        raise ValueError("Codex version output is invalid") from exc
+        raise ValueError(tr("Codex version output is invalid")) from exc
     match = _VERSION_PATTERN.fullmatch(text)
     if match is None:
-        raise ValueError("Codex version output is invalid")
+        raise ValueError(tr("Codex version output is invalid"))
     return match.group(1)
 
 
 ProcessFactory = Callable[[QObject], Any]
+
+
+@dataclass(frozen=True)
+class CodexProbeDiagnostic:
+    reason: str
+    candidate_source: str | None = None
+    candidate_path: str | None = None
+    stage: str = "candidate_enumeration"
+    process_error: int | None = None
+    exit_code: int | None = None
+    timeout_seconds: int = 3
 
 
 class CodexVersionProbe(QObject):
@@ -72,6 +85,7 @@ class CodexVersionProbe(QObject):
 
     resolved = Signal(object)
     failed = Signal(str)
+    diagnosticChanged = Signal(object)
 
     def __init__(
         self,
@@ -95,6 +109,7 @@ class CodexVersionProbe(QObject):
         self._output_size = 0
         self._started = False
         self._finished = False
+        self.diagnostic: CodexProbeDiagnostic | None = None
         self._timeout_timer = QTimer(self)
         self._timeout_timer.setSingleShot(True)
         self._timeout_timer.setInterval(3_000)
@@ -118,13 +133,13 @@ class CodexVersionProbe(QObject):
         if self._finished:
             return
         if self._candidate_index >= len(self._candidates):
-            self._fail()
+            self._fail("no_candidate")
             return
         candidate = self._candidates[self._candidate_index]
         if self._windows and candidate.path.casefold().endswith(".cmd"):
             cmd_executable = resolve_cmd_executable(self._environ, which=self._which)
             if cmd_executable is None:
-                self._advance_after_failure(candidate)
+                self._advance_after_failure(candidate, "missing_cmd_executable")
                 return
         else:
             cmd_executable = None
@@ -133,7 +148,9 @@ class CodexVersionProbe(QObject):
         process = self._process_factory(self)
         self._process = process
         process.finished.connect(lambda *_args, process=process: self._on_finished(process))
-        process.errorOccurred.connect(lambda *_args, process=process: self._on_error(process))
+        process.errorOccurred.connect(
+            lambda error=None, *args, process=process: self._on_error(process, error)
+        )
         process.readyReadStandardOutput.connect(
             lambda process=process: self._read_output(process, standard_error=False)
         )
@@ -161,11 +178,11 @@ class CodexVersionProbe(QObject):
         try:
             chunk = bytes(reader())
         except RuntimeError:
-            self._reject_current(process, kill=False)
+            self._reject_current(process, kill=False, reason="process_error")
             return
         self._output_size += len(chunk)
         if self._output_size > _MAX_PROBE_OUTPUT:
-            self._reject_current(process, kill=True)
+            self._reject_current(process, kill=True, reason="oversized_output")
             return
         if not standard_error:
             self._stdout.extend(chunk)
@@ -180,15 +197,17 @@ class CodexVersionProbe(QObject):
         try:
             exit_code = process.exitCode()
         except RuntimeError:
-            self._reject_current(process, kill=False)
+            self._reject_current(process, kill=False, reason="process_error")
             return
         if exit_code != 0:
-            self._reject_current(process, kill=False)
+            self._reject_current(process, kill=False, reason="nonzero_exit", exit_code=exit_code)
             return
         try:
             version = parse_codex_version(bytes(self._stdout))
         except ValueError:
-            self._reject_current(process, kill=False)
+            self._reject_current(
+                process, kill=False, reason="invalid_version_output", exit_code=exit_code
+            )
             return
         self._timeout_timer.stop()
         self._process = None
@@ -196,16 +215,32 @@ class CodexVersionProbe(QObject):
         candidate = self._candidates[self._candidate_index]
         self.resolved.emit(CodexResolution(candidate.path, version, candidate.source))
 
-    def _on_error(self, process: Any) -> None:
+    def _on_error(self, process: Any, error: Any = None) -> None:
         if process is self._process and not self._finished:
-            self._reject_current(process, kill=True)
+            error_getter = getattr(process, "error", None)
+            process_error = (
+                int(error)
+                if error is not None
+                else (int(error_getter()) if callable(error_getter) else None)
+            )
+            self._reject_current(
+                process, kill=True, reason="process_start_error", process_error=process_error
+            )
 
     def _on_timeout(self) -> None:
         process = self._process
         if process is not None:
-            self._reject_current(process, kill=True)
+            self._reject_current(process, kill=True, reason="timeout")
 
-    def _reject_current(self, process: Any, *, kill: bool) -> None:
+    def _reject_current(
+        self,
+        process: Any,
+        *,
+        kill: bool,
+        reason: str,
+        process_error: int | None = None,
+        exit_code: int | None = None,
+    ) -> None:
         if process is not self._process or self._finished:
             return
         candidate = self._candidates[self._candidate_index]
@@ -214,15 +249,31 @@ class CodexVersionProbe(QObject):
         if kill:
             active_process: Any = process
             active_process.kill()
-        self._advance_after_failure(candidate)
+        self._advance_after_failure(
+            candidate, reason, process_error=process_error, exit_code=exit_code
+        )
 
-    def _advance_after_failure(self, candidate: CodexCandidate) -> None:
+    def _advance_after_failure(
+        self,
+        candidate: CodexCandidate,
+        reason: str,
+        *,
+        process_error: int | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        self.diagnostic = CodexProbeDiagnostic(
+            reason, candidate.source, candidate.path, "process_validation", process_error, exit_code
+        )
+        self.diagnosticChanged.emit(self.diagnostic)
         if candidate.source == "explicit":
-            self._fail()
+            self._fail(reason)
             return
         self._candidate_index += 1
         self._start_next()
 
-    def _fail(self) -> None:
+    def _fail(self, reason: str = "no_candidate") -> None:
         self._finished = True
-        self.failed.emit("Codex version could not be verified")
+        if self.diagnostic is None:
+            self.diagnostic = CodexProbeDiagnostic(reason)
+            self.diagnosticChanged.emit(self.diagnostic)
+        self.failed.emit(tr("Codex version could not be verified"))
