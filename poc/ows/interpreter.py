@@ -15,6 +15,10 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "schema" / "workflow.yaml"
 SUPPORTED_TASKS = frozenset({"do", "set", "switch", "for", "call"})
 SUPPORTED_DIRECTIVES = frozenset({"continue", "exit"})
 _JQ_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SAFE_CODEX_JOB_PROMPT = (
+    "2+2を計算し、外部ツール・コマンド・ファイル操作・Git操作・ネットワーク操作を行わず、"
+    "回答本文に4の1文字だけを返すこと"
+)
 
 
 class OwsError(ValueError):
@@ -72,8 +76,13 @@ def validate_official_schema(definition: Any, schema_path: Path = SCHEMA_PATH) -
         raise OwsError(f"official OWS v1.0.3 schema violation at {location}: {error.message}")
 
 
-def validate_workflow(definition: Any, schema_path: Path = SCHEMA_PATH) -> None:
-    _validate_subset(definition)
+def validate_workflow(
+    definition: Any,
+    schema_path: Path = SCHEMA_PATH,
+    *,
+    codex_job_live: bool = False,
+) -> None:
+    _validate_subset(definition, codex_job_live=codex_job_live)
     validate_official_schema(definition, schema_path=schema_path)
 
 
@@ -102,7 +111,7 @@ def _validate_dataflow_config(
     _compile_required_expression(expression, f"{path}.{expression_key}", jq_variables)
 
 
-def _validate_subset(definition: Any) -> None:
+def _validate_subset(definition: Any, *, codex_job_live: bool = False) -> None:
     if not isinstance(definition, dict):
         raise OwsError("workflow definition must be an object")
 
@@ -142,10 +151,52 @@ def _validate_subset(definition: Any) -> None:
     tasks = definition.get("do")
     if not isinstance(tasks, list) or not tasks:
         raise OwsError("top-level do must be a non-empty task list")
-    _validate_task_list(tasks, "do", frozenset())
+    codex_calls, mock_calls, looped_codex_calls = _find_job_calls(tasks)
+    if codex_calls and not codex_job_live:
+        raise OwsError("codex-job requires --codex-job-live")
+    if codex_job_live:
+        if len(codex_calls) != 1:
+            raise OwsError("codex-job live mode requires exactly one codex-job call")
+        if mock_calls:
+            raise OwsError("codex-job live mode cannot be mixed with mock-job")
+        if looped_codex_calls:
+            raise OwsError("codex-job may not be nested under for")
+    _validate_task_list(tasks, "do", frozenset(), codex_job_live=codex_job_live)
 
 
-def _validate_task_list(tasks: Any, scope_path: str, jq_variables: frozenset[str]) -> None:
+def _find_job_calls(tasks: list[dict[str, Any]]) -> tuple[list[str], int, bool]:
+    codex_calls: list[str] = []
+    mock_calls = 0
+    looped_codex_calls = False
+
+    def visit(task_list: list[dict[str, Any]], *, inside_for: bool = False) -> None:
+        nonlocal mock_calls, looped_codex_calls
+        for task_item in task_list:
+            if not isinstance(task_item, dict) or len(task_item) != 1:
+                continue
+            task_name, task_spec = next(iter(task_item.items()))
+            if not isinstance(task_spec, dict):
+                continue
+            if task_spec.get("call") == "codex-job":
+                codex_calls.append(str(task_name))
+                looped_codex_calls = looped_codex_calls or inside_for
+            elif task_spec.get("call") == "mock-job":
+                mock_calls += 1
+            nested = task_spec.get("do")
+            if isinstance(nested, list):
+                visit(nested, inside_for=inside_for or "for" in task_spec)
+
+    visit(tasks)
+    return codex_calls, mock_calls, looped_codex_calls
+
+
+def _validate_task_list(
+    tasks: Any,
+    scope_path: str,
+    jq_variables: frozenset[str],
+    *,
+    codex_job_live: bool = False,
+) -> None:
     if not isinstance(tasks, list) or not tasks:
         raise OwsError(f"{scope_path} must be a non-empty task list")
 
@@ -219,7 +270,14 @@ def _validate_task_list(tasks: Any, scope_path: str, jq_variables: frozenset[str
                 path=f"{task_path}.export",
                 jq_variables=jq_variables.union({"context", "input", "output"}),
             )
-        _validate_action(operation, action, task_name, task_path, jq_variables)
+        _validate_action(
+            operation,
+            action,
+            task_name,
+            task_path,
+            jq_variables,
+            codex_job_live=codex_job_live,
+        )
         directive = task_spec.get("then")
         if directive is not None:
             _validate_directive_shape(directive, task_name)
@@ -278,9 +336,26 @@ def _validate_action(
     task_name: str,
     task_path: str,
     jq_variables: frozenset[str],
+    *,
+    codex_job_live: bool = False,
 ) -> None:
     if operation == "call":
         target = action["call"]
+        if target == "codex-job":
+            if not codex_job_live:
+                raise OwsError("codex-job requires --codex-job-live")
+            arguments = action.get("with")
+            if not isinstance(arguments, dict):
+                raise OwsError("codex-job with must be an argument map")
+            unsupported = set(arguments) - {"prompt"}
+            if unsupported:
+                key = sorted(unsupported)[0]
+                raise OwsError(f"unsupported codex-job argument '{key}'")
+            if set(arguments) != {"prompt"}:
+                raise OwsError("codex-job requires argument 'prompt'")
+            if arguments["prompt"] != SAFE_CODEX_JOB_PROMPT:
+                raise OwsError("codex-job prompt must be the fixed safe prompt")
+            return
         if target != "mock-job":
             raise OwsError(f"unsupported call target {target!r}; only 'mock-job' is allowed")
         arguments = action.get("with")
@@ -321,7 +396,12 @@ def _validate_action(
         _validate_set_value(value, task_path, jq_variables.union({"context", "input"}))
         return
     if operation == "do":
-        _validate_task_list(action["do"], f"{task_path}.do", jq_variables)
+        _validate_task_list(
+            action["do"],
+            f"{task_path}.do",
+            jq_variables,
+            codex_job_live=codex_job_live,
+        )
         return
     if operation == "for":
         for_spec = action.get("for")
@@ -357,6 +437,7 @@ def _validate_action(
             body,
             f"{task_path}.do",
             jq_variables.union({each_name, at_name}),
+            codex_job_live=codex_job_live,
         )
         return
     if operation == "switch":
@@ -561,6 +642,8 @@ def compute_task_action(
                 return {"__ows_control__": case_spec["then"]}
         return {"__ows_control__": default or "continue"}
     if operation == "call":
+        if task_spec.get("call") == "codex-job":
+            raise OwsError("call requires the codex-job live adapter")
         raise OwsError("call requires the mock-job DBOS adapter")
     raise OwsError(f"unsupported task '{operation}'")
 
@@ -577,6 +660,19 @@ def compute_mock_job_request(
         raise OwsError(str(error)) from error
 
 
+def compute_codex_job_request(
+    task_spec: Mapping[str, Any],
+    input_data: Any = None,
+    variables: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    del input_data, variables
+    arguments = task_spec.get("with")
+    prompt = arguments.get("prompt") if isinstance(arguments, Mapping) else None
+    if prompt != SAFE_CODEX_JOB_PROMPT:
+        raise OwsError("codex-job prompt must be the fixed safe prompt")
+    return {"prompt": SAFE_CODEX_JOB_PROMPT}
+
+
 class Interpreter:
     def __init__(
         self,
@@ -584,8 +680,9 @@ class Interpreter:
         *,
         max_tasks: int = 10_000,
         step_runner: StepRunner | None = None,
+        codex_job_live: bool = False,
     ) -> None:
-        validate_workflow(definition)
+        validate_workflow(definition, codex_job_live=codex_job_live)
         if max_tasks < 1:
             raise ValueError("max_tasks must be positive")
         self.definition = definition

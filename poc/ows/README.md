@@ -12,13 +12,13 @@ Windows上で、OWS DSL v1.0.3の限定subsetをPython Interpreterで実行し�
 
 公式schemaは上記tagから取得して[`schema/workflow.yaml`](schema/workflow.yaml)に固定しました。取得元URLは`https://raw.githubusercontent.com/open-workflow-specification/specification/v1.0.3/schema/workflow.yaml`、SHA-256は`df3326da907e17e743e9d9e888839481d1557abdf91c592e74f27506ff523f0b`です。`yaml.safe_load`で読み、`jsonschema.Draft202012Validator`で公式schemaを検査します。標準workflow、データフロー、復旧、`mock-job`の各fixtureはこの公式schemaを通ります。
 
-検査は二段階です。まずPoC subsetの静的検査で未対応task/属性/flowを拒否し、続いて公式schemaで構造を検査します。公式schema合格は、このPoCが全OWS意味論を実装したことを意味しません。subsetが実行できる`call`は`mock-job`だけです。HTTP、MCP、他の関数名は実行前に拒否し、`try`など未実装taskも拒否します。
+検査は二段階です。まずPoC subsetの静的検査で未対応task/属性/flowを拒否し、続いて公式schemaで構造を検査します。公式schema合格は、このPoCが全OWS意味論を実装したことを意味しません。通常modeの`call`は`mock-job`だけです。Phase 4Dの明示live modeでは固定fixtureの`codex-job`を1件だけ許可します。一般HTTP、MCP、他の関数名は実行前に拒否し、`try`など未実装taskも拒否します。
 
 ## Interpreter subset
 
 `document.dsl`は文字列`'1.0.3'`に限定します。`evaluate.language=jq`と`evaluate.mode=strict`を明示し、`${ ... }`だけをjq式として本物の`jq` packageに渡します。通常文字列は評価しません。`for.each`と`for.at`の値は`jq.compile(..., args=...)`で`$item`、`$index`等へJSON値として束縛します。
 
-対応するtaskは`do`、`set`、`switch`、`for`と限定された`call: mock-job`です。
+対応するtaskは`do`、`set`、`switch`、`for`、限定された`call: mock-job`です。`call: codex-job`はPhase 4D節の固定fixture・明示live modeだけで利用できます。
 
 - `do`は順次実行し、各taskの出力を次taskの入力にします。入れ子`do`は入れ子scopeで実行します。
 - `set`はmapまたは式の値をそのまま次taskへ渡します。辞書を暗黙mergeしません。
@@ -48,7 +48,7 @@ v1.0.3の`dsl.md`はstrict式の`${...}`、jq言語、式失敗の扱いを定�
 
 固定処理だけを行うmock serviceをDBOS workerと別の子Python processとして起動します。serviceは`QUEUED` jobを1回claimし、進捗と完了receiptをledgerへ記録します。`mock_failure: true` payloadは試験用に決定的`FAILED`を返します。FAILED receiptはDBOS stepをERRORにし、自動再送しません。bounded poll timeoutではjobをcancel扱いにせず、ledger状態を残してDBOS stepをtimeout ERRORにします。ledger状態を照合できない場合はadapter-owned `NEEDS_RECONCILIATION` markerで止め、自動再送しません。このmarkerはDBOSのworkflow statusではありません。
 
-Phase 4Bのstep内bounded pollingはPoC限定です。実Codex接続時には長時間MCP呼び出しをDBOS step内で待たせず、非同期start/status/event連携に置き換える必要があります。このPoCは実Codex、MCP、HTTPを呼びません。
+Phase 4Bのstep内bounded pollingはmock-job向けPoC限定です。実Codexの非同期start/status確認はPhase 4D adapterで別の短いDBOS stepに分けます。
 
 ### Phase 4C: 短いstepとdurable wait
 
@@ -76,7 +76,7 @@ Phase 4Bのstep内bounded pollingはPoC限定です。実Codex接続時には長
 
 Phase 4Cのworker kill/restart実験は、Phase 4Bと同じschema-valid recovery fixtureを別manifestで実行します。`phase4c_recovery_test.py`はstart step checkpoint後・service処理中に所有workerだけを既存のWindows process identity検証で終了し、service完了後に同じworkflow IDでrecoveryします。正常完了、job/request key固定、dispatch/service実行各1回、DBOS workflow 1件、4B baselineとのstatus/result一致を証跡に残します。
 
-これは非同期job APIとdurable workflow sleepのPoCです。`DBOS.sleep()`がDBOS workflow threadを必ず解放するとは主張せず、完全なevent-driven/zero-pollingでもありません。DBOS `recv`、HTTP/SSE、MCP、実Codex、GUIは未接続です。外部処理一般に対するexactly-once保証も主張しません。
+Phase 4B/4Cのmock-job pathは非同期job APIとdurable workflow sleepのPoCです。`DBOS.sleep()`がDBOS workflow threadを必ず解放するとは主張せず、完全なevent-driven/zero-pollingでもありません。Phase 4Dは固定CodexBridge HTTP API contractだけを扱い、DBOS `recv`、SSE、MCP、GUIは接続しません。外部処理一般に対するexactly-once保証も主張しません。
 
 ## DBOS checkpointと復旧
 
@@ -135,6 +135,34 @@ $normal = & .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
 ```
 
 Phase 4Cの回復証跡は`.state/phase4c-runs/run-<uuid>/phase4c-recovery-evidence.json`に保存されます。service crash後のRUNNING job照会とfail-closed markerは`tests/test_job_adapter.py`で実service processをkillして確認します。
+
+### Phase 4D: 本番CodexBridge HTTP API adapter
+
+Phase 4Dは固定fixture専用のHTTP job adapterです。既存`call: mock-job`とは別実装・別run-dir・別SQLite台帳を使い、mock serviceやheartbeat/claim TTLを共有しません。OWS subsetに`call: codex-job`を追加しますが、次の制約から外れるworkflowは実行前に拒否します。
+
+- `--codex-job-live`を明示し、fixtureの固定promptと`with: {prompt: <literal>}`だけを使います。任意prompt、複数live call、loop内live call、mock/live混在は拒否します。
+- live runは`.state/phase4d-runs/run-<uuid>/`に隔離し、作成前に一意のDBOS `workflow_id`、definition/input hash、`mode: codex-job-live`、loopback接続portをmanifestへ保存します。DBOS 3.4.0の`SetWorkflowID`で同じIDを使い、`resume`は`DBOS.launch()`から既存workflowを復旧します。
+- `codex_jobs.sqlite`へjob UUID、workflow/task request key、宛先を含むcanonical request digest、固定`client_request_id`、job title marker、run-dir内の空cwd、thread/turn ID、状態・receipt・イベントを保存します。mock job用の`jobs.sqlite`は作成しません。
+- HTTPは`127.0.0.1`または明示`localhost`に限定します。標準ライブラリ`http.client`を使い、proxyとredirectを使わず、有限timeoutと最大1 MiBのresponse上限を設定します。Bearer tokenは`CODEX_BRIDGE_CONTROL_TOKEN`環境変数からだけ読み、manifest/DB/worker logには保存しません。認証値がなければpreflightで止まります。
+- POST前に`PREPARED → MAYBE_SENT`を専用SQLite transactionでcommitします。POST応答の消失、timeout、4xx/5xx、不正応答では再送せず、`NEEDS_RECONCILIATION` markerと照合理由を残します。未知thread IDを一覧から自動採用する処理は行わず、固有title marker・専用cwd・promptで人が照合するまで停止します。
+- 正常な応答では`ACCEPTED`、status取得中は`RUNNING`、該当turnの明示`completed`と同じturnの`final_answer` itemがそろった場合に`SUCCEEDED`になります。`failed`/`interrupted`は`FAILED`、`needs_approval`/`needs_input`は自動承認せず照合停止です。有限回のstatus照会はDBOS短stepと`DBOS.sleep()`で行い、wait timeoutでもjobをcancelしません。
+
+Phase 4Dの実job開始コマンドは後続レビュー後の別作業でだけ実行します。この実装作業のoffline testは自分で起動したloopback fake HTTP serverだけを使います。
+
+```powershell
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
+  --workflow .\poc\ows\fixtures\codex_job_workflow.yaml `
+  --input-json '{}' `
+  --codex-job-live `
+  --codex-bridge-port 8001
+
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py job-status `
+  --run-dir <phase4d-run-directory> --job-id <job-id>
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py job-events `
+  --run-dir <phase4d-run-directory> --after-id 0 --limit 100
+```
+
+`--codex-job-live`がないrunは、workflow読込・subset検査だけで拒否し、run-dirやnetwork requestを作りません。PoCのrun-dirが本番AllowedRootsに入らずHTTP APIがcwdを拒否する場合は、別cwdへの迂回や本番設定変更をせず停止します。
 
 ## 検証
 

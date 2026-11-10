@@ -1,0 +1,15 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-codex-job
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+do:
+  - calculate:
+      call: codex-job
+      with:
+        prompt: '2+2を計算し、外部ツール・コマンド・ファイル操作・Git操作・ネットワーク操作を行わず、回答本文に4の1文字だけを返すこと'
+  - finish:
+      set: '${ . }'

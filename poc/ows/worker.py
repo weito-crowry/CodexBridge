@@ -13,10 +13,18 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-from dbos import DBOS, DBOSConfig
+from codex_http_client import CodexHTTPClient
+from codex_job_adapter import (
+    CodexJobAdapter,
+    CodexJobFailedError,
+    CodexJobReconciliationRequiredError,
+    CodexJobTimeoutError,
+)
+from dbos import DBOS, DBOSConfig, SetWorkflowID
 from interpreter import (
     Interpreter,
     OwsError,
+    compute_codex_job_request,
     compute_mock_job_request,
     compute_task_action,
     parse_workflow_text,
@@ -341,6 +349,210 @@ def _durable_poll_job_step(
     }
 
 
+def _durable_codex_job_start_step(
+    run_dir: str,
+    workflow_id: str,
+    identity: str,
+    request: dict[str, str],
+    port: int,
+    checkpoint_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    adapter = CodexJobAdapter(Path(run_dir) / "codex_jobs.sqlite")
+    started = adapter.start_job(
+        workflow_id,
+        identity,
+        request["prompt"],
+        Path(run_dir),
+        CodexHTTPClient(port=port),
+    )
+    result = {
+        key: started[key]
+        for key in (
+            "job_id",
+            "request_key",
+            "request_digest",
+            "state",
+            "status",
+            "thread_id",
+            "turn_id",
+        )
+    }
+    return {
+        **checkpoint_metadata,
+        "request_sha256": sha256_json(request),
+        "result": result,
+    }
+
+
+def _durable_codex_job_poll_step(
+    run_dir: str,
+    job_id: str,
+    request_key: str,
+    request_digest: str,
+    poll_index: int,
+    port: int,
+    checkpoint_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    adapter = CodexJobAdapter(Path(run_dir) / "codex_jobs.sqlite")
+    snapshot = adapter.observe_job(job_id, CodexHTTPClient(port=port))
+    if snapshot["request_key"] != request_key or snapshot["request_digest"] != request_digest:
+        raise CodexJobReconciliationRequiredError(
+            f"NEEDS_RECONCILIATION: codex-job identity changed for {request_key}"
+        )
+    return {
+        **checkpoint_metadata,
+        "request_sha256": sha256_json({"prompt": snapshot["request"]["prompt"]}),
+        "job_id": job_id,
+        "request_key": request_key,
+        "request_digest": request_digest,
+        "poll_index": poll_index,
+        "result": snapshot,
+    }
+
+
+@cache
+def _durable_codex_job_step(identity: str, stage: str, poll_index: int = 0) -> Any:
+    material = f"{identity}\0{stage}\0{poll_index}"
+    step_name = f"ows4d_{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
+    function = _durable_codex_job_start_step if stage == "start" else _durable_codex_job_poll_step
+    return DBOS.step(name=step_name)(function)
+
+
+def _run_durable_codex_job(
+    *,
+    identity: str,
+    task_name: str,
+    operation: str,
+    task_input: Any,
+    variables: dict[str, Any],
+    request: dict[str, str],
+    definition_sha256: str,
+    trace_path: str,
+    control: dict[str, Any],
+) -> dict[str, Any]:
+    workflow_id = DBOS.workflow_id
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise OwsError("codex-job adapter requires an active DBOS workflow")
+    port = control.get("codex_bridge_port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise OwsError("codex_bridge_port must be an integer from 1 to 65535")
+    max_polls = control.get("codex_job_max_polls", 600)
+    poll_interval = control.get("codex_job_poll_interval_seconds", 0.2)
+    if type(max_polls) is not int or not 1 <= max_polls <= 600:
+        raise OwsError("codex_job_max_polls must be an integer from 1 to 600")
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, (int, float))
+        or not 0.05 <= poll_interval <= 0.2
+        or max_polls * poll_interval > 120
+    ):
+        raise OwsError("codex_job_poll_interval_seconds produces an invalid bounded wait")
+
+    run_dir = Path(trace_path).parent
+    metadata = {
+        "identity": identity,
+        "task_name": task_name,
+        "operation": operation,
+        "definition_sha256": definition_sha256,
+        "input_sha256": sha256_json(task_input),
+        "context_sha256": sha256_json(variables.get("context")),
+        "variables_sha256": sha256_json(variables),
+    }
+    start_checkpoint = _durable_codex_job_step(identity, "start")(
+        str(run_dir), workflow_id, identity, request, port, metadata
+    )
+    start_checkpoint = _validate_task_checkpoint(
+        start_checkpoint,
+        identity=identity,
+        task_name=task_name,
+        operation=operation,
+        definition_sha256=definition_sha256,
+        task_input=task_input,
+        variables=variables,
+    )
+    started = start_checkpoint["result"]
+    job_id = started.get("job_id")
+    request_key = started.get("request_key")
+    request_digest = started.get("request_digest")
+    request_sha256 = sha256_json(request)
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or not isinstance(request_key, str)
+        or not request_key
+        or not isinstance(request_digest, str)
+        or started.get("status") == "NEEDS_RECONCILIATION"
+        or start_checkpoint.get("request_sha256") != request_sha256
+    ):
+        raise CodexJobReconciliationRequiredError(
+            f"NEEDS_RECONCILIATION: invalid codex-job start checkpoint for {identity}"
+        )
+
+    for poll_index in range(max_polls):
+        checkpoint = _durable_codex_job_step(identity, "status", poll_index)(
+            str(run_dir),
+            job_id,
+            request_key,
+            request_digest,
+            poll_index,
+            port,
+            metadata,
+        )
+        checkpoint = _validate_task_checkpoint(
+            checkpoint,
+            identity=identity,
+            task_name=task_name,
+            operation=operation,
+            definition_sha256=definition_sha256,
+            task_input=task_input,
+            variables=variables,
+        )
+        if (
+            checkpoint.get("request_sha256") != request_sha256
+            or checkpoint.get("job_id") != job_id
+            or checkpoint.get("request_key") != request_key
+            or checkpoint.get("request_digest") != request_digest
+            or checkpoint.get("poll_index") != poll_index
+        ):
+            raise CodexJobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: invalid codex-job status checkpoint for {identity}"
+            )
+        snapshot = checkpoint["result"]
+        if snapshot.get("status") == "NEEDS_RECONCILIATION":
+            raise CodexJobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: job {job_id} requires adapter reconciliation"
+            )
+        if snapshot.get("state") == "SUCCEEDED":
+            receipt = snapshot.get("receipt")
+            result = receipt.get("result") if isinstance(receipt, dict) else None
+            if not isinstance(result, dict) or not isinstance(result.get("final_text"), str):
+                raise CodexJobReconciliationRequiredError(
+                    f"NEEDS_RECONCILIATION: SUCCEEDED job has no final answer for {request_key}"
+                )
+            return {
+                "job_id": job_id,
+                "request_key": request_key,
+                "thread_id": snapshot["thread_id"],
+                "turn_id": snapshot["turn_id"],
+                "status": "SUCCEEDED",
+                "result": {"final_text": result["final_text"]},
+            }
+        if snapshot.get("state") == "FAILED":
+            raise CodexJobFailedError(
+                f"codex-job FAILED: job_id={job_id} request_key={request_key}"
+            )
+        if snapshot.get("state") not in {"ACCEPTED", "RUNNING"}:
+            raise CodexJobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: unsupported codex-job state for {request_key}"
+            )
+        if poll_index + 1 < max_polls:
+            DBOS.sleep(float(poll_interval))
+
+    raise CodexJobTimeoutError(
+        f"codex-job wait exceeded {max_polls} status checks for job {job_id}; job was not cancelled"
+    )
+
+
 @cache
 def _durable_job_step(identity: str, stage: str, poll_index: int = 0) -> Any:
     material = f"{identity}\0{stage}\0{poll_index}"
@@ -522,10 +734,15 @@ def execute_ows_workflow(
     if sha256_json(input_data) != input_sha256:
         raise OwsError("persisted OWS input hash mismatch")
     definition = parse_workflow_text(definition_text)
-    validate_workflow(definition)
+    codex_job_live = control.get("codex_job_live", False)
+    if not isinstance(codex_job_live, bool):
+        raise OwsError("codex_job_live must be a boolean")
     durable_wait = control.get("mock_job_durable_wait", False)
     if not isinstance(durable_wait, bool):
         raise OwsError("mock_job_durable_wait must be a boolean")
+    if codex_job_live and durable_wait:
+        raise OwsError("codex-job live mode cannot be mixed with mock-job durable-wait mode")
+    validate_workflow(definition, codex_job_live=codex_job_live)
 
     def run_named_step(
         identity: str,
@@ -535,6 +752,19 @@ def execute_ows_workflow(
         task_input: Any,
         variables: dict[str, Any],
     ) -> Any:
+        if codex_job_live and operation == "call":
+            request = compute_codex_job_request(task_spec, task_input, variables)
+            return _run_durable_codex_job(
+                identity=identity,
+                task_name=task_name,
+                operation=operation,
+                task_input=task_input,
+                variables=variables,
+                request=request,
+                definition_sha256=definition_sha256,
+                trace_path=trace_path,
+                control=control,
+            )
         if durable_wait and operation == "call":
             request = compute_mock_job_request(task_spec, task_input, variables)
             return _run_durable_mock_job(
@@ -575,6 +805,7 @@ def execute_ows_workflow(
         definition,
         max_tasks=max_tasks,
         step_runner=run_named_step,
+        codex_job_live=codex_job_live,
     )
     return interpreter.run(input_data)
 
@@ -626,6 +857,17 @@ def main() -> int:
     control = manifest.get("control", {})
     if not isinstance(control, dict):
         raise OwsError("manifest control must be an object")
+    codex_job_live = control.get("codex_job_live", False)
+    if not isinstance(codex_job_live, bool):
+        raise OwsError("manifest codex_job_live must be a boolean")
+    if codex_job_live and manifest.get("mode") != "codex-job-live":
+        raise OwsError("codex-job live mode does not match the run manifest")
+    if manifest.get("mode") == "codex-job-live" and not codex_job_live:
+        raise OwsError("codex-job live mode is missing from manifest control")
+    if codex_job_live:
+        workflow_id = manifest.get("workflow_id")
+        if not isinstance(workflow_id, str) or not workflow_id:
+            raise OwsError("codex-job live mode requires a pre-generated workflow_id")
 
     worker_identity = get_process_identity(os.getpid())
     if worker_identity is None or not worker_identity["active"]:
@@ -661,8 +903,7 @@ def main() -> int:
                 daemon=True,
             )
             heartbeat_thread.start()
-            handle = DBOS.start_workflow(
-                execute_ows_workflow,
+            workflow_arguments = (
                 definition_text,
                 manifest["definition_sha256"],
                 input_data,
@@ -671,6 +912,17 @@ def main() -> int:
                 control,
                 int(manifest.get("max_tasks", 10_000)),
             )
+            if codex_job_live:
+                requested_workflow_id = str(manifest["workflow_id"])
+                with SetWorkflowID(requested_workflow_id):
+                    handle = DBOS.start_workflow(
+                        execute_ows_workflow,
+                        *workflow_arguments,
+                    )
+                if handle.workflow_id != requested_workflow_id:
+                    raise OwsError("DBOS workflow_id differs from the pre-generated manifest ID")
+            else:
+                handle = DBOS.start_workflow(execute_ows_workflow, *workflow_arguments)
             workflow_id = handle.workflow_id
             manifest["workflow_id"] = workflow_id
             _write_json(run_dir / "manifest.json", manifest)
