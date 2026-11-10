@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 OWS_DIR = Path(__file__).resolve().parents[1]
 STATE_DIR = OWS_DIR / ".state"
 
@@ -80,6 +82,83 @@ def test_cli_runs_ows_tasks_as_dbos_checkpoints() -> None:
     assert all(completed_at is not None for _, completed_at in steps)
 
 
+def test_cli_replays_dataflow_transformations_around_dbos_checkpoints() -> None:
+    output = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        str(OWS_DIR / "fixtures" / "dataflow_workflow.yaml"),
+        "--input-json",
+        '{"request":{"value":8,"discarded":true},"discarded":"raw"}',
+    )
+
+    assert output["result"] == {
+        "result": 9,
+        "seen_context": 9,
+        "context": {"value": 8, "discarded": True, "published": 9, "source": 8},
+    }
+
+    database = Path(output["run_dir"]) / "dbos.sqlite"
+    database_uri = f"{database.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        steps = connection.execute(
+            "SELECT function_name, completed_at_epoch_ms FROM operation_outputs "
+            "WHERE workflow_uuid = ? ORDER BY function_id",
+            (output["workflow_id"],),
+        ).fetchall()
+    assert len(steps) == 2
+    assert all(completed_at is not None for _, completed_at in steps)
+
+
+@pytest.mark.parametrize(
+    ("task_input", "variables", "message"),
+    [
+        (
+            {"value": 3},
+            {"context": {"run": 1}, "item": 4},
+            "input digest mismatch",
+        ),
+        (
+            {"value": 2},
+            {"context": {"run": 2}, "item": 4},
+            "context digest mismatch",
+        ),
+        (
+            {"value": 2},
+            {"context": {"run": 1}, "item": 5},
+            "runtime variables digest mismatch",
+        ),
+    ],
+)
+def test_checkpoint_replay_rejects_changed_input_or_context_digest(
+    task_input: dict[str, int], variables: dict[str, Any], message: str
+) -> None:
+    import worker
+
+    definition_sha256 = "definition-hash"
+    checkpoint = {
+        "identity": "do[0].task",
+        "task_name": "task",
+        "operation": "set",
+        "definition_sha256": definition_sha256,
+        "input_sha256": worker.sha256_json({"value": 2}),
+        "context_sha256": worker.sha256_json({"run": 1}),
+        "variables_sha256": worker.sha256_json({"context": {"run": 1}, "item": 4}),
+        "result": {"value": 4},
+    }
+
+    with pytest.raises(worker.OwsError, match=message):
+        worker._validate_task_checkpoint(
+            checkpoint,
+            identity="do[0].task",
+            task_name="task",
+            operation="set",
+            definition_sha256=definition_sha256,
+            task_input=task_input,
+            variables=variables,
+        )
+
+
 def test_interrupted_run_manifest_resumes_through_cli_and_reuses_steps() -> None:
     state_root = STATE_DIR / "test-recovery" / f"run-{uuid.uuid4().hex}"
     output = _invoke(
@@ -94,6 +173,7 @@ def test_interrupted_run_manifest_resumes_through_cli_and_reuses_steps() -> None
     assert output["workflow_count"] == 1
     assert output["final_status"] == "SUCCESS"
     assert output["result_matches_uninterrupted"] is True
+    assert output["recovered_result"] == {"final": 2}
     assert output["task_start_counts"] == {"first": 1, "second": 2, "finish": 1}
     assert output["initial_popen_pid"] != output["recovery_popen_pid"]
     assert output["initial_heartbeat_pid"] == output["initial_worker_pid"]

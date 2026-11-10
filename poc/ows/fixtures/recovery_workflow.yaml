@@ -10,9 +10,11 @@ do:
   - first:
       set:
         value: ${ .value + 1 }
+      export:
+        as: '${ $context + {checkpointed: .value} }'
   - second:
       set:
         value: ${ .value + 1 }
   - finish:
       set:
-        final: ${ .value }
+        final: ${ $context.checkpointed + 1 }

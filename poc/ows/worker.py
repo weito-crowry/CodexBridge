@@ -131,6 +131,40 @@ def _output_digest(value: Any) -> str:
     return sha256_json(value)
 
 
+def _validate_task_checkpoint(
+    checkpoint: Any,
+    *,
+    identity: str,
+    task_name: str,
+    operation: str,
+    definition_sha256: str,
+    task_input: Any,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(checkpoint, dict):
+        raise OwsError(f"persisted task checkpoint is invalid for {identity}")
+    expected = {
+        "identity": identity,
+        "task_name": task_name,
+        "operation": operation,
+        "definition_sha256": definition_sha256,
+        "input_sha256": sha256_json(task_input),
+        "context_sha256": sha256_json(variables.get("context")),
+        "variables_sha256": sha256_json(variables),
+    }
+    for field, expected_value in expected.items():
+        if checkpoint.get(field) != expected_value:
+            label = "input digest" if field == "input_sha256" else field
+            if field == "context_sha256":
+                label = "context digest"
+            elif field == "variables_sha256":
+                label = "runtime variables digest"
+            raise OwsError(f"persisted task {label} mismatch for {identity}")
+    if "result" not in checkpoint:
+        raise OwsError(f"persisted task checkpoint has no result for {identity}")
+    return checkpoint
+
+
 def _run_task_step(
     identity: str,
     task_name: str,
@@ -168,6 +202,9 @@ def _run_task_step(
                 raise TimeoutError(f"test gate timed out for task {task_name!r}")
             time.sleep(0.05)
 
+    input_sha256 = sha256_json(input_data)
+    context_sha256 = sha256_json(variables.get("context"))
+    variables_sha256 = sha256_json(variables)
     result = compute_task_action(operation, task_spec, input_data, variables)
     _append_event(
         event_path,
@@ -187,6 +224,9 @@ def _run_task_step(
         "task_name": task_name,
         "operation": operation,
         "definition_sha256": definition_sha256,
+        "input_sha256": input_sha256,
+        "context_sha256": context_sha256,
+        "variables_sha256": variables_sha256,
         "result": result,
     }
 
@@ -233,13 +273,15 @@ def execute_ows_workflow(
             trace_path,
             control,
         )
-        if (
-            checkpoint.get("identity") != identity
-            or checkpoint.get("task_name") != task_name
-            or checkpoint.get("operation") != operation
-            or checkpoint.get("definition_sha256") != definition_sha256
-        ):
-            raise OwsError(f"persisted task identity mismatch for {identity}")
+        checkpoint = _validate_task_checkpoint(
+            checkpoint,
+            identity=identity,
+            task_name=task_name,
+            operation=operation,
+            definition_sha256=definition_sha256,
+            task_input=task_input,
+            variables=variables,
+        )
         return checkpoint["result"]
 
     interpreter = Interpreter(

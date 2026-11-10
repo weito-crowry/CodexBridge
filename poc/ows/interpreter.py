@@ -26,6 +26,11 @@ class _ScopeResult:
     exited: bool = False
 
 
+@dataclass
+class _WorkflowContext:
+    value: Any
+
+
 StepRunner = Callable[[str, str, str, dict[str, Any], Any, dict[str, Any]], Any]
 
 
@@ -71,16 +76,37 @@ def validate_workflow(definition: Any, schema_path: Path = SCHEMA_PATH) -> None:
     validate_official_schema(definition, schema_path=schema_path)
 
 
+def _validate_dataflow_config(
+    config: Any,
+    *,
+    config_name: str,
+    expression_key: str,
+    path: str,
+    jq_variables: frozenset[str],
+) -> None:
+    if not isinstance(config, dict):
+        raise OwsError(f"unsupported {config_name} configuration at {path}; expected an object")
+    unsupported = set(config) - {expression_key}
+    if unsupported:
+        key = sorted(unsupported)[0]
+        raise OwsError(f"unsupported {config_name} property '{key}' at {path}")
+    if expression_key not in config:
+        return
+    expression = config[expression_key]
+    if not isinstance(expression, str):
+        raise OwsError(
+            f"unsupported {config_name}.{expression_key} type at {path}; "
+            "only strict jq expression strings are supported"
+        )
+    _compile_required_expression(expression, f"{path}.{expression_key}", jq_variables)
+
+
 def _validate_subset(definition: Any) -> None:
     if not isinstance(definition, dict):
         raise OwsError("workflow definition must be an object")
 
     for key in definition:
-        if key not in {"document", "evaluate", "do"}:
-            if key == "input":
-                raise OwsError("unsupported top-level input; input.from is outside this subset")
-            if key == "output":
-                raise OwsError("unsupported top-level output; output.as is outside this subset")
+        if key not in {"document", "evaluate", "do", "input", "output"}:
             if key == "use":
                 raise OwsError("unsupported top-level use")
             raise OwsError(f"unsupported top-level key '{key}'")
@@ -94,6 +120,23 @@ def _validate_subset(definition: Any) -> None:
     evaluate = definition.get("evaluate")
     if evaluate != {"language": "jq", "mode": "strict"}:
         raise OwsError("evaluate must explicitly set language=jq and mode=strict")
+
+    if "input" in definition:
+        _validate_dataflow_config(
+            definition["input"],
+            config_name="input",
+            expression_key="from",
+            path="input",
+            jq_variables=frozenset(),
+        )
+    if "output" in definition:
+        _validate_dataflow_config(
+            definition["output"],
+            config_name="output",
+            expression_key="as",
+            path="output",
+            jq_variables=frozenset({"context"}),
+        )
 
     tasks = definition.get("do")
     if not isinstance(tasks, list) or not tasks:
@@ -119,23 +162,53 @@ def _validate_task_list(tasks: Any, scope_path: str, jq_variables: frozenset[str
         if not isinstance(task_spec, dict):
             raise OwsError(f"task '{task_name}' definition must be an object")
 
-        rejected_attrs = {"if", "input", "output", "export"}.intersection(task_spec)
+        rejected_attrs = {"if"}.intersection(task_spec)
         if rejected_attrs:
             attr = sorted(rejected_attrs)[0]
-            suffix = ".from" if attr == "input" else ".as" if attr in {"output", "export"} else ""
-            raise OwsError(f"unsupported task attribute '{attr}{suffix}' on '{task_name}'")
+            raise OwsError(f"unsupported task attribute '{attr}' on '{task_name}'")
 
         operation, action = _task_action(task_name, task_spec)
         if operation not in SUPPORTED_TASKS:
             raise OwsError(f"unsupported task '{operation}' at {scope_path}[{index}]")
-        unsupported = set(task_spec) - {"then", operation}
+        unsupported = set(task_spec) - {"then", operation, "input", "output", "export"}
         if operation == "for":
-            unsupported = set(task_spec) - {"then", "for", "do"}
+            unsupported = set(task_spec) - {
+                "then",
+                "for",
+                "do",
+                "input",
+                "output",
+                "export",
+            }
         if unsupported:
             key = sorted(unsupported)[0]
             raise OwsError(f"unsupported task key '{key}' on '{task_name}'")
 
         task_path = f"{scope_path}[{index}].{task_name}"
+        if "input" in task_spec:
+            _validate_dataflow_config(
+                task_spec["input"],
+                config_name="input",
+                expression_key="from",
+                path=f"{task_path}.input",
+                jq_variables=jq_variables.union({"context"}),
+            )
+        if "output" in task_spec:
+            _validate_dataflow_config(
+                task_spec["output"],
+                config_name="output",
+                expression_key="as",
+                path=f"{task_path}.output",
+                jq_variables=jq_variables.union({"context", "input"}),
+            )
+        if "export" in task_spec:
+            _validate_dataflow_config(
+                task_spec["export"],
+                config_name="export",
+                expression_key="as",
+                path=f"{task_path}.export",
+                jq_variables=jq_variables.union({"context", "input", "output"}),
+            )
         _validate_action(operation, action, task_name, task_path, jq_variables)
         directive = task_spec.get("then")
         if directive is not None:
@@ -163,7 +236,7 @@ def _validate_task_list(tasks: Any, scope_path: str, jq_variables: frozenset[str
 
 
 def _task_action(task_name: str, task_spec: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    action_keys = set(task_spec) - {"then"}
+    action_keys = set(task_spec) - {"then", "input", "output", "export"}
     if "for" in action_keys:
         operation = "for"
         action = {key: task_spec[key] for key in ("for", "do") if key in task_spec}
@@ -197,7 +270,7 @@ def _validate_action(
         value = action["set"]
         if not isinstance(value, (dict, str)):
             raise OwsError(f"set on '{task_name}' must be a map or string")
-        _validate_set_value(value, task_path, jq_variables)
+        _validate_set_value(value, task_path, jq_variables.union({"context", "input"}))
         return
     if operation == "do":
         _validate_task_list(action["do"], f"{task_path}.do", jq_variables)
@@ -215,7 +288,11 @@ def _validate_action(
             raise OwsError(f"unsupported for key '{key}' on '{task_name}'")
         if "in" not in for_spec:
             raise OwsError(f"for.in is required on '{task_name}'")
-        _compile_required_expression(for_spec["in"], f"{task_path}.for.in", jq_variables)
+        _compile_required_expression(
+            for_spec["in"],
+            f"{task_path}.for.in",
+            jq_variables.union({"context", "input"}),
+        )
         each_name = for_spec.get("each", "item")
         at_name = for_spec.get("at", "index")
         if not isinstance(each_name, str) or not _JQ_NAME.fullmatch(each_name):
@@ -224,6 +301,10 @@ def _validate_action(
             raise OwsError(f"for.at on '{task_name}' must be a jq variable name")
         if each_name == at_name:
             raise OwsError(f"for.each and for.at must use different names on '{task_name}'")
+        if {each_name, at_name}.intersection({"context", "input", "output"}):
+            raise OwsError(
+                f"for.each and for.at on '{task_name}' cannot shadow OWS dataflow variables"
+            )
         _validate_task_list(
             body,
             f"{task_path}.do",
@@ -254,7 +335,7 @@ def _validate_action(
                 _compile_required_expression(
                     case_spec["when"],
                     f"{task_path}.switch.{case_name}.when",
-                    jq_variables,
+                    jq_variables.union({"context", "input"}),
                 )
         if defaults > 1:
             raise OwsError(f"switch on '{task_name}' has more than one default")
@@ -452,14 +533,23 @@ class Interpreter:
 
     def run(self, input_data: Any) -> Any:
         self._task_count = 0
-        result = self._run_scope(self.definition["do"], input_data, {}, "do")
-        return result.value
+        workflow_input = input_data
+        workflow_input_config = self.definition.get("input", {})
+        if "from" in workflow_input_config:
+            workflow_input = evaluate_jq(workflow_input_config["from"], input_data)
+        context = _WorkflowContext(workflow_input)
+        result = self._run_scope(self.definition["do"], workflow_input, {}, context, "do").value
+        workflow_output_config = self.definition.get("output", {})
+        if "as" in workflow_output_config:
+            return evaluate_jq(workflow_output_config["as"], result, {"context": context.value})
+        return result
 
     def _run_scope(
         self,
         tasks: list[dict[str, Any]],
         input_data: Any,
         variables: dict[str, Any],
+        context: _WorkflowContext,
         scope_path: str,
     ) -> _ScopeResult:
         names = [next(iter(task)) for task in tasks]
@@ -473,15 +563,28 @@ class Interpreter:
             task_name, task_spec = next(iter(tasks[index].items()))
             operation, _ = _task_action(task_name, task_spec)
             task_path = f"{scope_path}[{index}].{task_name}"
+            task_input = current
+            task_input_variables = dict(variables)
+            task_input_variables["context"] = context.value
+            input_config = task_spec.get("input", {})
+            if "from" in input_config:
+                task_input = evaluate_jq(input_config["from"], current, task_input_variables)
+            task_variables = dict(variables)
+            task_variables["context"] = context.value
+            task_variables["input"] = task_input
             action_result = self._execute_step(
-                task_path, task_name, operation, task_spec, current, variables
+                task_path, task_name, operation, task_spec, task_input, task_variables
             )
 
             if operation == "do":
                 nested = self._run_scope(
-                    task_spec["do"], current, dict(variables), f"{task_path}.do"
+                    task_spec["do"],
+                    task_input,
+                    dict(variables),
+                    context,
+                    f"{task_path}.do",
                 )
-                current = nested.value
+                raw_task_output = nested.value
             elif operation == "for":
                 for_spec = task_spec["for"]
                 each_name = for_spec.get("each", "item")
@@ -493,13 +596,45 @@ class Interpreter:
                     loop_variables[at_name] = loop_index
                     nested = self._run_scope(
                         task_spec["do"],
-                        current,
+                        task_input,
                         loop_variables,
+                        context,
                         f"{task_path}.iteration[{loop_index}].do",
                     )
                     loop_outputs.append(nested.value)
-                current = loop_outputs
+                raw_task_output = loop_outputs
             elif operation == "switch":
+                raw_task_output = task_input
+            else:
+                raw_task_output = action_result
+
+            output_config = task_spec.get("output", {})
+            if "as" in output_config:
+                raw_output_variables = dict(variables)
+                raw_output_variables.update({"context": context.value, "input": task_input})
+                transformed_task_output = evaluate_jq(
+                    output_config["as"], raw_task_output, raw_output_variables
+                )
+            else:
+                transformed_task_output = raw_task_output
+
+            export_config = task_spec.get("export", {})
+            if "as" in export_config:
+                export_variables = dict(variables)
+                export_variables.update(
+                    {
+                        "context": context.value,
+                        "input": task_input,
+                        "output": transformed_task_output,
+                    }
+                )
+                context.value = evaluate_jq(
+                    export_config["as"], transformed_task_output, export_variables
+                )
+
+            current = transformed_task_output
+
+            if operation == "switch":
                 directive = action_result["__ows_control__"]
                 if directive == "exit":
                     return _ScopeResult(current, exited=True)
@@ -508,8 +643,6 @@ class Interpreter:
                 else:
                     index = name_to_index[directive]
                 continue
-            else:
-                current = action_result
 
             directive = task_spec.get("then", "continue")
             if directive == "exit":

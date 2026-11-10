@@ -26,15 +26,23 @@ Windows上で、OWS DSL v1.0.3の限定subsetをPython Interpreterで実行し�
 - `for`は`for.in`の結果が配列であることを要求し、順序を保って列挙します。`for.each`/`for.at`で束縛した値を利用して入れ子`do`を実行し、各反復の最後のtask出力を順に配列へ集めます。これはこのPoCの限定出力規則です。
 - `then`は同一`do`scope内のtask名へのジャンプ、`continue`、`exit`を扱います。`exit`は現在の`do`scopeを終えます。`end`は未対応として拒否します。存在しないscope外targetと静的に検出できるjump cycleを拒否し、実行task数にも上限を設けます。
 
+### データフローとworkflow context
+
+workflow `input.from`はraw workflow inputをjqで変換し、その結果を最初のtask inputとworkflow contextの初期値にします。workflow `output.as`は最後のtaskの変換済み出力に適用します。どちらも省略時はidentityです。
+
+taskでは`input.from`をraw task inputに適用してからtask本体を実行します。task `output.as`はraw task outputを変換し、その結果が次taskのraw inputになります。続いて`export.as`がある場合は変換済みtask outputを評価し、結果でworkflow context全体を置き換えます。`export.as`の省略時はcontextを維持します。nested `do`と`for`の各反復は同じcontextを共有します。`for`が反復ごとの最後のtask outputを配列へ集めるPoC限定規則は維持します。
+
+対応するデータフロー式は文字列のstrict jq式`${ ... }`だけです。workflow `input.from`はraw workflow input、task `input.from`はraw task input、task `output.as`はraw task output、`export.as`は変換済みtask output、workflow `output.as`は最後のtaskの変換済みoutputを`.`として評価します。式で使える変数は各段階に応じた`$context`、task本体とtask output/exportでの`$input`、`export.as`だけの`$output`です。`for.each`/`for.at`の変数も維持します。未提供の`$workflow`、`$task`、`$runtime`等はjq compile時に拒否します。
+
 v1.0.3の`dsl.md`はstrict式の`${...}`、jq言語、式失敗の扱いを定めていますが、jq filterが返す0件/1件/複数件streamの値への正規化は明記していません。このPoCでは曖昧さをPython式等で隠さず、テストで固定したローカル規則として0件=`null`、1件=その値、複数件=JSON配列を使います。
 
-未対応構文・属性はfail-fastです。`if`、task/top-level `input.from`、`output.as`、`export.as`、workflow output、`for.while`、`try`、`fork`、`call`、`listen`、`emit`、`run`、`wait`、`raise`、DSL内HTTP/MCP、任意script、top-level `use`/`schedule`等は実行しません。未対応の追加キーもsubset検査で拒否します。
+未対応構文・属性はfail-fastです。input/output/exportのschema設定、`input.from`/`output.as`/`export.as`のobject形式、`if`、`for.while`、`try`、`fork`、`call`、`listen`、`emit`、`run`、`wait`、`raise`、DSL内HTTP/MCP、任意script、top-level `use`/`schedule`等は実行しません。未対応の追加キーや型もsubset検査で拒否します。
 
 ## DBOS checkpointと復旧
 
 CLI実行ごとに`.state/runs/run-<uuid>/`を作り、workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。
 
-各named taskのDBOS stepはtask scope pathをidentityとして登録します。loop pathには0始まりのiteration indexを含めます。step出力にtask名・identity・task kind・DSL hashを含め、replay時の読み戻しでも照合します。`do`親taskと`for`親taskにもcheckpointを置き、`for`内の各named taskはiteration indexごとに別step identityになります。式評価・分岐・set処理は純粋計算です。復旧実験のtask JSONL、heartbeat、marker gateは実験を可視化するためのローカル制御記録で、OWS taskの外部副作用ではありません。
+各named taskのDBOS stepはtask scope pathをidentityとして登録します。loop pathには0始まりのiteration indexを含めます。step checkpointにはraw task action結果に加えてtask名・identity・task kind・DSL hash、変換済みtask inputのSHA-256、runtime variables（contextとloop変数を含む）のSHA-256を保存し、replay時に現在値と照合します。不一致やdigestのない旧形式checkpointはfail-closedします。`do`親taskと`for`親taskにも既存のnamed checkpointを使い、新しいcheckpoint段階は追加しません。input/output/export変換はcheckpointの外で純粋に再計算し、context更新もworkflow replayで同じexport式を再適用します。これにより完了stepのactionは再実行せずに、変換済み出力とcontextを再構成します。復旧fixtureは既存の最終結果`{"final":2}`を保ったまま、export済みcontextから結果を作ります。復旧実験のtask JSONL、heartbeat、marker gateは実験を可視化するためのローカル制御記録で、OWS taskの外部副作用ではありません。
 
 start workerは`DBOS.start_workflow()`からIDを得た直後、manifestをatomic replaceで更新します。実験はstart workerを自分の`subprocess.Popen`で起動し、2つ目のtaskがgateで待機中にそのPopenだけをkill・waitします。heartbeatはworker内`os.getpid()`を記録し、kill前の更新、kill後0.5秒超の静止、SQLiteの`PENDING`/完了step数を確認した後にmarkerを作ります。その後`cli.py resume`を実行し、同じworkflow IDが`SUCCESS`となることを確認します。
 
