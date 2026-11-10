@@ -62,6 +62,7 @@ from .codex_update_controller import CodexUpdateController
 from .codex_updates import CodexUpdateProbe
 from .composer_controller import create_composer_controller
 from .config import ConsoleConfig
+from .control_token_dialog import ControlTokenDialog
 from .diagnostics import DiagnosticsReader
 from .diagnostics_panel import DiagnosticsPanelController
 from .external_running_threads import ExternalThreadMonitor
@@ -297,6 +298,7 @@ class MainWindow(QMainWindow):
         self._detached_launch_started = False
         self._detached_pid: int | None = None
         self._control_token: str | None = None
+        self._control_token_dialog: ControlTokenDialog | None = None
         self._approval_control_pending = False
         self._launch_generation = 0
         self._bridge_transition = False
@@ -658,6 +660,53 @@ class MainWindow(QMainWindow):
     def _show_notification_settings(self) -> None:
         dialog = NotificationSettingsDialog(self._appearance_settings, self)
         dialog.exec()
+
+    def _can_display_control_token(self) -> bool:
+        token = self._control_token
+        return (
+            not self._closing
+            and self._runtime_state == "console_started"
+            and self._bridge_ready
+            and self._app_server_ready
+            and not self._bridge_transition
+            and self._detached_launch_started
+            and isinstance(token, str)
+            and bool(token.strip())
+        )
+
+    def _is_control_token_current(self, token: str) -> bool:
+        return self._can_display_control_token() and self._control_token == token
+
+    def _update_control_token_action(self) -> None:
+        action = self._settings_actions.get("Control API token…")
+        if action is not None:
+            action.setEnabled(self._can_display_control_token())
+
+    def _show_control_token_dialog(self) -> None:
+        if not self._can_display_control_token():
+            self._update_control_token_action()
+            return
+        active_dialog = self._control_token_dialog
+        if active_dialog is not None and active_dialog.isVisible():
+            active_dialog.raise_()
+            active_dialog.activateWindow()
+            return
+
+        token = self._control_token
+        if not isinstance(token, str):
+            return
+        dialog = ControlTokenDialog(token, self._is_control_token_current, self)
+        self._control_token_dialog = dialog
+        dialog.finished.connect(
+            lambda _result, finished_dialog=dialog: self._forget_control_token_dialog(
+                finished_dialog
+            )
+        )
+        dialog.open()
+
+    def _forget_control_token_dialog(self, dialog: ControlTokenDialog) -> None:
+        if self._control_token_dialog is dialog:
+            self._control_token_dialog = None
 
     def _install_settings_menu(self) -> None:
         self._settings_controller.install_settings_menu()

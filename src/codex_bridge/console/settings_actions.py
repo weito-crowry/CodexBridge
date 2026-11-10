@@ -47,6 +47,12 @@ class SettingsActionController:
         )
         window._apply_pending_settings_action.setEnabled(pending_enabled)
         menu.addAction(tr("Notification settings"), window._show_notification_settings)
+        developer_menu = menu.addMenu(tr("Developer"))
+        window._settings_actions["Control API token…"] = developer_menu.addAction(
+            tr("Control API token…"), window._show_control_token_dialog
+        )
+        developer_menu.aboutToShow.connect(window._update_control_token_action)
+        window._update_control_token_action()
 
     def active_config_path(self) -> Path | None:
         path = self._window._config.config_path
