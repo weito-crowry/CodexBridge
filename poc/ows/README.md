@@ -50,11 +50,41 @@ v1.0.3の`dsl.md`はstrict式の`${...}`、jq言語、式失敗の扱いを定�
 
 Phase 4Bのstep内bounded pollingはPoC限定です。実Codex接続時には長時間MCP呼び出しをDBOS step内で待たせず、非同期start/status/event連携に置き換える必要があります。このPoCは実Codex、MCP、HTTPを呼びません。
 
+### Phase 4C: 短いstepとdurable wait
+
+`cli.py run --mock-job-durable-wait`はmanifestの`control.mock_job_durable_wait=true`を固定し、mock runを`.state/phase4c-runs/run-<uuid>/`へ隔離します。この明示modeだけがPhase 4Cのcheckpoint構成を使います。従来のPhase 4B runは既存の`call` stepとstep内bounded pollingでresumeし、新modeのstep列へ切り替わりません。
+
+新modeの`call: mock-job`は同じ`workflow_id + task identity`をkeyに、完了を待たない短い`start_job` step、短いstatus/event取得step、workflow側の`DBOS.sleep()`を繰り返し、終端receiptを次taskへ返します。各status stepは状態snapshot、`read_events(after_id, limit)`、状態の再確認を行い、snapshotの`latest_event_id`までイベントを追いつかせます。sleep間隔は0.05～0.25秒、照会上限は1～600回、合計待機は最大30秒です。時間分岐に`time.monotonic()`は使いません。
+
+`jobs.sqlite`には永続`job_events(event_id, job_id, state, timestamp, payload_json)`、service heartbeat/claim情報、adapter-owned `job_reconciliation`を追加します。QUEUED生成、RUNNING claim、進捗、SUCCEEDED/FAILED receiptのイベントは対応するjob更新と同じSQLite transactionに書きます。`read_events`は単調増加cursorと1～1000件の上限を使い、同じcursorからの再読込を許容します。照会の間に状態が変わってもイベントはDBに残り、cursorによるcatch-upができます。
+
+所有serviceのheartbeatとjobの`updated_at`が指定TTLを超えて古くなったRUNNING jobは、`jobs.state`を変えずにsnapshotの`status`/`adapter_marker`へ`NEEDS_RECONCILIATION`を返します。明示的にSTOPPEDと記録されたserviceに属するRUNNING jobも同じ扱いです。service稼働中は進捗またはheartbeatを更新するため、job状態が一定時間変わらないことだけでは停止扱いしません。代替serviceはRUNNING jobを再claimしません。終端receiptがあればreceiptを優先し、手動解決UI/APIはありません。
+
+個別照会はPoCローカルCLIから行えます。`--run-dir`は`.state/phase4b-runs`または`.state/phase4c-runs`直下の`run-*`に限定されます。
+
+```powershell
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
+  --workflow .\poc\ows\fixtures\mock_job_workflow.yaml `
+  --input-json '{"values":[3,5]}' `
+  --mock-job-durable-wait
+
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py job-status `
+  --run-dir <phase4c-run-directory> --job-id <job-id>
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py job-events `
+  --run-dir <phase4c-run-directory> --after-id 0 --limit 100
+```
+
+Phase 4Cのworker kill/restart実験は、Phase 4Bと同じschema-valid recovery fixtureを別manifestで実行します。`phase4c_recovery_test.py`はstart step checkpoint後・service処理中に所有workerだけを既存のWindows process identity検証で終了し、service完了後に同じworkflow IDでrecoveryします。正常完了、job/request key固定、dispatch/service実行各1回、DBOS workflow 1件、4B baselineとのstatus/result一致を証跡に残します。
+
+これは非同期job APIとdurable workflow sleepのPoCです。`DBOS.sleep()`がDBOS workflow threadを必ず解放するとは主張せず、完全なevent-driven/zero-pollingでもありません。DBOS `recv`、HTTP/SSE、MCP、実Codex、GUIは未接続です。外部処理一般に対するexactly-once保証も主張しません。
+
 ## DBOS checkpointと復旧
 
-通常CLI runは`.state/runs/run-<uuid>/`、`mock-job` runは`.state/phase4b-runs/run-<uuid>/`を作り、workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。Phase 4B runには加えて`jobs.sqlite`、service/worker identity、service/worker logs、heartbeat、recovery evidenceを保存します。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。
+通常CLI runは`.state/runs/run-<uuid>/`、Phase 4B mock runは`.state/phase4b-runs/run-<uuid>/`、Phase 4C durable-wait runは`.state/phase4c-runs/run-<uuid>/`を作ります。workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。mock runには`jobs.sqlite`、service/worker identity、service/worker logs、heartbeat、recovery evidenceも保存します。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。
 
 各named taskのDBOS stepはtask scope pathをidentityとして登録します。loop pathには0始まりのiteration indexを含めます。step checkpointにはraw task action結果に加えてtask名・identity・task kind・DSL hash、変換済みtask inputのSHA-256、runtime variables（contextとloop変数を含む）のSHA-256を保存し、replay時に現在値と照合します。不一致やdigestのない旧形式checkpointはfail-closedします。`do`親taskと`for`親taskにも既存のnamed checkpointを使い、新しいcheckpoint段階は追加しません。input/output/export変換はcheckpointの外で純粋に再計算し、context更新もworkflow replayで同じexport式を再適用します。これにより完了stepのactionは再実行せずに、変換済み出力とcontextを再構成します。復旧fixtureは既存の最終結果`{"final":2}`を保ったまま、export済みcontextから結果を作ります。復旧実験のtask JSONL、heartbeat、marker gateは実験を可視化するためのローカル制御記録で、OWS taskの外部副作用ではありません。
+
+この段落はPhase 4Bのcheckpoint layoutを説明します。Phase 4Cでは`call` actionの単一stepを作らず、task/context checksumを保持した専用`start`/status step名とdurable sleepを使います。新modeは別manifest/run-dirに固定されるため、4Bの既存checkpoint identityと混ざりません。
 
 start workerは`DBOS.start_workflow()`からIDを得た直後、manifestをatomic replaceで更新します。Phase 4B recovery driverはworkerとserviceを別々の`subprocess.Popen`で起動し、run-dir、argv、実PID、Popenとの親子関係、creation time、実Python image pathを照合します。Windowsのprocess handle APIで実child PIDだけを終了し、redirector stubの孤児化は成功扱いしません。serviceはworker停止をまたいで動かし続け、worker heartbeat停止とjob完了後・DBOS step checkpoint確定前の障害窓を確認してから同じworkflow IDを復旧します。回復run内ではjob ID/request keyと1行のledgerを厳密比較し、baselineとの結果は実行固有識別子を除いたstatus/resultで比較します。完了済call stepのreplayでadapter dispatchも増えないことを確認します。
 
@@ -92,6 +122,19 @@ $normal = & .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
 ```
 
 Recovery evidenceは新しい`.state/phase4b-runs/run-<uuid>/phase4b-recovery-evidence.json`にあります。Pytestではnormal/recovery比較に加えFAILED receiptとbounded timeoutのDBOS状態も検証します。
+
+Phase 4Cの回復検証はPhase 4B baselineの`result.json`を使います。
+
+```powershell
+$normal = & .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
+  --workflow .\poc\ows\fixtures\mock_job_recovery_workflow.yaml `
+  --input-json '{"payload":{"value":42},"duration_ms":1800}' | ConvertFrom-Json
+
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\phase4c_recovery_test.py `
+  --normal-result-path "$($normal.run_dir)\result.json"
+```
+
+Phase 4Cの回復証跡は`.state/phase4c-runs/run-<uuid>/phase4c-recovery-evidence.json`に保存されます。service crash後のRUNNING job照会とfail-closed markerは`tests/test_job_adapter.py`で実service processをkillして確認します。
 
 ## 検証
 

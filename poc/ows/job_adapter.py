@@ -103,6 +103,59 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _append_job_event(
+    connection: sqlite3.Connection,
+    *,
+    job_id: str,
+    state: str,
+    timestamp: str,
+    payload: Any,
+) -> None:
+    connection.execute(
+        "INSERT INTO job_events (job_id, state, timestamp, payload_json) VALUES (?, ?, ?, ?)",
+        (job_id, state, timestamp, canonical_json(payload)),
+    )
+
+
+def register_service(
+    database_path: Path,
+    *,
+    service_id: str,
+    pid: int,
+    parent_pid: int | None,
+    creation_time_100ns: int,
+    image_path: str,
+    run_dir: str,
+) -> None:
+    now = _utc_now()
+    with _connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO service_runtime (service_id, pid, parent_pid, creation_time_100ns, "
+            "image_path, run_dir, status, heartbeat_at, stopped_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'RUNNING', ?, NULL)",
+            (service_id, pid, parent_pid, creation_time_100ns, image_path, run_dir, now),
+        )
+
+
+def heartbeat_service(database_path: Path, service_id: str) -> None:
+    with _connect(database_path) as connection:
+        connection.execute(
+            "UPDATE service_runtime SET heartbeat_at = ? "
+            "WHERE service_id = ? AND status = 'RUNNING'",
+            (_utc_now(), service_id),
+        )
+
+
+def stop_service(database_path: Path, service_id: str) -> None:
+    now = _utc_now()
+    with _connect(database_path) as connection:
+        connection.execute(
+            "UPDATE service_runtime SET status = 'STOPPED', heartbeat_at = ?, stopped_at = ? "
+            "WHERE service_id = ? AND status = 'RUNNING'",
+            (now, now, service_id),
+        )
+
+
 class DurableJobAdapter:
     """SQLite-backed idempotent request ledger for the mock-job allowlist."""
 
@@ -132,6 +185,55 @@ class DurableJobAdapter:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_state_created_idx "
                 "ON jobs(state, created_at, job_id)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS job_events_job_event_idx "
+                "ON job_events(job_id, event_id)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS service_runtime (
+                    service_id TEXT PRIMARY KEY,
+                    pid INTEGER NOT NULL,
+                    parent_pid INTEGER,
+                    creation_time_100ns INTEGER NOT NULL,
+                    image_path TEXT NOT NULL,
+                    run_dir TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('RUNNING','STOPPED')),
+                    heartbeat_at TEXT NOT NULL,
+                    stopped_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_service_claims (
+                    job_id TEXT PRIMARY KEY,
+                    service_id TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_reconciliation (
+                    job_id TEXT PRIMARY KEY,
+                    marker TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    detected_at TEXT NOT NULL
+                )
+                """
             )
 
     @staticmethod
@@ -195,6 +297,13 @@ class DurableJobAdapter:
                     canonical_json({"completed_ms": 0, "total_ms": normalized["duration_ms"]}),
                 ),
             )
+            _append_job_event(
+                connection,
+                job_id=job_id,
+                state="QUEUED",
+                timestamp=now,
+                payload={"request_key": request_key, "request_digest": request_digest},
+            )
             row = connection.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             connection.execute("COMMIT")
             return self._row_to_job(row)
@@ -216,6 +325,165 @@ class DurableJobAdapter:
                 "SELECT * FROM jobs WHERE request_key = ?", (request_key,)
             ).fetchone()
         return None if row is None else self._row_to_job(row)
+
+    def start_job(
+        self,
+        workflow_id: str,
+        identity: str,
+        request: Any,
+    ) -> dict[str, Any]:
+        """Create or identify a durable job and return without waiting for its result."""
+        job = self.submit_or_get_job(workflow_id, identity, request)
+        snapshot = self.get_job_status(job_id=job["job_id"])
+        return {
+            "job_id": job["job_id"],
+            "request_key": job["request_key"],
+            "status": snapshot["status"],
+        }
+
+    def get_job_status(
+        self,
+        *,
+        job_id: str | None = None,
+        request_key: str | None = None,
+        stale_ttl_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        if (job_id is None) == (request_key is None):
+            raise JobRequestError("provide exactly one of job_id or request_key")
+        if (
+            isinstance(stale_ttl_seconds, bool)
+            or not isinstance(stale_ttl_seconds, (int, float))
+            or not math.isfinite(stale_ttl_seconds)
+            or stale_ttl_seconds <= 0
+        ):
+            raise JobRequestError("stale_ttl_seconds must be a positive finite number")
+
+        connection = _connect(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if job_id is not None:
+                row = connection.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM jobs WHERE request_key = ?", (request_key,)
+                ).fetchone()
+            if row is None:
+                identifier = job_id if job_id is not None else request_key
+                raise JobReconciliationRequiredError(
+                    f"NEEDS_RECONCILIATION: job lookup is missing for {identifier}"
+                )
+            job = self._row_to_job(row)
+            reconciliation = connection.execute(
+                "SELECT marker, reason, detected_at FROM job_reconciliation WHERE job_id = ?",
+                (job["job_id"],),
+            ).fetchone()
+            if job["state"] == "RUNNING" and reconciliation is None:
+                service = connection.execute(
+                    "SELECT runtime.status, runtime.heartbeat_at, runtime.stopped_at "
+                    "FROM job_service_claims AS claim "
+                    "JOIN service_runtime AS runtime USING (service_id) "
+                    "WHERE claim.job_id = ?",
+                    (job["job_id"],),
+                ).fetchone()
+                reason: str | None = None
+                if service is None:
+                    reason = "RUNNING job has no recorded owning service identity"
+                elif service["status"] not in {"RUNNING", "STOPPED"}:
+                    raise JobReconciliationRequiredError(
+                        f"NEEDS_RECONCILIATION: invalid service status for {job['request_key']}"
+                    )
+                elif service["status"] == "STOPPED":
+                    reason = "claimed service stopped while job remained RUNNING"
+                else:
+                    try:
+                        now = datetime.now(UTC)
+                        job_age = (now - datetime.fromisoformat(job["updated_at"])).total_seconds()
+                        heartbeat_age = (
+                            now - datetime.fromisoformat(str(service["heartbeat_at"]))
+                        ).total_seconds()
+                    except (TypeError, ValueError) as error:
+                        raise JobReconciliationRequiredError(
+                            f"NEEDS_RECONCILIATION: invalid job/service heartbeat for "
+                            f"{job['request_key']}"
+                        ) from error
+                    if job_age >= stale_ttl_seconds and heartbeat_age >= stale_ttl_seconds:
+                        reason = "job and owning service heartbeats exceeded the stale TTL"
+                if reason is not None:
+                    detected_at = _utc_now()
+                    connection.execute(
+                        "INSERT OR IGNORE INTO job_reconciliation "
+                        "(job_id, marker, reason, detected_at) "
+                        "VALUES (?, 'NEEDS_RECONCILIATION', ?, ?)",
+                        (job["job_id"], reason, detected_at),
+                    )
+                    _append_job_event(
+                        connection,
+                        job_id=job["job_id"],
+                        state="NEEDS_RECONCILIATION",
+                        timestamp=detected_at,
+                        payload={"ledger_state": "RUNNING", "reason": reason},
+                    )
+                    reconciliation = connection.execute(
+                        "SELECT marker, reason, detected_at FROM job_reconciliation "
+                        "WHERE job_id = ?",
+                        (job["job_id"],),
+                    ).fetchone()
+            latest_event_id_row = connection.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM job_events WHERE job_id = ?",
+                (job["job_id"],),
+            ).fetchone()
+            job["latest_event_id"] = int(latest_event_id_row[0])
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+        if job["state"] == "SUCCEEDED" and job["result"] is None:
+            raise JobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: SUCCEEDED job has no result for {job['request_key']}"
+            )
+        if job["state"] == "FAILED" and not job["error"]:
+            raise JobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: FAILED job has no error receipt for {job['request_key']}"
+            )
+        job["status"] = job["state"]
+        job["adapter_marker"] = None
+        job["reconciliation"] = None
+        if reconciliation is not None and job["state"] == "RUNNING":
+            job["status"] = str(reconciliation["marker"])
+            job["adapter_marker"] = str(reconciliation["marker"])
+            job["reconciliation"] = {
+                "reason": str(reconciliation["reason"]),
+                "detected_at": str(reconciliation["detected_at"]),
+            }
+        return job
+
+    def read_events(self, *, after_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        if type(after_id) is not int or after_id < 0:
+            raise JobRequestError("after_id must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise JobRequestError("event limit must be an integer from 1 to 1000")
+        with _connect(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT event_id, job_id, state, timestamp, payload_json FROM job_events "
+                "WHERE event_id > ? ORDER BY event_id LIMIT ?",
+                (after_id, limit),
+            ).fetchall()
+        return [
+            {
+                "event_id": int(row["event_id"]),
+                "job_id": str(row["job_id"]),
+                "state": str(row["state"]),
+                "timestamp": str(row["timestamp"]),
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
 
     def count_jobs(self) -> int:
         with _connect(self.database_path) as connection:
@@ -247,7 +515,7 @@ class DurableJobAdapter:
         }
 
 
-def claim_next_job(database_path: Path) -> dict[str, Any] | None:
+def claim_next_job(database_path: Path, service_id: str | None = None) -> dict[str, Any] | None:
     connection = _connect(database_path)
     now = _utc_now()
     try:
@@ -268,6 +536,27 @@ def claim_next_job(database_path: Path) -> dict[str, Any] | None:
         if cursor.rowcount != 1:
             connection.execute("ROLLBACK")
             return None
+        if service_id is not None:
+            service = connection.execute(
+                "SELECT service_id FROM service_runtime WHERE service_id = ? "
+                "AND status = 'RUNNING'",
+                (service_id,),
+            ).fetchone()
+            if service is None:
+                raise JobReconciliationRequiredError(
+                    f"NEEDS_RECONCILIATION: claiming service {service_id} is not registered"
+                )
+            connection.execute(
+                "INSERT INTO job_service_claims (job_id, service_id, claimed_at) VALUES (?, ?, ?)",
+                (job_id, service_id, now),
+            )
+        _append_job_event(
+            connection,
+            job_id=job_id,
+            state="RUNNING",
+            timestamp=now,
+            payload={"service_id": service_id},
+        )
         row = connection.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         connection.execute("COMMIT")
         return DurableJobAdapter._row_to_job(row)
@@ -279,18 +568,48 @@ def claim_next_job(database_path: Path) -> dict[str, Any] | None:
         connection.close()
 
 
-def update_job_progress(database_path: Path, job_id: str, completed_ms: int, total_ms: int) -> None:
+def update_job_progress(
+    database_path: Path,
+    job_id: str,
+    completed_ms: int,
+    total_ms: int,
+    service_id: str | None = None,
+) -> None:
     progress = {
         "completed_ms": min(completed_ms, total_ms),
         "percent": 100 if total_ms == 0 else min(100, int(completed_ms * 100 / total_ms)),
         "total_ms": total_ms,
     }
-    with _connect(database_path) as connection:
-        connection.execute(
+    now = _utc_now()
+    connection = _connect(database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
             "UPDATE jobs SET progress_json = ?, updated_at = ? "
             "WHERE job_id = ? AND state = 'RUNNING'",
-            (canonical_json(progress), _utc_now(), job_id),
+            (canonical_json(progress), now, job_id),
         )
+        if cursor.rowcount == 1:
+            _append_job_event(
+                connection,
+                job_id=job_id,
+                state="RUNNING",
+                timestamp=now,
+                payload={"progress": progress},
+            )
+            if service_id is not None:
+                connection.execute(
+                    "UPDATE service_runtime SET heartbeat_at = ? "
+                    "WHERE service_id = ? AND status = 'RUNNING'",
+                    (now, service_id),
+                )
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
 
 
 def finish_job(
@@ -298,7 +617,10 @@ def finish_job(
 ) -> None:
     state = "FAILED" if error is not None else "SUCCEEDED"
     result_json = None if error is not None else canonical_json(result)
-    with _connect(database_path) as connection:
+    now = _utc_now()
+    connection = _connect(database_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
         cursor = connection.execute(
             "UPDATE jobs SET state = ?, result_json = ?, error = ?, updated_at = ?, "
             "progress_json = ? WHERE job_id = ? AND state = 'RUNNING'",
@@ -306,7 +628,7 @@ def finish_job(
                 state,
                 result_json,
                 error,
-                _utc_now(),
+                now,
                 canonical_json({"completed_ms": 0, "percent": 100}),
                 job_id,
             ),
@@ -315,6 +637,24 @@ def finish_job(
             raise JobReconciliationRequiredError(
                 f"NEEDS_RECONCILIATION: running claim disappeared for job {job_id}"
             )
+        _append_job_event(
+            connection,
+            job_id=job_id,
+            state=state,
+            timestamp=now,
+            payload=(
+                {"error": error}
+                if error is not None
+                else {"result": json.loads(result_json) if result_json is not None else None}
+            ),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
 
 
 def submit_and_wait(
@@ -374,8 +714,10 @@ def submit_and_wait(
         time.sleep(min(poll_interval_seconds, max(0.0, deadline - time.monotonic())))
 
 
-def process_one_job(database_path: Path, log_path: Path) -> str | None:
-    job = claim_next_job(database_path)
+def process_one_job(
+    database_path: Path, log_path: Path, service_id: str | None = None
+) -> str | None:
+    job = claim_next_job(database_path, service_id)
     if job is None:
         return None
     request = job["request"]
@@ -385,7 +727,7 @@ def process_one_job(database_path: Path, log_path: Path) -> str | None:
     while elapsed_ms < duration_ms:
         time.sleep(min(0.05, (duration_ms - elapsed_ms) / 1000))
         elapsed_ms = min(duration_ms, int((time.monotonic() - started) * 1000))
-        update_job_progress(database_path, job["job_id"], elapsed_ms, duration_ms)
+        update_job_progress(database_path, job["job_id"], elapsed_ms, duration_ms, service_id)
 
     if request["payload"] == {"mock_failure": True}:
         error = "mock service deterministic failure"

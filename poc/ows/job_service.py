@@ -12,7 +12,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from job_adapter import DurableJobAdapter, _append_service_event, process_one_job
+from job_adapter import (
+    DurableJobAdapter,
+    _append_service_event,
+    heartbeat_service,
+    process_one_job,
+    register_service,
+    stop_service,
+)
 from process_identity import get_process_identity, process_is_active
 
 OWS_DIR = Path(__file__).resolve().parent
@@ -35,6 +42,7 @@ class MockJobServiceProcess:
     stop_path: Path
     stdout_file: TextIO
     stderr_file: TextIO
+    service_id: str
     service_pid: int | None = None
     service_creation_time_100ns: int | None = None
     service_image_path: str | None = None
@@ -94,6 +102,8 @@ def start_mock_job_service(
             str(Path(__file__).resolve()),
             "--run-dir",
             str(run_dir),
+            "--service-id",
+            service_id,
             "--ready-file",
             str(ready_path),
             "--stop-file",
@@ -105,11 +115,13 @@ def start_mock_job_service(
         stdout=stdout_file,
         stderr=stderr_file,
     )
-    service = MockJobServiceProcess(process, stop_path, stdout_file, stderr_file)
+    service = MockJobServiceProcess(process, stop_path, stdout_file, stderr_file, service_id)
     expected_argv = [
         str(Path(__file__).resolve()),
         "--run-dir",
         str(run_dir),
+        "--service-id",
+        service_id,
         "--ready-file",
         str(ready_path),
         "--stop-file",
@@ -173,7 +185,11 @@ def _append_service_heartbeat(log_path: Path) -> None:
 
 
 def run_service(
-    run_dir: Path, ready_path: Path, stop_path: Path, poll_interval_seconds: float
+    run_dir: Path,
+    service_id: str,
+    ready_path: Path,
+    stop_path: Path,
+    poll_interval_seconds: float,
 ) -> int:
     if not 0 < poll_interval_seconds <= 1:
         raise ValueError("poll interval must be greater than 0 and at most 1 second")
@@ -185,6 +201,15 @@ def run_service(
     identity = get_process_identity(os.getpid())
     if identity is None or not identity["active"]:
         raise RuntimeError("mock-job service could not confirm its Windows process identity")
+    register_service(
+        database_path,
+        service_id=service_id,
+        pid=int(identity["pid"]),
+        parent_pid=identity["parent_pid"] if isinstance(identity["parent_pid"], int) else None,
+        creation_time_100ns=int(identity["creation_time_100ns"]),
+        image_path=str(identity["image_path"]),
+        run_dir=str(run_dir),
+    )
     _write_json(
         ready_path,
         {
@@ -201,13 +226,17 @@ def run_service(
     )
     _append_service_event(log_path, "service_started")
     heartbeat_at = time.monotonic()
-    while not stop_path.exists():
-        processed = process_one_job(database_path, log_path)
-        if processed is None:
-            time.sleep(poll_interval_seconds)
-        if time.monotonic() - heartbeat_at >= 0.5:
-            _append_service_heartbeat(log_path)
-            heartbeat_at = time.monotonic()
+    try:
+        while not stop_path.exists():
+            processed = process_one_job(database_path, log_path, service_id)
+            if processed is None:
+                time.sleep(poll_interval_seconds)
+            if time.monotonic() - heartbeat_at >= 0.5:
+                heartbeat_service(database_path, service_id)
+                _append_service_heartbeat(log_path)
+                heartbeat_at = time.monotonic()
+    finally:
+        stop_service(database_path, service_id)
     _append_service_event(log_path, "service_stopped")
     return 0
 
@@ -215,6 +244,7 @@ def run_service(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fixed mock-job SQLite service")
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--service-id", required=True)
     parser.add_argument("--ready-file", type=Path, required=True)
     parser.add_argument("--stop-file", type=Path, required=True)
     parser.add_argument("--poll-interval-seconds", type=float, default=0.02)
@@ -223,7 +253,13 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    return run_service(args.run_dir, args.ready_file, args.stop_file, args.poll_interval_seconds)
+    return run_service(
+        args.run_dir,
+        args.service_id,
+        args.ready_file,
+        args.stop_file,
+        args.poll_interval_seconds,
+    )
 
 
 if __name__ == "__main__":

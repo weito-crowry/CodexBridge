@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from interpreter import OwsError, parse_workflow_text, validate_workflow
+from job_adapter import DurableJobAdapter
 from job_service import start_mock_job_service
 from worker import (
     _read_workflow_status,
@@ -23,6 +24,7 @@ OWS_DIR = Path(__file__).resolve().parent
 WORKER_PATH = OWS_DIR / "worker.py"
 DEFAULT_STATE_ROOT = OWS_DIR / ".state" / "runs"
 PHASE4B_STATE_ROOT = OWS_DIR / ".state" / "phase4b-runs"
+PHASE4C_STATE_ROOT = OWS_DIR / ".state" / "phase4c-runs"
 
 
 def _invoke_worker(run_dir: Path, mode: str, timeout_seconds: int) -> dict[str, Any]:
@@ -56,7 +58,13 @@ def _invoke_worker(run_dir: Path, mode: str, timeout_seconds: int) -> dict[str, 
     return json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
 
 
-def _new_run(workflow_path: Path, input_json: str, max_tasks: int) -> Path:
+def _new_run(
+    workflow_path: Path,
+    input_json: str,
+    max_tasks: int,
+    *,
+    mock_job_durable_wait: bool = False,
+) -> Path:
     try:
         definition_text = workflow_path.resolve().read_text(encoding="utf-8")
         input_data = json.loads(input_json)
@@ -66,7 +74,10 @@ def _new_run(workflow_path: Path, input_json: str, max_tasks: int) -> Path:
     validate_workflow(definition)
     canonical_input = canonical_json(input_data)
 
-    state_root = PHASE4B_STATE_ROOT if _workflow_uses_mock_job(definition) else DEFAULT_STATE_ROOT
+    if _workflow_uses_mock_job(definition):
+        state_root = PHASE4C_STATE_ROOT if mock_job_durable_wait else PHASE4B_STATE_ROOT
+    else:
+        state_root = DEFAULT_STATE_ROOT
     run_dir = state_root / f"run-{uuid.uuid4().hex}"
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "workflow.yaml").write_text(definition_text, encoding="utf-8")
@@ -79,7 +90,7 @@ def _new_run(workflow_path: Path, input_json: str, max_tasks: int) -> Path:
             "definition_sha256": sha256_text(definition_text),
             "input_sha256": sha256_json(input_data),
             "max_tasks": max_tasks,
-            "control": {},
+            "control": ({"mock_job_durable_wait": True} if mock_job_durable_wait else {}),
         },
     )
     return run_dir
@@ -102,7 +113,12 @@ def _workflow_uses_mock_job(definition: dict[str, Any]) -> bool:
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_tasks < 1:
         raise OwsError("--max-tasks must be positive")
-    run_dir = _new_run(args.workflow, args.input_json, args.max_tasks)
+    run_dir = _new_run(
+        args.workflow,
+        args.input_json,
+        args.max_tasks,
+        mock_job_durable_wait=args.mock_job_durable_wait,
+    )
     manifest, definition_text, _ = load_run_request(run_dir)
     definition = parse_workflow_text(definition_text)
     service = start_mock_job_service(run_dir) if _workflow_uses_mock_job(definition) else None
@@ -164,6 +180,36 @@ def _status(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _job_run_dir(run_dir: Path) -> Path:
+    candidate = run_dir.resolve()
+    allowed_roots = (PHASE4B_STATE_ROOT.resolve(), PHASE4C_STATE_ROOT.resolve())
+    if candidate.parent not in allowed_roots or not candidate.name.startswith("run-"):
+        raise OwsError("job status and events require a run directory inside poc/ows/.state")
+    database_path = candidate / "jobs.sqlite"
+    if not database_path.is_file() or database_path.resolve().parent != candidate:
+        raise OwsError("job status and events require the run-local jobs.sqlite database")
+    load_run_request(candidate)
+    return candidate
+
+
+def _job_status(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = _job_run_dir(args.run_dir)
+    job = DurableJobAdapter(run_dir / "jobs.sqlite").get_job_status(
+        job_id=args.job_id,
+        request_key=args.request_key,
+    )
+    return {"run_dir": str(run_dir), "job": job}
+
+
+def _job_events(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = _job_run_dir(args.run_dir)
+    events = DurableJobAdapter(run_dir / "jobs.sqlite").read_events(
+        after_id=args.after_id,
+        limit=args.limit,
+    )
+    return {"run_dir": str(run_dir), "events": events}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run OWS v1.0.3 subset workflows on DBOS")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -173,6 +219,7 @@ def _parse_args() -> argparse.Namespace:
     run_parser.add_argument("--input-json", required=True)
     run_parser.add_argument("--max-tasks", type=int, default=10_000)
     run_parser.add_argument("--timeout-seconds", type=int, default=120)
+    run_parser.add_argument("--mock-job-durable-wait", action="store_true")
 
     resume_parser = subparsers.add_parser(
         "resume", help="call DBOS.launch to recover a saved workflow"
@@ -182,6 +229,17 @@ def _parse_args() -> argparse.Namespace:
 
     status_parser = subparsers.add_parser("status", help="read saved workflow status")
     status_parser.add_argument("--run-dir", type=Path, required=True)
+
+    job_status_parser = subparsers.add_parser("job-status", help="read one durable job status")
+    job_status_parser.add_argument("--run-dir", type=Path, required=True)
+    job_identifier = job_status_parser.add_mutually_exclusive_group(required=True)
+    job_identifier.add_argument("--job-id")
+    job_identifier.add_argument("--request-key")
+
+    job_events_parser = subparsers.add_parser("job-events", help="read durable job events")
+    job_events_parser.add_argument("--run-dir", type=Path, required=True)
+    job_events_parser.add_argument("--after-id", type=int, default=0)
+    job_events_parser.add_argument("--limit", type=int, default=100)
     return parser.parse_args()
 
 
@@ -192,6 +250,10 @@ def main() -> int:
             result = _run(args)
         elif args.command == "resume":
             result = _resume(args)
+        elif args.command == "job-status":
+            result = _job_status(args)
+        elif args.command == "job-events":
+            result = _job_events(args)
         else:
             result = _status(args)
     except Exception as error:

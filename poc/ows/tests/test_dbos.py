@@ -152,6 +152,87 @@ def test_mock_job_fixture_uses_durable_jobs_and_preserves_loop_dataflow() -> Non
     assert status == ("SUCCESS",)
 
 
+def test_durable_wait_mode_keeps_call_dataflow_and_exposes_status_and_events() -> None:
+    workflow = str(OWS_DIR / "fixtures" / "mock_job_workflow.yaml")
+    input_json = '{"values":[3,5]}'
+    phase4b = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        workflow,
+        "--input-json",
+        input_json,
+    )
+    durable = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        workflow,
+        "--input-json",
+        input_json,
+        "--mock-job-durable-wait",
+    )
+    run_dir = Path(durable["run_dir"])
+
+    assert run_dir.parent == STATE_DIR / "phase4c-runs"
+    assert (
+        json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))["control"][
+            "mock_job_durable_wait"
+        ]
+        is True
+    )
+    assert durable["result"]["result_values"] == phase4b["result"]["result_values"] == [3, 5]
+    assert durable["result"]["job_ids"][-1] == durable["result"]["last_job_id"]
+
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        jobs = connection.execute(
+            "SELECT job_id, request_key, state, dispatch_count, service_execution_count "
+            "FROM jobs ORDER BY task_identity"
+        ).fetchall()
+        event_states = connection.execute(
+            "SELECT job_id, state FROM job_events ORDER BY event_id"
+        ).fetchall()
+    assert len(jobs) == 2
+    assert all(row[2:] == ("SUCCEEDED", 1, 1) for row in jobs)
+    assert all(row[0] in durable["result"]["job_ids"] for row in event_states)
+    assert all(state in {"QUEUED", "RUNNING", "SUCCEEDED"} for _, state in event_states)
+    assert all(
+        {"QUEUED", "RUNNING", "SUCCEEDED"}.issubset(
+            {state for event_job_id, state in event_states if event_job_id == job_id}
+        )
+        for job_id, *_ in jobs
+    )
+
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?",
+            (durable["workflow_id"],),
+        ).fetchone()
+    assert status == ("SUCCESS",)
+
+    job_status = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "job-status",
+        "--run-dir",
+        str(run_dir),
+        "--job-id",
+        jobs[0][0],
+    )
+    assert job_status["job"]["status"] == "SUCCEEDED"
+    event_read = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "job-events",
+        "--run-dir",
+        str(run_dir),
+        "--after-id",
+        "0",
+        "--limit",
+        "100",
+    )
+    assert event_read["events"]
+    assert event_read["events"][0]["state"] == "QUEUED"
+
+
 def test_mock_job_survives_worker_kill_and_completed_checkpoint_replay() -> None:
     input_json = '{"payload":{"value":42},"duration_ms":250}'
     normal = _invoke(
@@ -197,8 +278,42 @@ def test_mock_job_survives_worker_kill_and_completed_checkpoint_replay() -> None
     assert output["result_matches_uninterrupted_semantics"] is True
 
 
+def test_durable_wait_survives_worker_kill_during_running_job_without_redispatch() -> None:
+    normal = _invoke(
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        str(OWS_DIR / "fixtures" / "mock_job_recovery_workflow.yaml"),
+        "--input-json",
+        '{"payload":{"value":42},"duration_ms":1800}',
+    )
+    output = _invoke(
+        str(OWS_DIR / "phase4c_recovery_test.py"),
+        "--normal-result-path",
+        str(Path(normal["run_dir"]) / "result.json"),
+        timeout=240,
+    )
+
+    assert output["result"] == "PASS"
+    assert output["service_survived_worker_kill"] is True
+    assert output["job_state_at_worker_kill"] in {"QUEUED", "RUNNING"}
+    assert output["job_state_after_service_completion"] == "SUCCEEDED"
+    assert output["dispatch_count"] == 1
+    assert output["service_execution_count"] == 1
+    assert output["ledger_row_count"] == 1
+    assert output["workflow_count"] == 1
+    assert output["recovered_workflow_id"] == output["initial_workflow_id"]
+    assert output["start_step_checkpointed_before_kill"] is True
+    assert output["final_status"] == "SUCCESS"
+    assert output["result_matches_uninterrupted_semantics"] is True
+
+
 def _run_mock_job_outcome(
-    *, payload: Any, timeout_seconds: float, start_service: bool
+    *,
+    payload: Any,
+    timeout_seconds: float,
+    start_service: bool,
+    durable_wait: bool = False,
 ) -> tuple[Path, subprocess.CompletedProcess[str]]:
     import cli
 
@@ -206,10 +321,19 @@ def _run_mock_job_outcome(
         OWS_DIR / "fixtures" / "mock_job_recovery_workflow.yaml",
         json.dumps({"payload": payload, "duration_ms": 0}, separators=(",", ":")),
         10_000,
+        mock_job_durable_wait=durable_wait,
     )
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["control"] = {"mock_job_timeout_seconds": timeout_seconds}
+    if durable_wait:
+        manifest["control"].update(
+            {
+                "mock_job_durable_wait": True,
+                "mock_job_max_polls": 3,
+                "mock_job_poll_interval_seconds": 0.05,
+            }
+        )
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     from job_service import start_mock_job_service
@@ -286,6 +410,56 @@ def test_mock_job_timeout_is_bounded_without_cancel_or_redispatch() -> None:
     assert status == ("ERROR",)
     assert len(jobs) == 1
     assert jobs[0] == ("QUEUED", 1, 0, None)
+
+
+def test_durable_wait_failure_keeps_failed_receipt_and_dbos_error() -> None:
+    run_dir, completed = _run_mock_job_outcome(
+        payload={"mock_failure": True},
+        timeout_seconds=5,
+        start_service=True,
+        durable_wait=True,
+    )
+    assert run_dir.parent == STATE_DIR / "phase4c-runs"
+    assert completed.returncode != 0
+    startup = json.loads((run_dir / "start-worker.json").read_text(encoding="utf-8"))
+    workflow_id = startup["workflow_id"]
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?", (workflow_id,)
+        ).fetchone()
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        jobs = connection.execute(
+            "SELECT state, dispatch_count, service_execution_count, error FROM jobs"
+        ).fetchall()
+        event_states = connection.execute(
+            "SELECT state FROM job_events ORDER BY event_id"
+        ).fetchall()
+    assert status == ("ERROR",)
+    assert jobs == [("FAILED", 1, 1, "mock service deterministic failure")]
+    assert [row[0] for row in event_states] == ["QUEUED", "RUNNING", "FAILED"]
+
+
+def test_durable_wait_timeout_does_not_cancel_or_redispatch_the_job() -> None:
+    run_dir, completed = _run_mock_job_outcome(
+        payload={"value": 17},
+        timeout_seconds=0.2,
+        start_service=False,
+        durable_wait=True,
+    )
+    assert completed.returncode != 0
+    assert "job was not cancelled" in completed.stderr
+    startup = json.loads((run_dir / "start-worker.json").read_text(encoding="utf-8"))
+    workflow_id = startup["workflow_id"]
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?", (workflow_id,)
+        ).fetchone()
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        jobs = connection.execute(
+            "SELECT state, dispatch_count, service_execution_count, result_json FROM jobs"
+        ).fetchall()
+    assert status == ("ERROR",)
+    assert jobs == [("QUEUED", 1, 0, None)]
 
 
 @pytest.mark.parametrize(

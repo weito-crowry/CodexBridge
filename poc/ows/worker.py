@@ -22,7 +22,13 @@ from interpreter import (
     parse_workflow_text,
     validate_workflow,
 )
-from job_adapter import DurableJobAdapter, submit_and_wait
+from job_adapter import (
+    DurableJobAdapter,
+    JobFailedError,
+    JobReconciliationRequiredError,
+    JobTimeoutError,
+    submit_and_wait,
+)
 from process_identity import get_process_identity
 from sqlalchemy.engine import URL
 
@@ -272,6 +278,229 @@ def _run_task_step(
     }
 
 
+def _durable_start_job_step(
+    run_dir: str,
+    workflow_id: str,
+    identity: str,
+    request: dict[str, Any],
+    checkpoint_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    started = DurableJobAdapter(Path(run_dir) / "jobs.sqlite").start_job(
+        workflow_id, identity, request
+    )
+    return {
+        **checkpoint_metadata,
+        "request_sha256": sha256_json(request),
+        "result": started,
+    }
+
+
+def _durable_poll_job_step(
+    run_dir: str,
+    job_id: str,
+    request_key: str,
+    request_sha256: str,
+    event_cursor: int,
+    poll_index: int,
+    stale_ttl_seconds: float,
+    checkpoint_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    adapter = DurableJobAdapter(Path(run_dir) / "jobs.sqlite")
+    before = adapter.get_job_status(job_id=job_id, stale_ttl_seconds=stale_ttl_seconds)
+    events = adapter.read_events(after_id=event_cursor, limit=100)
+    next_cursor = max((event["event_id"] for event in events), default=event_cursor)
+    after = adapter.get_job_status(job_id=job_id, stale_ttl_seconds=stale_ttl_seconds)
+    for _ in range(9):
+        if next_cursor >= after["latest_event_id"]:
+            break
+        more_events = adapter.read_events(after_id=next_cursor, limit=100)
+        if not more_events:
+            break
+        events.extend(more_events)
+        next_cursor = max(event["event_id"] for event in more_events)
+    if next_cursor < after["latest_event_id"]:
+        raise JobReconciliationRequiredError(
+            f"NEEDS_RECONCILIATION: event catch-up exceeded 1000 rows for {request_key}"
+        )
+    if after["request_key"] != request_key or after["request_digest"] != request_sha256:
+        raise JobReconciliationRequiredError(
+            f"NEEDS_RECONCILIATION: status identity changed for {request_key}"
+        )
+    if before["job_id"] != after["job_id"]:
+        raise JobReconciliationRequiredError(
+            f"NEEDS_RECONCILIATION: job identity changed for {request_key}"
+        )
+    return {
+        **checkpoint_metadata,
+        "request_sha256": request_sha256,
+        "job_id": job_id,
+        "request_key": request_key,
+        "event_cursor": event_cursor,
+        "poll_index": poll_index,
+        "result": {"snapshot": after, "events": events, "next_cursor": next_cursor},
+    }
+
+
+@cache
+def _durable_job_step(identity: str, stage: str, poll_index: int = 0) -> Any:
+    material = f"{identity}\0{stage}\0{poll_index}"
+    step_name = f"ows4c_{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
+    function = _durable_start_job_step if stage == "start" else _durable_poll_job_step
+    return DBOS.step(name=step_name)(function)
+
+
+def _run_durable_mock_job(
+    *,
+    identity: str,
+    task_name: str,
+    operation: str,
+    task_spec: dict[str, Any],
+    task_input: Any,
+    variables: dict[str, Any],
+    request: dict[str, Any],
+    definition_sha256: str,
+    trace_path: str,
+    control: dict[str, Any],
+) -> dict[str, Any]:
+    workflow_id = DBOS.workflow_id
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise OwsError("durable mock-job adapter requires an active DBOS workflow")
+    run_dir = Path(trace_path).parent
+    metadata = {
+        "identity": identity,
+        "task_name": task_name,
+        "operation": operation,
+        "definition_sha256": definition_sha256,
+        "input_sha256": sha256_json(task_input),
+        "context_sha256": sha256_json(variables.get("context")),
+        "variables_sha256": sha256_json(variables),
+    }
+
+    start_checkpoint = _durable_job_step(identity, "start")(
+        str(run_dir), workflow_id, identity, request, metadata
+    )
+    start_checkpoint = _validate_task_checkpoint(
+        start_checkpoint,
+        identity=identity,
+        task_name=task_name,
+        operation=operation,
+        definition_sha256=definition_sha256,
+        task_input=task_input,
+        variables=variables,
+    )
+    started = start_checkpoint["result"]
+    job_id = started.get("job_id")
+    request_key = started.get("request_key")
+    request_sha256 = start_checkpoint.get("request_sha256")
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or not isinstance(request_key, str)
+        or not request_key
+        or request_sha256 != sha256_json(request)
+    ):
+        raise JobReconciliationRequiredError(
+            f"NEEDS_RECONCILIATION: invalid durable start checkpoint for {identity}"
+        )
+    _append_event(
+        Path(trace_path),
+        {
+            "event": "durable_job_started_before_wait",
+            "identity": identity,
+            "job_id": job_id,
+            "request_key": request_key,
+            "pid": os.getpid(),
+            "timestamp_utc": datetime.now(UTC).isoformat(),
+        },
+    )
+
+    max_polls = control.get("mock_job_max_polls", 100)
+    poll_interval = control.get("mock_job_poll_interval_seconds", 0.1)
+    stale_ttl = control.get("mock_job_reconciliation_ttl_seconds", 2.0)
+    if type(max_polls) is not int or not 1 <= max_polls <= 600:
+        raise OwsError("mock_job_max_polls must be an integer from 1 to 600")
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, (int, float))
+        or not 0.05 <= poll_interval <= 0.25
+    ):
+        raise OwsError("mock_job_poll_interval_seconds must be from 0.05 to 0.25")
+    if (
+        isinstance(stale_ttl, bool)
+        or not isinstance(stale_ttl, (int, float))
+        or not 0.1 <= stale_ttl <= 30
+    ):
+        raise OwsError("mock_job_reconciliation_ttl_seconds must be from 0.1 to 30")
+    if max_polls * poll_interval > 30:
+        raise OwsError("durable mock-job wait may not exceed 30 seconds")
+
+    event_cursor = 0
+    for poll_index in range(max_polls):
+        checkpoint = _durable_job_step(identity, "status", poll_index)(
+            str(run_dir),
+            job_id,
+            request_key,
+            request_sha256,
+            event_cursor,
+            poll_index,
+            float(stale_ttl),
+            metadata,
+        )
+        checkpoint = _validate_task_checkpoint(
+            checkpoint,
+            identity=identity,
+            task_name=task_name,
+            operation=operation,
+            definition_sha256=definition_sha256,
+            task_input=task_input,
+            variables=variables,
+        )
+        if (
+            checkpoint.get("request_sha256") != request_sha256
+            or checkpoint.get("job_id") != job_id
+            or checkpoint.get("request_key") != request_key
+            or checkpoint.get("event_cursor") != event_cursor
+            or checkpoint.get("poll_index") != poll_index
+        ):
+            raise JobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: invalid durable status checkpoint for {identity}"
+            )
+        snapshot = checkpoint["result"]["snapshot"]
+        if snapshot.get("adapter_marker") == "NEEDS_RECONCILIATION":
+            raise JobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: job {job_id} requires adapter reconciliation"
+            )
+        if snapshot.get("state") == "SUCCEEDED":
+            if snapshot.get("result") is None:
+                raise JobReconciliationRequiredError(
+                    f"NEEDS_RECONCILIATION: SUCCEEDED job has no receipt for {request_key}"
+                )
+            return {
+                "job_id": job_id,
+                "request_key": request_key,
+                "status": "SUCCEEDED",
+                "result": snapshot["result"],
+            }
+        if snapshot.get("state") == "FAILED":
+            raise JobFailedError(
+                f"mock-job FAILED: job_id={job_id} request_key={request_key} "
+                f"error={snapshot.get('error')}"
+            )
+        if snapshot.get("state") not in {"QUEUED", "RUNNING"}:
+            raise JobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: unsupported job state {snapshot.get('state')!r} "
+                f"for {request_key}"
+            )
+        event_cursor = checkpoint["result"]["next_cursor"]
+        if poll_index + 1 < max_polls:
+            DBOS.sleep(float(poll_interval))
+
+    raise JobTimeoutError(
+        f"mock-job durable wait exceeded {max_polls} status checks for job {job_id}; "
+        "job was not cancelled"
+    )
+
+
 @cache
 def _named_step(identity: str) -> Any:
     step_name = f"ows_{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
@@ -294,6 +523,9 @@ def execute_ows_workflow(
         raise OwsError("persisted OWS input hash mismatch")
     definition = parse_workflow_text(definition_text)
     validate_workflow(definition)
+    durable_wait = control.get("mock_job_durable_wait", False)
+    if not isinstance(durable_wait, bool):
+        raise OwsError("mock_job_durable_wait must be a boolean")
 
     def run_named_step(
         identity: str,
@@ -303,6 +535,20 @@ def execute_ows_workflow(
         task_input: Any,
         variables: dict[str, Any],
     ) -> Any:
+        if durable_wait and operation == "call":
+            request = compute_mock_job_request(task_spec, task_input, variables)
+            return _run_durable_mock_job(
+                identity=identity,
+                task_name=task_name,
+                operation=operation,
+                task_spec=task_spec,
+                task_input=task_input,
+                variables=variables,
+                request=request,
+                definition_sha256=definition_sha256,
+                trace_path=trace_path,
+                control=control,
+            )
         checkpoint = _named_step(identity)(
             identity,
             task_name,
