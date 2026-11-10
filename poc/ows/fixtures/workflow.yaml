@@ -1,0 +1,65 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-minimal-interpreter
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+do:
+  - prepare:
+      set:
+        sign: ${ .sign }
+        offset: ${ .offset }
+        values: ${ .values }
+  - process:
+      do:
+        - choose:
+            switch:
+              - positive:
+                  when: ${ .sign > 0 }
+                  then: positive
+              - negative:
+                  when: ${ .sign < 0 }
+                  then: negative
+              - default:
+                  then: neutral
+        - positive:
+            set:
+              sign: ${ .sign }
+              offset: ${ .offset }
+              values: ${ .values }
+              branch: positive
+            then: loopValues
+        - negative:
+            set:
+              sign: ${ .sign }
+              offset: ${ .offset }
+              values: ${ .values }
+              branch: negative
+            then: loopValues
+        - neutral:
+            set:
+              sign: ${ .sign }
+              offset: ${ .offset }
+              values: ${ .values }
+              branch: neutral
+            then: loopValues
+        - loopValues:
+            for:
+              each: item
+              at: index
+              in: ${ .values }
+            do:
+              - record:
+                  set:
+                    item: ${ $item }
+                    index: ${ $index }
+                    score: ${ ($item + .offset) * $index }
+                    branch: ${ .branch }
+        - summarize:
+            set:
+              branch: ${ .[0].branch }
+              indexes: ${ map(.index) }
+              items: ${ map(.item) }
+              total: ${ map(.score) | add }

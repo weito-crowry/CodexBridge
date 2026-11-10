@@ -1,0 +1,6 @@
+dbos==3.4.0
+jq==1.13.0
+jsonschema==4.25.1
+PyYAML==6.0.3
+pytest==9.2.0
+ruff==0.17.4

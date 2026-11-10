@@ -1,0 +1,18 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-recovery-proof
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+do:
+  - first:
+      set:
+        value: ${ .value + 1 }
+  - second:
+      set:
+        value: ${ .value + 1 }
+  - finish:
+      set:
+        final: ${ .value }
