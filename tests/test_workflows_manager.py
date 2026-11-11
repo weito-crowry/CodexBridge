@@ -225,6 +225,154 @@ async def test_shutdown_is_bounded_and_terminates_only_managed_worker(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_spawn_before_completing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    process = FakeProcess()
+    spawn_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+
+    async def create_process(*_args: object, **_kwargs: object) -> FakeProcess:
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager.asyncio.create_subprocess_exec", create_process
+    )
+    manager = WorkflowWorkerManager(
+        state_root=tmp_path / "state",
+        allowed_roots=(str(workspace),),
+        control_token=_DUMMY_TOKEN,
+        graceful_shutdown_seconds=0.05,
+    )
+    run_dir = manager.create_run_directory()
+    _write_manifest(run_dir, live=True)
+    CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+
+    start_task = asyncio.create_task(
+        manager.start_worker(run_dir, mode="start", workspace_root=workspace)
+    )
+    await spawn_entered.wait()
+    shutdown_task = asyncio.create_task(manager.shutdown())
+    await asyncio.sleep(0)
+    shutdown_completed_before_spawn_release = shutdown_task.done()
+
+    release_spawn.set()
+    handle = await start_task
+    report = await shutdown_task
+    worker_was_stopped_by_shutdown = process.terminated
+    status_after_shutdown = handle.status
+    if not process.terminated:
+        process.terminate()
+    await handle.wait()
+
+    assert not shutdown_completed_before_spawn_release
+    assert worker_was_stopped_by_shutdown
+    assert status_after_shutdown.state == "stopped"
+    assert report.ownership_complete
+    assert report.owned_turns == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_start_during_shutdown_is_rejected_without_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_bridge.workflows.manager as manager_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    process = FakeProcess()
+    spawn_calls = 0
+    shutdown_signal_written = asyncio.Event()
+    write_signal = manager_module._write_shutdown_signal
+
+    async def create_process(*_args: object, **_kwargs: object) -> FakeProcess:
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return process
+
+    def write_shutdown_signal(path: Path) -> None:
+        write_signal(path)
+        shutdown_signal_written.set()
+
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager.asyncio.create_subprocess_exec", create_process
+    )
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager._write_shutdown_signal", write_shutdown_signal
+    )
+    manager = WorkflowWorkerManager(
+        state_root=tmp_path / "state",
+        allowed_roots=(str(workspace),),
+        graceful_shutdown_seconds=0.05,
+    )
+    active_run = manager.create_run_directory()
+    next_run = manager.create_run_directory()
+    _write_manifest(active_run)
+    _write_manifest(next_run)
+    await manager.start_worker(active_run, mode="start")
+
+    shutdown_task = asyncio.create_task(manager.shutdown())
+    await shutdown_signal_written.wait()
+
+    with pytest.raises(WorkflowManagerError, match="shutting down"):
+        await manager.start_worker(next_run, mode="start")
+    report = await shutdown_task
+
+    assert spawn_calls == 1
+    assert report.ownership_complete
+    assert manager.get_status(active_run.name).state == "stopped"
+    assert manager.get_status(next_run.name) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_shutdown_calls_share_one_shutdown_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import codex_bridge.workflows.manager as manager_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    process = FakeProcess()
+    signals: list[Path] = []
+    write_signal = manager_module._write_shutdown_signal
+
+    async def create_process(*_args: object, **_kwargs: object) -> FakeProcess:
+        return process
+
+    def write_shutdown_signal(path: Path) -> None:
+        signals.append(path)
+        write_signal(path)
+
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager.asyncio.create_subprocess_exec", create_process
+    )
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager._write_shutdown_signal", write_shutdown_signal
+    )
+    manager = WorkflowWorkerManager(
+        state_root=tmp_path / "state",
+        allowed_roots=(str(workspace),),
+        graceful_shutdown_seconds=0.05,
+    )
+    run_dir = manager.create_run_directory()
+    _write_manifest(run_dir)
+    await manager.start_worker(run_dir, mode="start")
+
+    first = asyncio.create_task(manager.shutdown())
+    second = asyncio.create_task(manager.shutdown())
+    first_report, second_report = await asyncio.gather(first, second)
+
+    assert len(signals) == 1
+    assert first_report is second_report
+    assert process.terminated
+    assert manager.get_status(run_dir.name).state == "stopped"
+
+
+@pytest.mark.asyncio
 async def test_live_worker_shutdown_reports_unknown_when_ledger_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

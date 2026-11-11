@@ -117,7 +117,9 @@ class WorkflowWorkerManager:
         self._frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
         self._graceful_shutdown_seconds = graceful_shutdown_seconds
         self._accepting = True
+        self._lifecycle_lock = asyncio.Lock()
         self._shutdown_report: WorkflowShutdownReport | None = None
+        self._shutdown_task: asyncio.Task[WorkflowShutdownReport] | None = None
         self._records: dict[str, _ManagedWorker] = {}
 
     def __repr__(self) -> str:
@@ -152,60 +154,61 @@ class WorkflowWorkerManager:
         mode: WorkerMode,
         workspace_root: Path | None = None,
     ) -> WorkflowWorkerHandle:
-        if not self._accepting:
-            raise WorkflowManagerError("workflow worker manager is shutting down")
-        if mode not in {"start", "recover"}:
-            raise WorkflowManagerError("worker mode must be start or recover")
-        canonical_run_dir = self._validate_run_directory(run_dir)
-        run_id = canonical_run_dir.name
-        current = self._records.get(run_id)
-        if current is not None and current.state == "running":
-            raise WorkflowManagerError("a worker is already running for this workflow run")
-        manifest = self._read_manifest(canonical_run_dir)
-        live = _codex_job_live(manifest)
-        canonical_workspace = self._validate_workspace(canonical_run_dir, workspace_root, live)
-        if live and not self._control_token:
-            raise WorkflowManagerError("live codex-job requires the Bridge control token")
+        async with self._lifecycle_lock:
+            if not self._accepting:
+                raise WorkflowManagerError("workflow worker manager is shutting down")
+            if mode not in {"start", "recover"}:
+                raise WorkflowManagerError("worker mode must be start or recover")
+            canonical_run_dir = self._validate_run_directory(run_dir)
+            run_id = canonical_run_dir.name
+            current = self._records.get(run_id)
+            if current is not None and current.state == "running":
+                raise WorkflowManagerError("a worker is already running for this workflow run")
+            manifest = self._read_manifest(canonical_run_dir)
+            live = _codex_job_live(manifest)
+            canonical_workspace = self._validate_workspace(canonical_run_dir, workspace_root, live)
+            if live and not self._control_token:
+                raise WorkflowManagerError("live codex-job requires the Bridge control token")
 
-        launch_id = uuid.uuid4().hex
-        config_path = canonical_run_dir / f"worker-config-{launch_id}.json"
-        shutdown_file = canonical_run_dir / f"worker-shutdown-{launch_id}.request"
-        worker_config = {
-            "version": 1,
-            "mode": mode,
-            "workspace_root": None if canonical_workspace is None else str(canonical_workspace),
-            "allowed_roots": list(self.allowed_roots),
-            "shutdown_file": shutdown_file.name,
-        }
-        _write_private_json(config_path, worker_config)
-        record = _ManagedWorker(
-            run_dir=canonical_run_dir,
-            mode=mode,
-            live=live,
-            shutdown_file=shutdown_file,
-        )
-        self._records[run_id] = record
-        command = self._command(mode, canonical_run_dir, config_path)
-        environment = build_worker_environment(
-            os.environ,
-            control_token=self._control_token if live else None,
-        )
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                cwd=str(canonical_run_dir),
-                env=environment,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+            launch_id = uuid.uuid4().hex
+            config_path = canonical_run_dir / f"worker-config-{launch_id}.json"
+            shutdown_file = canonical_run_dir / f"worker-shutdown-{launch_id}.request"
+            worker_config = {
+                "version": 1,
+                "mode": mode,
+                "workspace_root": None if canonical_workspace is None else str(canonical_workspace),
+                "allowed_roots": list(self.allowed_roots),
+                "shutdown_file": shutdown_file.name,
+            }
+            _write_private_json(config_path, worker_config)
+            record = _ManagedWorker(
+                run_dir=canonical_run_dir,
+                mode=mode,
+                live=live,
+                shutdown_file=shutdown_file,
             )
-        except (OSError, ValueError):
-            record.state = "failed"
-            record.error = "workflow worker process could not be started"
-            raise WorkflowManagerError(record.error) from None
-        record.process = process
-        record.exit_task = asyncio.create_task(self._observe_exit(record))
-        return WorkflowWorkerHandle(self, run_id, process.pid)
+            self._records[run_id] = record
+            command = self._command(mode, canonical_run_dir, config_path)
+            environment = build_worker_environment(
+                os.environ,
+                control_token=self._control_token if live else None,
+            )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    cwd=str(canonical_run_dir),
+                    env=environment,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            except (OSError, ValueError):
+                record.state = "failed"
+                record.error = "workflow worker process could not be started"
+                raise WorkflowManagerError(record.error) from None
+            record.process = process
+            record.exit_task = asyncio.create_task(self._observe_exit(record))
+            return WorkflowWorkerHandle(self, run_id, process.pid)
 
     def get_status(self, run_id: str) -> WorkflowWorkerStatus | None:
         record = self._records.get(run_id)
@@ -220,10 +223,22 @@ class WorkflowWorkerManager:
         )
 
     async def shutdown(self) -> WorkflowShutdownReport:
-        if self._shutdown_report is not None:
-            return self._shutdown_report
-        self._accepting = False
-        running = [record for record in self._records.values() if record.state == "running"]
+        async with self._lifecycle_lock:
+            if self._shutdown_report is not None:
+                return self._shutdown_report
+            if self._shutdown_task is None:
+                self._accepting = False
+                records = tuple(self._records.values())
+                running = tuple(record for record in records if record.state == "running")
+                self._shutdown_task = asyncio.create_task(self._finish_shutdown(running, records))
+            shutdown_task = self._shutdown_task
+        return await asyncio.shield(shutdown_task)
+
+    async def _finish_shutdown(
+        self,
+        running: tuple[_ManagedWorker, ...],
+        records: tuple[_ManagedWorker, ...],
+    ) -> WorkflowShutdownReport:
         for record in running:
             record.shutdown_requested = True
             try:
@@ -257,7 +272,7 @@ class WorkflowWorkerManager:
         owned_turns: set[tuple[str, str]] = set()
         ownership_complete = True
         errors: list[str] = []
-        for record in self._records.values():
+        for record in records:
             if not record.live:
                 continue
             database_path = record.run_dir / "codex_jobs.sqlite"
