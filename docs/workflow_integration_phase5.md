@@ -120,3 +120,18 @@ APIは少なくとも次の失敗を区別して返す: 認証失敗、request/s
 ## 11. Phase 5Aの受入と次の実装順
 
 5Aの受入条件は、標準ライブラリだけでimport可能な `workflows.http_client`、PoCと同じhost/port・token・payload・timeout・response size・loopback制約、GETのみのpreflight、固定POST shapeとBearer header、HTTP/JSON/size/redirect回帰テスト、そして本設計書である。HTTPテストは自前の127.0.0.1 fake serverだけに接続し、既定の本番port 18001へ接続しない。Phase 5Aの完了後、5Bの順序1からパッケージ移行を開始する。
+
+## 12. Phase 5C実装記録
+
+Phase 5Cでは、既存UI APIへ次のBearer認証付きrouteを追加した。各routeは既存control token照合とlocalhost Origin検査を通し、token未設定時は公開しない。
+
+- `POST /ui-api/control/workflows`: 128 KiB以下のJSONを受け付け、OWS v1.0.3 subset/schema、固定codex-job prompt、AllowedPathPolicyを検査する。成功時は`202`でworkflow/run IDと状態を返す。
+- `GET /ui-api/control/workflows`: 新しい順に最大100件を返す。既定は50件でcursor paginationは未実装。
+- `GET /ui-api/control/workflows/{workflow_id}`: request ledger、manifest、DBOS、job ledger、worker statusを読み取り照合する。
+- `GET /ui-api/control/workflows/{workflow_id}/result`: 成功かつID/hash整合済みの64 KiB以下のresultだけを返す。再実行・再POSTは行わない。
+
+`%LOCALAPPDATA%\CodexBridge\workflows\requests.sqlite`の`workflow_requests`は、client request ID・workflow ID・run IDのUNIQUE制約、正規化payloadのSHA-256、受付状態とUTC時刻を保持する。受付は`BEGIN IMMEDIATE`で直列化し、run内に`workflow.yaml`、`input.json`、`manifest.json`をatomic保存してから`queued`行をcommitする。commit後の状態遷移は`queued → starting → running`。managerが起動失敗を確定した場合は`failed_to_start`、開始結果を確定できない場合は`needs_reconciliation`とする。GETはSQLiteをread-onlyで開き、run filesのdigestとworkflow IDを照合して状態を投影する。
+
+同じclient request IDと同じ正規化payloadは記録済みworkflow/runを返し、再spawnしない。異なるpayloadは`409`。起動中・結果不明の既存runも再投入せず、`MAYBE_SENT`は`needs_reconciliation`として扱う。異なるrequest IDの同時live実行は1件に制限する。run状態はBridge再起動後も読み取れるが、Workerのautostart/autorecoverはしない。shutdown時は永続request ledgerから確定可能なworkflow所有turnを読み取り、既存の所有turn除外へ加える。
+
+Console UIと自由prompt・複数job対応はPhase 5D/5Eの範囲である。今回の製品検証は隔離fake manager/APIのみとし、本番checkout・稼働中サービス・実Codex jobには接続しない。

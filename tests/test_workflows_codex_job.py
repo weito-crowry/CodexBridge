@@ -9,6 +9,23 @@ from codex_bridge.workflows.codex_job_adapter import (
     CodexJobRequestError,
 )
 from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
+from codex_bridge.workflows.worker import _persist_workflow_id
+
+
+def test_preassigned_workflow_id_does_not_rewrite_immutable_manifest(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    original = b'{"workflow_id":"12345678-1234-4234-8234-123456789abc"}\n'
+    manifest_path.write_bytes(original)
+
+    _persist_workflow_id(
+        tmp_path,
+        {"workflow_id": "12345678-1234-4234-8234-123456789abc"},
+        "12345678-1234-4234-8234-123456789abc",
+    )
+
+    assert manifest_path.read_bytes() == original
 
 
 def test_product_codex_job_uses_explicit_allowed_workspace_not_state_root(tmp_path: Path) -> None:

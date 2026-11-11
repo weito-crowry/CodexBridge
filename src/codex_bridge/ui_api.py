@@ -25,6 +25,8 @@ from .models import ApprovalDecision, RequestId
 from .paths import PathPolicyError
 from .thread_titles import normalize_explicit_title
 from .ui_control import ControlConflictError, create_control_routes
+from .workflows.api import create_workflow_routes
+from .workflows.service import WorkflowService
 
 
 class UiBridge(Protocol):
@@ -244,6 +246,7 @@ def create_ui_app(
     config: BridgeConfig,
     *,
     shutdown_callback: ShutdownCallback | None = None,
+    workflow_service: WorkflowService | None = None,
 ) -> Starlette:
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "ok"})
@@ -449,6 +452,16 @@ def create_ui_app(
         routes.extend(
             create_control_routes(bridge, config, _authorized_control_request, _error_response)
         )
+        if workflow_service is not None:
+            routes.extend(
+                create_workflow_routes(
+                    workflow_service,
+                    token=config.control_token,
+                    ui_port=config.ui_port,
+                    authorize=_authorized_control_request,
+                    ready=lambda: _app_server_ready(bridge),
+                )
+            )
     app = Starlette(routes=routes)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     app.state.bridge = bridge

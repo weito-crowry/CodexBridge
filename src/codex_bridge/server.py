@@ -42,6 +42,7 @@ from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
 from .workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
+from .workflows.service import WorkflowService
 
 
 class RuntimeLike(Protocol):
@@ -171,8 +172,19 @@ def build_runtime(
         on_server_request=bridge.handle_server_request,
         on_failure=bridge.handle_app_server_failure,
     )
+    workflow_manager = WorkflowWorkerManager(
+        allowed_roots=config.allowed_roots,
+        control_token=config.control_token,
+    )
+    workflow_service = WorkflowService(workflow_manager, codex_bridge_port=config.ui_port)
     ui_server = LocalUiServer(
-        create_ui_app(bridge, activity_store, config, shutdown_callback=shutdown_callback),
+        create_ui_app(
+            bridge,
+            activity_store,
+            config,
+            shutdown_callback=shutdown_callback,
+            workflow_service=workflow_service,
+        ),
         config.ui_port,
         graceful_shutdown_timeout=config.shutdown_grace_seconds,
     )
@@ -183,10 +195,7 @@ def build_runtime(
         config=config,
         ui_server=ui_server,
         external_monitor=bridge.observations.external,
-        workflow_manager=WorkflowWorkerManager(
-            allowed_roots=config.allowed_roots,
-            control_token=config.control_token,
-        ),
+        workflow_manager=workflow_manager,
     )
 
 

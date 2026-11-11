@@ -1323,10 +1323,15 @@ def test_mcp_app_does_not_register_ui_routes(tmp_path) -> None:
 def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch) -> None:
     import codex_bridge.server as server_module
 
-    captured: list[object] = []
+    captured: list[dict[str, object]] = []
 
     def fake_create_ui_app(*args, **kwargs):
-        captured.append(kwargs.get("shutdown_callback"))
+        captured.append(
+            {
+                "shutdown_callback": kwargs.get("shutdown_callback"),
+                "workflow_service": kwargs.get("workflow_service"),
+            }
+        )
         return object()
 
     monkeypatch.setattr(server_module, "create_ui_app", fake_create_ui_app)
@@ -1334,9 +1339,10 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     def callback() -> None:
         pass
 
-    build_runtime(config(tmp_path), shutdown_callback=callback)
+    runtime = build_runtime(config(tmp_path), shutdown_callback=callback)
 
-    assert captured == [callback]
+    assert captured[0]["shutdown_callback"] is callback
+    assert captured[0]["workflow_service"]._worker_manager is runtime.workflow_manager
 
 
 def test_build_runtime_attaches_inert_workflow_manager(tmp_path) -> None:

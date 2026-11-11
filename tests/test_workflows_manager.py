@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from codex_bridge.runtime_mode import INTERNAL_RUNTIME_FLAG, WORKFLOW_WORKER_FLAG
 from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter
 from codex_bridge.workflows.http_client import CONTROL_TOKEN_ENV
+from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
 from codex_bridge.workflows.manager import WorkflowManagerError, WorkflowWorkerManager
 
 _DUMMY_TOKEN = "phase5b-test-token-never-persist"
@@ -57,6 +60,68 @@ def test_manager_creation_and_run_directory_do_not_start_a_worker(tmp_path: Path
     assert first.parent == second.parent == tmp_path / "state"
     assert first.is_dir() and second.is_dir() and first != second
     assert manager.get_status(first.name) is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_turns_from_durable_requests_after_manager_recreation(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "workflow-state"
+    run_id = "run-0123456789abcdef0123456789abcdef"
+    workflow_id = str(uuid.uuid4())
+    request_digest = "a" * 64
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "request_digest": request_digest,
+                "mode": "codex-job-live",
+                "control": {"codex_job_live": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    prepared = adapter.prepare_job(
+        workflow_id,
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+        port=18001,
+    )
+    assert adapter.claim_post(prepared["job_id"])
+    adapter.mark_accepted(
+        prepared["job_id"], "workflow-thread-123", "workflow-turn-123", "in_progress"
+    )
+
+    requests_db = sqlite3.connect(state_root / "requests.sqlite")
+    requests_db.execute(
+        "CREATE TABLE workflow_requests (client_request_id TEXT, workflow_id TEXT, "
+        "run_id TEXT, request_digest TEXT, state TEXT, created_at TEXT, updated_at TEXT)"
+    )
+    requests_db.execute(
+        "INSERT INTO workflow_requests VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "phase5c-request-durable",
+            workflow_id,
+            run_id,
+            request_digest,
+            "running",
+            "2026-11-11T00:00:00+00:00",
+            "2026-11-11T00:00:00+00:00",
+        ),
+    )
+    requests_db.commit()
+    requests_db.close()
+
+    manager_after_restart = WorkflowWorkerManager(state_root=state_root)
+    report = await manager_after_restart.shutdown()
+
+    assert report.ownership_complete
+    assert report.owned_turns == {("workflow-thread-123", "workflow-turn-123")}
 
 
 def test_default_state_root_uses_localappdata_without_eager_directory_creation(

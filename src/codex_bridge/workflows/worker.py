@@ -80,6 +80,13 @@ def _write_json(path: Path, value: Any) -> None:
     os.replace(temporary_path, path)
 
 
+def _persist_workflow_id(run_dir: Path, manifest: dict[str, Any], workflow_id: str) -> None:
+    if manifest.get("workflow_id") == workflow_id:
+        return
+    manifest["workflow_id"] = workflow_id
+    _write_json(run_dir / "manifest.json", manifest)
+
+
 def _append_event(path: Path, event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as event_file:
@@ -989,8 +996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 handle = DBOS.start_workflow(execute_ows_workflow, *workflow_arguments)
             workflow_id = handle.workflow_id
-            manifest["workflow_id"] = workflow_id
-            _write_json(run_dir / "manifest.json", manifest)
+            _persist_workflow_id(run_dir, manifest, workflow_id)
             startup_path = run_dir / "start-worker.json"
         else:
             workflow_id = manifest.get("workflow_id")

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import sys
 import uuid
 from collections.abc import Mapping
@@ -272,10 +273,18 @@ class WorkflowWorkerManager:
         owned_turns: set[tuple[str, str]] = set()
         ownership_complete = True
         errors: list[str] = []
-        for record in records:
-            if not record.live:
+        ownership_runs: dict[Path, bool] = {record.run_dir: record.live for record in records}
+        persisted_runs, persisted_complete = _persisted_live_run_directories(self.state_root)
+        if not persisted_complete:
+            ownership_complete = False
+            errors.append("persisted workflow run list is incomplete")
+        for run_dir in persisted_runs:
+            ownership_runs.setdefault(run_dir, True)
+
+        for run_dir, live in ownership_runs.items():
+            if not live:
                 continue
-            database_path = record.run_dir / "codex_jobs.sqlite"
+            database_path = run_dir / "codex_jobs.sqlite"
             turns: set[tuple[str, str]]
             try:
                 from .codex_job_adapter import CodexJobAdapter
@@ -398,6 +407,109 @@ def default_workflow_state_root() -> Path:
     if not local_app_data:
         raise WorkflowManagerError("LOCALAPPDATA is required for workflow state storage")
     return Path(local_app_data) / "CodexBridge" / "workflows"
+
+
+def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...], bool]:
+    root = Path(state_root)
+    if root.is_symlink():
+        return (), False
+    if not root.exists():
+        return (), True
+    try:
+        canonical_root = root.resolve(strict=True)
+    except OSError:
+        return (), False
+    if not canonical_root.is_dir():
+        return (), False
+    request_database = canonical_root / "requests.sqlite"
+    if request_database.is_symlink():
+        return (), False
+    if not request_database.exists():
+        return (), True
+    if not request_database.is_file():
+        return (), False
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = request_database.resolve(strict=True).as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+        connection.execute("PRAGMA query_only = ON")
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if "workflow_requests" not in tables:
+            return (), False
+        rows = connection.execute(
+            "SELECT workflow_id, run_id, request_digest, state FROM workflow_requests "
+            "WHERE state IN ('starting','running','needs_reconciliation') "
+            "ORDER BY created_at DESC LIMIT 101"
+        ).fetchall()
+    except (OSError, sqlite3.Error, ValueError):
+        return (), False
+    finally:
+        if connection is not None:
+            connection.close()
+    if len(rows) > 100:
+        return (), False
+
+    persisted: list[Path] = []
+    complete = True
+    for raw_workflow_id, raw_run_id, raw_digest, raw_state in rows:
+        workflow_id = str(raw_workflow_id)
+        run_id = str(raw_run_id)
+        request_digest = str(raw_digest)
+        state = str(raw_state)
+        if state not in {"starting", "running", "needs_reconciliation"}:
+            complete = False
+            continue
+        try:
+            parsed_workflow_id = str(uuid.UUID(workflow_id))
+        except ValueError:
+            complete = False
+            continue
+        if (
+            parsed_workflow_id != workflow_id
+            or _RUN_ID_RE.fullmatch(run_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", request_digest, re.ASCII) is None
+        ):
+            complete = False
+            continue
+        run_dir = canonical_root / run_id
+        if run_dir.is_symlink():
+            complete = False
+            continue
+        try:
+            resolved = run_dir.resolve(strict=True)
+        except OSError:
+            complete = False
+            continue
+        if not resolved.is_dir() or resolved.parent != canonical_root:
+            complete = False
+            continue
+        manifest_path = resolved / "manifest.json"
+        try:
+            if manifest_path.is_symlink() or not manifest_path.is_file():
+                complete = False
+                continue
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                complete = False
+                continue
+            live = _codex_job_live(manifest)
+        except (OSError, json.JSONDecodeError, WorkflowManagerError):
+            complete = False
+            continue
+        if (
+            not live
+            or manifest.get("workflow_id") != workflow_id
+            or manifest.get("run_id") != run_id
+            or manifest.get("request_digest") != request_digest
+            or manifest.get("mode") != "codex-job-live"
+        ):
+            complete = False
+            continue
+        persisted.append(resolved)
+    return tuple(persisted), complete
 
 
 def build_worker_environment(
