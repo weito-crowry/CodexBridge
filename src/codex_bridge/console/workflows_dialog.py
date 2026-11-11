@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -601,7 +602,7 @@ class StartWorkflowDialog(QDialog):
                     tr("Send result is unknown. Update the list and do not start a new run.")
                 )
         self.retry_button.setVisible(retry_allowed)
-        self.cancel_button.setEnabled(not outcome_unknown)
+        self.cancel_button.setEnabled(not self._request_in_flight)
 
     def show_request_accepted(self) -> None:
         self._request_in_flight = False
@@ -613,8 +614,40 @@ class StartWorkflowDialog(QDialog):
         self._force_close = True
         self.close()
 
+    def reject(self) -> None:
+        if not self._force_close:
+            if self._request_in_flight:
+                return
+            if self._outcome_unknown:
+                if not self._confirm_unknown_outcome_close():
+                    return
+                self._force_close = True
+        super().reject()
+
+    def _confirm_unknown_outcome_close(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            tr("Unresolved workflow request"),
+            tr(
+                "Closing this dialog does not cancel the request sent to the server. "
+                "Any job it started may continue. Check the workflow list before starting "
+                "another run."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self._force_close and (self._request_in_flight or self._outcome_unknown):
+        if self._force_close:
+            super().closeEvent(event)
+            return
+        if self._request_in_flight:
             event.ignore()
             return
+        if self._outcome_unknown:
+            if not self._confirm_unknown_outcome_close():
+                event.ignore()
+                return
+            self._force_close = True
         super().closeEvent(event)

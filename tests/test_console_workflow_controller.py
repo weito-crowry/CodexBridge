@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtWidgets import QApplication, QWidget
+import pytest
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from codex_bridge.console.workflow_controller import WorkflowManagementController
 
@@ -278,4 +279,38 @@ def test_workflow_controller_preserves_unknown_start_across_bridge_transition(
     assert not start_dialog.retry_button.isHidden()
     assert sum(call[0] == "start" for call in client.calls) == 1
     assert client.calls[-1][2] == "token-rotated"
+    controller.shutdown()
+
+
+def test_workflow_controller_can_close_unknown_start_without_posting_again(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _window, client, controller = _controller()
+    client.succeed(client.calls[-1], 200, _list_payload())
+    controller.dialog.start_button.click()
+    start_dialog = controller._active_start_dialog
+    assert start_dialog is not None
+    yaml_file = tmp_path / "workflow.yaml"
+    yaml_file.write_text("name: fixed\n", encoding="utf-8")
+    start_dialog.yaml_path_edit.setText(str(yaml_file))
+    start_dialog.workspace_path_edit.setText(str(tmp_path))
+    start_dialog.submit_button.click()
+    post_call = client.calls[-1]
+    client.fail(post_call, 0, "timeout")
+
+    assert start_dialog.has_unknown_outcome
+    assert start_dialog.cancel_button.isEnabled()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    start_dialog.cancel_button.click()
+
+    assert controller._active_start_dialog is None
+    assert sum(call[0] == "start" for call in client.calls) == 1
+    controller.refresh()
+    assert client.calls[-1][0] == "list"
+    assert sum(call[0] == "start" for call in client.calls) == 1
     controller.shutdown()

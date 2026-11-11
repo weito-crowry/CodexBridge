@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from codex_bridge.console.i18n import initialize_language
 from codex_bridge.console.workflows_dialog import (
@@ -195,9 +195,95 @@ def test_start_workflow_dialog_validates_yaml_and_workspace_and_reuses_request_o
     dialog.show_request_failure("timeout", outcome_unknown=True, retry_allowed=True)
     assert any(text in dialog.error_label.text().lower() for text in ("unknown", "確認できません"))
     assert not dialog.retry_button.isHidden()
+    assert dialog.cancel_button.isEnabled()
     dialog.retry_button.click()
 
     assert sent == [(request_id, payload), (request_id, payload)]
+
+
+@pytest.mark.parametrize("close_via", ["button", "window"])
+@pytest.mark.parametrize(
+    ("answer", "expected_visible"),
+    [
+        (QMessageBox.StandardButton.Yes, False),
+        (QMessageBox.StandardButton.No, True),
+    ],
+)
+@pytest.mark.parametrize(
+    ("language", "expected_title", "expected_notice"),
+    [
+        (
+            "en",
+            "Unresolved workflow request",
+            "Closing this dialog does not cancel the request sent to the server. "
+            "Any job it started may continue. Check the workflow list before starting "
+            "another run.",
+        ),
+        (
+            "ja-JP",
+            "未解決のワークフロー要求",
+            "このダイアログを閉じても、サーバーへ送信済みの要求は取り消されません。"
+            "開始済みのジョブが続行することがあります。新しい実行を始める前に"
+            "ワークフロー一覧を確認してください。",
+        ),
+    ],
+)
+def test_start_workflow_dialog_confirms_close_when_result_is_unknown(
+    close_via: str,
+    answer: QMessageBox.StandardButton,
+    expected_visible: bool,
+    language: str,
+    expected_title: str,
+    expected_notice: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _app()
+    settings = QSettings(str(tmp_path / f"{language}.ini"), QSettings.Format.IniFormat)
+    settings.setValue("language", language)
+    initialize_language(settings)
+    yaml_file = tmp_path / "pending.yaml"
+    yaml_file.write_text("name: pending\n", encoding="utf-8")
+    dialog = StartWorkflowDialog()
+    sent: list[tuple[str, dict[str, object]]] = []
+    dialog.submitted.connect(lambda request_id, payload: sent.append((request_id, payload)))
+    dialog.yaml_path_edit.setText(str(yaml_file))
+    dialog.workspace_path_edit.setText(str(tmp_path))
+    dialog.show()
+    dialog.submit_button.click()
+    request_id, payload = sent[0]
+    dialog.show_request_failure("timeout", outcome_unknown=True, retry_allowed=True)
+
+    assert dialog.cancel_button.isEnabled()
+    assert dialog.yaml_path_edit.text() == str(yaml_file)
+    assert dialog.workspace_path_edit.text() == str(tmp_path)
+    assert dialog._request_id == request_id
+    assert dialog._payload == payload
+
+    questions: list[tuple[object, ...]] = []
+
+    def answer_question(*args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        questions.append(args)
+        return answer
+
+    monkeypatch.setattr(QMessageBox, "question", answer_question)
+    if close_via == "button":
+        dialog.cancel_button.click()
+    else:
+        dialog.close()
+
+    assert len(questions) == 1
+    assert questions[0][1] == expected_title
+    assert questions[0][2] == expected_notice
+    assert questions[0][3] == QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    assert questions[0][4] == QMessageBox.StandardButton.No
+    assert dialog.isVisible() is expected_visible
+    assert len(sent) == 1
+    if expected_visible:
+        assert dialog.yaml_path_edit.text() == str(yaml_file)
+        assert dialog.workspace_path_edit.text() == str(tmp_path)
+        assert dialog._request_id == request_id
+        assert dialog._payload == payload
 
 
 def test_start_workflow_dialog_rejects_oversized_invalid_utf8_and_bad_paths(tmp_path: Path) -> None:

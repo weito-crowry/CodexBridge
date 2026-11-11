@@ -17,6 +17,8 @@ _MAX_WORKFLOW_LIST_RESPONSE_BYTES = 64 * 1024
 _MAX_WORKFLOW_DETAIL_RESPONSE_BYTES = 4 * 1024
 _MAX_WORKFLOW_RESULT_RESPONSE_BYTES = 64 * 1024
 _MAX_WORKFLOW_REQUEST_BYTES = 128 * 1024
+_WORKFLOW_GET_TRANSFER_TIMEOUT_MS = 10_000
+_WORKFLOW_POST_TRANSFER_TIMEOUT_MS = 25_000
 _WORKFLOW_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
 _COMPOSER_VALIDATION_CATEGORIES = frozenset(
@@ -307,7 +309,12 @@ class ApiClient(QObject):
         request_url = self._url("/ui-api/control/workflows")
         request = self._request(request_url)
         try:
-            self._add_workflow_headers(request, token, json_body=True)
+            self._add_workflow_headers(
+                request,
+                token,
+                json_body=True,
+                transfer_timeout_ms=_WORKFLOW_POST_TRANSFER_TIMEOUT_MS,
+            )
             reply = self._manager.post(request, body)
         except (UnicodeEncodeError, TypeError, ValueError):
             self.workflow_failed.emit(key, 0, "invalid_request")
@@ -320,7 +327,13 @@ class ApiClient(QObject):
         )
 
     @staticmethod
-    def _add_workflow_headers(request: QNetworkRequest, token: str, *, json_body: bool) -> None:
+    def _add_workflow_headers(
+        request: QNetworkRequest,
+        token: str,
+        *,
+        json_body: bool,
+        transfer_timeout_ms: int,
+    ) -> None:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("control token is unavailable")
         request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
@@ -328,7 +341,7 @@ class ApiClient(QObject):
             request.setRawHeader(b"Content-Type", b"application/json")
         set_transfer_timeout = getattr(request, "setTransferTimeout", None)
         if callable(set_transfer_timeout):
-            set_transfer_timeout(10_000)
+            set_transfer_timeout(transfer_timeout_ms)
 
     def _start_workflow_request(
         self,
@@ -344,7 +357,12 @@ class ApiClient(QObject):
             return False
         request = self._request(url)
         try:
-            self._add_workflow_headers(request, token, json_body=False)
+            self._add_workflow_headers(
+                request,
+                token,
+                json_body=False,
+                transfer_timeout_ms=_WORKFLOW_GET_TRANSFER_TIMEOUT_MS,
+            )
             reply = (
                 self._manager.get(request) if method == "GET" else self._manager.post(request, b"")
             )

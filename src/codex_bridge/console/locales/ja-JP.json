@@ -743,5 +743,7 @@
   "Workflow file: {p0}\nCodex workspace: {p1}": "ワークフローファイル: {p0}\nCodex作業フォルダー: {p1}",
   "Sending workflow request…": "ワークフロー要求を送信中…",
   "Send result is unknown. Update the list and do not start a new run.": "送信結果を確認できません。一覧を更新し、新しい実行を開始しないでください。",
-  "Send result is unknown. Update the list and do not start a new run. You may retry this same request ID and payload.": "送信結果を確認できません。一覧を更新し、新しい実行を開始しないでください。同じ要求IDと内容で再送できます。"
+  "Send result is unknown. Update the list and do not start a new run. You may retry this same request ID and payload.": "送信結果を確認できません。一覧を更新し、新しい実行を開始しないでください。同じ要求IDと内容で再送できます。",
+  "Unresolved workflow request": "未解決のワークフロー要求",
+  "Closing this dialog does not cancel the request sent to the server. Any job it started may continue. Check the workflow list before starting another run.": "このダイアログを閉じても、サーバーへ送信済みの要求は取り消されません。開始済みのジョブが続行することがあります。新しい実行を始める前にワークフロー一覧を確認してください。"
 }

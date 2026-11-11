@@ -147,6 +147,46 @@ def test_workflow_client_posts_json_once_and_returns_202_payload() -> None:
     assert successes == [("start-1", 202, {"workflow_id": "workflow-1", "status": "queued"})]
 
 
+def test_workflow_client_uses_longer_timeout_for_post_than_get() -> None:
+    _app()
+    manager = FakeManager([FakeReply(), FakeReply()])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    payload = {
+        "client_request_id": "request-1",
+        "workflow_yaml": "name: test\n",
+        "input": {},
+        "workspace_root": "C:/workspace",
+    }
+
+    assert client.post_control_workflow("safe-token", payload, key="start")
+    assert manager.requests[0].transferTimeout() == 25_000
+    assert client.get_control_workflows("safe-token", key="list")
+    assert manager.requests[1].transferTimeout() == 10_000
+
+
+def test_workflow_client_does_not_automatically_retry_timed_out_post() -> None:
+    _app()
+    timeout = FakeReply(error=QNetworkReply.NetworkError.TimeoutError.value)
+    manager = FakeManager([timeout, FakeReply(b'{"workflow_id":"unexpected"}', 202)])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, int, str]] = []
+    client.workflow_failed.connect(lambda *args: failures.append(args))
+    payload = {
+        "client_request_id": "request-1",
+        "workflow_yaml": "name: test\n",
+        "input": {},
+        "workspace_root": "C:/workspace",
+    }
+
+    assert client.post_control_workflow("safe-token", payload, key="start")
+    timeout.finished.emit()
+
+    assert failures == [("start", 200, "timeout")]
+    assert len(manager.requests) == 1
+    assert len(manager.post_bodies) == 1
+    assert json.loads(manager.post_bodies[0]) == payload
+
+
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
