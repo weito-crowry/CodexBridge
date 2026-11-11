@@ -49,12 +49,13 @@ def test_codex_job_fixture_is_schema_valid_and_requires_live_mode() -> None:
         Interpreter(definition, codex_job_live=True).run({})
 
 
-def test_codex_job_rejects_arbitrary_prompt_in_live_mode() -> None:
+def test_codex_job_accepts_arbitrary_literal_prompt_in_live_mode() -> None:
     definition = _definition()
-    definition["do"][0]["calculate"]["with"]["prompt"] = "run arbitrary work"
+    prompt = "  ${ . }\nＡＢＣ 東京ではなく日本の首都を一語で答えて\t "
+    definition["do"][0]["calculate"]["with"]["prompt"] = prompt
 
-    with pytest.raises(OwsError, match="fixed safe prompt"):
-        validate_workflow(definition, codex_job_live=True)
+    validate_workflow(definition, codex_job_live=True)
+    assert compute_codex_job_request(definition["do"][0]["calculate"]) == {"prompt": prompt}
 
 
 def test_codex_job_rejects_extra_with_fields() -> None:
@@ -65,11 +66,33 @@ def test_codex_job_rejects_extra_with_fields() -> None:
         validate_workflow(definition, codex_job_live=True)
 
 
-def test_codex_job_request_is_the_fixed_literal_only() -> None:
+def test_codex_job_request_preserves_fixture_and_arbitrary_literal_prompt() -> None:
     definition = _definition()
     task_spec = definition["do"][0]["calculate"]
 
     assert compute_codex_job_request(task_spec, {"ignored": True}, {}) == {"prompt": SAFE_PROMPT}
+
+    prompt = "\n日本語のliteral prompt\t "
+    task_spec["with"]["prompt"] = prompt
+    assert compute_codex_job_request(task_spec, {"ignored": True}, {}) == {"prompt": prompt}
+
+
+@pytest.mark.parametrize(
+    "prompt", ["", " \n\t", True, 1, [], {}, None, "bad\u0001value", "x" * 16385]
+)
+def test_codex_job_rejects_invalid_prompt_literals_in_live_mode(prompt: object) -> None:
+    definition = _definition()
+    definition["do"][0]["calculate"]["with"]["prompt"] = prompt
+
+    with pytest.raises(OwsError):
+        validate_workflow(definition, codex_job_live=True)
+
+
+def test_codex_job_prompt_validator_preserves_exact_16kib_utf8_literal() -> None:
+    prompt = "あ" * 5461 + "x"
+
+    assert len(prompt.encode("utf-8")) == 16 * 1024
+    assert compute_codex_job_request({"with": {"prompt": prompt}}) == {"prompt": prompt}
 
 
 def test_live_mode_requires_one_codex_job_and_rejects_mock_mixing() -> None:
@@ -418,25 +441,63 @@ def test_codex_job_prepared_crash_can_send_once_after_reopen(tmp_path: Path, fak
     assert fake_bridge.state.post_count == 1
 
 
-def test_codex_adapter_rejects_arbitrary_prompt_before_network_or_job_insert(
+def test_codex_adapter_rejects_invalid_prompt_before_network_or_job_insert(
     tmp_path: Path, fake_bridge
 ) -> None:
     from codex_job_adapter import CodexJobRequestError
 
     adapter = _codex_adapter(tmp_path)
-    with pytest.raises(CodexJobRequestError, match="fixed safe prompt"):
+    prompt = "private-marker\u0001prompt"
+    with pytest.raises(CodexJobRequestError) as error:
         adapter.prepare_job(
             "workflow-12345678",
             "do[0].calculate",
-            "run arbitrary work",
+            prompt,
             tmp_path,
             port=fake_bridge.server_address[1],
         )
+    assert prompt not in str(error.value)
 
     with sqlite3.connect(tmp_path / "codex_jobs.sqlite") as connection:
         job_count = connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     assert job_count == 0
     assert fake_bridge.state.paths == []
+
+
+def test_codex_adapter_prepares_arbitrary_prompt_with_existing_request_shape(
+    tmp_path: Path,
+) -> None:
+    adapter = _codex_adapter(tmp_path)
+    prompt = "\n日本の首都を一語で答えて\t"
+    job = adapter.prepare_job(
+        "workflow-12345678",
+        "do[0].calculate",
+        prompt,
+        tmp_path,
+        port=18001,
+    )
+
+    assert job["request"]["prompt"] == prompt
+    assert job["request"]["sandbox_mode"] == "inherit"
+    assert job["request"]["confirm_full_access"] is False
+
+
+@pytest.mark.parametrize("prompt", ["", " \t", "x" * 16385, "bad\u007ftext"])
+def test_codex_adapter_rejects_invalid_prompt_before_insert(tmp_path: Path, prompt: str) -> None:
+    from codex_job_adapter import CodexJobRequestError
+
+    adapter = _codex_adapter(tmp_path)
+    with pytest.raises(CodexJobRequestError):
+        adapter.prepare_job(
+            "workflow-12345678",
+            "do[0].calculate",
+            prompt,
+            tmp_path,
+            port=18001,
+        )
+
+    with sqlite3.connect(tmp_path / "codex_jobs.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
 
 
 def test_codex_job_maybe_sent_crash_never_posts_again(tmp_path: Path, fake_bridge) -> None:

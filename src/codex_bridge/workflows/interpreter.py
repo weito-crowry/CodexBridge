@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
@@ -18,6 +19,7 @@ SCHEMA_PATH: Traversable = files("codex_bridge.workflows").joinpath("schema", "w
 SUPPORTED_TASKS = frozenset({"do", "set", "switch", "for", "call"})
 SUPPORTED_DIRECTIVES = frozenset({"continue", "exit"})
 _JQ_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Retained as the Phase 5E-0 fixture and historical evidence, not as a live allowlist.
 SAFE_CODEX_JOB_PROMPT = (
     "2+2を計算し、外部ツール・コマンド・ファイル操作・Git操作・ネットワーク操作を行わず、"
     "回答本文に4の1文字だけを返すこと"
@@ -26,6 +28,26 @@ SAFE_CODEX_JOB_PROMPT = (
 
 class OwsError(ValueError):
     """Raised when a workflow is invalid or outside this PoC's subset."""
+
+
+def validate_codex_job_prompt(prompt: object) -> str:
+    """Validate and preserve one literal Codex job prompt."""
+    if not isinstance(prompt, str):
+        raise OwsError("codex-job prompt must be a literal string")
+    if not prompt or prompt.isspace():
+        raise OwsError("codex-job prompt must not be empty or whitespace-only")
+    try:
+        encoded = prompt.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise OwsError("codex-job prompt must be valid UTF-8") from None
+    if len(encoded) > 16 * 1024:
+        raise OwsError("codex-job prompt exceeds the 16 KiB UTF-8 limit")
+    if any(
+        unicodedata.category(character) == "Cc" and character not in "\t\n\r"
+        for character in prompt
+    ):
+        raise OwsError("codex-job prompt contains a disallowed control character")
+    return prompt
 
 
 @dataclass(frozen=True)
@@ -365,8 +387,7 @@ def _validate_action(
                 raise OwsError(f"unsupported codex-job argument '{key}'")
             if set(arguments) != {"prompt"}:
                 raise OwsError("codex-job requires argument 'prompt'")
-            if arguments["prompt"] != SAFE_CODEX_JOB_PROMPT:
-                raise OwsError("codex-job prompt must be the fixed safe prompt")
+            validate_codex_job_prompt(arguments["prompt"])
             return
         if target != "mock-job":
             raise OwsError(f"unsupported call target {target!r}; only 'mock-job' is allowed")
@@ -680,9 +701,7 @@ def compute_codex_job_request(
     del input_data, variables
     arguments = task_spec.get("with")
     prompt = arguments.get("prompt") if isinstance(arguments, Mapping) else None
-    if prompt != SAFE_CODEX_JOB_PROMPT:
-        raise OwsError("codex-job prompt must be the fixed safe prompt")
-    return {"prompt": SAFE_CODEX_JOB_PROMPT}
+    return {"prompt": validate_codex_job_prompt(prompt)}
 
 
 class Interpreter:

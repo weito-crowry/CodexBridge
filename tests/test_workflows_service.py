@@ -85,9 +85,10 @@ async def test_same_request_id_reuses_durable_run_after_service_recreation(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
 ) -> None:
     service, manager, workspace = service_fixture
+    prompt = "日本の首都を一語で答えて"
     arguments = {
         "client_request_id": "phase5c-request-0001",
-        "workflow_yaml": _workflow_yaml(),
+        "workflow_yaml": _workflow_yaml(prompt),
         "input_data": {"answer": 4},
         "workspace_root": str(workspace),
     }
@@ -97,7 +98,7 @@ async def test_same_request_id_reuses_durable_run_after_service_recreation(
     recreated = WorkflowService(recreated_manager, codex_bridge_port=18001)
     replay_arguments = {
         **arguments,
-        "workflow_yaml": "# semantically identical\n" + _workflow_yaml(),
+        "workflow_yaml": "# semantically identical\n" + _workflow_yaml(prompt),
     }
     replayed = await recreated.start_workflow(**replay_arguments)
 
@@ -123,8 +124,8 @@ async def test_request_id_with_different_payload_conflicts_without_second_spawn(
     with pytest.raises(WorkflowRequestConflict):
         await service.start_workflow(
             client_request_id="phase5c-request-0002",
-            workflow_yaml=_workflow_yaml(),
-            input_data={"answer": 5},
+            workflow_yaml=_workflow_yaml("同じrequest IDで別promptへ変更"),
+            input_data={"answer": 4},
             workspace_root=str(workspace),
         )
 
@@ -132,7 +133,7 @@ async def test_request_id_with_different_payload_conflicts_without_second_spawn(
 
 
 @pytest.mark.asyncio
-async def test_non_fixed_codex_prompt_is_rejected_before_creating_run(
+async def test_whitespace_only_codex_prompt_is_rejected_before_creating_run(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
 ) -> None:
     service, manager, workspace = service_fixture
@@ -140,7 +141,7 @@ async def test_non_fixed_codex_prompt_is_rejected_before_creating_run(
     with pytest.raises(WorkflowRequestError):
         await service.start_workflow(
             client_request_id="phase5c-request-0003",
-            workflow_yaml=_workflow_yaml("run an arbitrary command"),
+            workflow_yaml=_workflow_yaml(" \n\t"),
             input_data={},
             workspace_root=str(workspace),
         )
@@ -253,11 +254,13 @@ async def test_confirmed_manager_failure_is_durable_without_retry(
 @pytest.mark.asyncio
 async def test_manifest_matches_existing_live_worker_contract(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    tmp_path: Path,
 ) -> None:
     service, manager, workspace = service_fixture
+    prompt = "東京ではなく日本の首都を一語で答えて"
     accepted = await service.start_workflow(
         client_request_id="phase5c-request-manifest",
-        workflow_yaml=_workflow_yaml(),
+        workflow_yaml=_workflow_yaml(prompt),
         input_data={"value": 4},
         workspace_root=str(workspace),
     )
@@ -279,6 +282,20 @@ async def test_manifest_matches_existing_live_worker_contract(
     assert manifest["control"]["codex_job_poll_interval_seconds"] == 0.2
     assert definition_text.endswith("\n")
     assert input_data == {"value": 4}
+    definition = json.loads(definition_text)
+    assert definition["do"][0]["calculate"]["with"]["prompt"] == prompt
+
+    reference_manager = FakeWorkerManager(tmp_path / "reference-state", workspace)
+    await WorkflowService(reference_manager, codex_bridge_port=18001).start_workflow(
+        client_request_id="phase5c-request-manifest-reference",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"value": 4},
+        workspace_root=str(workspace),
+    )
+    reference_manifest = json.loads(
+        (reference_manager.start_calls[0][0] / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["definition_sha256"] != reference_manifest["definition_sha256"]
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,7 @@ from typing import Any
 
 from ..paths import AllowedPathPolicy, PathPolicyError
 from .http_client import CONTROL_TOKEN_ENV, CodexHTTPClient, CodexHTTPError
-from .interpreter import SAFE_CODEX_JOB_PROMPT
+from .interpreter import OwsError, validate_codex_job_prompt
 
 CODEX_JOB_STATES = frozenset(
     {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
@@ -37,7 +37,7 @@ class CodexJobError(RuntimeError):
 
 
 class CodexJobRequestError(CodexJobError, ValueError):
-    """A request falls outside the fixed Phase 4D fixture contract."""
+    """A request falls outside the supported single-job contract."""
 
 
 class CodexJobConflictError(CodexJobError):
@@ -97,7 +97,7 @@ def _append_event(
 
 
 class CodexJobAdapter:
-    """Write-ahead SQLite ledger for one fixed CodexBridge job per workflow."""
+    """Write-ahead SQLite ledger for one CodexBridge job per workflow."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = Path(database_path)
@@ -177,8 +177,10 @@ class CodexJobAdapter:
         workspace_root: Path | None = None,
         allowed_roots: tuple[str, ...] = (),
     ) -> dict[str, Any]:
-        if prompt != SAFE_CODEX_JOB_PROMPT:
-            raise CodexJobRequestError("codex-job prompt must be the fixed safe prompt")
+        try:
+            prompt = validate_codex_job_prompt(prompt)
+        except OwsError as error:
+            raise CodexJobRequestError(str(error)) from error
         if type(port) is not int or not 1 <= port <= 65535:
             raise CodexJobRequestError("CodexBridge port must be from 1 to 65535")
         request_key = self.make_request_key(workflow_id, task_identity)

@@ -112,7 +112,7 @@ APIは少なくとも次の失敗を区別して返す: 認証失敗、request/s
 - PyInstaller環境の `sys.executable` は通常Python executableではない。Worker用internal modeとEXE梱包は5Bで実装する。
 - Bridge shutdownは現状全active turnにinterruptを送る。workflow turn所有権とshutdown policyは5B/5Cで実装する。
 - 二重投入を防ぐ `MAYBE_SENT` と、結果照合ができるまでの停止状態は維持する。
-- 初期提供範囲は固定single-jobに限定する。任意prompt、複数Codex job、分岐、loop、job cancel、approval拡張は後続設計・実装の対象である。
+- 5E-0時点では固定single-jobだった。5E-1ではsingle-jobの任意literal promptのみを追加し、複数Codex job、分岐、loop、job cancel、approval拡張は引き続き後続設計・実装の対象である。
 - 対象はWindows nativeのみ。WSLとDockerは対象外である。
 - PoCでスキップした障害注入はPhase 5Aの判断を変えない。一方、各Phaseの通常系・negative testは必要であり、製品化の受入に含める。
 - 手動で本番APIへPOSTする検証は行わない。自動テストは自前のloopback fake serverまたはHTTP stubを使用する。
@@ -152,3 +152,27 @@ Console UIと自由prompt・複数job対応はPhase 5D/5Eの範囲である。5C
 状態の扱い: 保存列`workflow_requests.state`は受付時のdurable admission stateとして更新されるが、Worker完了を検知して必ず`succeeded`へ同期する機構ではない。GETのeffective statusはrun-local worker status、DBOS、job ledger、検証済resultをread-onlyで照合した投影である。次回の新規受付では保存stateだけでcapacityを決めず、既存runの実状態を照合する。このため台帳の`running`は、その時点で実ジョブがまだ稼働中である証拠ではない。この仕様を安全性を保って将来材料化する方法は後続フェーズで検討する。
 
 初回pollingが一時的に`unknown`/`needs_reconciliation`で停止した確定原因は、保存証跡だけでは特定できない。今回修正するWorker正常完了途中の状態投影競合と同一原因とは断定しない。追加診断の再起動後thread-status照会は`completed`以外を返したが、具体値は記録していない。thread自体のpersisted turn stateとWorkflow resultは別の状態観測であり、このthread-statusだけではWorkflow resultを確定しない。workflow一覧・詳細・結果、thread IDの永続表示、job/DBOS状態、同ID replayはPASS。Consoleのoffscreen描画は未確認で、関連pytestに分離した。
+
+## 14. Phase 5E-1: single Codex jobのliteral prompt
+
+5E-1は、1 workflow内のCodex jobを従来どおり1件に固定したまま、`with.prompt`に任意のliteral stringを指定できるようにする。例えば次のOWS YAMLは、日本の首都を一語で答えるpromptを1件のCodex jobへ渡す。
+
+```yaml
+document:
+  dsl: "1.0.3"
+  namespace: codexbridge
+  name: literal-prompt-example
+  version: "1.0.0"
+evaluate:
+  language: jq
+  mode: strict
+do:
+  - answer:
+      call: codex-job
+      with:
+        prompt: "日本の首都を一語で答えて"
+```
+
+promptはYAMLでデコードした文字列をそのまま使い、NFKC・trim・jq/OWS式展開は行わない。空・空白のみ、非文字列、禁止制御文字、不正UTF-8は拒否し、UTF-8で16 KiBまでを受け付ける。`with`では`prompt`だけを指定できる。1件制限、mock混在禁止、loop内禁止、state/cwd分離、認証、AllowedPathPolicy、既存の`sandbox_mode="inherit"`と`confirm_full_access=false`、先行台帳保存、`MAYBE_SENT`非再送、request ID冪等性、同時live 1件を維持する。prompt本文が実行可能な操作を要求しても、Codex App Server / Bridgeの既存認証・承認・sandbox設定に従い、権限上昇や自動承認は行わない。
+
+5E-0の実live成功証跡は固定fixture promptに対するものだけである。任意literal promptを使った実live実行は未検証であり、本Phaseのfake/ASGIテスト結果は実Codex成功を示さない。

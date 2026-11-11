@@ -69,7 +69,7 @@ def _settings(tmp_path: Path, *, token: str | None = _TOKEN) -> BridgeConfig:
     )
 
 
-def _workflow_yaml(prompt: str = SAFE_CODEX_JOB_PROMPT) -> str:
+def _workflow_yaml(prompt: Any = SAFE_CODEX_JOB_PROMPT) -> str:
     return "\n".join(
         (
             "document:",
@@ -411,7 +411,7 @@ async def test_workflow_post_rejects_content_type_non_json_and_oversized_body(
         "extra_key",
         "missing_workspace",
         "invalid_request_id",
-        "arbitrary_prompt",
+        "invalid_prompt",
         "outside_root",
         "path_traversal",
         "yaml_too_large",
@@ -429,8 +429,8 @@ async def test_workflow_post_rejects_invalid_shape_and_workspace(
         payload.pop("workspace_root")
     elif mutation == "invalid_request_id":
         payload["client_request_id"] = "short"
-    elif mutation == "arbitrary_prompt":
-        payload["workflow_yaml"] = _workflow_yaml("run an arbitrary command")
+    elif mutation == "invalid_prompt":
+        payload["workflow_yaml"] = _workflow_yaml(" \n\t")
     elif mutation == "outside_root":
         payload["workspace_root"] = str(tmp_path.parent)
     elif mutation == "path_traversal":
@@ -446,6 +446,89 @@ async def test_workflow_post_rejects_invalid_shape_and_workspace(
 
     assert response.status_code == 400
     assert len(manager.start_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_workflow_post_accepts_literal_japanese_prompt_and_replays_once(
+    tmp_path: Path,
+) -> None:
+    app, manager, workspace = _app(tmp_path)
+    prompt = "日本の首都を一語で答えて"
+    payload = _valid_payload(workspace)
+    payload["workflow_yaml"] = _workflow_yaml(prompt)
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        accepted = await client.post(_PATH, headers=headers, json=payload)
+        replayed = await client.post(_PATH, headers=headers, json=payload)
+        changed = {**payload, "workflow_yaml": _workflow_yaml("異なるprompt")}
+        conflict = await client.post(_PATH, headers=headers, json=changed)
+
+    assert accepted.status_code == 202
+    assert replayed.status_code == 202
+    assert replayed.json()["workflow_id"] == accepted.json()["workflow_id"]
+    assert replayed.json()["run_id"] == accepted.json()["run_id"]
+    assert conflict.status_code == 409
+    assert len(manager.start_calls) == 1
+    for response in (accepted, replayed, conflict):
+        assert prompt not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "",
+        " \n\t",
+        True,
+        1,
+        [],
+        {},
+        None,
+        "private-marker\u0001prompt",
+        "private-marker\u007fprompt",
+        "private-marker\u0085prompt",
+        "private-marker\ud800prompt",
+        "x" * (16 * 1024 + 1),
+    ],
+)
+async def test_workflow_post_rejects_invalid_prompt_without_worker_or_prompt_echo(
+    tmp_path: Path,
+    prompt: object,
+) -> None:
+    app, manager, workspace = _app(tmp_path)
+    payload = _valid_payload(workspace)
+    payload["workflow_yaml"] = _workflow_yaml(prompt)
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert len(manager.start_calls) == 0
+    assert "private-marker" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_workflow_post_accepts_prompt_at_exact_utf8_byte_limit(tmp_path: Path) -> None:
+    app, manager, workspace = _app(tmp_path)
+    prompt = "あ" * 5461 + "x"
+    assert len(prompt.encode("utf-8")) == 16 * 1024
+    payload = _valid_payload(workspace)
+    payload["workflow_yaml"] = _workflow_yaml(prompt)
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 202
+    assert len(manager.start_calls) == 1
 
 
 @pytest.mark.asyncio
