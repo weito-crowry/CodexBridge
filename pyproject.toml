@@ -28,6 +28,12 @@ console = [
 package = [
     "pyinstaller>=6.22,<7",
 ]
+workflows = [
+    "dbos==3.4.0",
+    "jq==1.13.0",
+    "jsonschema==4.25.1",
+    "PyYAML==6.0.3",
+]
 
 [project.scripts]
 codex-bridge = "codex_bridge.__main__:main"
@@ -35,7 +41,12 @@ codex-bridge-console = "codex_bridge.console_entry:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_bridge"]
-include = ["src/codex_bridge/assets/*.html", "src/codex_bridge/assets/*.ico", "src/codex_bridge/console/locales/*.json"]
+include = [
+    "src/codex_bridge/assets/*.html",
+    "src/codex_bridge/assets/*.ico",
+    "src/codex_bridge/console/locales/*.json",
+    "src/codex_bridge/workflows/schema/*.yaml",
+]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
@@ -64,3 +75,7 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 strict = true
 files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["jq", "yaml", "jsonschema"]
+ignore_missing_imports = true

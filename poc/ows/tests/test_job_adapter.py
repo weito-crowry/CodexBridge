@@ -60,7 +60,11 @@ def test_start_job_returns_before_service_finishes_and_reuses_the_request_key(tm
                 {"operation": "process", "payload": {"value": 8}, "duration_ms": 1200},
             )
         assert adapter.count_jobs() == 1
-        assert adapter.get_job(first["job_id"])["service_execution_count"] == 0
+        in_progress = adapter.get_job(first["job_id"])
+        assert in_progress["state"] in {"QUEUED", "RUNNING"}
+        assert in_progress["service_execution_count"] == (
+            0 if in_progress["state"] == "QUEUED" else 1
+        )
         assert adapter.get_job(first["job_id"])["dispatch_count"] == 2
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:

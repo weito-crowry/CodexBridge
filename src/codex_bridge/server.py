@@ -41,6 +41,7 @@ from .server_instructions import MCP_SERVER_INSTRUCTIONS
 from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
+from .workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
 
 
 class RuntimeLike(Protocol):
@@ -59,6 +60,7 @@ class BridgeRuntime:
     config: BridgeConfig
     ui_server: LocalUiServer
     external_monitor: ExternalExecutionMonitor | None = None
+    workflow_manager: WorkflowWorkerManager | None = None
 
     async def start(self) -> None:
         await self.app_server.start()
@@ -72,17 +74,53 @@ class BridgeRuntime:
         log_event("bridge.start")
 
     async def shutdown(self) -> None:
-        self.activity_store.close_subscriptions()
+        shutdown_error: BaseException | None = None
+        try:
+            self.activity_store.close_subscriptions()
+        except BaseException as error:
+            shutdown_error = error
         if self.external_monitor is not None:
-            await self.external_monitor.close()
-        await self.bridge.interrupt_active_turns(
-            wait_seconds=min(0.5, self.config.shutdown_grace_seconds)
-        )
+            try:
+                await self.external_monitor.close()
+            except BaseException as error:
+                shutdown_error = shutdown_error or error
+        ownership = WorkflowShutdownReport(frozenset(), True)
+        if self.workflow_manager is not None:
+            try:
+                ownership = await self.workflow_manager.shutdown()
+            except BaseException as error:
+                ownership = WorkflowShutdownReport(
+                    frozenset(), False, ("workflow worker shutdown failed",)
+                )
+                shutdown_error = shutdown_error or error
+            if ownership.ownership_complete:
+                try:
+                    await self.bridge.interrupt_active_turns(
+                        wait_seconds=min(0.5, self.config.shutdown_grace_seconds),
+                        exclude_turns=ownership.owned_turns,
+                    )
+                except BaseException as error:
+                    shutdown_error = shutdown_error or error
+            else:
+                log_event("workflow.shutdown.ownership_unknown")
+        else:
+            try:
+                await self.bridge.interrupt_active_turns(
+                    wait_seconds=min(0.5, self.config.shutdown_grace_seconds)
+                )
+            except BaseException as error:
+                shutdown_error = shutdown_error or error
         try:
             await self.ui_server.shutdown(self.config.shutdown_grace_seconds)
-        finally:
+        except BaseException as error:
+            shutdown_error = shutdown_error or error
+        try:
             await self.app_server.shutdown(self.config.shutdown_grace_seconds)
+        except BaseException as error:
+            shutdown_error = shutdown_error or error
         log_event("bridge.shutdown")
+        if shutdown_error is not None:
+            raise shutdown_error
 
 
 def prepare_config(config: BridgeConfig) -> BridgeConfig:
@@ -145,6 +183,10 @@ def build_runtime(
         config=config,
         ui_server=ui_server,
         external_monitor=bridge.observations.external,
+        workflow_manager=WorkflowWorkerManager(
+            allowed_roots=config.allowed_roots,
+            control_token=config.control_token,
+        ),
     )
 
 

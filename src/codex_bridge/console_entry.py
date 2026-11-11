@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, TextIO, cast
 
 from .console.config import ConsoleConfig, ConsoleConfigurationError
-from .runtime_mode import INTERNAL_RUNTIME_FLAG
+from .runtime_mode import INTERNAL_RUNTIME_FLAG, WORKFLOW_WORKER_FLAG
 
 _MISSING_EXTRA_MESSAGE = (
     "CodexBridge Console requires the 'console' extra.\nInstall with: uv sync --extra console"
@@ -78,6 +78,12 @@ def _run_internal_bridge_runtime() -> int:
     return int(bridge_main([]))
 
 
+def _run_workflow_worker(arguments: list[str]) -> int:
+    from .workflows.worker_entry import main as worker_main
+
+    return int(worker_main(arguments))
+
+
 def _load_gui() -> tuple[type[Any], type[Any]]:
     try:
         from PySide6.QtWidgets import QApplication
@@ -121,6 +127,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == WORKFLOW_WORKER_FLAG:
+        return _run_workflow_worker(arguments[1:])
     if arguments == [INTERNAL_RUNTIME_FLAG]:
         _prepare_internal_runtime_stdio()
         return _run_internal_bridge_runtime()

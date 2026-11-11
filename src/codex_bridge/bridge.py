@@ -820,8 +820,18 @@ class Bridge:
         log_event("turn.interrupt", thread_id=thread_id, turn_id=turn_id)
         return self._public_snapshot(thread_id, turn_id)
 
-    async def interrupt_active_turns(self, wait_seconds: float = 0.5) -> None:
-        active = self._state.active_turns()
+    async def interrupt_active_turns(
+        self,
+        wait_seconds: float = 0.5,
+        *,
+        exclude_turns: frozenset[tuple[str, str]] | set[tuple[str, str]] | None = None,
+    ) -> None:
+        excluded = exclude_turns or frozenset()
+
+        def interruptible_turns() -> tuple[tuple[str, str], ...]:
+            return tuple(turn for turn in self._state.active_turns() if turn not in excluded)
+
+        active = interruptible_turns()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         remaining = deadline - time.monotonic()
         if remaining > 0 and active:
@@ -847,7 +857,7 @@ class Bridge:
             )
             if not any(changes):
                 return
-            active = self._state.active_turns()
+            active = interruptible_turns()
 
     def handle_app_server_failure(self, error: str) -> None:
         lines = error.splitlines()

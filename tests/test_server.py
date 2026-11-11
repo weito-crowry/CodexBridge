@@ -24,6 +24,7 @@ from codex_bridge.config import (
 )
 from codex_bridge.paths import PathPolicyError
 from codex_bridge.server import build_runtime, create_app, prepare_config
+from codex_bridge.workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
 
 
 @dataclass
@@ -1336,3 +1337,152 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     build_runtime(config(tmp_path), shutdown_callback=callback)
 
     assert captured == [callback]
+
+
+def test_build_runtime_attaches_inert_workflow_manager(tmp_path) -> None:
+    runtime = build_runtime(config(tmp_path))
+
+    assert isinstance(runtime.workflow_manager, WorkflowWorkerManager)
+    assert runtime.workflow_manager.get_status("run-0123456789abcdef0123456789abcdef") is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_stops_worker_before_interrupting_other_turns(tmp_path) -> None:
+    import codex_bridge.server as server_module
+
+    calls: list[object] = []
+
+    class StubBridge:
+        async def interrupt_active_turns(self, *, wait_seconds: float, exclude_turns) -> None:
+            calls.append(("interrupt", wait_seconds, exclude_turns))
+
+    class StubResource:
+        async def start(self) -> None:
+            calls.append("start")
+
+        async def shutdown(self, *_args) -> None:
+            calls.append("shutdown")
+
+    class StubActivityStore:
+        def close_subscriptions(self) -> None:
+            calls.append("close_subscriptions")
+
+    class StubWorkflowManager:
+        async def shutdown(self):
+            calls.append("worker_shutdown")
+            return WorkflowShutdownReport(frozenset({("workflow-thread", "workflow-turn")}), True)
+
+    runtime = server_module.BridgeRuntime(
+        bridge=StubBridge(),
+        app_server=StubResource(),
+        activity_store=StubActivityStore(),
+        config=config(tmp_path),
+        ui_server=StubResource(),
+        workflow_manager=StubWorkflowManager(),
+    )
+
+    await runtime.start()
+    assert "worker_shutdown" not in calls
+    await runtime.shutdown()
+
+    assert calls.index("worker_shutdown") < next(
+        index
+        for index, value in enumerate(calls)
+        if isinstance(value, tuple) and value[0] == "interrupt"
+    )
+    interrupt = next(
+        value for value in calls if isinstance(value, tuple) and value[0] == "interrupt"
+    )
+    assert interrupt[2] == frozenset({("workflow-thread", "workflow-turn")})
+    assert calls[-2:] == ["shutdown", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_skips_interrupts_when_workflow_turn_ownership_is_unknown(
+    tmp_path,
+) -> None:
+    import codex_bridge.server as server_module
+
+    calls: list[object] = []
+
+    class StubBridge:
+        async def interrupt_active_turns(self, **_kwargs) -> None:
+            calls.append("interrupt")
+
+    class StubResource:
+        async def shutdown(self, *_args) -> None:
+            calls.append("shutdown")
+
+    class StubActivityStore:
+        def close_subscriptions(self) -> None:
+            pass
+
+    class StubWorkflowManager:
+        async def shutdown(self):
+            return WorkflowShutdownReport(frozenset(), False, ("ownership unknown",))
+
+    runtime = server_module.BridgeRuntime(
+        bridge=StubBridge(),
+        app_server=StubResource(),
+        activity_store=StubActivityStore(),
+        config=config(tmp_path),
+        ui_server=StubResource(),
+        workflow_manager=StubWorkflowManager(),
+    )
+
+    await runtime.shutdown()
+
+    assert "interrupt" not in calls
+    assert calls == ["shutdown", "shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_cleans_worker_and_servers_when_monitor_close_fails(
+    tmp_path,
+) -> None:
+    import codex_bridge.server as server_module
+
+    calls: list[str] = []
+
+    class StubBridge:
+        async def interrupt_active_turns(self, **_kwargs) -> None:
+            calls.append("interrupt")
+
+    class StubResource:
+        async def shutdown(self, *_args) -> None:
+            calls.append("server_shutdown")
+
+    class StubActivityStore:
+        def close_subscriptions(self) -> None:
+            calls.append("close_subscriptions")
+
+    class StubMonitor:
+        async def close(self) -> None:
+            calls.append("monitor_close")
+            raise RuntimeError("monitor close failed")
+
+    class StubWorkflowManager:
+        async def shutdown(self):
+            calls.append("worker_shutdown")
+            return WorkflowShutdownReport(frozenset(), False, ("ownership unknown",))
+
+    runtime = server_module.BridgeRuntime(
+        bridge=StubBridge(),
+        app_server=StubResource(),
+        activity_store=StubActivityStore(),
+        config=config(tmp_path),
+        ui_server=StubResource(),
+        external_monitor=StubMonitor(),
+        workflow_manager=StubWorkflowManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="monitor close failed"):
+        await runtime.shutdown()
+
+    assert calls == [
+        "close_subscriptions",
+        "monitor_close",
+        "worker_shutdown",
+        "server_shutdown",
+        "server_shutdown",
+    ]

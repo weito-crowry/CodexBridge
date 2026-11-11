@@ -8,11 +8,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from codex_job_adapter import CodexJobAdapter
-from interpreter import OwsError, parse_workflow_text, validate_workflow
-from job_adapter import DurableJobAdapter
-from job_service import start_mock_job_service
-from worker import (
+from _product_imports import prepare_product_import
+
+prepare_product_import()
+
+from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter  # noqa: E402
+from codex_bridge.workflows.interpreter import (  # noqa: E402
+    OwsError,
+    parse_workflow_text,
+    validate_workflow,
+)
+from codex_bridge.workflows.job_adapter import DurableJobAdapter  # noqa: E402
+from codex_bridge.workflows.job_service import start_mock_job_service  # noqa: E402
+from codex_bridge.workflows.worker import (  # noqa: E402
     _read_workflow_status,
     _write_json,
     canonical_json,

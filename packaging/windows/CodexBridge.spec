@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from PySide6.QtCore import QLibraryInfo
+from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parents[1]
 SOURCE = ROOT / "src"
@@ -8,20 +9,26 @@ ENTRY = ROOT / "packaging" / "windows" / "codexbridge_entry.py"
 ICON = SOURCE / "codex_bridge" / "assets" / "codexbridge_icon_256.ico"
 LOCALES = SOURCE / "codex_bridge" / "console" / "locales"
 SETUP_APP = SOURCE / "codex_bridge" / "assets" / "codexbridge_setup_app.html"
+WORKFLOW_SCHEMA = SOURCE / "codex_bridge" / "workflows" / "schema" / "workflow.yaml"
 
 QT_BASE_JA = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)) / "qtbase_ja.qm"
+
+workflow_datas = [(str(WORKFLOW_SCHEMA), "codex_bridge/workflows/schema")]
+workflow_binaries = []
+workflow_hiddenimports = collect_submodules("dbos")
 
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(SOURCE)],
-    binaries=[],
+    binaries=workflow_binaries,
     datas=[
         (str(ICON), "codex_bridge/assets"),
         (str(SETUP_APP), "codex_bridge/assets"),
         (str(LOCALES), "codex_bridge/console/locales"),
         (str(QT_BASE_JA), "PySide6/translations"),
+        *workflow_datas,
     ],
-    hiddenimports=[],
+    hiddenimports=workflow_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
