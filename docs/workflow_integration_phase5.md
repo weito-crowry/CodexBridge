@@ -182,3 +182,9 @@ promptはYAMLでデコードした文字列をそのまま使い、NFKC・trim�
 5E-2AではCodex job ledgerをV2 schemaへ更新し、同一workflow内の複数行を保存できる複合一意制約とworkflow検索indexを用意する。V1 ledgerは空または全jobが終端状態の場合だけtransactional migrationし、PREPARED/MAYBE_SENT/ACCEPTED/RUNNINGを含むledgerはV1のまま保持する。Adapterの同一workflow一件ガードと既存single-jobの状態遷移・非再POST契約は維持する。限定件数のread-only workflow job一覧をAdapterに追加するが、Service/API/Consoleには公開しない。
 
 未実装の5E-2Bは2件の固定順序実行と結果受け渡し、5E-2CはAPI/Console状態投影と隔離E2Eを扱う。OWSのone-job制約、Worker呼出し、結果prompt組み立ては5E-2Aの範囲外とする。
+
+## 16. Phase 5E-2B: 内部Workerの逐次2-job
+
+5E-2Bでは内部Worker manifest controlの`max_live_codex_jobs=2`を明示した場合だけ、固定subsetの2 taskを順番に実行する。既定は1件で、公開Managerはこのcontrol keyを受け付けず、Service/APIの受付と生成manifestは従来の1件制限を維持する。2件目の`prompt_from`は1件目のSUCCEEDED receiptから評価し、literal prefixへそのまま連結する。失敗・照合要・空値・型不正では2件目を開始しない。V2 ledger、既存のrequest digest、DBOS taskごとのstart/status checkpointを使い、同一taskの再開POSTを抑止する。
+
+Windows nativeのtmp_pathとfake DBOS step / fake CodexHTTPClientで、first SUCCEEDEDからsecond SUCCEEDEDまでの順序、result受け渡し、失敗停止、再実行時のPOST抑止を確認する。これは仮想fixtureによる検証であり、実Codex job、Bridgeへのlive POST、本番影響を示さない。5E-2CのService/API/Console複数job状態投影と隔離E2Eは未実装・未検証である。

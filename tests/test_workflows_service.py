@@ -274,6 +274,12 @@ async def test_manifest_matches_existing_live_worker_contract(
     assert manifest["workflow_id"] == accepted.workflow_id
     assert manifest["mode"] == "codex-job-live"
     assert manifest["control"]["codex_job_live"] is True
+    assert set(manifest["control"]) == {
+        "codex_job_live",
+        "codex_bridge_port",
+        "codex_job_max_polls",
+        "codex_job_poll_interval_seconds",
+    }
     assert manifest["control"]["codex_bridge_port"] == 18001
     assert manifest["definition_sha256"]
     assert manifest["input_sha256"]

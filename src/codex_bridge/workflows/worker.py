@@ -368,6 +368,7 @@ def _durable_codex_job_start_step(
     checkpoint_metadata: dict[str, Any],
     workspace_root: str | None = None,
     allowed_roots: tuple[str, ...] = (),
+    max_jobs_per_workflow: int = 1,
 ) -> dict[str, Any]:
     adapter = CodexJobAdapter(Path(run_dir) / "codex_jobs.sqlite")
     started = adapter.start_job(
@@ -378,6 +379,7 @@ def _durable_codex_job_start_step(
         CodexHTTPClient(port=port),
         workspace_root=None if workspace_root is None else Path(workspace_root),
         allowed_roots=allowed_roots,
+        max_jobs_per_workflow=max_jobs_per_workflow,
     )
     result = {
         key: started[key]
@@ -447,6 +449,9 @@ def _run_durable_codex_job(
     workflow_id = DBOS.workflow_id
     if not isinstance(workflow_id, str) or not workflow_id:
         raise OwsError("codex-job adapter requires an active DBOS workflow")
+    max_live_codex_jobs = control.get("max_live_codex_jobs", 1)
+    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
+        raise OwsError("max_live_codex_jobs must be the integer 1 or 2")
     port = control.get("codex_bridge_port")
     if type(port) is not int or not 1 <= port <= 65535:
         raise OwsError("codex_bridge_port must be an integer from 1 to 65535")
@@ -483,13 +488,24 @@ def _run_durable_codex_job(
     start_step = _durable_codex_job_step(identity, "start")
     start_arguments = (str(run_dir), workflow_id, identity, request, port, metadata)
     if workspace_root is None and not raw_allowed_roots:
-        start_checkpoint = start_step(*start_arguments)
+        if max_live_codex_jobs == 1:
+            start_checkpoint = start_step(*start_arguments)
+        else:
+            start_checkpoint = start_step(*start_arguments, None, (), max_live_codex_jobs)
     else:
-        start_checkpoint = start_step(
-            *start_arguments,
-            workspace_root,
-            tuple(raw_allowed_roots),
-        )
+        if max_live_codex_jobs == 1:
+            start_checkpoint = start_step(
+                *start_arguments,
+                workspace_root,
+                tuple(raw_allowed_roots),
+            )
+        else:
+            start_checkpoint = start_step(
+                *start_arguments,
+                workspace_root,
+                tuple(raw_allowed_roots),
+                max_live_codex_jobs,
+            )
     start_checkpoint = _validate_task_checkpoint(
         start_checkpoint,
         identity=identity,
@@ -766,12 +782,19 @@ def execute_ows_workflow(
     codex_job_live = control.get("codex_job_live", False)
     if not isinstance(codex_job_live, bool):
         raise OwsError("codex_job_live must be a boolean")
+    max_live_codex_jobs = control.get("max_live_codex_jobs", 1)
+    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
+        raise OwsError("max_live_codex_jobs must be the integer 1 or 2")
     durable_wait = control.get("mock_job_durable_wait", False)
     if not isinstance(durable_wait, bool):
         raise OwsError("mock_job_durable_wait must be a boolean")
     if codex_job_live and durable_wait:
         raise OwsError("codex-job live mode cannot be mixed with mock-job durable-wait mode")
-    validate_workflow(definition, codex_job_live=codex_job_live)
+    validate_workflow(
+        definition,
+        codex_job_live=codex_job_live,
+        max_live_codex_jobs=max_live_codex_jobs,
+    )
 
     def run_named_step(
         identity: str,
@@ -782,7 +805,12 @@ def execute_ows_workflow(
         variables: dict[str, Any],
     ) -> Any:
         if codex_job_live and operation == "call":
-            request = compute_codex_job_request(task_spec, task_input, variables)
+            request = compute_codex_job_request(
+                task_spec,
+                task_input,
+                variables,
+                max_live_codex_jobs=max_live_codex_jobs,
+            )
             return _run_durable_codex_job(
                 identity=identity,
                 task_name=task_name,
@@ -835,6 +863,7 @@ def execute_ows_workflow(
         max_tasks=max_tasks,
         step_runner=run_named_step,
         codex_job_live=codex_job_live,
+        max_live_codex_jobs=max_live_codex_jobs,
     )
     return interpreter.run(input_data)
 

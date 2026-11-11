@@ -90,6 +90,32 @@ def _workflow_yaml(prompt: Any = SAFE_CODEX_JOB_PROMPT) -> str:
     )
 
 
+def _two_job_workflow_yaml() -> str:
+    return "\n".join(
+        (
+            "document:",
+            '  dsl: "1.0.3"',
+            "  namespace: codexbridge",
+            "  name: two-sequential-jobs",
+            '  version: "1.0.0"',
+            "evaluate:",
+            "  language: jq",
+            "  mode: strict",
+            "do:",
+            "  - first:",
+            "      call: codex-job",
+            "      with:",
+            '        prompt: "first prompt"',
+            "  - second:",
+            "      call: codex-job",
+            "      with:",
+            '        prompt: "translate: "',
+            "        prompt_from: '${ .result.final_text }'",
+            "",
+        )
+    )
+
+
 def _app(
     tmp_path: Path,
     *,
@@ -409,6 +435,8 @@ async def test_workflow_post_rejects_content_type_non_json_and_oversized_body(
     "mutation",
     [
         "extra_key",
+        "max_live_codex_jobs",
+        "codex_job_max_jobs",
         "missing_workspace",
         "invalid_request_id",
         "invalid_prompt",
@@ -425,6 +453,10 @@ async def test_workflow_post_rejects_invalid_shape_and_workspace(
     payload = _valid_payload(workspace)
     if mutation == "extra_key":
         payload["unexpected"] = True
+    elif mutation == "max_live_codex_jobs":
+        payload["max_live_codex_jobs"] = 2
+    elif mutation == "codex_job_max_jobs":
+        payload["codex_job_max_jobs"] = 2
     elif mutation == "missing_workspace":
         payload.pop("workspace_root")
     elif mutation == "invalid_request_id":
@@ -446,6 +478,24 @@ async def test_workflow_post_rejects_invalid_shape_and_workspace(
 
     assert response.status_code == 400
     assert len(manager.start_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_public_api_keeps_two_job_workflow_rejected(tmp_path: Path) -> None:
+    app, manager, workspace = _app(tmp_path)
+    payload = _valid_payload(workspace)
+    payload["workflow_yaml"] = _two_job_workflow_yaml()
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_workflow_request"}
+    assert manager.start_calls == []
 
 
 @pytest.mark.asyncio

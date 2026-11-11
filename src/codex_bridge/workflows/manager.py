@@ -536,6 +536,8 @@ def _codex_job_live(manifest: Mapping[str, object]) -> bool:
     control = manifest.get("control", {})
     if not isinstance(control, dict):
         raise WorkflowManagerError("workflow manifest control must be an object")
+    if "max_live_codex_jobs" in control:
+        raise WorkflowManagerError("max_live_codex_jobs is reserved for internal worker execution")
     live = control.get("codex_job_live", False)
     if not isinstance(live, bool):
         raise WorkflowManagerError("workflow manifest codex_job_live must be a boolean")

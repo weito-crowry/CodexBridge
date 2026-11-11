@@ -20,6 +20,13 @@ class WorkflowWorkerEntryError(ValueError):
     """A worker invocation or its non-secret run configuration is invalid."""
 
 
+def _max_live_codex_jobs(control: dict[str, object]) -> int:
+    value = control.get("max_live_codex_jobs", 1)
+    if type(value) is not int or value not in {1, 2}:
+        raise WorkflowWorkerEntryError("manifest max_live_codex_jobs must be the integer 1 or 2")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codexbridge-workflow-worker")
     parser.add_argument("--mode", choices=("start", "recover"), required=True)
@@ -40,6 +47,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         live = control.get("codex_job_live", False)
         if not isinstance(live, bool):
             raise WorkflowWorkerEntryError("workflow manifest codex_job_live must be a boolean")
+        max_live_codex_jobs = _max_live_codex_jobs(control)
+        if max_live_codex_jobs == 2 and not live:
+            raise WorkflowWorkerEntryError("manifest max_live_codex_jobs=2 requires codex_job_live")
         worker_args = _validate_worker_configuration(run_dir, args.mode, config, live)
     except WorkflowWorkerEntryError as error:
         _write_status(args.run_dir, state="failed", exit_code=2, error_code="invalid_config")

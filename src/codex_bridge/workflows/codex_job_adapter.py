@@ -600,7 +600,10 @@ class CodexJobAdapter:
         port: int,
         workspace_root: Path | None = None,
         allowed_roots: tuple[str, ...] = (),
+        max_jobs_per_workflow: int = 1,
     ) -> dict[str, Any]:
+        if type(max_jobs_per_workflow) is not int or max_jobs_per_workflow not in {1, 2}:
+            raise CodexJobRequestError("max_jobs_per_workflow must be the integer 1 or 2")
         try:
             prompt = validate_codex_job_prompt(prompt)
         except OwsError as error:
@@ -657,12 +660,26 @@ class CodexJobAdapter:
                 connection.execute("COMMIT")
                 return job
 
-            other = connection.execute(
-                "SELECT request_key FROM jobs WHERE workflow_id = ?", (workflow_id,)
-            ).fetchone()
-            if other is not None:
+            if max_jobs_per_workflow == 2 and self._detect_schema_version(connection) != 2:
+                raise CodexJobConflictError("max_jobs_per_workflow=2 requires a V2 job ledger")
+
+            existing_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE workflow_id = ?", (workflow_id,)
+                ).fetchone()[0]
+            )
+            if existing_count >= max_jobs_per_workflow:
+                if max_jobs_per_workflow == 1:
+                    other = connection.execute(
+                        "SELECT request_key FROM jobs WHERE workflow_id = ? LIMIT 1",
+                        (workflow_id,),
+                    ).fetchone()
+                    existing_key = "unknown" if other is None else str(other["request_key"])
+                    raise CodexJobConflictError(
+                        f"one live job is allowed per workflow; existing key {existing_key}"
+                    )
                 raise CodexJobConflictError(
-                    f"one live job is allowed per workflow; existing key {other['request_key']}"
+                    f"workflow job limit ({max_jobs_per_workflow}) was reached"
                 )
 
             job_id = str(uuid.uuid4())
@@ -783,6 +800,7 @@ class CodexJobAdapter:
         *,
         workspace_root: Path | None = None,
         allowed_roots: tuple[str, ...] = (),
+        max_jobs_per_workflow: int = 1,
     ) -> dict[str, Any]:
         job = self.prepare_job(
             workflow_id,
@@ -792,6 +810,7 @@ class CodexJobAdapter:
             port=client.port,
             workspace_root=workspace_root,
             allowed_roots=allowed_roots,
+            max_jobs_per_workflow=max_jobs_per_workflow,
         )
         if job["state"] == "MAYBE_SENT":
             self.mark_reconciliation(

@@ -115,8 +115,13 @@ def validate_workflow(
     schema_path: Path | Traversable | None = None,
     *,
     codex_job_live: bool = False,
+    max_live_codex_jobs: int = 1,
 ) -> None:
-    _validate_subset(definition, codex_job_live=codex_job_live)
+    _validate_subset(
+        definition,
+        codex_job_live=codex_job_live,
+        max_live_codex_jobs=max_live_codex_jobs,
+    )
     validate_official_schema(definition, schema_path=schema_path)
 
 
@@ -145,7 +150,48 @@ def _validate_dataflow_config(
     _compile_required_expression(expression, f"{path}.{expression_key}", jq_variables)
 
 
-def _validate_subset(definition: Any, *, codex_job_live: bool = False) -> None:
+def _validate_max_live_codex_jobs(value: object) -> int:
+    if type(value) is not int or value not in {1, 2}:
+        raise OwsError("max_live_codex_jobs must be the integer 1 or 2")
+    return value
+
+
+def _validate_two_live_codex_job_shape(definition: dict[str, Any], tasks: list[Any]) -> None:
+    if "input" in definition or "output" in definition:
+        raise OwsError("two-job live mode does not support top-level input or output")
+    if len(tasks) != 2:
+        raise OwsError("two-job live mode requires exactly two top-level codex-job calls")
+    task_names: set[str] = set()
+    for index, item in enumerate(tasks):
+        expected_arguments = {"prompt"} if index == 0 else {"prompt", "prompt_from"}
+        if not isinstance(item, dict) or len(item) != 1:
+            raise OwsError("two-job live mode requires two named top-level codex-job calls")
+        task_name, task_spec = next(iter(item.items()))
+        if not isinstance(task_name, str) or not task_name or task_name in task_names:
+            raise OwsError("two-job live mode requires distinct non-empty task names")
+        task_names.add(task_name)
+        if not isinstance(task_spec, dict) or set(task_spec) != {"call", "with"}:
+            raise OwsError("two-job live tasks may contain only call and with")
+        if task_spec.get("call") != "codex-job":
+            raise OwsError("two-job live mode permits only codex-job calls")
+        arguments = task_spec.get("with")
+        if not isinstance(arguments, dict) or set(arguments) != expected_arguments:
+            raise OwsError("two-job live mode has an invalid codex-job argument shape")
+        if index == 0:
+            validate_codex_job_prompt(arguments["prompt"])
+        elif not isinstance(arguments["prompt"], str):
+            raise OwsError("second codex-job prompt must be a literal string prefix")
+
+
+def _validate_subset(
+    definition: Any,
+    *,
+    codex_job_live: bool = False,
+    max_live_codex_jobs: int = 1,
+) -> None:
+    max_live_codex_jobs = _validate_max_live_codex_jobs(max_live_codex_jobs)
+    if max_live_codex_jobs == 2 and not codex_job_live:
+        raise OwsError("max_live_codex_jobs=2 requires codex-job live mode")
     if not isinstance(definition, dict):
         raise OwsError("workflow definition must be an object")
 
@@ -189,13 +235,23 @@ def _validate_subset(definition: Any, *, codex_job_live: bool = False) -> None:
     if codex_calls and not codex_job_live:
         raise OwsError("codex-job requires --codex-job-live")
     if codex_job_live:
-        if len(codex_calls) != 1:
+        if max_live_codex_jobs == 1 and len(codex_calls) != 1:
             raise OwsError("codex-job live mode requires exactly one codex-job call")
+        if max_live_codex_jobs == 2:
+            _validate_two_live_codex_job_shape(definition, tasks)
+            if len(codex_calls) != 2:
+                raise OwsError("two-job live mode requires exactly two codex-job calls")
         if mock_calls:
             raise OwsError("codex-job live mode cannot be mixed with mock-job")
         if looped_codex_calls:
             raise OwsError("codex-job may not be nested under for")
-    _validate_task_list(tasks, "do", frozenset(), codex_job_live=codex_job_live)
+    _validate_task_list(
+        tasks,
+        "do",
+        frozenset(),
+        codex_job_live=codex_job_live,
+        max_live_codex_jobs=max_live_codex_jobs,
+    )
 
 
 def _find_job_calls(tasks: list[dict[str, Any]]) -> tuple[list[str], int, bool]:
@@ -230,6 +286,7 @@ def _validate_task_list(
     jq_variables: frozenset[str],
     *,
     codex_job_live: bool = False,
+    max_live_codex_jobs: int = 1,
 ) -> None:
     if not isinstance(tasks, list) or not tasks:
         raise OwsError(f"{scope_path} must be a non-empty task list")
@@ -311,6 +368,7 @@ def _validate_task_list(
             task_path,
             jq_variables,
             codex_job_live=codex_job_live,
+            max_live_codex_jobs=max_live_codex_jobs,
         )
         directive = task_spec.get("then")
         if directive is not None:
@@ -372,6 +430,7 @@ def _validate_action(
     jq_variables: frozenset[str],
     *,
     codex_job_live: bool = False,
+    max_live_codex_jobs: int = 1,
 ) -> None:
     if operation == "call":
         target = action["call"]
@@ -381,13 +440,27 @@ def _validate_action(
             arguments = action.get("with")
             if not isinstance(arguments, dict):
                 raise OwsError("codex-job with must be an argument map")
-            unsupported = set(arguments) - {"prompt"}
+            allowed_arguments = {"prompt"}
+            if max_live_codex_jobs == 2:
+                allowed_arguments.add("prompt_from")
+            unsupported = set(arguments) - allowed_arguments
             if unsupported:
                 key = sorted(unsupported)[0]
                 raise OwsError(f"unsupported codex-job argument '{key}'")
-            if set(arguments) != {"prompt"}:
+            if set(arguments) not in ({"prompt"}, {"prompt", "prompt_from"}):
                 raise OwsError("codex-job requires argument 'prompt'")
-            validate_codex_job_prompt(arguments["prompt"])
+            if "prompt_from" not in arguments:
+                validate_codex_job_prompt(arguments["prompt"])
+            else:
+                if max_live_codex_jobs != 2:
+                    raise OwsError("codex-job prompt_from requires max_live_codex_jobs=2")
+                if not isinstance(arguments["prompt"], str):
+                    raise OwsError("second codex-job prompt must be a literal string prefix")
+                _compile_required_expression(
+                    arguments["prompt_from"],
+                    f"{task_path}.with.prompt_from",
+                    jq_variables,
+                )
             return
         if target != "mock-job":
             raise OwsError(f"unsupported call target {target!r}; only 'mock-job' is allowed")
@@ -697,11 +770,27 @@ def compute_codex_job_request(
     task_spec: Mapping[str, Any],
     input_data: Any = None,
     variables: Mapping[str, Any] | None = None,
+    *,
+    max_live_codex_jobs: int = 1,
 ) -> dict[str, str]:
-    del input_data, variables
+    max_live_codex_jobs = _validate_max_live_codex_jobs(max_live_codex_jobs)
     arguments = task_spec.get("with")
-    prompt = arguments.get("prompt") if isinstance(arguments, Mapping) else None
-    return {"prompt": validate_codex_job_prompt(prompt)}
+    if not isinstance(arguments, Mapping):
+        raise OwsError("codex-job with must be an argument map")
+    if set(arguments) == {"prompt"}:
+        return {"prompt": validate_codex_job_prompt(arguments["prompt"])}
+    if max_live_codex_jobs != 2 or set(arguments) != {"prompt", "prompt_from"}:
+        raise OwsError("codex-job prompt_from requires the two-job live subset")
+    prefix = arguments["prompt"]
+    if not isinstance(prefix, str):
+        raise OwsError("second codex-job prompt must be a literal string prefix")
+    try:
+        evaluated = evaluate_jq(arguments["prompt_from"], input_data, variables)
+    except Exception:
+        raise OwsError("codex-job prompt_from evaluation failed") from None
+    if not isinstance(evaluated, str) or not evaluated:
+        raise OwsError("codex-job prompt_from must produce a non-empty string")
+    return {"prompt": validate_codex_job_prompt(prefix + evaluated)}
 
 
 class Interpreter:
@@ -712,13 +801,19 @@ class Interpreter:
         max_tasks: int = 10_000,
         step_runner: StepRunner | None = None,
         codex_job_live: bool = False,
+        max_live_codex_jobs: int = 1,
     ) -> None:
-        validate_workflow(definition, codex_job_live=codex_job_live)
+        validate_workflow(
+            definition,
+            codex_job_live=codex_job_live,
+            max_live_codex_jobs=max_live_codex_jobs,
+        )
         if max_tasks < 1:
             raise ValueError("max_tasks must be positive")
         self.definition = definition
         self.max_tasks = max_tasks
         self.step_runner = step_runner
+        self.max_live_codex_jobs = max_live_codex_jobs
         self._task_count = 0
 
     def run(self, input_data: Any) -> Any:
