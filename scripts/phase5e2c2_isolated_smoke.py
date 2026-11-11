@@ -78,6 +78,11 @@ MAX_DIAGNOSTIC_EVIDENCE_BYTES = 8 * 1024
 STDERR_READ_CHUNK_BYTES = 1024
 MAX_STDERR_DIAGNOSTIC_LINE_BYTES = 512
 MAX_STDERR_DIAGNOSTIC_EVENTS = 8
+STDERR_RELAY_START_TIMEOUT_SECONDS = 10.0
+STDERR_RELAY_EOF_TIMEOUT_SECONDS = 5.0
+STDERR_RELAY_READY_LINE = "workflow.stderr_relay.ready"
+STDERR_RELAY_EVENTS_TRUNCATED_LINE = "workflow.stderr_relay.events_truncated"
+STDERR_RELAY_LONG_LINE_DISCARDED_LINE = "workflow.stderr_relay.long_line_discarded"
 PREVIOUS_EVIDENCE_REASON = "runner_definition_hash_verifier_added_a_second_newline"
 RETEST_REASON = "previous_runner_hash_validation_false_positive"
 DIAGNOSTIC_RETEST_REASON = "capture_workflow_startup_diagnostic_after_reconciliation"
@@ -743,6 +748,7 @@ _STDERR_DIAGNOSTIC_EVENT = re.compile(
     r"persistence_exception=(?P<persistence>[A-Za-z_][A-Za-z0-9_]{0,63})\Z",
     re.ASCII,
 )
+_STDERR_RELAY_SCRIPT_PATH = Path(__file__).with_name("phase5e2c2_stderr_relay.py")
 
 
 class _StderrDiagnosticCollector:
@@ -757,14 +763,15 @@ class _StderrDiagnosticCollector:
         self._events: list[dict[str, str]] = []
         self._events_truncated = False
         self._long_line_discarded = False
+        self._relay_ready = threading.Event()
 
     def start_reader(self) -> None:
         with self._lock:
             self._read_status = "STARTING"
         reader = threading.Thread(
-            target=_drain_bridge_stderr,
+            target=_drain_relay_output,
             args=(self._source, self),
-            name="codexbridge-isolated-stderr-reader",
+            name="codexbridge-stderr-relay-output-reader",
             daemon=True,
         )
         reader.start()
@@ -837,12 +844,27 @@ class _StderrDiagnosticCollector:
         reader.join(timeout=max(0.0, timeout))
         return not reader.is_alive()
 
+    def wait_for_relay_ready(self, timeout: float) -> bool:
+        return self._relay_ready.wait(timeout=max(0.0, timeout))
+
+    def relay_ready(self) -> bool:
+        return self._relay_ready.is_set()
+
     def _accept_line_locked(self, raw_line: bytes) -> None:
         if raw_line.endswith(b"\r"):
             raw_line = raw_line[:-1]
         try:
             line = raw_line.decode("ascii")
         except UnicodeDecodeError:
+            return
+        if line == STDERR_RELAY_READY_LINE:
+            self._relay_ready.set()
+            return
+        if line == STDERR_RELAY_EVENTS_TRUNCATED_LINE:
+            self._events_truncated = True
+            return
+        if line == STDERR_RELAY_LONG_LINE_DISCARDED_LINE:
+            self._long_line_discarded = True
             return
         match = _STDERR_DIAGNOSTIC_EVENT.fullmatch(line)
         if match is None:
@@ -881,7 +903,7 @@ def _safe_exception_name(value: str) -> str:
     return value if _SAFE_EXCEPTION_CLASS.fullmatch(value) else "UnknownException"
 
 
-def _drain_bridge_stderr(source: queue.Queue[Any], collector: _StderrDiagnosticCollector) -> None:
+def _drain_relay_output(source: queue.Queue[Any], collector: _StderrDiagnosticCollector) -> None:
     stream = source.get()
     if stream is None:
         return
@@ -909,17 +931,259 @@ def _drain_bridge_stderr(source: queue.Queue[Any], collector: _StderrDiagnosticC
             collector.mark_read_failure(error)
 
 
+class _BridgeStderrRelay:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        collector: _StderrDiagnosticCollector,
+    ) -> None:
+        self.process = process
+        self.collector = collector
+        self._parent_write_close_failed = False
+        self._final_record: dict[str, Any] | None = None
+
+    def mark_parent_write_close_failed(self) -> None:
+        self._parent_write_close_failed = True
+
+    def wait_until_ready(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self.collector.relay_ready():
+                return self.is_running()
+            try:
+                if self.process.poll() is not None:
+                    return False
+            except BaseException:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.collector.wait_for_relay_ready(min(0.05, remaining)):
+                return self.is_running()
+            if self.collector.snapshot()["read_status"] in {"EOF", "READ_FAILED"}:
+                return False
+
+    def is_running(self) -> bool:
+        if self._parent_write_close_failed or not self.collector.relay_ready():
+            return False
+        if self.collector.snapshot()["read_status"] in {"EOF", "READ_FAILED"}:
+            return False
+        try:
+            return self.process.poll() is None
+        except BaseException:
+            return False
+
+    def snapshot(self) -> dict[str, Any]:
+        if self._final_record is not None:
+            return dict(self._final_record)
+        try:
+            returncode = self.process.poll()
+        except BaseException:
+            return {
+                "pid": self.process.pid,
+                "status": "STATUS_UNAVAILABLE",
+                "failure_reason": "stderr_relay_status_unavailable",
+            }
+        collector_status = self.collector.snapshot()["read_status"]
+        failure_reason: str | None
+        if self._parent_write_close_failed:
+            status = "UNAVAILABLE"
+            failure_reason = "stderr_relay_parent_write_handle_not_closed"
+        elif returncode is None:
+            status = "RUNNING"
+            failure_reason = (
+                "stderr_relay_output_unavailable"
+                if collector_status in {"EOF", "READ_FAILED"}
+                else None
+            )
+        else:
+            status = "EXITED_UNEXPECTEDLY"
+            failure_reason = "stderr_relay_exited_while_bridge_active"
+        result: dict[str, Any] = {
+            "pid": self.process.pid,
+            "status": status,
+            "failure_reason": failure_reason,
+            "output_read_status": collector_status,
+        }
+        if returncode is not None:
+            result["exit_code"] = returncode
+        return result
+
+    def finish_after_bridge(self, *, bridge_reaped: bool) -> dict[str, Any]:
+        if self._final_record is not None:
+            return dict(self._final_record)
+        failure_reason: str | None = None
+        try:
+            returncode = self.process.poll()
+        except BaseException:
+            returncode = None
+            failure_reason = "stderr_relay_status_unavailable"
+
+        if not bridge_reaped:
+            if returncode is None:
+                status = "PRESERVED_WITH_BRIDGE_OR_UNKNOWN"
+                if self._parent_write_close_failed:
+                    failure_reason = "stderr_relay_parent_write_handle_not_closed"
+                elif self.collector.snapshot()["read_status"] in {"EOF", "READ_FAILED"}:
+                    failure_reason = "stderr_relay_output_unavailable"
+            else:
+                status = "EXITED_UNEXPECTEDLY"
+                failure_reason = "stderr_relay_exited_while_bridge_active"
+                try:
+                    self.process.wait(timeout=0)
+                except BaseException:
+                    pass
+        elif returncode is None:
+            try:
+                returncode = self.process.wait(timeout=STDERR_RELAY_EOF_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                failure_reason = "stderr_relay_eof_timeout"
+                try:
+                    self.process.terminate()
+                    returncode = self.process.wait(timeout=2.0)
+                    status = "TERMINATED_AFTER_BRIDGE_EXIT"
+                except BaseException:
+                    status = "EXIT_UNCONFIRMED"
+                    failure_reason = "stderr_relay_exit_unconfirmed"
+            except BaseException:
+                status = "EXIT_UNCONFIRMED"
+                failure_reason = "stderr_relay_exit_unconfirmed"
+            else:
+                status = "REAPED" if returncode == 0 else "EXITED_UNEXPECTEDLY"
+                if returncode != 0:
+                    failure_reason = "stderr_relay_exited_nonzero"
+        else:
+            try:
+                self.process.wait(timeout=0)
+            except BaseException:
+                pass
+            status = "REAPED" if returncode == 0 else "EXITED_UNEXPECTEDLY"
+            if returncode != 0:
+                failure_reason = "stderr_relay_exited_nonzero"
+
+        reader_reaped = self.collector.wait(timeout=0.25)
+        output_read_status = self.collector.snapshot()["read_status"]
+        if not reader_reaped and status == "REAPED":
+            status = "OUTPUT_READER_INCOMPLETE"
+            failure_reason = "stderr_relay_output_reader_incomplete"
+        self._final_record = {
+            "pid": self.process.pid,
+            "status": status,
+            "failure_reason": failure_reason,
+            "output_read_status": output_read_status,
+            "output_reader_reaped": reader_reaped,
+        }
+        if returncode is not None:
+            self._final_record["exit_code"] = returncode
+        return dict(self._final_record)
+
+
+def _stderr_relay_environment() -> dict[str, str]:
+    required_names = {"path", "systemroot", "windir"}
+    environment = {
+        name: value for name, value in os.environ.items() if name.casefold() in required_names
+    }
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
+    return environment
+
+
+def _close_pipe_stream(stream: Any) -> bool:
+    try:
+        stream.close()
+        return True
+    except BaseException:
+        try:
+            os.close(stream.fileno())
+            return True
+        except BaseException:
+            return bool(getattr(stream, "closed", False))
+
+
 def _start_bridge(
     environment: dict[str, str],
-) -> tuple[subprocess.Popen[bytes], _StderrDiagnosticCollector]:
+) -> tuple[subprocess.Popen[bytes], _BridgeStderrRelay]:
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
         subprocess, "CREATE_NO_WINDOW", 0
     )
+    read_fd: int | None = None
+    write_fd: int | None = None
+    read_stream: Any | None = None
+    write_stream: Any | None = None
+    try:
+        read_fd, write_fd = os.pipe()
+        read_stream = os.fdopen(read_fd, "rb", buffering=0)
+        read_fd = None
+        write_stream = os.fdopen(write_fd, "wb", buffering=0)
+        write_fd = None
+    except (OSError, ValueError):
+        for stream in (read_stream, write_stream):
+            if stream is not None:
+                _close_pipe_stream(stream)
+        for descriptor in (read_fd, write_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        raise SmokeAbort("BLOCKED", "isolated_bridge_stderr_relay_pipe_unavailable") from None
+    except BaseException:
+        for stream in (read_stream, write_stream):
+            if stream is not None:
+                _close_pipe_stream(stream)
+        for descriptor in (read_fd, write_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        raise
+
+    assert read_stream is not None and write_stream is not None
+
     stderr_collector = _StderrDiagnosticCollector()
     try:
         stderr_collector.start_reader()
     except BaseException:
+        _close_pipe_stream(read_stream)
+        _close_pipe_stream(write_stream)
         raise SmokeAbort("BLOCKED", "isolated_bridge_stderr_reader_unavailable") from None
+
+    try:
+        relay_process = subprocess.Popen(
+            [sys.executable, "-I", str(_STDERR_RELAY_SCRIPT_PATH)],
+            cwd=REPOSITORY_ROOT,
+            env=_stderr_relay_environment(),
+            stdin=read_stream,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+    except (OSError, ValueError):
+        _close_pipe_stream(read_stream)
+        _close_pipe_stream(write_stream)
+        stderr_collector.finish_without_stream()
+        stderr_collector.wait(timeout=0.25)
+        raise SmokeAbort("BLOCKED", "isolated_bridge_stderr_relay_could_not_start") from None
+    except BaseException:
+        _close_pipe_stream(read_stream)
+        _close_pipe_stream(write_stream)
+        stderr_collector.finish_without_stream()
+        stderr_collector.wait(timeout=0.25)
+        raise
+    finally:
+        _close_pipe_stream(read_stream)
+
+    stderr_collector.attach(relay_process.stdout)
+    stderr_relay = _BridgeStderrRelay(relay_process, stderr_collector)
+    if relay_process.stdout is None or not stderr_relay.wait_until_ready(
+        STDERR_RELAY_START_TIMEOUT_SECONDS
+    ):
+        _close_pipe_stream(write_stream)
+        stderr_relay.finish_after_bridge(bridge_reaped=True)
+        raise SmokeAbort("BLOCKED", "isolated_bridge_stderr_relay_unavailable")
+
     try:
         process = subprocess.Popen(
             [sys.executable, "-m", "codex_bridge"],
@@ -927,17 +1191,21 @@ def _start_bridge(
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=write_stream,
             creationflags=flags,
+            close_fds=True,
         )
     except (OSError, ValueError):
-        stderr_collector.finish_without_stream()
+        _close_pipe_stream(write_stream)
+        stderr_relay.finish_after_bridge(bridge_reaped=True)
         raise SmokeAbort("BLOCKED", "isolated_bridge_process_could_not_start") from None
     except BaseException:
-        stderr_collector.finish_without_stream()
+        _close_pipe_stream(write_stream)
+        stderr_relay.finish_after_bridge(bridge_reaped=True)
         raise
-    stderr_collector.attach(process.stderr)
-    return process, stderr_collector
+    if not _close_pipe_stream(write_stream):
+        stderr_relay.mark_parent_write_close_failed()
+    return process, stderr_relay
 
 
 def _http_json(
@@ -1974,7 +2242,8 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
     token = secrets.token_urlsafe(32)
     client_request_id = f"phase5e2c2-{uuid.uuid4().hex}"
     process: subprocess.Popen[bytes] | None = None
-    stderr_collectors: list[_StderrDiagnosticCollector] = []
+    stderr_relay: _BridgeStderrRelay | None = None
+    stderr_relays: list[_BridgeStderrRelay] = []
     process_records: list[dict[str, Any]] = []
     ports: tuple[int, int] | None = None
     reservations: list[socket.socket] = []
@@ -2042,8 +2311,8 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
             reservation.close()
         reservations.clear()
         _assert_ports_free(ports)
-        process, stderr_collector = _start_bridge(child_environment)
-        stderr_collectors.append(stderr_collector)
+        process, stderr_relay = _start_bridge(child_environment)
+        stderr_relays.append(stderr_relay)
         _wait_for_bridge(process, ui_port)
         preflight = _preflight_bridge(
             process,
@@ -2120,11 +2389,11 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
                 token=token,
                 client_request_id=client_request_id,
             )
-            if post_status == 409 and stderr_collectors:
+            if post_status == 409 and stderr_relays:
                 evidence["workflow"]["startup_diagnostics"] = _collect_startup_diagnostics(
                     state_root=state_root,
                     client_request_id=client_request_id,
-                    stderr_collector=stderr_collectors[0],
+                    stderr_collector=stderr_relays[0].collector,
                 )
             raise SmokeAbort("FAIL", "initial_workflow_post_was_not_accepted")
         workflow_id, run_id = _bridge_run_directory_from_response(post_response)
@@ -2287,12 +2556,15 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
         first_stop = _stop_bridge(process, ui_port=ui_port, token=token)
         process_records.append(first_stop)
         cleanup_reaped = bool(first_stop.get("reaped"))
+        if stderr_relay is not None:
+            stderr_relay.finish_after_bridge(bridge_reaped=cleanup_reaped)
         process = None
+        stderr_relay = None
         if not cleanup_reaped:
             raise SmokeAbort("BLOCKED", "first_isolated_bridge_normal_shutdown_not_reaped")
         _assert_ports_free(ports)
-        process, stderr_collector = _start_bridge(child_environment)
-        stderr_collectors.append(stderr_collector)
+        process, stderr_relay = _start_bridge(child_environment)
+        stderr_relays.append(stderr_relay)
         _wait_for_bridge(process, ui_port)
         restart_preflight = _preflight_bridge(
             process,
@@ -2367,20 +2639,29 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
                 process_records.append(stopped)
                 cleanup_reaped = cleanup_reaped and bool(stopped.get("reaped"))
                 evidence["cleanup"]["last_bridge"] = stopped
+                if stderr_relay is not None:
+                    stderr_relay.finish_after_bridge(bridge_reaped=bool(stopped.get("reaped")))
             else:
                 cleanup_reaped = False
                 evidence["cleanup"]["status"] = "PRESERVED_ACTIVE_OR_UNKNOWN"
                 evidence["cleanup"]["forced_termination"] = False
+                if stderr_relay is not None:
+                    stderr_relay.finish_after_bridge(bridge_reaped=False)
         if process_records:
             evidence["cleanup"]["bridge_processes"] = process_records
         evidence["cleanup"]["forced_termination"] = False
         evidence["cleanup"]["owned_children_reaped"] = cleanup_reaped
-        for stderr_collector in stderr_collectors:
-            stderr_collector.wait(timeout=0.25)
+        for relay in stderr_relays:
+            relay.collector.wait(timeout=0.25)
+        if stderr_relays:
+            evidence["cleanup"]["stderr_relay_processes"] = [
+                relay.snapshot() for relay in stderr_relays
+            ]
         startup_diagnostics = evidence.get("workflow", {}).get("startup_diagnostics")
-        if isinstance(startup_diagnostics, dict) and stderr_collectors:
-            stderr_result = stderr_collectors[0].snapshot()
+        if isinstance(startup_diagnostics, dict) and stderr_relays:
+            stderr_result = stderr_relays[0].collector.snapshot()
             startup_diagnostics["stderr"] = stderr_result
+            startup_diagnostics["stderr_relay"] = stderr_relays[0].snapshot()
             file_result = startup_diagnostics.get("file")
             file_obtained = isinstance(file_result, dict) and file_result.get("status") == "VALID"
             stderr_events = stderr_result.get("events")

@@ -230,19 +230,13 @@ class _FakeBridgeProcess:
 
 def _start_fake_bridge(
     module: ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
     stderr: Any,
-) -> tuple[Any, Any, list[dict[str, Any]]]:
+) -> tuple[Any, Any]:
     process = _FakeBridgeProcess(stderr)
-    calls: list[dict[str, Any]] = []
-
-    def fake_popen(*_args: Any, **kwargs: Any) -> _FakeBridgeProcess:
-        calls.append(kwargs)
-        return process
-
-    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
-    started_process, collector = module._start_bridge({})
-    return started_process, collector, calls
+    collector = module._StderrDiagnosticCollector()
+    collector.start_reader()
+    collector.attach(stderr)
+    return process, collector
 
 
 def test_checked_in_previous_evidence_matches_the_retest_baseline() -> None:
@@ -556,10 +550,9 @@ def test_bridge_stderr_reader_extracts_only_valid_diagnostic_events(
         + valid
     ).encode("ascii")
 
-    process, collector, calls = _start_fake_bridge(module, monkeypatch, io.BytesIO(private_stderr))
+    process, collector = _start_fake_bridge(module, io.BytesIO(private_stderr))
 
     assert process.stderr is not None
-    assert calls[0]["stderr"] == module.subprocess.PIPE
     assert collector.wait(timeout=2.0)
     captured = collector.snapshot()
     assert captured["read_status"] == "EOF"
@@ -590,7 +583,7 @@ def test_bridge_stderr_reader_bounds_lines_and_event_storage(
     noisy_stderr = b"x" * (module.MAX_STDERR_DIAGNOSTIC_LINE_BYTES + 10_000)
     noisy_stderr += b"\n" + valid * (module.MAX_STDERR_DIAGNOSTIC_EVENTS + 4)
 
-    _process, collector, _calls = _start_fake_bridge(module, monkeypatch, io.BytesIO(noisy_stderr))
+    _process, collector = _start_fake_bridge(module, io.BytesIO(noisy_stderr))
 
     assert collector.wait(timeout=2.0)
     captured = collector.snapshot()
@@ -627,7 +620,7 @@ def test_bridge_stderr_reader_uses_available_pipe_chunks_immediately(
             pass
 
     stderr = _Read1Stderr()
-    _process, collector, _calls = _start_fake_bridge(module, monkeypatch, stderr)
+    _process, collector = _start_fake_bridge(module, stderr)
 
     assert collector.wait(timeout=2.0)
     assert stderr.calls == 2
@@ -653,7 +646,7 @@ def test_bridge_stderr_reader_records_read_failure_without_error_text(
         def close(self) -> None:
             pass
 
-    _process, collector, _calls = _start_fake_bridge(module, monkeypatch, _FailingStderr())
+    _process, collector = _start_fake_bridge(module, _FailingStderr())
 
     assert collector.wait(timeout=2.0)
     captured = collector.snapshot()
@@ -778,9 +771,7 @@ def test_missing_startup_diagnostic_and_stderr_are_reported_explicitly(
         ],
     )
     monkeypatch.setattr(module, "_run_directory", lambda _root, _run_id: run_dir)
-    _process, collector, _calls = _start_fake_bridge(
-        module, monkeypatch, io.BytesIO(b"private stderr is discarded\n")
-    )
+    _process, collector = _start_fake_bridge(module, io.BytesIO(b"private stderr is discarded\n"))
     assert collector.wait(timeout=2.0)
 
     result = module._collect_startup_diagnostics(
@@ -821,9 +812,7 @@ def test_missing_startup_diagnostic_uses_valid_stderr_event(
         "stage=worker_spawn original_exception=RuntimeError "
         "persistence_exception=OSError\n"
     )
-    _process, collector, _calls = _start_fake_bridge(
-        module, monkeypatch, io.BytesIO(stderr_event.encode("ascii"))
-    )
+    _process, collector = _start_fake_bridge(module, io.BytesIO(stderr_event.encode("ascii")))
     assert collector.wait(timeout=2.0)
 
     result = module._collect_startup_diagnostics(
