@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from ..paths import AllowedPathPolicy, PathPolicyError
 from .http_client import CONTROL_TOKEN_ENV, CodexHTTPClient, CodexHTTPError
@@ -30,6 +30,60 @@ _BRIDGE_STATES = frozenset(
     }
 )
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$")
+MAX_JOBS_PER_WORKFLOW = 16
+_JOB_COLUMNS = (
+    "job_id",
+    "request_key",
+    "workflow_id",
+    "task_identity",
+    "request_digest",
+    "request_json",
+    "state",
+    "client_request_id",
+    "title_marker",
+    "agent_cwd",
+    "created_at",
+    "updated_at",
+    "thread_id",
+    "turn_id",
+    "remote_state",
+    "receipt_json",
+    "error",
+)
+_JOB_COLUMN_SIGNATURE = (
+    ("job_id", "TEXT", 0, 1),
+    ("request_key", "TEXT", 1, 0),
+    ("workflow_id", "TEXT", 1, 0),
+    ("task_identity", "TEXT", 1, 0),
+    ("request_digest", "TEXT", 1, 0),
+    ("request_json", "TEXT", 1, 0),
+    ("state", "TEXT", 1, 0),
+    ("client_request_id", "TEXT", 1, 0),
+    ("title_marker", "TEXT", 1, 0),
+    ("agent_cwd", "TEXT", 1, 0),
+    ("created_at", "TEXT", 1, 0),
+    ("updated_at", "TEXT", 1, 0),
+    ("thread_id", "TEXT", 0, 0),
+    ("turn_id", "TEXT", 0, 0),
+    ("remote_state", "TEXT", 0, 0),
+    ("receipt_json", "TEXT", 0, 0),
+    ("error", "TEXT", 0, 0),
+)
+_EVENT_COLUMN_SIGNATURE = (
+    ("event_id", "INTEGER", 0, 1),
+    ("job_id", "TEXT", 1, 0),
+    ("state", "TEXT", 1, 0),
+    ("timestamp", "TEXT", 1, 0),
+    ("payload_json", "TEXT", 1, 0),
+)
+_RECONCILIATION_COLUMN_SIGNATURE = (
+    ("job_id", "TEXT", 0, 1),
+    ("marker", "TEXT", 1, 0),
+    ("reason", "TEXT", 1, 0),
+    ("detected_at", "TEXT", 1, 0),
+    ("details_json", "TEXT", 1, 0),
+)
+_EVENT_STATES = CODEX_JOB_STATES | frozenset({"NEEDS_RECONCILIATION"})
 
 
 class CodexJobError(RuntimeError):
@@ -96,64 +150,434 @@ def _append_event(
     )
 
 
+def _compact_sql(sql: str | None) -> str:
+    if sql is None:
+        return ""
+    compact = re.sub(r"\s+", "", sql).lower().rstrip(";")
+    return compact.replace('"', "").replace("`", "").replace("[", "").replace("]", "")
+
+
+def _jobs_table_sql(table_name: str, *, version: int) -> str:
+    workflow_unique = (
+        "" if version == 1 else ",\n                    UNIQUE(workflow_id, task_identity)"
+    )
+    workflow_constraint = " UNIQUE" if version == 1 else ""
+    return f"""
+        CREATE TABLE {table_name} (
+            job_id TEXT PRIMARY KEY,
+            request_key TEXT NOT NULL UNIQUE,
+            workflow_id TEXT NOT NULL{workflow_constraint},
+            task_identity TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('PREPARED','MAYBE_SENT','ACCEPTED','RUNNING','SUCCEEDED','FAILED')
+            ),
+            client_request_id TEXT NOT NULL UNIQUE,
+            title_marker TEXT NOT NULL UNIQUE,
+            agent_cwd TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            thread_id TEXT,
+            turn_id TEXT,
+            remote_state TEXT,
+            receipt_json TEXT,
+            error TEXT{workflow_unique}
+        )
+    """
+
+
+def _job_events_table_sql() -> str:
+    return """
+        CREATE TABLE job_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+    """
+
+
+def _job_reconciliation_table_sql() -> str:
+    return """
+        CREATE TABLE job_reconciliation (
+            job_id TEXT PRIMARY KEY,
+            marker TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            details_json TEXT NOT NULL
+        )
+    """
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 class CodexJobAdapter:
     """Write-ahead SQLite ledger for one CodexBridge job per workflow."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = Path(database_path)
-        with _connect(self.database_path) as connection:
+        connection = _connect(self.database_path)
+        try:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id TEXT PRIMARY KEY,
-                    request_key TEXT NOT NULL UNIQUE,
-                    workflow_id TEXT NOT NULL UNIQUE,
-                    task_identity TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (
-                        state IN ('PREPARED','MAYBE_SENT','ACCEPTED','RUNNING','SUCCEEDED','FAILED')
-                    ),
-                    client_request_id TEXT NOT NULL UNIQUE,
-                    title_marker TEXT NOT NULL UNIQUE,
-                    agent_cwd TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    thread_id TEXT,
-                    turn_id TEXT,
-                    remote_state TEXT,
-                    receipt_json TEXT,
-                    error TEXT
+            self._initialize_ledger(connection)
+        except sqlite3.Error as error:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise CodexJobReconciliationRequiredError(
+                "NEEDS_RECONCILIATION: could not initialize the Codex job ledger"
+            ) from error
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _schema_failure(reason: str) -> NoReturn:
+        raise CodexJobReconciliationRequiredError(f"NEEDS_RECONCILIATION: {reason}")
+
+    @staticmethod
+    def _schema_objects(connection: sqlite3.Connection) -> set[tuple[str, str]]:
+        return {
+            (str(row["type"]), str(row["name"]))
+            for row in connection.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE name NOT GLOB 'sqlite_*' AND type IN ('table', 'index', 'view', 'trigger')"
+            )
+        }
+
+    @staticmethod
+    def _column_signature(
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> tuple[tuple[str, str, int, int], ...]:
+        quoted_table = _quote_identifier(table)
+        return tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({quoted_table})")
+        )
+
+    @staticmethod
+    def _table_sql(connection: sqlite3.Connection, table: str) -> str:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        return "" if row is None or row[0] is None else str(row[0])
+
+    @staticmethod
+    def _index_entries(
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> list[tuple[bool, str, tuple[str, ...]]]:
+        quoted_table = _quote_identifier(table)
+        entries: list[tuple[bool, str, tuple[str, ...]]] = []
+        for row in connection.execute(f"PRAGMA index_list({quoted_table})"):
+            index_name = str(row[1])
+            quoted_index = _quote_identifier(index_name)
+            columns = tuple(
+                str(column[2])
+                for column in connection.execute(f"PRAGMA index_info({quoted_index})")
+            )
+            entries.append((bool(row[2]), index_name, columns))
+        return entries
+
+    def _validate_database_schema(self, connection: sqlite3.Connection, version: int) -> None:
+        expected_objects = {
+            ("table", "jobs"),
+            ("table", "job_events"),
+            ("table", "job_reconciliation"),
+            ("index", "job_events_job_event_idx"),
+        }
+        if version == 2:
+            expected_objects.add(("index", "jobs_workflow_idx"))
+        if self._schema_objects(connection) != expected_objects:
+            self._schema_failure("unexpected objects were found in the Codex job ledger")
+
+        if self._column_signature(connection, "jobs") != _JOB_COLUMN_SIGNATURE:
+            self._schema_failure("the Codex job ledger columns do not match a supported schema")
+        if _compact_sql(self._table_sql(connection, "jobs")) != _compact_sql(
+            _jobs_table_sql("jobs", version=version)
+        ):
+            self._schema_failure("the Codex job ledger definition is not a supported version")
+
+        expected_unique: list[tuple[str, ...]] = [
+            ("job_id",),
+            ("request_key",),
+            ("client_request_id",),
+            ("title_marker",),
+        ]
+        if version == 1:
+            expected_unique.append(("workflow_id",))
+            expected_non_unique: list[tuple[str, tuple[str, ...]]] = []
+        else:
+            expected_unique.append(("workflow_id", "task_identity"))
+            expected_non_unique = [("jobs_workflow_idx", ("workflow_id", "created_at", "job_id"))]
+        job_indexes = self._index_entries(connection, "jobs")
+        actual_unique = [columns for unique, _, columns in job_indexes if unique]
+        actual_non_unique = [(name, columns) for unique, name, columns in job_indexes if not unique]
+        if sorted(actual_unique) != sorted(expected_unique) or sorted(actual_non_unique) != sorted(
+            expected_non_unique
+        ):
+            self._schema_failure("the Codex job ledger indexes do not match its supported version")
+
+        if self._column_signature(connection, "job_events") != _EVENT_COLUMN_SIGNATURE:
+            self._schema_failure("the Codex job event table columns are unexpected")
+        if _compact_sql(self._table_sql(connection, "job_events")) != _compact_sql(
+            _job_events_table_sql()
+        ):
+            self._schema_failure("the Codex job event table definition is unexpected")
+        event_indexes = self._index_entries(connection, "job_events")
+        if event_indexes != [(False, "job_events_job_event_idx", ("job_id", "event_id"))]:
+            self._schema_failure("the Codex job event index is unexpected")
+
+        if (
+            self._column_signature(connection, "job_reconciliation")
+            != _RECONCILIATION_COLUMN_SIGNATURE
+        ):
+            self._schema_failure("the Codex job reconciliation table columns are unexpected")
+        if _compact_sql(self._table_sql(connection, "job_reconciliation")) != _compact_sql(
+            _job_reconciliation_table_sql()
+        ):
+            self._schema_failure("the Codex job reconciliation table definition is unexpected")
+        reconciliation_indexes = self._index_entries(connection, "job_reconciliation")
+        if len(reconciliation_indexes) != 1 or reconciliation_indexes[0][0] is not True:
+            self._schema_failure("the Codex job reconciliation primary key is unexpected")
+        if reconciliation_indexes[0][2] != ("job_id",):
+            self._schema_failure("the Codex job reconciliation primary key is unexpected")
+
+    def _validate_ledger_data(self, connection: sqlite3.Connection) -> None:
+        job_ids: set[str] = set()
+        for row in connection.execute("SELECT * FROM jobs ORDER BY job_id"):
+            job_id = row["job_id"]
+            workflow_id = row["workflow_id"]
+            task_identity = row["task_identity"]
+            request_key = row["request_key"]
+            if any(
+                not isinstance(value, str) or not value
+                for value in (job_id, workflow_id, task_identity, request_key)
+            ):
+                self._schema_failure("a Codex job row has a missing identity key")
+            if request_key != f"{workflow_id}::{task_identity}":
+                self._schema_failure("a Codex job row has inconsistent identity keys")
+            assert isinstance(job_id, str)
+            job_ids.add(job_id)
+
+            for column in (
+                "request_digest",
+                "request_json",
+                "client_request_id",
+                "title_marker",
+                "agent_cwd",
+                "created_at",
+                "updated_at",
+            ):
+                if not isinstance(row[column], str) or not row[column]:
+                    self._schema_failure("a Codex job row has a missing required value")
+            if re.fullmatch(r"[0-9a-f]{64}", row["request_digest"]) is None:
+                self._schema_failure("a Codex job row has an invalid request digest")
+
+            try:
+                request = json.loads(row["request_json"])
+            except (TypeError, json.JSONDecodeError):
+                self._schema_failure("a Codex job row has invalid request JSON")
+            if not isinstance(request, dict) or set(request) != {
+                "client_request_id",
+                "cwd",
+                "prompt",
+                "title",
+                "sandbox_mode",
+                "confirm_full_access",
+            }:
+                self._schema_failure("a Codex job row has an unexpected request shape")
+            if (
+                request["client_request_id"] != row["client_request_id"]
+                or request["cwd"] != row["agent_cwd"]
+                or request["title"] != row["title_marker"]
+                or request["sandbox_mode"] != "inherit"
+                or request["confirm_full_access"] is not False
+            ):
+                self._schema_failure("a Codex job row disagrees with its stored request")
+            try:
+                validate_codex_job_prompt(request["prompt"])
+            except OwsError:
+                self._schema_failure("a Codex job row has an invalid stored prompt")
+
+            state = row["state"]
+            if not isinstance(state, str) or state not in CODEX_JOB_STATES:
+                self._schema_failure("a Codex job row has an unsupported state")
+            thread_id = row["thread_id"]
+            turn_id = row["turn_id"]
+            remote_state = row["remote_state"]
+            receipt_json = row["receipt_json"]
+            if state in {"PREPARED", "MAYBE_SENT"}:
+                if any(
+                    value is not None for value in (thread_id, turn_id, remote_state, receipt_json)
+                ):
+                    self._schema_failure("a pre-acceptance Codex job row has remote data")
+            elif not self._valid_persisted_id(thread_id) or not self._valid_persisted_id(turn_id):
+                self._schema_failure("an accepted Codex job row has incomplete remote identity")
+            elif state == "ACCEPTED":
+                if remote_state not in _BRIDGE_STATES or receipt_json is not None:
+                    self._schema_failure("an accepted Codex job row has inconsistent remote data")
+            elif state == "RUNNING":
+                if remote_state != "in_progress" or receipt_json is not None:
+                    self._schema_failure("a running Codex job row has inconsistent remote data")
+            elif state == "SUCCEEDED":
+                receipt = self._parse_receipt(receipt_json)
+                result = receipt.get("result") if isinstance(receipt, dict) else None
+                if (
+                    remote_state != "completed"
+                    or not isinstance(result, dict)
+                    or set(receipt) != {"result"}
+                    or set(result) != {"final_text"}
+                    or not isinstance(result["final_text"], str)
+                ):
+                    self._schema_failure("a succeeded Codex job row has an invalid receipt")
+                token = os.environ.get(CONTROL_TOKEN_ENV)
+                if token and token in result["final_text"]:
+                    self._schema_failure("a succeeded Codex job receipt contains a secret")
+            elif state == "FAILED":
+                receipt = self._parse_receipt(receipt_json)
+                if (
+                    remote_state not in {"failed", "interrupted"}
+                    or receipt != {"remote_state": remote_state}
+                    or not isinstance(row["error"], str)
+                    or not row["error"]
+                ):
+                    self._schema_failure("a failed Codex job row has an invalid receipt")
+
+        for event in connection.execute("SELECT * FROM job_events ORDER BY event_id"):
+            if event["job_id"] not in job_ids:
+                self._schema_failure("a Codex job event has no matching job")
+            if event["state"] not in _EVENT_STATES or not event["timestamp"]:
+                self._schema_failure("a Codex job event has invalid state or timestamp")
+            self._parse_json_object(event["payload_json"], "a Codex job event has invalid payload")
+
+        for reconciliation in connection.execute("SELECT * FROM job_reconciliation"):
+            if reconciliation["job_id"] not in job_ids:
+                self._schema_failure("a Codex job reconciliation row has no matching job")
+            if (
+                reconciliation["marker"] != "NEEDS_RECONCILIATION"
+                or not reconciliation["reason"]
+                or not reconciliation["detected_at"]
+            ):
+                self._schema_failure("a Codex job reconciliation row is incomplete")
+            self._parse_json_object(
+                reconciliation["details_json"],
+                "a Codex job reconciliation row has invalid details",
+            )
+
+    @staticmethod
+    def _valid_persisted_id(value: Any) -> bool:
+        return CodexJobAdapter._valid_id(value)
+
+    @classmethod
+    def _parse_json_object(cls, value: Any, error_message: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            cls._schema_failure(error_message)
+        if not isinstance(parsed, dict):
+            cls._schema_failure(error_message)
+        return parsed
+
+    @classmethod
+    def _parse_receipt(cls, value: Any) -> dict[str, Any]:
+        return cls._parse_json_object(value, "a terminal Codex job row has invalid receipt JSON")
+
+    @staticmethod
+    def _ledger_snapshot(
+        connection: sqlite3.Connection,
+    ) -> tuple[tuple[tuple[Any, ...], ...], ...]:
+        return tuple(
+            tuple(tuple(row) for row in connection.execute(query))
+            for query in (
+                "SELECT * FROM jobs ORDER BY job_id",
+                "SELECT * FROM job_events ORDER BY event_id",
+                "SELECT * FROM job_reconciliation ORDER BY job_id",
+            )
+        )
+
+    @staticmethod
+    def _assert_migrated_content(
+        connection: sqlite3.Connection,
+        expected: tuple[tuple[tuple[Any, ...], ...], ...],
+    ) -> None:
+        if CodexJobAdapter._ledger_snapshot(connection) != expected:
+            CodexJobAdapter._schema_failure("the V1 to V2 migration changed ledger content")
+
+    def _initialize_ledger(self, connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            objects = self._schema_objects(connection)
+            if not objects:
+                connection.execute(_jobs_table_sql("jobs", version=2))
+                connection.execute(_job_events_table_sql())
+                connection.execute(
+                    "CREATE INDEX job_events_job_event_idx ON job_events(job_id, event_id)"
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS job_events (
-                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    payload_json TEXT NOT NULL
+                connection.execute(_job_reconciliation_table_sql())
+                connection.execute(
+                    "CREATE INDEX jobs_workflow_idx ON jobs(workflow_id, created_at, job_id)"
                 )
-                """
-            )
+                self._validate_database_schema(connection, version=2)
+                connection.execute("COMMIT")
+                return
+
+            version = self._detect_schema_version(connection)
+            self._validate_database_schema(connection, version=version)
+            self._validate_ledger_data(connection)
+            if version == 2:
+                connection.execute("COMMIT")
+                return
+
+            active = connection.execute(
+                "SELECT 1 FROM jobs WHERE state IN "
+                "('PREPARED','MAYBE_SENT','ACCEPTED','RUNNING') LIMIT 1"
+            ).fetchone()
+            if active is not None:
+                connection.execute("COMMIT")
+                return
+
+            before = self._ledger_snapshot(connection)
+            connection.execute(_jobs_table_sql("jobs_v2", version=2))
+            columns = ", ".join(_JOB_COLUMNS)
+            connection.execute(f"INSERT INTO jobs_v2 ({columns}) SELECT {columns} FROM jobs")
+            connection.execute("DROP TABLE jobs")
+            connection.execute("ALTER TABLE jobs_v2 RENAME TO jobs")
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS job_events_job_event_idx "
-                "ON job_events(job_id, event_id)"
+                "CREATE INDEX jobs_workflow_idx ON jobs(workflow_id, created_at, job_id)"
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS job_reconciliation (
-                    job_id TEXT PRIMARY KEY,
-                    marker TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    detected_at TEXT NOT NULL,
-                    details_json TEXT NOT NULL
-                )
-                """
-            )
+            self._validate_database_schema(connection, version=2)
+            self._validate_ledger_data(connection)
+            self._assert_migrated_content(connection, before)
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or integrity[0] != "ok":
+                self._schema_failure("the migrated Codex job ledger failed SQLite integrity_check")
+            connection.execute("COMMIT")
+        except CodexJobReconciliationRequiredError:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        except sqlite3.Error as error:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise CodexJobReconciliationRequiredError(
+                "NEEDS_RECONCILIATION: the Codex job ledger schema is unsupported or inconsistent"
+            ) from error
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    def _detect_schema_version(self, connection: sqlite3.Connection) -> int:
+        actual_sql = _compact_sql(self._table_sql(connection, "jobs"))
+        for version in (1, 2):
+            if actual_sql == _compact_sql(_jobs_table_sql("jobs", version=version)):
+                return version
+        self._schema_failure("the Codex job ledger schema is not a recognized V1 or V2 definition")
+        raise AssertionError("unreachable")
 
     @staticmethod
     def make_request_key(workflow_id: str, task_identity: str) -> str:
@@ -753,6 +1177,139 @@ class CodexJobAdapter:
                 "details": json.loads(reconciliation["details_json"]),
             }
         return job
+
+    def get_jobs_for_workflow(
+        self,
+        workflow_id: str,
+        *,
+        limit: int = MAX_JOBS_PER_WORKFLOW,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(workflow_id, str) or not workflow_id:
+            raise CodexJobRequestError("workflow_id must be a non-empty string")
+        if type(limit) is not int or not 1 <= limit <= MAX_JOBS_PER_WORKFLOW:
+            raise CodexJobRequestError(
+                f"workflow job limit must be an integer from 1 to {MAX_JOBS_PER_WORKFLOW}"
+            )
+        database_path = self.database_path
+        if database_path.is_symlink() or not database_path.is_file():
+            raise CodexJobReconciliationRequiredError(
+                "NEEDS_RECONCILIATION: the Codex job ledger is missing or unavailable"
+            )
+        try:
+            database_uri = f"{database_path.resolve(strict=True).as_uri()}?mode=ro"
+            connection = sqlite3.connect(database_uri, uri=True, timeout=2.0)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA query_only = ON")
+                tables = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if "jobs" not in tables:
+                    raise CodexJobReconciliationRequiredError(
+                        "NEEDS_RECONCILIATION: the Codex job ledger has no jobs table"
+                    )
+                rows = connection.execute(
+                    "SELECT workflow_id, job_id, task_identity, state, thread_id, turn_id, "
+                    "remote_state, receipt_json FROM jobs WHERE workflow_id = ? "
+                    "ORDER BY created_at ASC, job_id ASC LIMIT ?",
+                    (workflow_id, limit + 1),
+                ).fetchall()
+            finally:
+                connection.close()
+        except CodexJobReconciliationRequiredError:
+            raise
+        except (OSError, sqlite3.Error, ValueError) as error:
+            raise CodexJobReconciliationRequiredError(
+                "NEEDS_RECONCILIATION: could not read the Codex job ledger"
+            ) from error
+
+        if len(rows) > limit:
+            raise CodexJobReconciliationRequiredError(
+                f"NEEDS_RECONCILIATION: workflow has more than the requested job limit ({limit})"
+            )
+        jobs: list[dict[str, Any]] = []
+        for row in rows:
+            if row["workflow_id"] != workflow_id:
+                raise CodexJobReconciliationRequiredError(
+                    "NEEDS_RECONCILIATION: workflow job query returned an unrelated row"
+                )
+            state = row["state"]
+            job_id = row["job_id"]
+            task_identity = row["task_identity"]
+            if (
+                not isinstance(job_id, str)
+                or not job_id
+                or not isinstance(task_identity, str)
+                or not task_identity
+                or not isinstance(state, str)
+                or state not in CODEX_JOB_STATES
+            ):
+                raise CodexJobReconciliationRequiredError(
+                    "NEEDS_RECONCILIATION: workflow job row has invalid identity or state"
+                )
+            thread_id = row["thread_id"]
+            turn_id = row["turn_id"]
+            if state in {"PREPARED", "MAYBE_SENT"}:
+                if thread_id is not None or turn_id is not None:
+                    raise CodexJobReconciliationRequiredError(
+                        "NEEDS_RECONCILIATION: unaccepted workflow job has remote identity"
+                    )
+            elif not self._valid_persisted_id(thread_id) or not self._valid_persisted_id(turn_id):
+                raise CodexJobReconciliationRequiredError(
+                    "NEEDS_RECONCILIATION: workflow job has incomplete remote identity"
+                )
+
+            receipt: dict[str, Any] | None = None
+            receipt_json = row["receipt_json"]
+            if state == "SUCCEEDED":
+                parsed = self._parse_receipt(receipt_json)
+                result = parsed.get("result")
+                if (
+                    set(parsed) != {"result"}
+                    or not isinstance(result, dict)
+                    or set(result) != {"final_text"}
+                    or not isinstance(result["final_text"], str)
+                    or row["remote_state"] != "completed"
+                ):
+                    raise CodexJobReconciliationRequiredError(
+                        "NEEDS_RECONCILIATION: workflow job receipt is inconsistent"
+                    )
+                token = os.environ.get(CONTROL_TOKEN_ENV)
+                if token and token in result["final_text"]:
+                    raise CodexJobReconciliationRequiredError(
+                        "NEEDS_RECONCILIATION: workflow job receipt contains a secret"
+                    )
+                receipt = {"result": {"final_text": result["final_text"]}}
+            elif state == "FAILED":
+                parsed = self._parse_receipt(receipt_json)
+                if (
+                    set(parsed) != {"remote_state"}
+                    or parsed.get("remote_state") != row["remote_state"]
+                    or row["remote_state"] not in {"failed", "interrupted"}
+                ):
+                    raise CodexJobReconciliationRequiredError(
+                        "NEEDS_RECONCILIATION: workflow job receipt is inconsistent"
+                    )
+                receipt = {"remote_state": row["remote_state"]}
+            elif receipt_json is not None:
+                raise CodexJobReconciliationRequiredError(
+                    "NEEDS_RECONCILIATION: non-terminal workflow job has a receipt"
+                )
+
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "task_identity": task_identity,
+                    "state": state,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "receipt": receipt,
+                }
+            )
+        return jobs
 
     @classmethod
     def read_shutdown_ownership(

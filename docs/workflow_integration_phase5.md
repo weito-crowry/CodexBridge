@@ -176,3 +176,9 @@ do:
 promptはYAMLでデコードした文字列をそのまま使い、NFKC・trim・jq/OWS式展開は行わない。空・空白のみ、非文字列、禁止制御文字、不正UTF-8は拒否し、UTF-8で16 KiBまでを受け付ける。`with`では`prompt`だけを指定できる。1件制限、mock混在禁止、loop内禁止、state/cwd分離、認証、AllowedPathPolicy、既存の`sandbox_mode="inherit"`と`confirm_full_access=false`、先行台帳保存、`MAYBE_SENT`非再送、request ID冪等性、同時live 1件を維持する。prompt本文が実行可能な操作を要求しても、Codex App Server / Bridgeの既存認証・承認・sandbox設定に従い、権限上昇や自動承認は行わない。
 
 5E-0の実live成功証跡は固定fixture promptに対するものだけである。任意literal promptを使った実live実行は未検証であり、本Phaseのfake/ASGIテスト結果は実Codex成功を示さない。
+
+## 15. Phase 5E-2A: 複数job ledger基盤（実ジョブ上限1）
+
+5E-2AではCodex job ledgerをV2 schemaへ更新し、同一workflow内の複数行を保存できる複合一意制約とworkflow検索indexを用意する。V1 ledgerは空または全jobが終端状態の場合だけtransactional migrationし、PREPARED/MAYBE_SENT/ACCEPTED/RUNNINGを含むledgerはV1のまま保持する。Adapterの同一workflow一件ガードと既存single-jobの状態遷移・非再POST契約は維持する。限定件数のread-only workflow job一覧をAdapterに追加するが、Service/API/Consoleには公開しない。
+
+未実装の5E-2Bは2件の固定順序実行と結果受け渡し、5E-2CはAPI/Console状態投影と隔離E2Eを扱う。OWSのone-job制約、Worker呼出し、結果prompt組み立ては5E-2Aの範囲外とする。
