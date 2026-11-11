@@ -18,6 +18,7 @@ from .manager import WorkflowManagerError, missing_workflow_dependencies
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
+_CODEX_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _WORKFLOW_STATES = frozenset(
     {
         "queued",
@@ -51,6 +52,7 @@ class WorkflowWorkerStarter(Protocol):
         *,
         mode: Literal["start", "recover"],
         workspace_root: Path | None = None,
+        max_live_codex_jobs: int = 1,
     ) -> object: ...
 
 
@@ -91,6 +93,15 @@ class WorkflowStartFailed(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowJobSnapshot:
+    job_id: str
+    task_identity: str
+    state: str
+    thread_id: str | None
+    turn_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowSnapshot:
     workflow_id: str
     run_id: str
@@ -101,6 +112,8 @@ class WorkflowSnapshot:
     terminal: bool
     job_id: str | None = None
     thread_id: str | None = None
+    max_live_codex_jobs: int = 1
+    jobs: tuple[WorkflowJobSnapshot, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +132,7 @@ class _PreparedRequest:
     input_data: Any
     workspace_root: str
     request_digest: str
+    max_live_codex_jobs: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +154,8 @@ class _RunInspection:
     thread_id: str | None
     result: dict[str, Any] | None
     updated_at: str
+    max_live_codex_jobs: int = 1
+    jobs: tuple[WorkflowJobSnapshot, ...] = ()
 
 
 class WorkflowService:
@@ -166,6 +182,7 @@ class WorkflowService:
         workflow_yaml: str,
         input_data: Any,
         workspace_root: str,
+        max_live_codex_jobs: int = 1,
     ) -> WorkflowSnapshot:
         missing = await asyncio.to_thread(missing_workflow_dependencies)
         if missing:
@@ -177,6 +194,8 @@ class WorkflowService:
                 workflow_yaml,
                 input_data,
                 workspace_root,
+                max_live_codex_jobs,
+                False,
             )
         except WorkflowRequestError:
             raise
@@ -190,7 +209,26 @@ class WorkflowService:
             except (OSError, sqlite3.Error, ValueError):
                 raise WorkflowServiceUnavailable("workflow request ledger is unavailable") from None
             if existing is not None:
+                if existing.request_digest != prepared.request_digest:
+                    raise WorkflowRequestConflict(
+                        "request ID is already bound to different workflow content"
+                    )
+                try:
+                    await asyncio.to_thread(self._validate_prepared_request, prepared)
+                except WorkflowRequestError:
+                    raise
+                except (ImportError, ModuleNotFoundError):
+                    raise WorkflowServiceUnavailable(
+                        "workflow dependencies are unavailable"
+                    ) from None
                 return await self._replay(existing, prepared.request_digest)
+
+            try:
+                await asyncio.to_thread(self._validate_prepared_request, prepared)
+            except WorkflowRequestError:
+                raise
+            except (ImportError, ModuleNotFoundError):
+                raise WorkflowServiceUnavailable("workflow dependencies are unavailable") from None
 
             try:
                 row, inserted = await asyncio.to_thread(
@@ -216,11 +254,19 @@ class WorkflowService:
 
             try:
                 await self._set_state(row.run_id, "starting")
-                await self._worker_manager.start_worker(
-                    self._run_directory(row.run_id),
-                    mode="start",
-                    workspace_root=Path(prepared.workspace_root),
-                )
+                if prepared.max_live_codex_jobs == 2:
+                    await self._worker_manager.start_worker(
+                        self._run_directory(row.run_id),
+                        mode="start",
+                        workspace_root=Path(prepared.workspace_root),
+                        max_live_codex_jobs=2,
+                    )
+                else:
+                    await self._worker_manager.start_worker(
+                        self._run_directory(row.run_id),
+                        mode="start",
+                        workspace_root=Path(prepared.workspace_root),
+                    )
             except WorkflowStartFailed:
                 raise
             except WorkflowManagerError:
@@ -339,6 +385,8 @@ class WorkflowService:
                 inspection.thread_id,
                 inspection.result,
                 inspection.updated_at,
+                inspection.max_live_codex_jobs,
+                inspection.jobs,
             )
         return _snapshot_from_inspection(row, inspection)
 
@@ -359,6 +407,8 @@ class WorkflowService:
         workflow_yaml: str,
         input_data: Any,
         workspace_root: str,
+        max_live_codex_jobs: int = 1,
+        validate_definition: bool = True,
     ) -> _PreparedRequest:
         if (
             not isinstance(client_request_id, str)
@@ -375,15 +425,27 @@ class WorkflowService:
             raise WorkflowRequestError("workflow_yaml must not exceed 64 KiB")
         if not isinstance(workspace_root, str):
             raise WorkflowRequestError("workspace_root must be an absolute allowed directory")
+        if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
+            raise WorkflowRequestError("max_live_codex_jobs must be the integer 1 or 2")
 
         from .interpreter import OwsError, parse_workflow_text, validate_workflow
 
         try:
             definition = parse_workflow_text(workflow_yaml)
-            validate_workflow(definition, codex_job_live=True)
+            if validate_definition:
+                validate_workflow(
+                    definition,
+                    codex_job_live=True,
+                    max_live_codex_jobs=max_live_codex_jobs,
+                )
             definition_text = _canonical_json(definition)
             input_text = _canonical_json(input_data)
         except (OwsError, TypeError, ValueError, RecursionError):
+            raise WorkflowRequestError("workflow YAML or input is invalid") from None
+        try:
+            definition_text.encode("utf-8")
+            input_text.encode("utf-8")
+        except UnicodeEncodeError:
             raise WorkflowRequestError("workflow YAML or input is invalid") from None
         try:
             policy = AllowedPathPolicy(self._allowed_roots)
@@ -407,6 +469,8 @@ class WorkflowService:
             "input": input_data,
             "workspace_root": canonical_workspace,
         }
+        if max_live_codex_jobs == 2:
+            digest_payload["max_live_codex_jobs"] = 2
         digest = hashlib.sha256(_canonical_json(digest_payload).encode("utf-8")).hexdigest()
         return _PreparedRequest(
             client_request_id=client_request_id,
@@ -417,7 +481,22 @@ class WorkflowService:
             input_data=input_data,
             workspace_root=canonical_workspace,
             request_digest=digest,
+            max_live_codex_jobs=max_live_codex_jobs,
         )
+
+    @staticmethod
+    def _validate_prepared_request(prepared: _PreparedRequest) -> None:
+        from .interpreter import OwsError, validate_workflow
+
+        try:
+            definition = _strict_json(prepared.definition_text.encode("utf-8"))
+            validate_workflow(
+                definition,
+                codex_job_live=True,
+                max_live_codex_jobs=prepared.max_live_codex_jobs,
+            )
+        except (OwsError, TypeError, ValueError, RecursionError):
+            raise WorkflowRequestError("workflow YAML or input is invalid") from None
 
 
 def _utc_now() -> str:
@@ -649,6 +728,14 @@ def _reserve_request(
         ) != run_dir.resolve(strict=True):
             raise WorkflowServiceUnavailable("workflow manager returned an invalid run directory")
         now = _utc_now()
+        control: dict[str, object] = {
+            "codex_job_live": True,
+            "codex_bridge_port": codex_bridge_port,
+            "codex_job_max_polls": 600,
+            "codex_job_poll_interval_seconds": 0.2,
+        }
+        if prepared.max_live_codex_jobs == 2:
+            control["max_live_codex_jobs"] = 2
         manifest = {
             "workflow_id": workflow_id,
             "run_id": run_id,
@@ -660,12 +747,7 @@ def _reserve_request(
             "input_sha256": prepared.input_sha256,
             "max_tasks": 10_000,
             "codex_bridge_port": codex_bridge_port,
-            "control": {
-                "codex_job_live": True,
-                "codex_bridge_port": codex_bridge_port,
-                "codex_job_max_polls": 600,
-                "codex_job_poll_interval_seconds": 0.2,
-            },
+            "control": control,
             "created_at": now,
         }
         _write_new_file(run_dir / "workflow.yaml", prepared.definition_text.encode("utf-8"))
@@ -824,21 +906,31 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
         ):
             raise ValueError("manifest identity does not match the request ledger")
         control = manifest_value.get("control")
+        base_control_keys = {
+            "codex_job_live",
+            "codex_bridge_port",
+            "codex_job_max_polls",
+            "codex_job_poll_interval_seconds",
+        }
+        if not isinstance(control, dict):
+            raise ValueError("manifest live control is invalid")
+        max_live_codex_jobs = 1
+        if set(control) == base_control_keys | {"max_live_codex_jobs"}:
+            if type(control.get("max_live_codex_jobs")) is not int:
+                raise ValueError("manifest live job limit is invalid")
+            max_live_codex_jobs = control["max_live_codex_jobs"]
+        elif set(control) != base_control_keys:
+            raise ValueError("manifest live control is invalid")
+        bridge_port = control.get("codex_bridge_port")
         if (
-            not isinstance(control, dict)
-            or set(control)
-            != {
-                "codex_job_live",
-                "codex_bridge_port",
-                "codex_job_max_polls",
-                "codex_job_poll_interval_seconds",
-            }
+            max_live_codex_jobs not in {1, 2}
             or control.get("codex_job_live") is not True
-            or type(control.get("codex_bridge_port")) is not int
-            or not 1 <= control["codex_bridge_port"] <= 65535
-            or manifest_value.get("codex_bridge_port") != control["codex_bridge_port"]
+            or type(bridge_port) is not int
+            or not 1 <= bridge_port <= 65535
+            or manifest_value.get("codex_bridge_port") != bridge_port
             or control.get("codex_job_max_polls") != 600
             or control.get("codex_job_poll_interval_seconds") != 0.2
+            or (max_live_codex_jobs == 1 and "max_live_codex_jobs" in control)
         ):
             raise ValueError("manifest live control is invalid")
         definition_text = _read_regular_file(
@@ -848,6 +940,19 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
             _read_regular_file(run_dir / "input.json", limit=_MAX_RUN_FILE_BYTES)
         )
         definition = _strict_json(definition_text.encode("utf-8"))
+        expected_task_identities: tuple[str, ...] = ()
+        if max_live_codex_jobs == 2:
+            from .interpreter import OwsError, validate_workflow
+
+            try:
+                validate_workflow(
+                    definition,
+                    codex_job_live=True,
+                    max_live_codex_jobs=2,
+                )
+            except (OwsError, TypeError, ValueError, RecursionError):
+                raise ValueError("two-job workflow definition is invalid") from None
+            expected_task_identities = _two_job_task_identities(definition)
         workspace = manifest_value.get("workspace_root")
         if not isinstance(workspace, str) or not Path(workspace).is_absolute():
             raise ValueError("manifest workspace is invalid")
@@ -856,6 +961,8 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
             "input": input_data,
             "workspace_root": workspace,
         }
+        if max_live_codex_jobs == 2:
+            digest_payload["max_live_codex_jobs"] = 2
         digest = hashlib.sha256(_canonical_json(digest_payload).encode("utf-8")).hexdigest()
         if (
             digest != row.request_digest
@@ -893,33 +1000,67 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
             return _RunInspection("needs_reconciliation", "unknown", None, None, None, base_updated)
 
     job_record: dict[str, Any] | None = None
+    job_records: tuple[dict[str, Any], ...] = ()
+    reconciliation_marker = False
+    public_jobs: tuple[WorkflowJobSnapshot, ...] = ()
     jobs_path = run_dir / "codex_jobs.sqlite"
     if jobs_path.exists() or jobs_path.is_symlink():
         try:
-            job_record = _read_codex_job(jobs_path, row.workflow_id)
+            if max_live_codex_jobs == 2:
+                job_records, reconciliation_marker = _read_codex_jobs(
+                    jobs_path,
+                    row.workflow_id,
+                    expected_task_identities,
+                )
+                public_jobs = tuple(
+                    WorkflowJobSnapshot(
+                        job_id=str(job["job_id"]),
+                        task_identity=str(job["task_identity"]),
+                        state=str(job["state"]),
+                        thread_id=_optional_string(job.get("thread_id")),
+                        turn_id=_optional_string(job.get("turn_id")),
+                    )
+                    for job in job_records
+                )
+            else:
+                job_record = _read_codex_job(jobs_path, row.workflow_id)
         except (OSError, sqlite3.Error, ValueError, WorkflowServiceUnavailable):
             return _RunInspection(
-                "needs_reconciliation", worker_state, None, None, None, base_updated
+                "needs_reconciliation",
+                worker_state,
+                None,
+                None,
+                None,
+                base_updated,
+                max_live_codex_jobs=max_live_codex_jobs,
             )
     job_state = None if job_record is None else job_record.get("state")
     job_id = None if job_record is None else _optional_string(job_record.get("job_id"))
     thread_id = None if job_record is None else _optional_string(job_record.get("thread_id"))
-    if job_state == "MAYBE_SENT":
+    if max_live_codex_jobs == 2 and public_jobs:
+        job_id = public_jobs[-1].job_id
+        thread_id = public_jobs[-1].thread_id
+        job_state = public_jobs[-1].state
+    if max_live_codex_jobs == 1 and job_state == "MAYBE_SENT":
         return _RunInspection(
             "needs_reconciliation", worker_state, job_id, thread_id, None, base_updated
         )
 
     dbos_status: str | None = None
+    dbos_invalid = False
     dbos_path = run_dir / "dbos.sqlite"
     if dbos_path.exists() or dbos_path.is_symlink():
         try:
             dbos_status = _read_dbos_status(dbos_path, row.workflow_id)
         except (OSError, sqlite3.Error, ValueError, WorkflowServiceUnavailable):
-            return _RunInspection(
-                "needs_reconciliation", worker_state, job_id, thread_id, None, base_updated
-            )
+            if max_live_codex_jobs == 1:
+                return _RunInspection(
+                    "needs_reconciliation", worker_state, job_id, thread_id, None, base_updated
+                )
+            dbos_invalid = True
 
     result_value: dict[str, Any] | None = None
+    result_invalid = False
     result_path = run_dir / "result.json"
     if result_path.exists() or result_path.is_symlink():
         try:
@@ -936,7 +1077,25 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
             result_value = parsed_result
             base_updated = _latest_file_time(base_updated, result_path)
         except (OSError, ValueError, TypeError):
-            return _RunInspection("unknown", worker_state, job_id, thread_id, None, base_updated)
+            if max_live_codex_jobs == 1:
+                return _RunInspection(
+                    "unknown", worker_state, job_id, thread_id, None, base_updated
+                )
+            result_invalid = True
+
+    if max_live_codex_jobs == 2:
+        return _project_two_job_run(
+            row,
+            worker_state=worker_state,
+            dbos_status=dbos_status,
+            result_value=result_value,
+            updated_at=base_updated,
+            jobs=public_jobs,
+            records=job_records,
+            reconciliation_marker=reconciliation_marker,
+            dbos_invalid=dbos_invalid,
+            result_invalid=result_invalid,
+        )
 
     if job_state == "FAILED" or dbos_status in {"ERROR", "CANCELLED", "FAILED"}:
         return _RunInspection("failed", worker_state, job_id, thread_id, None, base_updated)
@@ -976,6 +1135,266 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
     return _RunInspection(
         "needs_reconciliation", worker_state, job_id, thread_id, None, base_updated
     )
+
+
+def _two_job_task_identities(definition: Any) -> tuple[str, str]:
+    tasks = definition.get("do") if isinstance(definition, dict) else None
+    if not isinstance(tasks, list) or len(tasks) != 2:
+        raise ValueError("two-job workflow task list is invalid")
+    names: list[str] = []
+    for task in tasks:
+        if not isinstance(task, dict) or len(task) != 1:
+            raise ValueError("two-job workflow task is invalid")
+        name = next(iter(task))
+        if not isinstance(name, str) or not name:
+            raise ValueError("two-job workflow task name is invalid")
+        names.append(name)
+    return (f"do[0].{names[0]}", f"do[1].{names[1]}")
+
+
+def _read_codex_jobs(
+    database: Path,
+    workflow_id: str,
+    expected_task_identities: tuple[str, ...],
+) -> tuple[tuple[dict[str, Any], ...], bool]:
+    if (
+        database.is_symlink()
+        or not database.is_file()
+        or database.stat().st_size > _MAX_RUN_FILE_BYTES * 8
+    ):
+        raise ValueError("codex job ledger is invalid")
+    connection = _connect_read(database)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        if not {"jobs", "job_reconciliation"} <= tables:
+            raise ValueError("two-job ledger schema is incomplete")
+        unique_indexes: set[tuple[str, ...]] = set()
+        for index in connection.execute("PRAGMA index_list(jobs)"):
+            if not bool(index[2]):
+                continue
+            index_name = str(index[1]).replace('"', '""')
+            columns = tuple(
+                str(column[2])
+                for column in connection.execute(f'PRAGMA index_info("{index_name}")')
+                if column[2] is not None
+            )
+            unique_indexes.add(columns)
+        if ("workflow_id", "task_identity") not in unique_indexes:
+            raise ValueError("two-job ledger must use the V2 workflow/task uniqueness")
+        rows = connection.execute(
+            "SELECT job_id, workflow_id, task_identity, state, thread_id, turn_id, "
+            "remote_state, receipt_json FROM jobs "
+            "ORDER BY created_at ASC, rowid ASC LIMIT 3"
+        ).fetchall()
+        markers = connection.execute(
+            "SELECT job_id, marker FROM job_reconciliation LIMIT 3"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    if len(rows) > 2 or len(rows) > len(expected_task_identities) or len(markers) > 2:
+        raise ValueError("two-job ledger contains too many rows")
+    records: list[dict[str, Any]] = []
+    job_ids: set[str] = set()
+    for index, row in enumerate(rows):
+        job_id = row["job_id"]
+        task_identity = row["task_identity"]
+        state = row["state"]
+        if (
+            row["workflow_id"] != workflow_id
+            or not isinstance(job_id, str)
+            or _CODEX_JOB_ID.fullmatch(job_id) is None
+            or job_id in job_ids
+            or task_identity != expected_task_identities[index]
+            or state not in {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
+        ):
+            raise ValueError("two-job ledger identity or order is invalid")
+        job_ids.add(job_id)
+        thread_id = row["thread_id"]
+        turn_id = row["turn_id"]
+        if state in {"PREPARED", "MAYBE_SENT"}:
+            if thread_id is not None or turn_id is not None:
+                raise ValueError("unaccepted two-job row has a remote identity")
+        elif (
+            not isinstance(thread_id, str)
+            or _CODEX_JOB_ID.fullmatch(thread_id) is None
+            or not isinstance(turn_id, str)
+            or _CODEX_JOB_ID.fullmatch(turn_id) is None
+        ):
+            raise ValueError("accepted two-job row has an invalid remote identity")
+
+        remote_state = row["remote_state"]
+        receipt_json = row["receipt_json"]
+        receipt: dict[str, Any] | None = None
+        if state in {"PREPARED", "MAYBE_SENT"}:
+            if remote_state is not None or receipt_json is not None:
+                raise ValueError("unaccepted two-job row has a remote receipt")
+        elif state in {"ACCEPTED", "RUNNING"}:
+            if (
+                remote_state
+                not in {
+                    "in_progress",
+                    "needs_approval",
+                    "needs_input",
+                    "completed",
+                    "interrupted",
+                    "failed",
+                    "not_loaded",
+                    "unknown",
+                }
+                or receipt_json is not None
+            ):
+                raise ValueError("active two-job row has an invalid receipt")
+        elif state == "SUCCEEDED":
+            if (
+                not isinstance(receipt_json, str)
+                or len(receipt_json.encode("utf-8")) > _MAX_RESULT_BYTES
+            ):
+                raise ValueError("succeeded two-job row has no bounded receipt")
+            receipt = _strict_json(receipt_json.encode("utf-8"))
+            result = receipt.get("result") if isinstance(receipt, dict) else None
+            if (
+                not isinstance(receipt, dict)
+                or set(receipt) != {"result"}
+                or not isinstance(result, dict)
+                or set(result) != {"final_text"}
+                or not isinstance(result.get("final_text"), str)
+                or remote_state != "completed"
+            ):
+                raise ValueError("succeeded two-job row receipt is invalid")
+        else:
+            if not isinstance(receipt_json, str) or len(receipt_json.encode("utf-8")) > 4096:
+                raise ValueError("failed two-job row has no bounded receipt")
+            receipt = _strict_json(receipt_json.encode("utf-8"))
+            if (
+                not isinstance(receipt, dict)
+                or set(receipt) != {"remote_state"}
+                or receipt.get("remote_state") != remote_state
+                or remote_state not in {"failed", "interrupted"}
+            ):
+                raise ValueError("failed two-job row receipt is invalid")
+        records.append(
+            {
+                "job_id": job_id,
+                "task_identity": task_identity,
+                "state": state,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "remote_state": remote_state,
+                "receipt": receipt,
+            }
+        )
+
+    reconciliation_marker = False
+    for marker_row in markers:
+        marker_job_id = marker_row["job_id"]
+        if marker_job_id not in job_ids or marker_row["marker"] != "NEEDS_RECONCILIATION":
+            raise ValueError("two-job reconciliation marker is invalid")
+        reconciliation_marker = True
+    return tuple(records), reconciliation_marker
+
+
+def _project_two_job_run(
+    row: _RequestRow,
+    *,
+    worker_state: str,
+    dbos_status: str | None,
+    result_value: dict[str, Any] | None,
+    updated_at: str,
+    jobs: tuple[WorkflowJobSnapshot, ...],
+    records: tuple[dict[str, Any], ...],
+    reconciliation_marker: bool,
+    dbos_invalid: bool,
+    result_invalid: bool,
+) -> _RunInspection:
+    job_id = jobs[-1].job_id if jobs else None
+    thread_id = jobs[-1].thread_id if jobs else None
+
+    def inspection(status: str, result: dict[str, Any] | None = None) -> _RunInspection:
+        return _RunInspection(
+            status,
+            worker_state,
+            job_id,
+            thread_id,
+            result,
+            updated_at,
+            max_live_codex_jobs=2,
+            jobs=jobs,
+        )
+
+    if reconciliation_marker or any(job["state"] == "MAYBE_SENT" for job in records):
+        return inspection("needs_reconciliation")
+    if any(job["state"] == "FAILED" for job in records) or dbos_status in {
+        "ERROR",
+        "CANCELLED",
+        "FAILED",
+    }:
+        return inspection("failed")
+    if worker_state == "failed":
+        return inspection("failed")
+    if len(records) == 2 and records[0]["state"] != "SUCCEEDED":
+        return inspection("needs_reconciliation")
+    if dbos_invalid:
+        return inspection("needs_reconciliation")
+    if result_invalid:
+        return inspection("unknown")
+
+    if len(records) == 2 and all(job["state"] == "SUCCEEDED" for job in records):
+        if result_value is not None and not _two_job_result_matches(row, records[1], result_value):
+            return inspection("unknown")
+        if (
+            worker_state == "completed"
+            and dbos_status in {"SUCCESS", "SUCCEEDED"}
+            and result_value is not None
+        ):
+            return inspection("succeeded", result_value)
+        if worker_state == "running":
+            return inspection("running")
+        return inspection("unknown")
+
+    if result_value is not None:
+        return inspection("unknown")
+    if worker_state == "completed" or dbos_status in {"SUCCESS", "SUCCEEDED"}:
+        return inspection("unknown")
+    if (
+        worker_state == "running"
+        or dbos_status
+        in {
+            "PENDING",
+            "ENQUEUED",
+            "RETRIES_EXCEEDED",
+            "RUNNING",
+        }
+        or records
+    ):
+        return inspection("running")
+    if row.state == "queued":
+        return inspection("queued")
+    if row.state == "failed_to_start":
+        return inspection("failed_to_start")
+    return inspection("needs_reconciliation")
+
+
+def _two_job_result_matches(
+    row: _RequestRow,
+    second_job: dict[str, Any],
+    result_value: dict[str, Any],
+) -> bool:
+    receipt = second_job.get("receipt")
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("result"), dict):
+        return False
+    expected = {
+        "job_id": second_job["job_id"],
+        "request_key": f"{row.workflow_id}::{second_job['task_identity']}",
+        "thread_id": second_job["thread_id"],
+        "turn_id": second_job["turn_id"],
+        "status": "SUCCEEDED",
+        "result": receipt["result"],
+    }
+    return result_value.get("result") == expected
 
 
 def _read_codex_job(database: Path, workflow_id: str) -> dict[str, Any] | None:
@@ -1070,4 +1489,6 @@ def _snapshot_from_inspection(row: _RequestRow, inspection: _RunInspection) -> W
         terminal=status in _TERMINAL_STATES,
         job_id=inspection.job_id,
         thread_id=inspection.thread_id,
+        max_live_codex_jobs=inspection.max_live_codex_jobs,
+        jobs=inspection.jobs,
     )

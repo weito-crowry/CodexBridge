@@ -39,7 +39,13 @@ def create_workflow_routes(
             return forbidden
         try:
             payload = await _json_payload(request)
-            if set(payload) - {"client_request_id", "workflow_yaml", "input", "workspace_root"}:
+            if set(payload) - {
+                "client_request_id",
+                "workflow_yaml",
+                "input",
+                "workspace_root",
+                "max_live_codex_jobs",
+            }:
                 raise WorkflowRequestError("request contains unsupported fields")
             if not {"client_request_id", "workflow_yaml", "workspace_root"} <= set(payload):
                 raise WorkflowRequestError("request is missing required fields")
@@ -58,6 +64,9 @@ def create_workflow_routes(
                 raise WorkflowRequestError("workflow_yaml exceeds 64 KiB")
             if not isinstance(workspace_root, str):
                 raise WorkflowRequestError("workspace_root must be an absolute path")
+            max_live_codex_jobs = payload.get("max_live_codex_jobs", 1)
+            if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
+                raise WorkflowRequestError("max_live_codex_jobs must be the integer 1 or 2")
             if not ready():
                 return JSONResponse({"error": "bridge_not_ready"}, status_code=503)
             snapshot = await service.start_workflow(
@@ -65,6 +74,7 @@ def create_workflow_routes(
                 workflow_yaml=workflow_yaml,
                 input_data=payload.get("input", {}),
                 workspace_root=workspace_root,
+                max_live_codex_jobs=max_live_codex_jobs,
             )
             return JSONResponse(_snapshot_json(snapshot), status_code=202)
         except WorkflowRequestError:
@@ -249,6 +259,18 @@ def _snapshot_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
         result["job_id"] = snapshot.job_id
     if snapshot.thread_id is not None:
         result["thread_id"] = snapshot.thread_id
+    if snapshot.max_live_codex_jobs == 2:
+        result["max_live_codex_jobs"] = 2
+        result["jobs"] = [
+            {
+                "job_id": job.job_id,
+                "task_identity": job.task_identity,
+                "state": job.state,
+                "thread_id": job.thread_id,
+                "turn_id": job.turn_id,
+            }
+            for job in snapshot.jobs
+        ]
     return result
 
 

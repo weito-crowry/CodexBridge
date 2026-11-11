@@ -154,6 +154,7 @@ class WorkflowWorkerManager:
         *,
         mode: WorkerMode,
         workspace_root: Path | None = None,
+        max_live_codex_jobs: int = 1,
     ) -> WorkflowWorkerHandle:
         async with self._lifecycle_lock:
             if not self._accepting:
@@ -166,7 +167,10 @@ class WorkflowWorkerManager:
             if current is not None and current.state == "running":
                 raise WorkflowManagerError("a worker is already running for this workflow run")
             manifest = self._read_manifest(canonical_run_dir)
-            live = _codex_job_live(manifest)
+            live = _codex_job_live(
+                manifest,
+                max_live_codex_jobs=max_live_codex_jobs,
+            )
             canonical_workspace = self._validate_workspace(canonical_run_dir, workspace_root, live)
             if live and not self._control_token:
                 raise WorkflowManagerError("live codex-job requires the Bridge control token")
@@ -348,8 +352,11 @@ class WorkflowWorkerManager:
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise WorkflowManagerError("workflow run manifest is unavailable")
         try:
-            value = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            value = json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_unique_json_object,
+            )
+        except (OSError, ValueError):
             raise WorkflowManagerError("workflow run manifest is invalid") from None
         if not isinstance(value, dict):
             raise WorkflowManagerError("workflow run manifest must be an object")
@@ -491,12 +498,22 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
             if manifest_path.is_symlink() or not manifest_path.is_file():
                 complete = False
                 continue
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_unique_json_object,
+            )
             if not isinstance(manifest, dict):
                 complete = False
                 continue
-            live = _codex_job_live(manifest)
-        except (OSError, json.JSONDecodeError, WorkflowManagerError):
+            control = manifest.get("control")
+            declared_limit = (
+                control.get("max_live_codex_jobs", 1) if isinstance(control, dict) else 1
+            )
+            live = _codex_job_live(
+                manifest,
+                max_live_codex_jobs=declared_limit,
+            )
+        except (OSError, ValueError, WorkflowManagerError):
             complete = False
             continue
         if (
@@ -506,6 +523,9 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
             or manifest.get("request_digest") != request_digest
             or manifest.get("mode") != "codex-job-live"
         ):
+            complete = False
+            continue
+        if declared_limit == 2 and manifest.get("workflow_source") != "ui-api":
             complete = False
             continue
         persisted.append(resolved)
@@ -532,16 +552,56 @@ def missing_workflow_dependencies() -> tuple[str, ...]:
     return tuple(name for name in _WORKFLOW_DEPENDENCIES if find_spec(name) is None)
 
 
-def _codex_job_live(manifest: Mapping[str, object]) -> bool:
+def _codex_job_live(
+    manifest: Mapping[str, object],
+    *,
+    max_live_codex_jobs: object = 1,
+) -> bool:
     control = manifest.get("control", {})
     if not isinstance(control, dict):
         raise WorkflowManagerError("workflow manifest control must be an object")
-    if "max_live_codex_jobs" in control:
-        raise WorkflowManagerError("max_live_codex_jobs is reserved for internal worker execution")
+    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
+        raise WorkflowManagerError("worker max_live_codex_jobs must be the integer 1 or 2")
+    declared_limit = control.get("max_live_codex_jobs", 1)
+    if type(declared_limit) is not int or declared_limit not in {1, 2}:
+        raise WorkflowManagerError("workflow manifest max_live_codex_jobs is invalid")
+    if declared_limit != max_live_codex_jobs:
+        raise WorkflowManagerError("worker max_live_codex_jobs does not match the manifest")
+    if declared_limit == 1 and "max_live_codex_jobs" in control:
+        raise WorkflowManagerError("single-job manifests must omit max_live_codex_jobs")
+    if declared_limit == 2:
+        expected_control = {
+            "codex_job_live",
+            "codex_bridge_port",
+            "codex_job_max_polls",
+            "codex_job_poll_interval_seconds",
+            "max_live_codex_jobs",
+        }
+        bridge_port = control.get("codex_bridge_port")
+        if (
+            set(control) != expected_control
+            or control.get("codex_job_live") is not True
+            or type(bridge_port) is not int
+            or not 1 <= bridge_port <= 65535
+            or manifest.get("codex_bridge_port") != bridge_port
+            or control.get("codex_job_max_polls") != 600
+            or control.get("codex_job_poll_interval_seconds") != 0.2
+            or manifest.get("max_tasks") != 10_000
+        ):
+            raise WorkflowManagerError("two-job workflow manifest control is invalid")
     live = control.get("codex_job_live", False)
     if not isinstance(live, bool):
         raise WorkflowManagerError("workflow manifest codex_job_live must be a boolean")
     return live
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("workflow manifest contains a duplicate key")
+        result[key] = value
+    return result
 
 
 def _write_private_json(path: Path, value: Mapping[str, object]) -> None:

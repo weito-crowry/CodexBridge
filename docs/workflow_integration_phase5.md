@@ -183,6 +183,14 @@ promptはYAMLでデコードした文字列をそのまま使い、NFKC・trim�
 
 未実装の5E-2Bは2件の固定順序実行と結果受け渡し、5E-2CはAPI/Console状態投影と隔離E2Eを扱う。OWSのone-job制約、Worker呼出し、結果prompt組み立ては5E-2Aの範囲外とする。
 
+## 17. Phase 5E-2C1: Workflow APIの明示2-job受付
+
+5E-2C1では既存の`POST /ui-api/control/workflows`にoptional integer `max_live_codex_jobs`を追加する。省略時と`1`指定時は従来single-job契約、digest、manifest、状態API JSON shapeを維持する。`2`指定時だけ5E-2Bの固定2-task subsetを検証し、digestとimmutable manifestへopt-inを記録してManagerへ明示的に渡す。同じrequest IDと同じpayloadは永続runを返し、再spawnしない。
+
+Workflow detailは2-job runに限り、task順の`jobs`状態と`max_live_codex_jobs: 2`を返す。状態照会はWorker/DBOS/job ledger/resultをread-onlyで照合し、2件ともSUCCEEDED、Worker completed、DBOS SUCCESS、hash整合済み`result.json`を確認してから成功を返す。result endpointは従来の`result.json`を返す。Managerは呼出し側limitとmanifestを照合し、Bridge再起動時は両jobのactive thread/turnをshutdown ownershipへ含める。`MAYBE_SENT`があればownershipを不完全として扱う。
+
+Consoleでの2-job指定・表示とWindows隔離実E2Eは5E-2C2に残す。5E-2C1のテストはWindows nativeのtemp stateとfake Manager/合成ledgerを使い、実Codex POSTは行わない。
+
 ## 16. Phase 5E-2B: 内部Workerの逐次2-job
 
 5E-2Bでは内部Worker manifest controlの`max_live_codex_jobs=2`を明示した場合だけ、固定subsetの2 taskを順番に実行する。既定は1件で、公開Managerはこのcontrol keyを受け付けず、Service/APIの受付と生成manifestは従来の1件制限を維持する。2件目の`prompt_from`は1件目のSUCCEEDED receiptから評価し、literal prefixへそのまま連結する。失敗・照合要・空値・型不正では2件目を開始しない。V2 ledger、既存のrequest digest、DBOS taskごとのstart/status checkpointを使い、同一taskの再開POSTを抑止する。
