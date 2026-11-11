@@ -280,6 +280,49 @@ def test_workflow_client_applies_detail_and_result_response_limits(kind: str, li
     assert reply.aborted and reply.deleted
 
 
+def test_workflow_client_accepts_two_job_detail_within_four_kibibytes() -> None:
+    _app()
+    detail = {
+        "workflow_id": "12345678-1234-5678-1234-567812345678",
+        "run_id": "abcdefgh-1234-5678-1234-abcdefghijkl",
+        "status": "running",
+        "created_at": "2026-11-11T00:00:00+00:00",
+        "updated_at": "2026-11-11T00:00:01+00:00",
+        "worker_state": "running",
+        "terminal": False,
+        "job_id": "job-second-12345678",
+        "thread_id": "thread-second-12345678",
+        "max_live_codex_jobs": 2,
+        "jobs": [
+            {
+                "job_id": "job-first-12345678",
+                "task_identity": "do[0].first",
+                "state": "SUCCEEDED",
+                "thread_id": "thread-first-12345678",
+                "turn_id": "turn-first-12345678",
+            },
+            {
+                "job_id": "job-second-12345678",
+                "task_identity": "do[1].second",
+                "state": "RUNNING",
+                "thread_id": "thread-second-12345678",
+                "turn_id": "turn-second-12345678",
+            },
+        ],
+    }
+    body = json.dumps(detail, separators=(",", ":")).encode("utf-8")
+    assert len(body) < 4 * 1024
+    reply = FakeReply(body, 200)
+    client = ApiClient("http://127.0.0.1:8001", manager=FakeManager([reply]))
+    successes: list[tuple[str, int, object]] = []
+    client.workflow_succeeded.connect(lambda *args: successes.append(args))
+
+    assert client.get_control_workflow_detail(detail["workflow_id"], "safe-token", key="detail")
+    reply.finished.emit()
+
+    assert successes == [("detail", 200, detail)]
+
+
 def test_workflow_client_suppresses_duplicate_key_and_rejects_path_ids() -> None:
     _app()
     reply = FakeReply()

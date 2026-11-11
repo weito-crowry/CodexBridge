@@ -119,6 +119,121 @@ def test_workflow_management_dialog_displays_details_and_redacts_result_secrets(
     assert "normal result" in dialog.result_json.toPlainText()
 
 
+def test_workflow_management_dialog_projects_only_two_job_identifiers_and_states() -> None:
+    _app()
+    dialog = WorkflowManagementDialog()
+    detail = {
+        "workflow_id": "workflow-safe-123",
+        "status": "running",
+        "max_live_codex_jobs": 2,
+        "jobs": [],
+    }
+
+    dialog.set_detail(detail)
+    assert not dialog.jobs_group.isHidden()
+    assert dialog.job_list.count() == 0
+
+    detail["jobs"] = [
+        {
+            "job_id": "job-first-123",
+            "task_identity": "do[0].first",
+            "state": "SUCCEEDED",
+            "thread_id": "thread-first-123",
+            "turn_id": "turn-first-123",
+            "request_json": {"prompt": "private prompt text", "token": "private-token"},
+            "workspace_root": "C:\\private\\workspace",
+        },
+        {
+            "job_id": "job-second-123",
+            "task_identity": "do[1].second",
+            "state": "RUNNING",
+            "thread_id": "thread-second-123",
+            "turn_id": "turn-second-123",
+            "credential": "private-credential",
+            "request_json": {"prompt": "second private prompt"},
+        },
+        {
+            "job_id": "job-third-should-not-display",
+            "task_identity": "do[2].third",
+            "state": "FAILED",
+        },
+    ]
+    dialog.set_detail(detail)
+
+    assert dialog.job_list.count() == 2
+    assert all(
+        len(dialog.job_list.item(index).text()) <= 768 for index in range(dialog.job_list.count())
+    )
+    displayed = "\n".join(
+        dialog.job_list.item(index).text() for index in range(dialog.job_list.count())
+    )
+    assert "do[0].first" in displayed
+    assert "SUCCEEDED" in displayed
+    assert "job-first-123" in displayed
+    assert "thread-first-123" in displayed
+    assert "turn-first-123" in displayed
+    assert "do[1].second" in displayed
+    assert "RUNNING" in displayed
+    for secret in (
+        "private prompt text",
+        "private-token",
+        "private-credential",
+        "C:\\private\\workspace",
+        "job-third-should-not-display",
+    ):
+        assert secret not in displayed
+
+
+def test_workflow_management_dialog_hides_non_two_job_details_and_sanitizes_job_text() -> None:
+    _app()
+    dialog = WorkflowManagementDialog()
+    detail = {"workflow_id": "workflow-safe", "status": "running"}
+    dialog.set_detail(detail)
+    assert dialog.jobs_group.isHidden()
+    assert dialog.job_list.count() == 0
+
+    detail.update(
+        {
+            "max_live_codex_jobs": 2,
+            "jobs": [
+                {
+                    "job_id": "<script>alert(1)</script>",
+                    "task_identity": "do[0].first\nforged row",
+                    "state": "<img src=x>",
+                    "thread_id": "thread-safe",
+                    "turn_id": "turn-safe",
+                }
+            ],
+        }
+    )
+    dialog.set_detail(detail)
+    assert dialog.job_list.count() == 1
+    displayed = dialog.job_list.item(0).text()
+    assert "<script>" not in displayed
+    assert "<img" not in displayed
+    assert "forged row" not in displayed
+    assert any(text in displayed for text in ("Unknown", "不明"))
+
+
+@pytest.mark.parametrize(
+    "state", ["PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"]
+)
+def test_workflow_management_dialog_preserves_known_codex_job_states(state: str) -> None:
+    _app()
+    dialog = WorkflowManagementDialog()
+    dialog.set_detail(
+        {
+            "workflow_id": "workflow-state",
+            "status": "running",
+            "max_live_codex_jobs": 2,
+            "jobs": [{"task_identity": "do[0].first", "state": state}],
+        }
+    )
+
+    assert dialog.job_list.count() == 1
+    assert state in dialog.job_list.item(0).text()
+
+
 @pytest.mark.parametrize(
     ("path", "fragments"),
     [
@@ -177,6 +292,7 @@ def test_start_workflow_dialog_validates_yaml_and_workspace_and_reuses_request_o
     dialog.workspace_path_edit.setText(str(tmp_path))
 
     assert dialog.submit_button.isEnabled()
+    assert dialog.job_count_combo.currentData() == 1
     assert "approved.yaml" in dialog.preview_label.text()
     assert str(tmp_path.resolve()) in dialog.preview_label.text()
     assert "name: fixed" not in dialog.preview_label.text()
@@ -191,6 +307,7 @@ def test_start_workflow_dialog_validates_yaml_and_workspace_and_reuses_request_o
         "workspace_root": str(tmp_path.resolve()),
     }
     assert not dialog.yaml_path_edit.isEnabled()
+    assert not dialog.job_count_combo.isEnabled()
 
     dialog.show_request_failure("timeout", outcome_unknown=True, retry_allowed=True)
     assert any(text in dialog.error_label.text().lower() for text in ("unknown", "確認できません"))
@@ -199,6 +316,36 @@ def test_start_workflow_dialog_validates_yaml_and_workspace_and_reuses_request_o
     dialog.retry_button.click()
 
     assert sent == [(request_id, payload), (request_id, payload)]
+
+
+def test_start_workflow_dialog_two_job_opt_in_is_frozen_and_retried_unchanged(
+    tmp_path: Path,
+) -> None:
+    _app()
+    yaml_file = tmp_path / "two-jobs.yaml"
+    yaml_file.write_bytes(b"name: two-jobs\n")
+    dialog = StartWorkflowDialog((str(tmp_path),))
+    sent: list[tuple[str, dict[str, object]]] = []
+    dialog.submitted.connect(lambda request_id, payload: sent.append((request_id, payload)))
+    dialog.yaml_path_edit.setText(str(yaml_file))
+    dialog.workspace_path_edit.setText(str(tmp_path))
+    dialog.job_count_combo.setCurrentIndex(dialog.job_count_combo.findData(2))
+
+    dialog.submit_button.click()
+    request_id, payload = sent[0]
+    assert payload == {
+        "client_request_id": request_id,
+        "workflow_yaml": "name: two-jobs\n",
+        "input": {},
+        "workspace_root": str(tmp_path.resolve()),
+        "max_live_codex_jobs": 2,
+    }
+    assert not dialog.job_count_combo.isEnabled()
+
+    dialog.show_request_failure("timeout", outcome_unknown=True, retry_allowed=True)
+    dialog.retry_button.click()
+    assert sent == [(request_id, payload), (request_id, payload)]
+    assert not dialog.job_count_combo.isEnabled()
 
 
 @pytest.mark.parametrize("close_via", ["button", "window"])
@@ -347,7 +494,16 @@ def test_workflow_dialog_translations(
     settings.setValue("language", language)
     initialize_language(settings)
     dialog = WorkflowManagementDialog()
+    start_dialog = StartWorkflowDialog()
 
     assert dialog.windowTitle() == expected_title
     assert workflow_status_label("needs_reconciliation") == expected_reconciliation
     assert dialog.refresh_button.text() in {"Update", "更新"}
+    assert dialog.jobs_group.title() in {"Codex jobs", "Codexジョブ一覧"}
+    assert start_dialog.job_count_combo.count() == 2
+    assert start_dialog.job_count_notice.isHidden()
+    start_dialog.job_count_combo.setCurrentIndex(start_dialog.job_count_combo.findData(2))
+    assert not start_dialog.job_count_notice.isHidden()
+    assert any(
+        text in start_dialog.job_count_notice.text() for text in ("sequentially", "順次実行")
+    )

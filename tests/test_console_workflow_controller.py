@@ -146,6 +146,34 @@ def test_workflow_controller_ignores_old_detail_after_selection_changes() -> Non
     controller.shutdown()
 
 
+def test_workflow_controller_clears_jobs_when_selection_changes() -> None:
+    _window, client, controller = _controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one", "workflow-two"))
+    first_detail = client.calls[-1]
+    first = _detail("workflow-one")
+    first["max_live_codex_jobs"] = 2
+    first["jobs"] = [
+        {
+            "job_id": "first-job-id",
+            "task_identity": "do[0].first",
+            "state": "SUCCEEDED",
+            "thread_id": "first-thread-id",
+            "turn_id": "first-turn-id",
+        }
+    ]
+    client.succeed(first_detail, 200, first)
+    assert controller.dialog.job_list.count() == 1
+
+    controller.dialog.workflow_list.setCurrentRow(1)
+
+    assert controller.dialog.job_list.count() == 0
+    assert controller.dialog.jobs_group.isHidden()
+    second_detail = client.calls[-1]
+    client.succeed(second_detail, 200, _detail("workflow-two"))
+    assert controller.dialog.job_list.count() == 0
+    controller.shutdown()
+
+
 def test_workflow_controller_keeps_communication_failures_separate_from_run_state() -> None:
     _window, client, controller = _controller()
     client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
@@ -262,9 +290,13 @@ def test_workflow_controller_preserves_unknown_start_across_bridge_transition(
     yaml_file.write_bytes(b"name: fixed\n")
     start_dialog.yaml_path_edit.setText(str(yaml_file))
     start_dialog.workspace_path_edit.setText(str(tmp_path))
+    start_dialog.job_count_combo.setCurrentIndex(start_dialog.job_count_combo.findData(2))
     start_dialog.submit_button.click()
     post_call = client.calls[-1]
     assert post_call[0] == "start"
+    first_payload = post_call[3]
+    assert isinstance(first_payload, dict)
+    assert first_payload["max_live_codex_jobs"] == 2
 
     window._ready = False
     controller.notify_readiness_changed()
@@ -278,7 +310,17 @@ def test_workflow_controller_preserves_unknown_start_across_bridge_transition(
     controller.notify_readiness_changed()
     assert not start_dialog.retry_button.isHidden()
     assert sum(call[0] == "start" for call in client.calls) == 1
-    assert client.calls[-1][2] == "token-rotated"
+    updated_list = client.calls[-1]
+    assert updated_list[0] == "list"
+    assert updated_list[2] == "token-rotated"
+    client.succeed(updated_list, 200, _list_payload())
+    start_dialog.retry_button.click()
+    retry_call = client.calls[-1]
+    assert retry_call[0] == "start"
+    assert retry_call[2] == "token-rotated"
+    assert retry_call[3] == first_payload
+    assert retry_call[3]["client_request_id"] == post_call[3]["client_request_id"]
+    assert sum(call[0] == "start" for call in client.calls) == 2
     controller.shutdown()
 
 

@@ -1,0 +1,183 @@
+{
+  "checks": {
+    "active_job_concurrency": {
+      "maximum_active": 1,
+      "maybe_sent_post_claims": 2,
+      "new_codex_jobs": 2,
+      "new_threads": 2,
+      "status": "PASS"
+    },
+    "bridge_preflight_and_authentication": {
+      "appserver_ready": true,
+      "capabilities_authenticated": true,
+      "incorrect_token_rejected": true,
+      "missing_token_rejected": true,
+      "ports_owned_by_bridge": true,
+      "process_identity_matches": true,
+      "status": "PASS"
+    },
+    "bridge_restart_readback": {
+      "restart_count": 0,
+      "status": "NOT_RUN"
+    },
+    "console_qt_get_readback": {
+      "reason": "runner_blocked_before_qt_get",
+      "status": "NOT_RUN"
+    },
+    "dedicated_loopback_ports": {
+      "mcp": 58885,
+      "production_ports_avoided": true,
+      "status": "PASS",
+      "ui": 58886
+    },
+    "expected_final_texts": {
+      "first": "4",
+      "second": "5",
+      "status": "PASS",
+      "verified_from_job_receipts_and_saved_result": true
+    },
+    "immutable_hashes_and_ledgers": {
+      "dbos_status": "SUCCESS",
+      "definition_sha256_matches_stored_bytes": true,
+      "input_sha256_matches": true,
+      "job_request_sha256_matches": true,
+      "job_rows": 2,
+      "request_rows": 1,
+      "request_sha256_matches": true,
+      "status": "PASS",
+      "worker_exit_code": 0,
+      "worker_state": "completed"
+    },
+    "isolated_environment_and_roots": {
+      "allowlist": true,
+      "state_and_workspace_separate": true,
+      "status": "PASS"
+    },
+    "native_windows": {
+      "platform": "windows_native",
+      "status": "PASS"
+    },
+    "production_side_effects": {
+      "basis": "isolated_loopback_config_and_state",
+      "count": 0,
+      "status": "PASS"
+    },
+    "same_id_replay": {
+      "replay_count": 0,
+      "status": "NOT_RUN"
+    },
+    "single_live_workflow_post": {
+      "accepted_http_status": 202,
+      "post_count": 1,
+      "status": "PASS"
+    },
+    "workflow_api_identity_and_jobs": {
+      "job_ids_match_ledger": true,
+      "live_http_list_detail_result_reads_completed": true,
+      "ordered_jobs": 2,
+      "post_stop_read_only_service_projection": true,
+      "status": "PASS"
+    },
+    "workspace_allowed_root_and_cwd": {
+      "allowed_root_is_workspace": true,
+      "status": "PASS",
+      "verified_job_cwds": 2
+    }
+  },
+  "cleanup": {
+    "bridge_processes": [
+      {
+        "descendant_count": 11,
+        "forced_termination": false,
+        "reaped": true,
+        "shutdown_http_status": 202
+      }
+    ],
+    "forced_termination": false,
+    "isolated_temp_state_removed": true,
+    "last_bridge": {
+      "descendant_count": 11,
+      "forced_termination": false,
+      "reaped": true,
+      "shutdown_http_status": 202
+    },
+    "manual_temp_removal_after_read_only_reconciliation": true,
+    "owned_children_reaped": true,
+    "script_temp_removal_initial_attempt": "FAILED",
+    "status": "PASS",
+    "temp_root_containment_verified": true
+  },
+  "exit_code": 2,
+  "finished_at_utc": "2026-11-11T13:12:28+00:00",
+  "jobs": [
+    {
+      "job_id": "25acd820-dcd8-4545-9685-e02cfbdad05f",
+      "request_sha256": "8e74865befc827e7e5a58402b4f4f76d1b91f16d5c20042d7162872764563a45",
+      "state": "SUCCEEDED",
+      "task_identity": "do[0].first",
+      "thread_id": "01a1caaf-adbf-7991-bfa9-1896f99ad68b",
+      "turn_id": "01a1caaf-ae91-73e0-8463-af633ca35655"
+    },
+    {
+      "job_id": "9134e24d-827d-48c1-824d-9afb95a88e10",
+      "request_sha256": "02989bc6813af4369de63cdbf2d95b691ec190cebaad0de4773f63e7e75b8631",
+      "state": "SUCCEEDED",
+      "task_identity": "do[1].second",
+      "thread_id": "01a1caaf-c14c-7a92-bdd8-7d5b66327f0e",
+      "turn_id": "01a1caaf-c178-7c92-9763-da3c9f79392e"
+    }
+  ],
+  "live_workflow_post_attempted": true,
+  "live_workflow_post_count": 1,
+  "maximum_active_codex_jobs": 1,
+  "new_codex_job_count": 2,
+  "new_codex_thread_count": 2,
+  "phase": "5E-2C2",
+  "ports": {
+    "loopback_only": true,
+    "mcp": 58885,
+    "ui": 58886
+  },
+  "production_side_effect_count": 0,
+  "reason": "runner_definition_hash_verifier_added_a_second_newline",
+  "reconciliation": {
+    "completed_at_utc": "2026-11-11T13:10:56+00:00",
+    "live_rerun_or_additional_job_post": false,
+    "method": "read_only_local_service_and_sqlite_after_normal_bridge_shutdown",
+    "replay_restart_and_console_qt_checks": "NOT_RUN_AFTER_RUNNER_BLOCK",
+    "runner_hash_check": "incorrectly_added_a_second_newline_to_stored_definition_text",
+    "stored_definition_bytes_match_manifest": true,
+    "temp_cleanup_completed_at_utc": "2026-11-11T13:12:28+00:00"
+  },
+  "same_id_replay_post_attempted": false,
+  "same_id_replay_post_count": 0,
+  "started_at_utc": "2026-11-11T12:57:43+00:00",
+  "status": "BLOCKED",
+  "workflow": {
+    "accepted_status": 202,
+    "client_request_id": "phase5e2c2-cad025e9374046a8a3a8c86aab80eff6",
+    "dbos_status": "SUCCESS",
+    "definition_sha256": "56ef4949610ee129e04ea4f7b5e94d374d7851d5db7af2798ff17793facadb84",
+    "final_texts": [
+      "4",
+      "5"
+    ],
+    "input_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "max_live_codex_jobs": 2,
+    "post_stop_read_only_service_readback": {
+      "detail_jobs_match_ledger": true,
+      "list_match_once": true,
+      "result_second_job_matches_ledger": true
+    },
+    "request_ledger_state": "running",
+    "request_sha256": "d3cd69e7667f09b6e9eeb87059eeeef4bccc34e1d5d924c757266ed308c8a33b",
+    "run_id": "run-7416d0e3c0ba4d049eb74fda42e68720",
+    "status": "succeeded",
+    "worker_state": "completed",
+    "workflow_id": "c935c822-2f42-4147-b6d2-f04e7f6ea10b",
+    "workspace_preflight": {
+      "allowed_root_isolated_workspace": true,
+      "workspace_exists": true
+    }
+  }
+}

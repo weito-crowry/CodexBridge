@@ -9,7 +9,9 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent, QFontDatabase
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -43,6 +45,11 @@ _KNOWN_WORKFLOW_STATUSES = frozenset(
 )
 _KNOWN_WORKER_STATES = frozenset({"unknown", "not_started", "running", "completed", "failed"})
 _SAFE_STATE = re.compile(r"^[a-zA-Z0-9_.-]{1,48}$")
+_KNOWN_CODEX_JOB_STATES = frozenset(
+    {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
+)
+_SAFE_JOB_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,128}$", re.ASCII)
+_MAX_JOB_LIST_ITEM_CHARS = 768
 _SECRET_KEY_PARTS = ("authorization", "token", "api_key", "secret", "password")
 _PATH_KEY_PARTS = ("path", "workspace_root", "cwd", "working_directory")
 _WINDOWS_PATH = re.compile(r"(?i)\b[A-Z]:\\[^\r\n\"'<>|]+")
@@ -90,6 +97,32 @@ def _safe_state(value: object) -> str:
     if isinstance(value, str) and value in _KNOWN_WORKER_STATES and _SAFE_STATE.fullmatch(value):
         return value
     return tr("Unknown")
+
+
+def _display_job_identifier(value: object) -> str:
+    displayed = _display_identifier(value)
+    if displayed == tr("Not available") or not _SAFE_JOB_IDENTIFIER.fullmatch(displayed):
+        return tr("Not available")
+    return displayed
+
+
+def _display_codex_job_state(value: object) -> str:
+    if isinstance(value, str) and value in _KNOWN_CODEX_JOB_STATES:
+        return value
+    return tr("Unknown")
+
+
+def _codex_job_list_item(index: int, job: Mapping[str, object]) -> str:
+    displayed = tr(
+        "Job {p0}: task identity {p1} · state {p2} · job ID {p3} · thread ID {p4} · turn ID {p5}",
+        p0=index,
+        p1=_display_job_identifier(job.get("task_identity")),
+        p2=_display_codex_job_state(job.get("state")),
+        p3=_display_job_identifier(job.get("job_id")),
+        p4=_display_job_identifier(job.get("thread_id")),
+        p5=_display_job_identifier(job.get("turn_id")),
+    )
+    return displayed[:_MAX_JOB_LIST_ITEM_CHARS]
 
 
 def _redact_result(value: object, *, key: str = "") -> object:
@@ -190,6 +223,17 @@ class WorkflowManagementDialog(QDialog):
             detail_form.addRow(label, self.detail_labels[key])
         upper.addWidget(detail_group, 2)
         root.addLayout(upper, 2)
+
+        self.jobs_group = QGroupBox(tr("Codex jobs"), self)
+        jobs_layout = QVBoxLayout(self.jobs_group)
+        self.job_list = QListWidget(self.jobs_group)
+        self.job_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.job_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.job_list.setWordWrap(False)
+        self.job_list.setMaximumHeight(96)
+        jobs_layout.addWidget(self.job_list)
+        self.jobs_group.setVisible(False)
+        root.addWidget(self.jobs_group)
 
         result_group = QGroupBox(tr("Result"), self)
         result_layout = QVBoxLayout(result_group)
@@ -313,6 +357,8 @@ class WorkflowManagementDialog(QDialog):
     def clear_detail(self) -> None:
         for label in self.detail_labels.values():
             label.setText(tr("Not available"))
+        self.job_list.clear()
+        self.jobs_group.setVisible(False)
 
     def clear_result(self) -> None:
         self.final_text_view.clear()
@@ -333,6 +379,15 @@ class WorkflowManagementDialog(QDialog):
         self.detail_labels["error"].setText(
             workflow_error_message(classification) if classification else tr("None")
         )
+        self.job_list.clear()
+        max_jobs = detail.get("max_live_codex_jobs")
+        two_job_workflow = type(max_jobs) is int and max_jobs == 2
+        self.jobs_group.setVisible(two_job_workflow)
+        jobs = detail.get("jobs")
+        if two_job_workflow and isinstance(jobs, list):
+            for index, job in enumerate(jobs[:2], start=1):
+                if isinstance(job, Mapping):
+                    self.job_list.addItem(_codex_job_list_item(index, job))
         self.result_button.setEnabled(status == "succeeded")
 
     def set_error_classification(self, code: str) -> None:
@@ -398,7 +453,7 @@ class StartWorkflowDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(tr("New workflow run"))
         self.setModal(True)
-        self.resize(680, 300)
+        self.resize(680, 340)
         self._allowed_roots = tuple(allowed_roots)
         self._workflow_yaml: str | None = None
         self._request_id: str | None = None
@@ -428,9 +483,21 @@ class StartWorkflowDialog(QDialog):
         self.workspace_browse_button.clicked.connect(self._choose_workspace)
         workspace_row.addWidget(self.workspace_browse_button)
         form.addRow(tr("Codex workspace"), workspace_row)
+        self.job_count_combo = QComboBox(self)
+        self.job_count_combo.addItem(tr("1 Codex job"), 1)
+        self.job_count_combo.addItem(tr("2 Codex jobs"), 2)
+        self.job_count_combo.currentIndexChanged.connect(self._update_job_count_notice)
+        form.addRow(tr("Number of Codex jobs"), self.job_count_combo)
         self.input_preview = QLabel("{}", self)
         form.addRow(tr("JSON input"), self.input_preview)
         layout.addLayout(form)
+
+        self.job_count_notice = QLabel(
+            tr("Two Codex jobs run sequentially; job 2 starts after job 1 completes."), self
+        )
+        self.job_count_notice.setWordWrap(True)
+        self.job_count_notice.setVisible(False)
+        layout.addWidget(self.job_count_notice)
 
         self.preview_label = QLabel(tr("Select a YAML file and workspace folder."), self)
         self.preview_label.setWordWrap(True)
@@ -457,6 +524,9 @@ class StartWorkflowDialog(QDialog):
     @property
     def has_unknown_outcome(self) -> bool:
         return self._outcome_unknown and self._payload is not None
+
+    def _update_job_count_notice(self, *_args: object) -> None:
+        self.job_count_notice.setVisible(self.job_count_combo.currentData() == 2)
 
     def set_retry_allowed(self, allowed: bool) -> None:
         if self.has_unknown_outcome:
@@ -556,6 +626,8 @@ class StartWorkflowDialog(QDialog):
             "input": {},
             "workspace_root": workspace,
         }
+        if self.job_count_combo.currentData() == 2:
+            self._payload["max_live_codex_jobs"] = 2
         self._freeze_input()
         self._send_saved_request()
 
@@ -565,6 +637,7 @@ class StartWorkflowDialog(QDialog):
             self.yaml_browse_button,
             self.workspace_path_edit,
             self.workspace_browse_button,
+            self.job_count_combo,
             self.submit_button,
         ):
             widget.setEnabled(False)
