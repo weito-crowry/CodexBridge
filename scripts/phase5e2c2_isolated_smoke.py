@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import http.client
 import json
@@ -52,6 +53,7 @@ from codex_bridge.workflows.interpreter import validate_workflow
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5e-2c2-evidence.json"
+RETEST_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5e-2c2-retest-evidence.json"
 FIRST_JOB_FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "codex_job_workflow.yaml"
 SECOND_PROMPT_ENVIRONMENT_VARIABLE = "CODEXBRIDGE_PHASE5E2C2_SECOND_PROMPT"
 APPROVED_SECOND_PROMPT_SHA256 = "0e12daed6b090fc7c47bf72ecb37e50a69d39e7b1e3bacf02793c453e31fcf05"
@@ -63,6 +65,9 @@ HTTP_TIMEOUT_SECONDS = 10.0
 MAX_HTTP_BODY_BYTES = 128 * 1024
 MAX_LOCAL_JSON_BYTES = 256 * 1024
 MAX_AUTH_BYTES = 1024 * 1024
+MAX_PREVIOUS_EVIDENCE_BYTES = 64 * 1024
+PREVIOUS_EVIDENCE_REASON = "runner_definition_hash_verifier_added_a_second_newline"
+RETEST_REASON = "previous_runner_hash_validation_false_positive"
 KNOWN_JOB_STATES = frozenset(
     {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
 )
@@ -190,7 +195,7 @@ def maximum_active_codex_jobs(events: Sequence[Mapping[str, object]]) -> int:
     return maximum
 
 
-def _new_evidence() -> dict[str, Any]:
+def _new_evidence(*, previous_evidence_sha256: str | None = None) -> dict[str, Any]:
     check_names = (
         "native_windows",
         "dedicated_loopback_ports",
@@ -207,8 +212,8 @@ def _new_evidence() -> dict[str, Any]:
         "bridge_restart_readback",
         "production_side_effects",
     )
-    return {
-        "phase": "5E-2C2",
+    evidence: dict[str, Any] = {
+        "phase": "5E-2C2-R" if previous_evidence_sha256 is not None else "5E-2C2",
         "started_at_utc": _utc_now(),
         "status": "RUNNING",
         "ports": {},
@@ -224,19 +229,109 @@ def _new_evidence() -> dict[str, Any]:
         "production_side_effect_count": 0,
         "cleanup": {"status": "NOT_RUN", "forced_termination": False},
     }
+    if previous_evidence_sha256 is not None:
+        evidence.update(
+            {
+                "retry_of": "5E-2C2",
+                "retest_reason": RETEST_REASON,
+                "previous_evidence_path": "docs/phase5e-2c2-evidence.json",
+                "previous_evidence_sha256": previous_evidence_sha256,
+            }
+        )
+    return evidence
 
 
-def _save_evidence(evidence: dict[str, Any]) -> None:
-    temporary = EVIDENCE_PATH.with_name(f"{EVIDENCE_PATH.name}.{uuid.uuid4().hex}.tmp")
+def _save_evidence(evidence: dict[str, Any], path: Path = EVIDENCE_PATH) -> None:
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(
             json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
             newline="\n",
         )
-        os.replace(temporary, EVIDENCE_PATH)
+        os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _validated_previous_evidence(path: Path) -> str:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError
+        if path.stat().st_size > MAX_PREVIOUS_EVIDENCE_BYTES:
+            raise OSError
+        with path.open("rb") as stream:
+            encoded = stream.read(MAX_PREVIOUS_EVIDENCE_BYTES + 1)
+        if len(encoded) > MAX_PREVIOUS_EVIDENCE_BYTES:
+            raise OSError
+        previous = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SmokeAbort("BLOCKED", "previous_evidence_unexpected") from None
+
+    if not isinstance(previous, dict):
+        raise SmokeAbort("BLOCKED", "previous_evidence_unexpected")
+    workflow = previous.get("workflow")
+    checks = previous.get("checks")
+    jobs = previous.get("jobs")
+    if not isinstance(workflow, dict) or not isinstance(checks, dict) or not isinstance(jobs, list):
+        raise SmokeAbort("BLOCKED", "previous_evidence_unexpected")
+    if any(not isinstance(row, dict) for row in jobs):
+        raise SmokeAbort("BLOCKED", "previous_evidence_unexpected")
+    check_statuses = {
+        name: check.get("status") if isinstance(check, dict) else None
+        for name, check in checks.items()
+    }
+    job_ids = [row.get("job_id") for row in jobs]
+    thread_ids = [row.get("thread_id") for row in jobs]
+    turn_ids = [row.get("turn_id") for row in jobs]
+    if (
+        previous.get("phase") != "5E-2C2"
+        or previous.get("status") != "BLOCKED"
+        or previous.get("reason") != PREVIOUS_EVIDENCE_REASON
+        or type(previous.get("live_workflow_post_count")) is not int
+        or previous.get("live_workflow_post_count") != 1
+        or type(previous.get("new_codex_job_count")) is not int
+        or previous.get("new_codex_job_count") != 2
+        or type(previous.get("new_codex_thread_count")) is not int
+        or previous.get("new_codex_thread_count") != 2
+        or type(previous.get("maximum_active_codex_jobs")) is not int
+        or previous.get("maximum_active_codex_jobs") != 1
+        or workflow.get("final_texts") != ["4", "5"]
+        or len(jobs) != 2
+        or any(not isinstance(value, str) or not value for value in job_ids + thread_ids + turn_ids)
+        or len(set(job_ids)) != 2
+        or len(set(thread_ids)) != 2
+        or len(set(turn_ids)) != 2
+        or any(row.get("state") != "SUCCEEDED" for row in jobs)
+        or any(
+            check_statuses.get(name) != "PASS"
+            for name in (
+                "expected_final_texts",
+                "immutable_hashes_and_ledgers",
+                "workflow_api_identity_and_jobs",
+                "active_job_concurrency",
+            )
+        )
+        or any(
+            check_statuses.get(name) != "NOT_RUN"
+            for name in (
+                "same_id_replay",
+                "bridge_restart_readback",
+                "console_qt_get_readback",
+            )
+        )
+    ):
+        raise SmokeAbort("BLOCKED", "previous_evidence_unexpected")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _select_evidence_paths(*, retest_once: bool) -> tuple[Path, str | None]:
+    if not retest_once:
+        return EVIDENCE_PATH, None
+    if RETEST_EVIDENCE_PATH.exists() or RETEST_EVIDENCE_PATH.is_symlink():
+        raise SmokeAbort("BLOCKED", "retest_evidence_already_exists")
+    previous_sha256 = _validated_previous_evidence(EVIDENCE_PATH)
+    return RETEST_EVIDENCE_PATH, previous_sha256
 
 
 def _mark_pass(evidence: dict[str, Any], name: str, **details: Any) -> None:
@@ -1175,9 +1270,11 @@ def _no_sensitive_evidence(
     sensitive_strings: Sequence[str],
 ) -> None:
     encoded = json.dumps(evidence, ensure_ascii=False)
+    encoded_temp_root = json.dumps(str(temp_root), ensure_ascii=False)[1:-1]
     if (
         token in encoded
         or str(temp_root) in encoded
+        or encoded_temp_root in encoded
         or any(value and value in encoded for value in sensitive_strings)
     ):
         raise SmokeAbort("BLOCKED", "evidence_contains_sensitive_or_private_material")
@@ -1701,12 +1798,30 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
         )
 
 
-def main() -> int:
-    evidence = _new_evidence()
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the isolated Phase 5E-2C2 E2E once")
+    parser.add_argument(
+        "--retest-once",
+        action="store_true",
+        help="claim the dedicated retest evidence path after validating the original evidence",
+    )
+    arguments = parser.parse_args(argv)
     try:
-        claim_evidence_path(EVIDENCE_PATH, evidence)
+        evidence_path, previous_evidence_sha256 = _select_evidence_paths(
+            retest_once=arguments.retest_once
+        )
+    except SmokeAbort as error:
+        print(json.dumps({"status": error.status, "reason": error.code}, ensure_ascii=False))
+        return 2
+
+    evidence = _new_evidence(previous_evidence_sha256=previous_evidence_sha256)
+    try:
+        claim_evidence_path(evidence_path, evidence)
     except FileExistsError:
-        print(json.dumps({"status": "BLOCKED", "reason": "evidence_already_exists"}))
+        reason = (
+            "retest_evidence_already_exists" if arguments.retest_once else "evidence_already_exists"
+        )
+        print(json.dumps({"status": "BLOCKED", "reason": reason}, ensure_ascii=False))
         return 2
     except OSError:
         print(json.dumps({"status": "BLOCKED", "reason": "evidence_path_unavailable"}))
@@ -1765,7 +1880,7 @@ def main() -> int:
             and evidence["checks"]["same_id_replay"]["status"] == "NOT_RUN"
         ):
             _set_check(evidence, "same_id_replay", status, replay_count=1)
-        _save_evidence(evidence)
+        _save_evidence(evidence, evidence_path)
     print(
         json.dumps(
             {
