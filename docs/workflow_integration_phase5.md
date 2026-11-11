@@ -149,4 +149,6 @@ Console UIと自由prompt・複数job対応はPhase 5D/5Eの範囲である。5C
 - sanitized runtime証跡は [`phase5e-0-evidence.json`](phase5e-0-evidence.json)。token、個人パス、生ログは含めない。稼働中本番checkout・Bridge・AppServer、既存workflow state、既存thread、18000/18001への接続・変更は行っていない。
 - `ruff check`, `ruff format --check`, `mypy src`, `compileall` はPASS。関連pytestは168 PASS / 2 SKIP（Windows symlink作成権限 `WinError 1314`）。Console関連テストは`QT_QPA_PLATFORM=offscreen`で実行したが、APIを表示する実GUI描画は未確認。
 
-残る確認事項: `workflow_requests`の保存行は`running`のままだが、read-only APIは完了済みrunから`succeeded`を投影した。5E後半へ進む前に、この保存状態の意味と完了後のreconciliation/updateタイミングを確認する。また追加診断として行った再起動後thread-status照会は`completed`以外を返したため受入条件には含めず、値は記録していない。workflow一覧・詳細・結果、thread IDの永続表示、job/DBOS状態、同ID replayはPASS。Consoleのoffscreen描画は未確認で、関連pytestに分離した。
+状態の扱い: 保存列`workflow_requests.state`は受付時のdurable admission stateとして更新されるが、Worker完了を検知して必ず`succeeded`へ同期する機構ではない。GETのeffective statusはrun-local worker status、DBOS、job ledger、検証済resultをread-onlyで照合した投影である。次回の新規受付では保存stateだけでcapacityを決めず、既存runの実状態を照合する。このため台帳の`running`は、その時点で実ジョブがまだ稼働中である証拠ではない。この仕様を安全性を保って将来材料化する方法は後続フェーズで検討する。
+
+初回pollingが一時的に`unknown`/`needs_reconciliation`で停止した確定原因は、保存証跡だけでは特定できない。今回修正するWorker正常完了途中の状態投影競合と同一原因とは断定しない。追加診断の再起動後thread-status照会は`completed`以外を返したが、具体値は記録していない。thread自体のpersisted turn stateとWorkflow resultは別の状態観測であり、このthread-statusだけではWorkflow resultを確定しない。workflow一覧・詳細・結果、thread IDの永続表示、job/DBOS状態、同ID replayはPASS。Consoleのoffscreen描画は未確認で、関連pytestに分離した。

@@ -938,17 +938,21 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
         except (OSError, ValueError, TypeError):
             return _RunInspection("unknown", worker_state, job_id, thread_id, None, base_updated)
 
-    if result_value is not None:
-        if worker_state == "completed" and dbos_status in {"SUCCESS", "SUCCEEDED"}:
-            return _RunInspection(
-                "succeeded", worker_state, job_id, thread_id, result_value, base_updated
-            )
-        return _RunInspection("unknown", worker_state, job_id, thread_id, None, base_updated)
     if job_state == "FAILED" or dbos_status in {"ERROR", "CANCELLED", "FAILED"}:
         return _RunInspection("failed", worker_state, job_id, thread_id, None, base_updated)
     if worker_state == "failed":
         status = "failed" if job_state is not None else "failed_to_start"
         return _RunInspection(status, worker_state, job_id, thread_id, None, base_updated)
+    if result_value is not None:
+        if worker_state == "completed" and dbos_status in {"SUCCESS", "SUCCEEDED"}:
+            return _RunInspection(
+                "succeeded", worker_state, job_id, thread_id, result_value, base_updated
+            )
+        if worker_state == "running":
+            return _RunInspection("running", worker_state, job_id, thread_id, None, base_updated)
+        return _RunInspection("unknown", worker_state, job_id, thread_id, None, base_updated)
+    if worker_state == "running" and dbos_status in {"SUCCESS", "SUCCEEDED"}:
+        return _RunInspection("running", worker_state, job_id, thread_id, None, base_updated)
     if worker_state == "completed" or dbos_status in {"SUCCESS", "SUCCEEDED"}:
         return _RunInspection("unknown", worker_state, job_id, thread_id, None, base_updated)
     if (

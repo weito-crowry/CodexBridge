@@ -329,6 +329,114 @@ async def test_status_and_result_use_read_only_sqlite_and_verify_saved_result(
 
 
 @pytest.mark.asyncio
+async def test_success_projects_running_until_worker_entry_completes(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+) -> None:
+    service, manager, workspace = service_fixture
+    accepted = await service.start_workflow(
+        client_request_id="phase5c-request-success-transition",
+        workflow_yaml=_workflow_yaml(),
+        input_data={},
+        workspace_root=str(workspace),
+    )
+    run_dir = manager.start_calls[0][0]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE workflow_status (workflow_uuid TEXT PRIMARY KEY, status TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO workflow_status VALUES (?, 'SUCCESS')", (accepted.workflow_id,)
+        )
+
+    before_result = await service.get_workflow(accepted.workflow_id)
+    assert before_result.status == "running"
+
+    result_body = {
+        "workflow_id": accepted.workflow_id,
+        "result": {"final_text": "4"},
+        "definition_sha256": manifest["definition_sha256"],
+        "input_sha256": manifest["input_sha256"],
+    }
+    (run_dir / "result.json").write_text(json.dumps(result_body), encoding="utf-8")
+    after_result = await service.get_workflow(accepted.workflow_id)
+    assert after_result.status == "running"
+
+    (run_dir / "worker-entry-status.json").write_text(
+        json.dumps({"state": "completed", "exit_code": 0, "error_code": None}),
+        encoding="utf-8",
+    )
+    completed = await service.get_workflow(accepted.workflow_id)
+
+    assert completed.status == "succeeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("worker_state", "dbos_status", "job_state", "expected"),
+    [
+        ("running", "SUCCESS", "FAILED", "failed"),
+        ("running", "ERROR", None, "failed"),
+        ("failed", "SUCCESS", None, "failed_to_start"),
+    ],
+    ids=["failed_job", "dbos_error", "worker_failed"],
+)
+async def test_explicit_failure_states_are_not_overridden_by_saved_result(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    worker_state: str,
+    dbos_status: str,
+    job_state: str | None,
+    expected: str,
+) -> None:
+    service, manager, workspace = service_fixture
+    accepted = await service.start_workflow(
+        client_request_id="phase5c-request-failed-job",
+        workflow_yaml=_workflow_yaml(),
+        input_data={},
+        workspace_root=str(workspace),
+    )
+    run_dir = manager.start_calls[0][0]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE workflow_status (workflow_uuid TEXT PRIMARY KEY, status TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO workflow_status VALUES (?, ?)", (accepted.workflow_id, dbos_status)
+        )
+    if job_state is not None:
+        with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+            connection.execute(
+                "CREATE TABLE jobs (job_id TEXT, workflow_id TEXT, state TEXT, "
+                "thread_id TEXT, turn_id TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO jobs VALUES ('job-1', ?, ?, NULL, NULL)",
+                (accepted.workflow_id, job_state),
+            )
+    if worker_state == "failed":
+        (run_dir / "worker-entry-status.json").write_text(
+            json.dumps({"state": "failed", "exit_code": 1, "error_code": "worker_failed"}),
+            encoding="utf-8",
+        )
+    (run_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "workflow_id": accepted.workflow_id,
+                "result": {"final_text": "4"},
+                "definition_sha256": manifest["definition_sha256"],
+                "input_sha256": manifest["input_sha256"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = await service.get_workflow(accepted.workflow_id)
+
+    assert snapshot.status == expected
+
+
+@pytest.mark.asyncio
 async def test_maybe_sent_and_tampered_snapshot_require_reconciliation(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
 ) -> None:
@@ -360,10 +468,10 @@ async def test_maybe_sent_and_tampered_snapshot_require_reconciliation(
     assert maybe_sent.terminal is False
 
     jobs_database.unlink()
-    workflow_file = run_dir / "workflow.yaml"
-    workflow_file.write_text(
-        workflow_file.read_text(encoding="utf-8") + "# tampered\n", encoding="utf-8"
-    )
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["workflow_id"] = str(uuid.uuid4())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     tampered = await service.get_workflow(accepted.workflow_id)
 
     assert tampered.status == "needs_reconciliation"

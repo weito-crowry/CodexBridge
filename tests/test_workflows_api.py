@@ -316,6 +316,71 @@ async def test_result_route_covers_running_reconciliation_success_and_missing(
 
 
 @pytest.mark.asyncio
+async def test_success_transition_keeps_api_running_until_worker_entry_completes(
+    tmp_path: Path,
+) -> None:
+    app, manager, workspace = _app(tmp_path)
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        accepted = await client.post(_PATH, headers=headers, json=_valid_payload(workspace))
+        workflow_id = accepted.json()["workflow_id"]
+        detail_path = _PATH + "/" + workflow_id
+        result_path = detail_path + "/result"
+        initial_detail = await client.get(detail_path, headers=headers)
+        initial_listing = await client.get(_PATH, headers=headers)
+        initial_result = await client.get(result_path, headers=headers)
+
+        run_dir = manager.start_calls[0]
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+            connection.execute(
+                "CREATE TABLE workflow_status (workflow_uuid TEXT PRIMARY KEY, "
+                "status TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO workflow_status VALUES (?, 'SUCCESS')", (workflow_id,))
+        dbos_success_result = await client.get(result_path, headers=headers)
+
+        stored_result = {
+            "workflow_id": workflow_id,
+            "result": {"final_text": "4"},
+            "definition_sha256": manifest["definition_sha256"],
+            "input_sha256": manifest["input_sha256"],
+        }
+        (run_dir / "result.json").write_text(json.dumps(stored_result), encoding="utf-8")
+        result_saved_detail = await client.get(detail_path, headers=headers)
+        result_saved_listing = await client.get(_PATH, headers=headers)
+        result_saved = await client.get(result_path, headers=headers)
+
+        (run_dir / "worker-entry-status.json").write_text(
+            json.dumps({"state": "completed", "exit_code": 0, "error_code": None}),
+            encoding="utf-8",
+        )
+        completed_detail = await client.get(detail_path, headers=headers)
+        completed_listing = await client.get(_PATH, headers=headers)
+        completed_result = await client.get(result_path, headers=headers)
+
+    assert accepted.status_code == 202
+    assert initial_detail.status_code == 200
+    assert initial_detail.json()["status"] == "running"
+    assert initial_listing.status_code == 200
+    assert initial_listing.json()["workflows"][0]["status"] == "running"
+    assert initial_result.status_code == 202
+    assert dbos_success_result.status_code == 202
+    assert result_saved_detail.status_code == 200
+    assert result_saved_detail.json()["status"] == "running"
+    assert result_saved_listing.status_code == 200
+    assert result_saved_listing.json()["workflows"][0]["status"] == "running"
+    assert result_saved.status_code == 202
+    assert completed_detail.status_code == 200
+    assert completed_detail.json()["status"] == "succeeded"
+    assert completed_listing.status_code == 200
+    assert completed_listing.json()["workflows"][0]["status"] == "succeeded"
+    assert completed_result.status_code == 200
+    assert completed_result.json() == stored_result
+    assert len(manager.start_calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("headers", "body"),
     [
