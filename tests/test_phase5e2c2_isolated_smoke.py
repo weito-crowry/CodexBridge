@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 from pathlib import Path
 from types import ModuleType
@@ -147,7 +148,101 @@ def _install_evidence_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     retest_path = tmp_path / "phase5e-2c2-retest-evidence.json"
     monkeypatch.setattr(module, "EVIDENCE_PATH", previous_path)
     monkeypatch.setattr(module, "RETEST_EVIDENCE_PATH", retest_path)
+    monkeypatch.setattr(
+        module,
+        "DIAGNOSTIC_RETEST_EVIDENCE_PATH",
+        tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json",
+        raising=False,
+    )
     return previous_path, retest_path
+
+
+def _legacy_r2_evidence(previous_sha256: str) -> dict[str, Any]:
+    checks = {
+        "native_windows": "PASS",
+        "dedicated_loopback_ports": "PASS",
+        "isolated_environment_and_roots": "PASS",
+        "bridge_preflight_and_authentication": "PASS",
+        "workspace_allowed_root_and_cwd": "NOT_RUN",
+        "single_live_workflow_post": "FAIL",
+        "workflow_api_identity_and_jobs": "NOT_RUN",
+        "immutable_hashes_and_ledgers": "NOT_RUN",
+        "expected_final_texts": "NOT_RUN",
+        "active_job_concurrency": "NOT_RUN",
+        "console_qt_get_readback": "NOT_RUN",
+        "same_id_replay": "NOT_RUN",
+        "bridge_restart_readback": "NOT_RUN",
+        "production_side_effects": "PASS",
+    }
+    return {
+        "phase": "5E-2C2-R",
+        "status": "FAIL",
+        "reason": "initial_workflow_post_was_not_accepted",
+        "retry_of": "5E-2C2",
+        "retest_reason": "previous_runner_hash_validation_false_positive",
+        "previous_evidence_path": "docs/phase5e-2c2-evidence.json",
+        "previous_evidence_sha256": previous_sha256,
+        "live_workflow_post_attempted": True,
+        "live_workflow_post_count": 1,
+        "same_id_replay_post_attempted": False,
+        "same_id_replay_post_count": 0,
+        "new_codex_job_count": 0,
+        "new_codex_thread_count": None,
+        "maximum_active_codex_jobs": None,
+        "production_side_effect_count": 0,
+        "workflow": {"initial_post_http_status": 409},
+        "checks": {name: {"status": status} for name, status in checks.items()},
+        "cleanup": {"status": "PRESERVED_ACTIVE_OR_UNKNOWN", "forced_termination": False},
+    }
+
+
+def _startup_diagnostic_document(
+    *,
+    workflow_id: str = "123e4567-e89b-12d3-a456-426614174000",
+    run_id: str = "run-0123456789abcdef0123456789abcdef",
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "stages": [
+            {
+                "stage": "worker_config_write",
+                "phase": "started",
+                "at_utc": "2026-11-12T01:02:03.456+00:00",
+            }
+        ],
+        "failure": {
+            "stage": "worker_config_write",
+            "exception_class": "RuntimeError",
+            "reason": "exception",
+            "at_utc": "2026-11-12T01:02:03.457+00:00",
+            "worker_config_write_completed": False,
+            "worker_spawned": False,
+        },
+    }
+
+
+class _FakeBridgeProcess:
+    def __init__(self, stderr: Any) -> None:
+        self.stderr = stderr
+
+
+def _start_fake_bridge(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: Any,
+) -> tuple[Any, Any, list[dict[str, Any]]]:
+    process = _FakeBridgeProcess(stderr)
+    calls: list[dict[str, Any]] = []
+
+    def fake_popen(*_args: Any, **kwargs: Any) -> _FakeBridgeProcess:
+        calls.append(kwargs)
+        return process
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    started_process, collector = module._start_bridge({})
+    return started_process, collector, calls
 
 
 def test_checked_in_previous_evidence_matches_the_retest_baseline() -> None:
@@ -155,9 +250,159 @@ def test_checked_in_previous_evidence_matches_the_retest_baseline() -> None:
     assert module is not None
 
     assert (
-        module._validated_previous_evidence(module.EVIDENCE_PATH)
+        module._validated_previous_evidence_hashes(module.EVIDENCE_PATH)[1]
         == "5eb3e3bb66471bd1e7d18e83ce09e1dab8774752fc3ba4936787eb9bdea82844"
     )
+
+
+def test_checked_in_diagnostic_retest_baselines_are_valid_and_read_only() -> None:
+    module = _load_runner()
+    assert module is not None
+    original_bytes = module.EVIDENCE_PATH.read_bytes()
+    r2_bytes = module.RETEST_EVIDENCE_PATH.read_bytes()
+
+    original_sha256, normalized_original_sha256 = module._validated_previous_evidence_hashes(
+        module.EVIDENCE_PATH
+    )
+    r2_sha256 = module._validated_retest_evidence(
+        module.RETEST_EVIDENCE_PATH,
+        original_evidence_sha256=normalized_original_sha256,
+    )
+
+    assert len(original_sha256) == 64
+    assert len(r2_sha256) == 64
+    assert module.EVIDENCE_PATH.read_bytes() == original_bytes
+    assert module.RETEST_EVIDENCE_PATH.read_bytes() == r2_bytes
+
+
+def test_diagnostic_retest_selection_records_both_baseline_hashes_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    previous_path, r2_path = _install_evidence_paths(monkeypatch, tmp_path)
+    previous_path.write_text(json.dumps(_legacy_evidence()), encoding="utf-8")
+    original_sha256, normalized_original_sha256 = module._validated_previous_evidence_hashes(
+        previous_path
+    )
+    r2_path.write_text(
+        json.dumps(_legacy_r2_evidence(normalized_original_sha256)),
+        encoding="utf-8",
+    )
+    previous_bytes = previous_path.read_bytes()
+    r2_bytes = r2_path.read_bytes()
+
+    evidence_path, baseline_hashes = module._select_diagnostic_retest_evidence()
+
+    assert evidence_path == tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json"
+    assert baseline_hashes == {
+        "original": original_sha256,
+        "r2": hashlib.sha256(r2_bytes).hexdigest(),
+    }
+    assert previous_path.read_bytes() == previous_bytes
+    assert r2_path.read_bytes() == r2_bytes
+
+
+@pytest.mark.parametrize("mutation", ["previous_hash", "post_count"])
+def test_diagnostic_retest_rejects_an_unexpected_r2_baseline_read_only(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    previous_path = tmp_path / "phase5e-2c2-evidence.json"
+    r2_path = tmp_path / "phase5e-2c2-retest-evidence.json"
+    previous_path.write_text(json.dumps(_legacy_evidence()), encoding="utf-8")
+    _raw_original_sha256, normalized_original_sha256 = module._validated_previous_evidence_hashes(
+        previous_path
+    )
+    r2_evidence = _legacy_r2_evidence(normalized_original_sha256)
+    if mutation == "previous_hash":
+        r2_evidence["previous_evidence_sha256"] = "0" * 64
+    else:
+        r2_evidence["live_workflow_post_count"] = 2
+    r2_path.write_text(json.dumps(r2_evidence), encoding="utf-8")
+    previous_bytes = previous_path.read_bytes()
+    r2_bytes = r2_path.read_bytes()
+
+    with pytest.raises(module.SmokeAbort) as error:
+        module._validated_retest_evidence(
+            r2_path,
+            original_evidence_sha256=normalized_original_sha256,
+        )
+
+    assert error.value.code == "retest_evidence_unexpected"
+    assert previous_path.read_bytes() == previous_bytes
+    assert r2_path.read_bytes() == r2_bytes
+
+
+def test_diagnostic_retest_main_records_hashes_without_running_live_e2e(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    previous_path, r2_path = _install_evidence_paths(monkeypatch, tmp_path)
+    previous_path.write_text(json.dumps(_legacy_evidence()), encoding="utf-8")
+    original_sha256, normalized_original_sha256 = module._validated_previous_evidence_hashes(
+        previous_path
+    )
+    r2_path.write_text(
+        json.dumps(_legacy_r2_evidence(normalized_original_sha256)),
+        encoding="utf-8",
+    )
+    previous_bytes = previous_path.read_bytes()
+    r2_bytes = r2_path.read_bytes()
+    run_calls: list[dict[str, Any]] = []
+
+    def stop_before_live(evidence: dict[str, Any]) -> int:
+        run_calls.append(evidence)
+        raise module.SmokeAbort("BLOCKED", "test_stopped_before_live")
+
+    monkeypatch.setattr(module, "_run_e2e", stop_before_live)
+
+    assert module.main(["--diagnostic-retest-once"]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "phase": "5E-2C2-R3",
+        "status": "BLOCKED",
+        "reason": "test_stopped_before_live",
+    }
+    assert len(run_calls) == 1
+    evidence_path = tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["previous_evidence"]["original"]["sha256"] == original_sha256
+    assert evidence["previous_evidence"]["r2"]["sha256"] == hashlib.sha256(r2_bytes).hexdigest()
+    assert previous_path.read_bytes() == previous_bytes
+    assert r2_path.read_bytes() == r2_bytes
+
+
+def test_diagnostic_retest_main_blocks_existing_evidence_before_e2e(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    _previous_path, _r2_path = _install_evidence_paths(monkeypatch, tmp_path)
+    evidence_path = tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json"
+    original = b"preserve existing R3 evidence"
+    evidence_path.write_bytes(original)
+
+    def fail_if_live(_evidence: dict[str, Any]) -> int:
+        pytest.fail("an existing R3 evidence file must block before E2E")
+
+    monkeypatch.setattr(module, "_run_e2e", fail_if_live)
+
+    assert module.main(["--diagnostic-retest-once"]) == 2
+
+    assert evidence_path.read_bytes() == original
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "BLOCKED",
+        "reason": "diagnostic_retest_evidence_already_exists",
+    }
 
 
 @pytest.mark.parametrize(
@@ -284,6 +529,320 @@ def test_retest_cli_does_not_accept_an_arbitrary_evidence_path() -> None:
         module.main(["--evidence", "elsewhere.json"])
 
     assert error.value.code == 2
+
+
+def test_bridge_stderr_reader_extracts_only_valid_diagnostic_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    valid = (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=worker_config_write original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    )
+    invalid_stage = valid.replace("stage=worker_config_write", "stage=untrusted_stage")
+    invalid_exception = valid.replace(
+        "original_exception=RuntimeError", "original_exception=token=private"
+    )
+    invalid_persistence = valid.replace(
+        "persistence_exception=OSError", "persistence_exception=none"
+    )
+    private_stderr = (
+        "private prompt and api_key=synthetic-secret C:\\private\\file.txt\n"
+        + invalid_stage
+        + invalid_exception
+        + invalid_persistence
+        + valid
+    ).encode("ascii")
+
+    process, collector, calls = _start_fake_bridge(module, monkeypatch, io.BytesIO(private_stderr))
+
+    assert process.stderr is not None
+    assert calls[0]["stderr"] == module.subprocess.PIPE
+    assert collector.wait(timeout=2.0)
+    captured = collector.snapshot()
+    assert captured["read_status"] == "EOF"
+    assert captured["events"] == [
+        {
+            "stage": "worker_config_write",
+            "original_exception": "RuntimeError",
+            "persistence_exception": "OSError",
+        }
+    ]
+    encoded = json.dumps(captured)
+    assert "private prompt" not in encoded
+    assert "synthetic-secret" not in encoded
+    assert "C:\\private" not in encoded
+    assert "token=private" not in encoded
+
+
+def test_bridge_stderr_reader_bounds_lines_and_event_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    valid = (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=worker_config_write original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    ).encode("ascii")
+    noisy_stderr = b"x" * (module.MAX_STDERR_DIAGNOSTIC_LINE_BYTES + 10_000)
+    noisy_stderr += b"\n" + valid * (module.MAX_STDERR_DIAGNOSTIC_EVENTS + 4)
+
+    _process, collector, _calls = _start_fake_bridge(module, monkeypatch, io.BytesIO(noisy_stderr))
+
+    assert collector.wait(timeout=2.0)
+    captured = collector.snapshot()
+    assert len(captured["events"]) == module.MAX_STDERR_DIAGNOSTIC_EVENTS
+    assert captured["events_truncated"] is True
+    assert captured["long_line_discarded"] is True
+    assert len(json.dumps(captured).encode("utf-8")) <= module.MAX_DIAGNOSTIC_EVIDENCE_BYTES
+
+
+def test_bridge_stderr_reader_uses_available_pipe_chunks_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    event = (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=worker_config_write original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    ).encode("ascii")
+
+    class _Read1Stderr:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read1(self, size: int) -> bytes:
+            assert size == module.STDERR_READ_CHUNK_BYTES
+            self.calls += 1
+            return event if self.calls == 1 else b""
+
+        def read(self, _size: int) -> bytes:
+            pytest.fail("pipe reader should prefer read1 when available")
+
+        def close(self) -> None:
+            pass
+
+    stderr = _Read1Stderr()
+    _process, collector, _calls = _start_fake_bridge(module, monkeypatch, stderr)
+
+    assert collector.wait(timeout=2.0)
+    assert stderr.calls == 2
+    assert collector.snapshot()["events"] == [
+        {
+            "stage": "worker_config_write",
+            "original_exception": "RuntimeError",
+            "persistence_exception": "OSError",
+        }
+    ]
+
+
+def test_bridge_stderr_reader_records_read_failure_without_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    assert module is not None
+
+    class _FailingStderr:
+        def read(self, _size: int) -> bytes:
+            raise OSError("private path and token=synthetic-secret")
+
+        def close(self) -> None:
+            pass
+
+    _process, collector, _calls = _start_fake_bridge(module, monkeypatch, _FailingStderr())
+
+    assert collector.wait(timeout=2.0)
+    captured = collector.snapshot()
+    assert captured["read_status"] == "READ_FAILED"
+    assert captured["read_error_class"] == "OSError"
+    assert captured["events"] == []
+    assert "private path" not in json.dumps(captured)
+    assert "synthetic-secret" not in json.dumps(captured)
+
+
+def test_startup_diagnostic_json_is_validated_and_allowlisted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    workflow_id = "123e4567-e89b-12d3-a456-426614174000"
+    run_id = "run-0123456789abcdef0123456789abcdef"
+    request_id = "phase5e2c2-diagnostic-test"
+    state_root = tmp_path / "state"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    diagnostic = _startup_diagnostic_document(workflow_id=workflow_id, run_id=run_id)
+    diagnostic["unsafe_message"] = "api_key=synthetic-secret private prompt"
+    (run_dir / "startup-diagnostic.json").write_text(
+        json.dumps({key: value for key, value in diagnostic.items() if key != "unsafe_message"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        module,
+        "_read_request_ledger",
+        lambda _root: [
+            {"client_request_id": request_id, "workflow_id": workflow_id, "run_id": run_id}
+        ],
+    )
+    monkeypatch.setattr(module, "_run_directory", lambda _root, _run_id: run_dir)
+
+    result = module._read_startup_diagnostic(state_root, request_id)
+
+    assert result["status"] == "VALID"
+    assert result["workflow_id"] == workflow_id
+    assert result["run_id"] == run_id
+    assert result["failure"]["stage"] == "worker_config_write"
+    assert result["failure"]["exception_class"] == "RuntimeError"
+    assert "unsafe_message" not in json.dumps(result)
+    assert "synthetic-secret" not in json.dumps(result)
+
+    (run_dir / "startup-diagnostic.json").write_text(json.dumps(diagnostic), encoding="utf-8")
+    rejected = module._read_startup_diagnostic(state_root, request_id)
+    assert rejected["status"] == "INVALID"
+    assert "unsafe_message" not in json.dumps(rejected)
+    assert "synthetic-secret" not in json.dumps(rejected)
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ["truncated_json", "oversized", "stage", "exception_class", "identity", "run_identity"],
+)
+def test_startup_diagnostic_json_rejects_invalid_or_mismatched_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    workflow_id = "123e4567-e89b-12d3-a456-426614174000"
+    run_id = "run-0123456789abcdef0123456789abcdef"
+    request_id = "phase5e2c2-diagnostic-invalid"
+    state_root = tmp_path / "state"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    diagnostic_path = run_dir / "startup-diagnostic.json"
+    if invalid_kind == "truncated_json":
+        diagnostic_path.write_text('{"version":1,"failure":', encoding="utf-8")
+    elif invalid_kind == "oversized":
+        diagnostic_path.write_bytes(b"x" * (module.MAX_STARTUP_DIAGNOSTIC_BYTES + 1))
+    else:
+        diagnostic = _startup_diagnostic_document(
+            workflow_id=workflow_id,
+            run_id=run_id,
+        )
+        if invalid_kind == "stage":
+            diagnostic["failure"]["stage"] = "untrusted_stage"
+        elif invalid_kind == "exception_class":
+            diagnostic["failure"]["exception_class"] = "token=private"
+        elif invalid_kind == "identity":
+            diagnostic["workflow_id"] = "123e4567-e89b-12d3-a456-426614174001"
+        else:
+            diagnostic["run_id"] = "run-abcdef0123456789abcdef0123456789"
+        diagnostic_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_read_request_ledger",
+        lambda _root: [
+            {"client_request_id": request_id, "workflow_id": workflow_id, "run_id": run_id}
+        ],
+    )
+    monkeypatch.setattr(module, "_run_directory", lambda _root, _run_id: run_dir)
+
+    result = module._read_startup_diagnostic(state_root, request_id)
+
+    assert result["status"] == "INVALID"
+    assert "reason" in result
+    assert "token=private" not in json.dumps(result)
+
+
+def test_missing_startup_diagnostic_and_stderr_are_reported_explicitly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    workflow_id = "123e4567-e89b-12d3-a456-426614174000"
+    run_id = "run-0123456789abcdef0123456789abcdef"
+    request_id = "phase5e2c2-diagnostic-missing"
+    state_root = tmp_path / "state"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        module,
+        "_read_request_ledger",
+        lambda _root: [
+            {"client_request_id": request_id, "workflow_id": workflow_id, "run_id": run_id}
+        ],
+    )
+    monkeypatch.setattr(module, "_run_directory", lambda _root, _run_id: run_dir)
+    _process, collector, _calls = _start_fake_bridge(
+        module, monkeypatch, io.BytesIO(b"private stderr is discarded\n")
+    )
+    assert collector.wait(timeout=2.0)
+
+    result = module._collect_startup_diagnostics(
+        state_root=state_root,
+        client_request_id=request_id,
+        stderr_collector=collector,
+    )
+
+    assert result["file"]["status"] == "NOT_FOUND"
+    assert result["stderr"]["read_status"] == "EOF"
+    assert result["stderr"]["events"] == []
+    assert result["diagnostic_obtained"] is False
+    assert result["diagnostics_unavailable"] is True
+    assert "private stderr" not in json.dumps(result)
+
+
+def test_missing_startup_diagnostic_uses_valid_stderr_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    workflow_id = "123e4567-e89b-12d3-a456-426614174000"
+    run_id = "run-0123456789abcdef0123456789abcdef"
+    request_id = "phase5e2c2-stderr-diagnostic-fallback"
+    state_root = tmp_path / "state"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        module,
+        "_read_request_ledger",
+        lambda _root: [
+            {"client_request_id": request_id, "workflow_id": workflow_id, "run_id": run_id}
+        ],
+    )
+    monkeypatch.setattr(module, "_run_directory", lambda _root, _run_id: run_dir)
+    stderr_event = (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=worker_spawn original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    )
+    _process, collector, _calls = _start_fake_bridge(
+        module, monkeypatch, io.BytesIO(stderr_event.encode("ascii"))
+    )
+    assert collector.wait(timeout=2.0)
+
+    result = module._collect_startup_diagnostics(
+        state_root=state_root,
+        client_request_id=request_id,
+        stderr_collector=collector,
+    )
+
+    assert result["file"]["status"] == "NOT_FOUND"
+    assert result["stderr"]["events"] == [
+        {
+            "stage": "worker_spawn",
+            "original_exception": "RuntimeError",
+            "persistence_exception": "OSError",
+        }
+    ]
+    assert result["diagnostic_obtained"] is True
+    assert result["diagnostics_unavailable"] is False
+    assert len(json.dumps(result).encode("utf-8")) <= module.MAX_DIAGNOSTIC_EVIDENCE_BYTES
 
 
 def test_production_roots_and_ports_are_excluded() -> None:

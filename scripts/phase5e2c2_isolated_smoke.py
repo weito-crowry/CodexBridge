@@ -5,6 +5,8 @@ import hashlib
 import http.client
 import json
 import os
+import queue
+import re
 import secrets
 import shutil
 import socket
@@ -12,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -54,6 +57,9 @@ from codex_bridge.workflows.interpreter import validate_workflow
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5e-2c2-evidence.json"
 RETEST_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5e-2c2-retest-evidence.json"
+DIAGNOSTIC_RETEST_EVIDENCE_PATH = (
+    REPOSITORY_ROOT / "docs" / "phase5e-2c2-diagnostic-retest-evidence.json"
+)
 FIRST_JOB_FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "codex_job_workflow.yaml"
 SECOND_PROMPT_ENVIRONMENT_VARIABLE = "CODEXBRIDGE_PHASE5E2C2_SECOND_PROMPT"
 APPROVED_SECOND_PROMPT_SHA256 = "0e12daed6b090fc7c47bf72ecb37e50a69d39e7b1e3bacf02793c453e31fcf05"
@@ -66,8 +72,45 @@ MAX_HTTP_BODY_BYTES = 128 * 1024
 MAX_LOCAL_JSON_BYTES = 256 * 1024
 MAX_AUTH_BYTES = 1024 * 1024
 MAX_PREVIOUS_EVIDENCE_BYTES = 64 * 1024
+MAX_STARTUP_DIAGNOSTIC_BYTES = 4 * 1024
+MAX_STARTUP_DIAGNOSTIC_STAGE_EVENTS = 16
+MAX_DIAGNOSTIC_EVIDENCE_BYTES = 8 * 1024
+STDERR_READ_CHUNK_BYTES = 1024
+MAX_STDERR_DIAGNOSTIC_LINE_BYTES = 512
+MAX_STDERR_DIAGNOSTIC_EVENTS = 8
 PREVIOUS_EVIDENCE_REASON = "runner_definition_hash_verifier_added_a_second_newline"
 RETEST_REASON = "previous_runner_hash_validation_false_positive"
+DIAGNOSTIC_RETEST_REASON = "capture_workflow_startup_diagnostic_after_reconciliation"
+STARTUP_DIAGNOSTIC_FILENAME = "startup-diagnostic.json"
+STARTUP_DIAGNOSTIC_EVENT_ID = "workflow.startup_diagnostic.persistence_failed"
+KNOWN_STARTUP_STAGES = frozenset(
+    {
+        "request_reserved",
+        "starting_state_persisted",
+        "manager_validation",
+        "worker_config_write",
+        "worker_spawn",
+        "worker_readiness_wait",
+    }
+)
+KNOWN_STARTUP_FAILURE_REASONS = frozenset(
+    {
+        "exception",
+        "readiness_inspection_failed",
+        "readiness_timeout",
+        "readiness_unconfirmed",
+        "worker_failed",
+    }
+)
+PERSISTENCE_FAILURE_REASON_CODES = frozenset(
+    {"diagnostic_payload_too_large", "diagnostic_persistence_failed"}
+)
+_SAFE_EXCEPTION_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z", re.ASCII)
+_WORKFLOW_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
+    re.ASCII,
+)
+_RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
 KNOWN_JOB_STATES = frozenset(
     {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
 )
@@ -195,7 +238,11 @@ def maximum_active_codex_jobs(events: Sequence[Mapping[str, object]]) -> int:
     return maximum
 
 
-def _new_evidence(*, previous_evidence_sha256: str | None = None) -> dict[str, Any]:
+def _new_evidence(
+    *,
+    previous_evidence_sha256: str | None = None,
+    diagnostic_retest_sha256: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     check_names = (
         "native_windows",
         "dedicated_loopback_ports",
@@ -213,7 +260,13 @@ def _new_evidence(*, previous_evidence_sha256: str | None = None) -> dict[str, A
         "production_side_effects",
     )
     evidence: dict[str, Any] = {
-        "phase": "5E-2C2-R" if previous_evidence_sha256 is not None else "5E-2C2",
+        "phase": (
+            "5E-2C2-R3"
+            if diagnostic_retest_sha256 is not None
+            else "5E-2C2-R"
+            if previous_evidence_sha256 is not None
+            else "5E-2C2"
+        ),
         "started_at_utc": _utc_now(),
         "status": "RUNNING",
         "ports": {},
@@ -238,6 +291,23 @@ def _new_evidence(*, previous_evidence_sha256: str | None = None) -> dict[str, A
                 "previous_evidence_sha256": previous_evidence_sha256,
             }
         )
+    if diagnostic_retest_sha256 is not None:
+        evidence.update(
+            {
+                "retry_of": "5E-2C2-R",
+                "retest_reason": DIAGNOSTIC_RETEST_REASON,
+                "previous_evidence": {
+                    "original": {
+                        "path": "docs/phase5e-2c2-evidence.json",
+                        "sha256": diagnostic_retest_sha256["original"],
+                    },
+                    "r2": {
+                        "path": "docs/phase5e-2c2-retest-evidence.json",
+                        "sha256": diagnostic_retest_sha256["r2"],
+                    },
+                },
+            }
+        )
     return evidence
 
 
@@ -255,6 +325,10 @@ def _save_evidence(evidence: dict[str, Any], path: Path = EVIDENCE_PATH) -> None
 
 
 def _validated_previous_evidence(path: Path) -> str:
+    return _validated_previous_evidence_hashes(path)[0]
+
+
+def _validated_previous_evidence_hashes(path: Path) -> tuple[str, str]:
     try:
         if path.is_symlink() or not path.is_file():
             raise OSError
@@ -322,7 +396,95 @@ def _validated_previous_evidence(path: Path) -> str:
         )
     ):
         raise SmokeAbort("BLOCKED", "previous_evidence_unexpected")
+    raw_sha256 = hashlib.sha256(encoded).hexdigest()
+    normalized_sha256 = hashlib.sha256(encoded.replace(b"\r\n", b"\n")).hexdigest()
+    return raw_sha256, normalized_sha256
+
+
+def _validated_retest_evidence(path: Path, *, original_evidence_sha256: str) -> str:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError
+        if path.stat().st_size > MAX_PREVIOUS_EVIDENCE_BYTES:
+            raise OSError
+        with path.open("rb") as stream:
+            encoded = stream.read(MAX_PREVIOUS_EVIDENCE_BYTES + 1)
+        if len(encoded) > MAX_PREVIOUS_EVIDENCE_BYTES:
+            raise OSError
+        retest = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SmokeAbort("BLOCKED", "retest_evidence_unexpected") from None
+
+    if not isinstance(retest, dict):
+        raise SmokeAbort("BLOCKED", "retest_evidence_unexpected")
+    workflow = retest.get("workflow")
+    checks = retest.get("checks")
+    cleanup = retest.get("cleanup")
+    expected_check_statuses = {
+        "native_windows": "PASS",
+        "dedicated_loopback_ports": "PASS",
+        "isolated_environment_and_roots": "PASS",
+        "bridge_preflight_and_authentication": "PASS",
+        "workspace_allowed_root_and_cwd": "NOT_RUN",
+        "single_live_workflow_post": "FAIL",
+        "workflow_api_identity_and_jobs": "NOT_RUN",
+        "immutable_hashes_and_ledgers": "NOT_RUN",
+        "expected_final_texts": "NOT_RUN",
+        "active_job_concurrency": "NOT_RUN",
+        "console_qt_get_readback": "NOT_RUN",
+        "same_id_replay": "NOT_RUN",
+        "bridge_restart_readback": "NOT_RUN",
+        "production_side_effects": "PASS",
+    }
+    if (
+        not isinstance(workflow, dict)
+        or not isinstance(checks, dict)
+        or not isinstance(cleanup, dict)
+    ):
+        raise SmokeAbort("BLOCKED", "retest_evidence_unexpected")
+    actual_check_statuses = {
+        name: check.get("status") if isinstance(check, dict) else None
+        for name, check in checks.items()
+    }
+    if (
+        retest.get("phase") != "5E-2C2-R"
+        or retest.get("status") != "FAIL"
+        or retest.get("reason") != "initial_workflow_post_was_not_accepted"
+        or retest.get("retry_of") != "5E-2C2"
+        or retest.get("retest_reason") != RETEST_REASON
+        or retest.get("previous_evidence_path") != "docs/phase5e-2c2-evidence.json"
+        or retest.get("previous_evidence_sha256") != original_evidence_sha256
+        or retest.get("live_workflow_post_attempted") is not True
+        or type(retest.get("live_workflow_post_count")) is not int
+        or retest.get("live_workflow_post_count") != 1
+        or retest.get("same_id_replay_post_attempted") is not False
+        or type(retest.get("same_id_replay_post_count")) is not int
+        or retest.get("same_id_replay_post_count") != 0
+        or type(retest.get("new_codex_job_count")) is not int
+        or retest.get("new_codex_job_count") != 0
+        or retest.get("new_codex_thread_count") is not None
+        or retest.get("maximum_active_codex_jobs") is not None
+        or type(retest.get("production_side_effect_count")) is not int
+        or retest.get("production_side_effect_count") != 0
+        or type(workflow.get("initial_post_http_status")) is not int
+        or workflow.get("initial_post_http_status") != 409
+        or actual_check_statuses != expected_check_statuses
+        or cleanup.get("status") != "PRESERVED_ACTIVE_OR_UNKNOWN"
+        or cleanup.get("forced_termination") is not False
+    ):
+        raise SmokeAbort("BLOCKED", "retest_evidence_unexpected")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _select_diagnostic_retest_evidence() -> tuple[Path, dict[str, str]]:
+    if DIAGNOSTIC_RETEST_EVIDENCE_PATH.exists() or DIAGNOSTIC_RETEST_EVIDENCE_PATH.is_symlink():
+        raise SmokeAbort("BLOCKED", "diagnostic_retest_evidence_already_exists")
+    original_sha256, normalized_original_sha256 = _validated_previous_evidence_hashes(EVIDENCE_PATH)
+    r2_sha256 = _validated_retest_evidence(
+        RETEST_EVIDENCE_PATH,
+        original_evidence_sha256=normalized_original_sha256,
+    )
+    return DIAGNOSTIC_RETEST_EVIDENCE_PATH, {"original": original_sha256, "r2": r2_sha256}
 
 
 def _select_evidence_paths(*, retest_once: bool) -> tuple[Path, str | None]:
@@ -574,22 +736,208 @@ def _wait_for_no_workers(bridge_pid: int, timeout_seconds: float = 10.0) -> None
     raise SmokeAbort("BLOCKED", "completed_workflow_worker_child_did_not_exit")
 
 
-def _start_bridge(environment: dict[str, str]) -> subprocess.Popen[bytes]:
+_STDERR_DIAGNOSTIC_EVENT = re.compile(
+    rf"{re.escape(STARTUP_DIAGNOSTIC_EVENT_ID)} "
+    r"stage=(?P<stage>[A-Za-z_][A-Za-z0-9_]*) "
+    r"original_exception=(?P<original>none|[A-Za-z_][A-Za-z0-9_]{0,63}) "
+    r"persistence_exception=(?P<persistence>[A-Za-z_][A-Za-z0-9_]{0,63})\Z",
+    re.ASCII,
+)
+
+
+class _StderrDiagnosticCollector:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._source: queue.Queue[Any] = queue.Queue(maxsize=1)
+        self._reader: threading.Thread | None = None
+        self._read_status = "NOT_STARTED"
+        self._read_error_class: str | None = None
+        self._line_buffer = bytearray()
+        self._discarding_long_line = False
+        self._events: list[dict[str, str]] = []
+        self._events_truncated = False
+        self._long_line_discarded = False
+
+    def start_reader(self) -> None:
+        with self._lock:
+            self._read_status = "STARTING"
+        reader = threading.Thread(
+            target=_drain_bridge_stderr,
+            args=(self._source, self),
+            name="codexbridge-isolated-stderr-reader",
+            daemon=True,
+        )
+        reader.start()
+        self._reader = reader
+
+    def attach(self, stream: Any) -> None:
+        if stream is None:
+            self._set_read_failure_name("StderrUnavailable")
+            self._source.put(None)
+            return
+        with self._lock:
+            if self._read_status != "READ_FAILED":
+                self._read_status = "READING"
+        self._source.put(stream)
+
+    def finish_without_stream(self) -> None:
+        with self._lock:
+            self._read_status = "NOT_STARTED"
+        self._source.put(None)
+
+    def feed(self, chunk: bytes) -> None:
+        if not isinstance(chunk, bytes) or len(chunk) > STDERR_READ_CHUNK_BYTES:
+            self._set_read_failure_name("InvalidStderrChunk")
+            return
+        with self._lock:
+            for byte in chunk:
+                if byte == 0x0A:
+                    if self._discarding_long_line:
+                        self._long_line_discarded = True
+                    else:
+                        self._accept_line_locked(bytes(self._line_buffer))
+                    self._line_buffer.clear()
+                    self._discarding_long_line = False
+                elif not self._discarding_long_line:
+                    if len(self._line_buffer) >= MAX_STDERR_DIAGNOSTIC_LINE_BYTES:
+                        self._line_buffer.clear()
+                        self._discarding_long_line = True
+                        self._long_line_discarded = True
+                    else:
+                        self._line_buffer.append(byte)
+
+    def finish_eof(self) -> None:
+        with self._lock:
+            if not self._discarding_long_line and self._line_buffer:
+                self._accept_line_locked(bytes(self._line_buffer))
+            self._line_buffer.clear()
+            self._discarding_long_line = False
+            if self._read_status != "READ_FAILED":
+                self._read_status = "EOF"
+
+    def mark_read_failure(self, error: BaseException) -> None:
+        self._set_read_failure_name(_safe_exception_name(type(error).__name__))
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot: dict[str, Any] = {
+                "read_status": self._read_status,
+                "events": [dict(event) for event in self._events],
+                "events_truncated": self._events_truncated,
+                "long_line_discarded": self._long_line_discarded,
+            }
+            if self._read_error_class is not None:
+                snapshot["read_error_class"] = self._read_error_class
+            return snapshot
+
+    def wait(self, timeout: float) -> bool:
+        reader = self._reader
+        if reader is None:
+            return True
+        reader.join(timeout=max(0.0, timeout))
+        return not reader.is_alive()
+
+    def _accept_line_locked(self, raw_line: bytes) -> None:
+        if raw_line.endswith(b"\r"):
+            raw_line = raw_line[:-1]
+        try:
+            line = raw_line.decode("ascii")
+        except UnicodeDecodeError:
+            return
+        match = _STDERR_DIAGNOSTIC_EVENT.fullmatch(line)
+        if match is None:
+            return
+        stage = match.group("stage")
+        original = match.group("original")
+        persistence = match.group("persistence")
+        if (
+            stage not in KNOWN_STARTUP_STAGES
+            or (original != "none" and not _SAFE_EXCEPTION_CLASS.fullmatch(original))
+            or persistence == "none"
+            or (
+                not _SAFE_EXCEPTION_CLASS.fullmatch(persistence)
+                and persistence not in PERSISTENCE_FAILURE_REASON_CODES
+            )
+        ):
+            return
+        if len(self._events) >= MAX_STDERR_DIAGNOSTIC_EVENTS:
+            self._events_truncated = True
+            return
+        self._events.append(
+            {
+                "stage": stage,
+                "original_exception": original,
+                "persistence_exception": persistence,
+            }
+        )
+
+    def _set_read_failure_name(self, exception_name: str) -> None:
+        with self._lock:
+            self._read_status = "READ_FAILED"
+            self._read_error_class = _safe_exception_name(exception_name)
+
+
+def _safe_exception_name(value: str) -> str:
+    return value if _SAFE_EXCEPTION_CLASS.fullmatch(value) else "UnknownException"
+
+
+def _drain_bridge_stderr(source: queue.Queue[Any], collector: _StderrDiagnosticCollector) -> None:
+    stream = source.get()
+    if stream is None:
+        return
+    try:
+        read_chunk = getattr(stream, "read1", None)
+        while True:
+            chunk = (
+                read_chunk(STDERR_READ_CHUNK_BYTES)
+                if callable(read_chunk)
+                else stream.read(STDERR_READ_CHUNK_BYTES)
+            )
+            if not chunk:
+                collector.finish_eof()
+                return
+            collector.feed(chunk)
+            snapshot = collector.snapshot()
+            if snapshot["read_status"] == "READ_FAILED":
+                return
+    except BaseException as error:
+        collector.mark_read_failure(error)
+    finally:
+        try:
+            stream.close()
+        except BaseException as error:
+            collector.mark_read_failure(error)
+
+
+def _start_bridge(
+    environment: dict[str, str],
+) -> tuple[subprocess.Popen[bytes], _StderrDiagnosticCollector]:
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
         subprocess, "CREATE_NO_WINDOW", 0
     )
+    stderr_collector = _StderrDiagnosticCollector()
     try:
-        return subprocess.Popen(
+        stderr_collector.start_reader()
+    except BaseException:
+        raise SmokeAbort("BLOCKED", "isolated_bridge_stderr_reader_unavailable") from None
+    try:
+        process = subprocess.Popen(
             [sys.executable, "-m", "codex_bridge"],
             cwd=REPOSITORY_ROOT,
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             creationflags=flags,
         )
     except (OSError, ValueError):
+        stderr_collector.finish_without_stream()
         raise SmokeAbort("BLOCKED", "isolated_bridge_process_could_not_start") from None
+    except BaseException:
+        stderr_collector.finish_without_stream()
+        raise
+    stderr_collector.attach(process.stderr)
+    return process, stderr_collector
 
 
 def _http_json(
@@ -1262,6 +1610,257 @@ def _read_reconciliation_state(
     return response
 
 
+def _diagnostic_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def _valid_diagnostic_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or len(value) > 40:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == UTC.utcoffset(None)
+
+
+def _validate_startup_diagnostic(
+    value: object,
+    *,
+    workflow_id: str,
+    run_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "workflow_id",
+        "run_id",
+        "stages",
+        "failure",
+    }:
+        return None
+    if (
+        type(value.get("version")) is not int
+        or value.get("version") != 1
+        or value.get("workflow_id") != workflow_id
+        or value.get("run_id") != run_id
+    ):
+        return None
+
+    raw_stages = value.get("stages")
+    raw_failure = value.get("failure")
+    if (
+        not isinstance(raw_stages, list)
+        or not 1 <= len(raw_stages) <= MAX_STARTUP_DIAGNOSTIC_STAGE_EVENTS
+        or not isinstance(raw_failure, dict)
+        or set(raw_failure)
+        != {
+            "stage",
+            "exception_class",
+            "reason",
+            "at_utc",
+            "worker_config_write_completed",
+            "worker_spawned",
+        }
+    ):
+        return None
+
+    stages: list[dict[str, str]] = []
+    started_stages: set[str] = set()
+    for raw_event in raw_stages:
+        event_stage = raw_event.get("stage") if isinstance(raw_event, dict) else None
+        event_phase = raw_event.get("phase") if isinstance(raw_event, dict) else None
+        if (
+            not isinstance(raw_event, dict)
+            or set(raw_event) != {"stage", "phase", "at_utc"}
+            or not isinstance(event_stage, str)
+            or event_stage not in KNOWN_STARTUP_STAGES
+            or not isinstance(event_phase, str)
+            or event_phase not in {"started", "completed"}
+            or not _valid_diagnostic_timestamp(raw_event.get("at_utc"))
+        ):
+            return None
+        stage = event_stage
+        phase = event_phase
+        if phase == "started":
+            started_stages.add(stage)
+        stages.append({"stage": stage, "phase": phase, "at_utc": str(raw_event["at_utc"])})
+
+    failure_stage = raw_failure.get("stage")
+    exception_class = raw_failure.get("exception_class")
+    reason = raw_failure.get("reason")
+    worker_config_completed = raw_failure.get("worker_config_write_completed")
+    worker_spawned = raw_failure.get("worker_spawned")
+    if (
+        not isinstance(failure_stage, str)
+        or failure_stage not in KNOWN_STARTUP_STAGES
+        or failure_stage not in started_stages
+        or (
+            exception_class is not None
+            and (
+                not isinstance(exception_class, str)
+                or not _SAFE_EXCEPTION_CLASS.fullmatch(exception_class)
+            )
+        )
+        or not isinstance(reason, str)
+        or reason not in KNOWN_STARTUP_FAILURE_REASONS
+        or not _valid_diagnostic_timestamp(raw_failure.get("at_utc"))
+        or type(worker_config_completed) is not bool
+        or (worker_spawned is not None and type(worker_spawned) is not bool)
+    ):
+        return None
+
+    return {
+        "status": "VALID",
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "stages": stages,
+        "failure": {
+            "stage": str(failure_stage),
+            "exception_class": exception_class,
+            "reason": str(reason),
+            "at_utc": str(raw_failure["at_utc"]),
+            "worker_config_write_completed": worker_config_completed,
+            "worker_spawned": worker_spawned,
+        },
+    }
+
+
+def _read_startup_diagnostic(state_root: Path, client_request_id: str) -> dict[str, Any]:
+    try:
+        rows = _read_request_ledger(state_root)
+    except BaseException:
+        return {"status": "UNAVAILABLE", "reason": "request_ledger_unreadable"}
+    matches = [row for row in rows if row.get("client_request_id") == client_request_id]
+    if len(matches) != 1:
+        return {"status": "IDENTITY_UNAVAILABLE", "reason": "request_identity_not_unique"}
+
+    workflow_id = matches[0].get("workflow_id")
+    run_id = matches[0].get("run_id")
+    if (
+        not isinstance(workflow_id, str)
+        or not _WORKFLOW_ID.fullmatch(workflow_id)
+        or not isinstance(run_id, str)
+        or not _RUN_ID.fullmatch(run_id)
+    ):
+        return {"status": "IDENTITY_INVALID", "reason": "request_identity_invalid"}
+    try:
+        run_dir = _run_directory(state_root, run_id)
+    except BaseException:
+        return {
+            "status": "UNAVAILABLE",
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "reason": "run_directory_unavailable",
+        }
+
+    diagnostic_path = run_dir / STARTUP_DIAGNOSTIC_FILENAME
+    try:
+        if diagnostic_path.is_symlink():
+            return {
+                "status": "INVALID",
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "reason": "diagnostic_file_is_a_symlink",
+            }
+        if not diagnostic_path.exists():
+            return {"status": "NOT_FOUND", "workflow_id": workflow_id, "run_id": run_id}
+        if not diagnostic_path.is_file():
+            return {
+                "status": "INVALID",
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "reason": "diagnostic_file_not_regular",
+            }
+        if diagnostic_path.stat().st_size > MAX_STARTUP_DIAGNOSTIC_BYTES:
+            return {
+                "status": "INVALID",
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "reason": "diagnostic_file_oversized",
+            }
+        with diagnostic_path.open("rb") as stream:
+            encoded = stream.read(MAX_STARTUP_DIAGNOSTIC_BYTES + 1)
+    except OSError:
+        return {
+            "status": "READ_FAILED",
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "reason": "diagnostic_file_read_failed",
+        }
+    if len(encoded) > MAX_STARTUP_DIAGNOSTIC_BYTES:
+        return {
+            "status": "INVALID",
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "reason": "diagnostic_file_oversized",
+        }
+    try:
+        document = json.loads(encoded.decode("utf-8"), object_pairs_hook=_diagnostic_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        return {
+            "status": "INVALID",
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "reason": "diagnostic_json_invalid",
+        }
+    validated = _validate_startup_diagnostic(
+        document,
+        workflow_id=workflow_id,
+        run_id=run_id,
+    )
+    if validated is None:
+        return {
+            "status": "INVALID",
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "reason": "diagnostic_schema_or_identity_invalid",
+        }
+    return validated
+
+
+def _collect_startup_diagnostics(
+    *,
+    state_root: Path,
+    client_request_id: str,
+    stderr_collector: _StderrDiagnosticCollector,
+) -> dict[str, Any]:
+    file_result = _read_startup_diagnostic(state_root, client_request_id)
+    stderr_result = stderr_collector.snapshot()
+    file_obtained = file_result.get("status") == "VALID"
+    stderr_events = stderr_result.get("events")
+    stderr_obtained = isinstance(stderr_events, list) and bool(stderr_events)
+    read_incomplete = stderr_result.get("read_status") in {"STARTING", "READING"}
+    result: dict[str, Any] = {
+        "file": file_result,
+        "stderr": stderr_result,
+        "diagnostic_obtained": file_obtained or stderr_obtained,
+        "diagnostics_unavailable": not file_obtained
+        and not stderr_obtained
+        and not read_incomplete,
+        "stderr_capture_incomplete": read_incomplete,
+    }
+    if len(_canonical_json(result).encode("utf-8")) > MAX_DIAGNOSTIC_EVIDENCE_BYTES:
+        return {
+            "file": {"status": "EVIDENCE_LIMIT"},
+            "stderr": {
+                "read_status": stderr_result.get("read_status", "UNKNOWN"),
+                "events": [],
+                "events_truncated": True,
+                "long_line_discarded": bool(stderr_result.get("long_line_discarded")),
+            },
+            "diagnostic_obtained": False,
+            "diagnostics_unavailable": False,
+            "stderr_capture_incomplete": read_incomplete,
+            "evidence_truncated": True,
+        }
+    return result
+
+
 def _no_sensitive_evidence(
     evidence: Mapping[str, Any],
     *,
@@ -1375,6 +1974,7 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
     token = secrets.token_urlsafe(32)
     client_request_id = f"phase5e2c2-{uuid.uuid4().hex}"
     process: subprocess.Popen[bytes] | None = None
+    stderr_collectors: list[_StderrDiagnosticCollector] = []
     process_records: list[dict[str, Any]] = []
     ports: tuple[int, int] | None = None
     reservations: list[socket.socket] = []
@@ -1442,7 +2042,8 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
             reservation.close()
         reservations.clear()
         _assert_ports_free(ports)
-        process = _start_bridge(child_environment)
+        process, stderr_collector = _start_bridge(child_environment)
+        stderr_collectors.append(stderr_collector)
         _wait_for_bridge(process, ui_port)
         preflight = _preflight_bridge(
             process,
@@ -1519,6 +2120,12 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
                 token=token,
                 client_request_id=client_request_id,
             )
+            if post_status == 409 and stderr_collectors:
+                evidence["workflow"]["startup_diagnostics"] = _collect_startup_diagnostics(
+                    state_root=state_root,
+                    client_request_id=client_request_id,
+                    stderr_collector=stderr_collectors[0],
+                )
             raise SmokeAbort("FAIL", "initial_workflow_post_was_not_accepted")
         workflow_id, run_id = _bridge_run_directory_from_response(post_response)
         evidence["workflow"].update(
@@ -1684,7 +2291,8 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
         if not cleanup_reaped:
             raise SmokeAbort("BLOCKED", "first_isolated_bridge_normal_shutdown_not_reaped")
         _assert_ports_free(ports)
-        process = _start_bridge(child_environment)
+        process, stderr_collector = _start_bridge(child_environment)
+        stderr_collectors.append(stderr_collector)
         _wait_for_bridge(process, ui_port)
         restart_preflight = _preflight_bridge(
             process,
@@ -1767,6 +2375,22 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
             evidence["cleanup"]["bridge_processes"] = process_records
         evidence["cleanup"]["forced_termination"] = False
         evidence["cleanup"]["owned_children_reaped"] = cleanup_reaped
+        for stderr_collector in stderr_collectors:
+            stderr_collector.wait(timeout=0.25)
+        startup_diagnostics = evidence.get("workflow", {}).get("startup_diagnostics")
+        if isinstance(startup_diagnostics, dict) and stderr_collectors:
+            stderr_result = stderr_collectors[0].snapshot()
+            startup_diagnostics["stderr"] = stderr_result
+            file_result = startup_diagnostics.get("file")
+            file_obtained = isinstance(file_result, dict) and file_result.get("status") == "VALID"
+            stderr_events = stderr_result.get("events")
+            stderr_obtained = isinstance(stderr_events, list) and bool(stderr_events)
+            read_incomplete = stderr_result.get("read_status") in {"STARTING", "READING"}
+            startup_diagnostics["diagnostic_obtained"] = file_obtained or stderr_obtained
+            startup_diagnostics["diagnostics_unavailable"] = (
+                not file_obtained and not stderr_obtained and not read_incomplete
+            )
+            startup_diagnostics["stderr_capture_incomplete"] = read_incomplete
         if cleanup_reaped:
             try:
                 temporary_parent = Path(tempfile.gettempdir()).resolve(strict=True)
@@ -1805,22 +2429,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="claim the dedicated retest evidence path after validating the original evidence",
     )
+    parser.add_argument(
+        "--diagnostic-retest-once",
+        action="store_true",
+        help="claim the dedicated diagnostic retest evidence path after validating both baselines",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.retest_once and arguments.diagnostic_retest_once:
+        parser.error("--retest-once and --diagnostic-retest-once cannot be combined")
+    previous_evidence_sha256: str | None = None
+    diagnostic_retest_sha256: dict[str, str] | None = None
     try:
-        evidence_path, previous_evidence_sha256 = _select_evidence_paths(
-            retest_once=arguments.retest_once
-        )
+        if arguments.diagnostic_retest_once:
+            evidence_path, diagnostic_retest_sha256 = _select_diagnostic_retest_evidence()
+        else:
+            evidence_path, previous_evidence_sha256 = _select_evidence_paths(
+                retest_once=arguments.retest_once
+            )
     except SmokeAbort as error:
         print(json.dumps({"status": error.status, "reason": error.code}, ensure_ascii=False))
         return 2
 
-    evidence = _new_evidence(previous_evidence_sha256=previous_evidence_sha256)
+    evidence = _new_evidence(
+        previous_evidence_sha256=previous_evidence_sha256,
+        diagnostic_retest_sha256=diagnostic_retest_sha256,
+    )
     try:
         claim_evidence_path(evidence_path, evidence)
     except FileExistsError:
-        reason = (
-            "retest_evidence_already_exists" if arguments.retest_once else "evidence_already_exists"
-        )
+        if arguments.diagnostic_retest_once:
+            reason = "diagnostic_retest_evidence_already_exists"
+        else:
+            reason = (
+                "retest_evidence_already_exists"
+                if arguments.retest_once
+                else "evidence_already_exists"
+            )
         print(json.dumps({"status": "BLOCKED", "reason": reason}, ensure_ascii=False))
         return 2
     except OSError:
