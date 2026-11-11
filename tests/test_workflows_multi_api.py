@@ -65,6 +65,7 @@ class _FakeManager:
         self.state_root = state_root
         self.allowed_roots = (str(allowed_root),)
         self.start_calls: list[tuple[Path, dict[str, object]]] = []
+        self.start_error: BaseException | None = None
 
     def create_run_directory(self) -> Path:
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -88,6 +89,8 @@ class _FakeManager:
                 {"workspace_root": workspace_root, **kwargs},
             )
         )
+        if self.start_error is not None:
+            raise self.start_error
         (run_dir / "worker-entry-status.json").write_text(
             json.dumps({"state": "running", "exit_code": None, "error_code": None}),
             encoding="utf-8",
@@ -226,6 +229,64 @@ async def test_explicit_two_job_start_is_durable_idempotent_and_projects_detail(
     async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
         different_limit = await client.post(_PATH, headers=headers, json=payload)
     assert different_limit.status_code == 409
+    assert len(manager.start_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_error", "http_status", "error_code", "workflow_status", "exception_class"),
+    [
+        (
+            RuntimeError(f"{_TOKEN} diagnostic must not contain {__file__}"),
+            409,
+            "workflow_needs_reconciliation",
+            "needs_reconciliation",
+            "RuntimeError",
+        ),
+        (
+            WorkflowManagerError("worker process could not be started"),
+            503,
+            "workflow_worker_not_ready",
+            "failed_to_start",
+            "WorkflowManagerError",
+        ),
+    ],
+)
+async def test_startup_exception_diagnostic_preserves_http_classification_and_no_retry(
+    tmp_path: Path,
+    start_error: BaseException,
+    http_status: int,
+    error_code: str,
+    workflow_status: str,
+    exception_class: str,
+) -> None:
+    app, _service, manager, workspace = _app(tmp_path)
+    manager.start_error = start_error
+    payload = _payload(workspace, request_id="phase5e2c2-diagnostic-http-01")
+    payload["max_live_codex_jobs"] = 2
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        first = await client.post(_PATH, headers=headers, json=payload)
+
+    assert first.status_code == http_status
+    assert first.json()["error"] == error_code
+    assert first.json()["status"] == workflow_status
+    assert len(manager.start_calls) == 1
+    run_dir = manager.start_calls[0][0]
+    diagnostic_path = run_dir / "startup-diagnostic.json"
+    assert diagnostic_path.is_file()
+    diagnostic_text = diagnostic_path.read_text(encoding="utf-8")
+    diagnostic = json.loads(diagnostic_text)
+    assert diagnostic["failure"]["stage"] == "manager_validation"
+    assert diagnostic["failure"]["exception_class"] == exception_class
+    assert _TOKEN not in diagnostic_text
+    assert str(workspace) not in diagnostic_text
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        replay = await client.post(_PATH, headers=headers, json=payload)
+    assert replay.status_code == 202
+    assert replay.json()["status"] == workflow_status
     assert len(manager.start_calls) == 1
 
 

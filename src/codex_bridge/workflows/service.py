@@ -15,6 +15,13 @@ from typing import Any, Literal, Protocol
 
 from ..paths import AllowedPathPolicy, PathPolicyError
 from .manager import WorkflowManagerError, missing_workflow_dependencies
+from .startup_diagnostics import (
+    WorkflowStartupDiagnostic,
+    WorkflowStartupFailureReason,
+    WorkflowStartupStage,
+    current_startup_diagnostic,
+    startup_diagnostic_scope,
+)
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -252,53 +259,86 @@ class WorkflowService:
             if not inserted:
                 return await self._replay(row, prepared.request_digest)
 
-            try:
-                await self._set_state(row.run_id, "starting")
-                if prepared.max_live_codex_jobs == 2:
-                    await self._worker_manager.start_worker(
-                        self._run_directory(row.run_id),
-                        mode="start",
-                        workspace_root=Path(prepared.workspace_root),
-                        max_live_codex_jobs=2,
-                    )
-                else:
-                    await self._worker_manager.start_worker(
-                        self._run_directory(row.run_id),
-                        mode="start",
-                        workspace_root=Path(prepared.workspace_root),
-                    )
-            except WorkflowStartFailed:
-                raise
-            except WorkflowManagerError:
-                await self._set_state(row.run_id, "failed_to_start")
-                raise WorkflowStartFailed(
-                    await self._snapshot_for_row(row, forced_state="failed_to_start")
-                ) from None
-            except asyncio.CancelledError:
-                await asyncio.shield(self._set_state(row.run_id, "needs_reconciliation"))
-                raise
-            except BaseException:
-                await self._set_state(row.run_id, "needs_reconciliation")
-                raise WorkflowReconciliationRequired(
-                    await self._snapshot_for_row(row, forced_state="needs_reconciliation")
-                ) from None
+            diagnostic = WorkflowStartupDiagnostic(
+                row.workflow_id,
+                row.run_id,
+                self._state_root / row.run_id,
+            )
+            with startup_diagnostic_scope(diagnostic):
+                diagnostic.begin(WorkflowStartupStage.REQUEST_RESERVED)
+                diagnostic.complete_if_active(WorkflowStartupStage.REQUEST_RESERVED)
+                return await self._start_reserved_workflow(row, prepared, diagnostic)
 
-            startup_state = await self._wait_for_worker_start(row)
-            if startup_state == "running":
-                await self._set_state(row.run_id, "running")
-                return await self._snapshot_for_row(row)
-            if startup_state in {"succeeded", "failed"}:
-                await self._set_state(row.run_id, startup_state)
-                return await self._snapshot_for_row(row)
-            if startup_state == "failed_to_start":
-                await self._set_state(row.run_id, "failed_to_start")
-                raise WorkflowStartFailed(
-                    await self._snapshot_for_row(row, forced_state="failed_to_start")
+    async def _start_reserved_workflow(
+        self,
+        row: _RequestRow,
+        prepared: _PreparedRequest,
+        diagnostic: WorkflowStartupDiagnostic,
+    ) -> WorkflowSnapshot:
+        try:
+            diagnostic.begin(WorkflowStartupStage.STARTING_STATE_PERSISTED)
+            await self._set_state(row.run_id, "starting")
+            diagnostic.complete_if_active(WorkflowStartupStage.STARTING_STATE_PERSISTED)
+            diagnostic.begin(WorkflowStartupStage.MANAGER_VALIDATION)
+            if prepared.max_live_codex_jobs == 2:
+                await self._worker_manager.start_worker(
+                    self._run_directory(row.run_id),
+                    mode="start",
+                    workspace_root=Path(prepared.workspace_root),
+                    max_live_codex_jobs=2,
                 )
+            else:
+                await self._worker_manager.start_worker(
+                    self._run_directory(row.run_id),
+                    mode="start",
+                    workspace_root=Path(prepared.workspace_root),
+                )
+            diagnostic.complete_if_active(WorkflowStartupStage.MANAGER_VALIDATION)
+        except WorkflowStartFailed as error:
+            diagnostic.fail(error)
+            raise
+        except WorkflowManagerError as error:
+            diagnostic.fail(error)
+            await self._set_state(row.run_id, "failed_to_start")
+            raise WorkflowStartFailed(
+                await self._snapshot_for_row(row, forced_state="failed_to_start")
+            ) from None
+        except asyncio.CancelledError as error:
+            diagnostic.fail(error)
+            await asyncio.shield(self._set_state(row.run_id, "needs_reconciliation"))
+            raise
+        except BaseException as error:
+            diagnostic.fail(error)
             await self._set_state(row.run_id, "needs_reconciliation")
             raise WorkflowReconciliationRequired(
                 await self._snapshot_for_row(row, forced_state="needs_reconciliation")
+            ) from None
+
+        diagnostic.begin(WorkflowStartupStage.WORKER_READINESS_WAIT)
+        try:
+            startup_state = await self._wait_for_worker_start(row)
+        except BaseException as error:
+            diagnostic.fail(error)
+            raise
+        if startup_state == "running":
+            diagnostic.complete_if_active(WorkflowStartupStage.WORKER_READINESS_WAIT)
+            await self._set_state(row.run_id, "running")
+            return await self._snapshot_for_row(row)
+        if startup_state in {"succeeded", "failed"}:
+            diagnostic.complete_if_active(WorkflowStartupStage.WORKER_READINESS_WAIT)
+            await self._set_state(row.run_id, startup_state)
+            return await self._snapshot_for_row(row)
+        if startup_state == "failed_to_start":
+            diagnostic.fail(None, reason=WorkflowStartupFailureReason.WORKER_FAILED)
+            await self._set_state(row.run_id, "failed_to_start")
+            raise WorkflowStartFailed(
+                await self._snapshot_for_row(row, forced_state="failed_to_start")
             )
+        diagnostic.fail(None, reason=WorkflowStartupFailureReason.READINESS_UNCONFIRMED)
+        await self._set_state(row.run_id, "needs_reconciliation")
+        raise WorkflowReconciliationRequired(
+            await self._snapshot_for_row(row, forced_state="needs_reconciliation")
+        )
 
     async def list_workflows(self, *, limit: int = 50) -> list[WorkflowSnapshot]:
         if type(limit) is not int or not 1 <= limit <= 100:
@@ -351,17 +391,27 @@ class WorkflowService:
         return await self._snapshot_for_row(row)
 
     async def _wait_for_worker_start(self, row: _RequestRow) -> str:
+        diagnostic = current_startup_diagnostic()
         deadline = time.monotonic() + _WORKER_START_TIMEOUT_SECONDS
         while True:
             try:
                 inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
-            except (OSError, sqlite3.Error, ValueError):
+            except (OSError, sqlite3.Error, ValueError) as error:
+                if diagnostic is not None:
+                    diagnostic.fail(
+                        error,
+                        reason=WorkflowStartupFailureReason.READINESS_INSPECTION_FAILED,
+                    )
                 return "needs_reconciliation"
             if inspection.status in {"running", "succeeded", "failed", "failed_to_start"}:
                 return inspection.status
             if inspection.status == "needs_reconciliation" and inspection.worker_state == "failed":
+                if diagnostic is not None:
+                    diagnostic.fail(None, reason=WorkflowStartupFailureReason.WORKER_FAILED)
                 return "needs_reconciliation"
             if time.monotonic() >= deadline:
+                if diagnostic is not None:
+                    diagnostic.fail(None, reason=WorkflowStartupFailureReason.READINESS_TIMEOUT)
                 return "needs_reconciliation"
             await asyncio.sleep(0.05)
 
@@ -393,7 +443,11 @@ class WorkflowService:
     async def _set_state(self, run_id: str, state: str) -> None:
         try:
             await asyncio.to_thread(_update_request_state, self._state_root, run_id, state)
-        except (OSError, sqlite3.Error, ValueError):
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if state == "starting":
+                diagnostic = current_startup_diagnostic()
+                if diagnostic is not None:
+                    diagnostic.fail(error)
             raise WorkflowServiceUnavailable("workflow request state could not be saved") from None
 
     def _run_directory(self, run_id: str) -> Path:
