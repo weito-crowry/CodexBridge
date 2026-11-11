@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -110,8 +111,53 @@ class WorkflowStartupDiagnostic:
                 sort_keys=True,
             ).encode("utf-8")
             if len(payload) > _MAX_DIAGNOSTIC_BYTES:
+                self._write_persistence_failure_stderr(None, reason="diagnostic_payload_too_large")
                 return
-            _write_diagnostic_exclusive(self._run_dir, payload)
+            if not _write_diagnostic_exclusive(self._run_dir, payload):
+                # Existing files and symlinks are deliberate refusal cases.
+                return
+        except BaseException as error:
+            self._write_persistence_failure_stderr(error)
+
+    def _write_persistence_failure_stderr(
+        self,
+        persistence_error: BaseException | None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        try:
+            failure = self._failure
+            if failure is None:
+                return
+            stage = failure.get("stage")
+            known_stages = {item.value for item in WorkflowStartupStage}
+            if not isinstance(stage, str) or stage not in known_stages:
+                stage = "unknown"
+
+            original_exception = failure.get("exception_class")
+            if original_exception is None:
+                original_name = "none"
+            elif isinstance(original_exception, str) and _SAFE_EXCEPTION_NAME.fullmatch(
+                original_exception
+            ):
+                original_name = original_exception
+            else:
+                original_name = "UnknownException"
+
+            if persistence_error is not None:
+                persistence_name = _safe_exception_class(persistence_error)
+            elif reason == "diagnostic_payload_too_large":
+                persistence_name = reason
+            else:
+                persistence_name = "diagnostic_persistence_failed"
+
+            message = (
+                "workflow.startup_diagnostic.persistence_failed "
+                f"stage={stage} original_exception={original_name} "
+                f"persistence_exception={persistence_name}\n"
+            )
+            sys.stderr.write(message)
+            sys.stderr.flush()
         except BaseException:
             return
 
@@ -134,15 +180,15 @@ def current_startup_diagnostic() -> WorkflowStartupDiagnostic | None:
     return _ACTIVE_DIAGNOSTIC.get()
 
 
-def _write_diagnostic_exclusive(run_dir: Path, payload: bytes) -> None:
+def _write_diagnostic_exclusive(run_dir: Path, payload: bytes) -> bool:
     if run_dir.is_symlink():
-        return
+        return False
     resolved_run_dir = run_dir.resolve(strict=True)
     if resolved_run_dir != run_dir.absolute() or not resolved_run_dir.is_dir():
-        return
+        return False
     diagnostic_path = resolved_run_dir / _DIAGNOSTIC_FILENAME
     if diagnostic_path.is_symlink() or diagnostic_path.exists():
-        return
+        return False
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
@@ -151,6 +197,7 @@ def _write_diagnostic_exclusive(run_dir: Path, payload: bytes) -> None:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+    return True
 
 
 def _safe_workflow_id(value: str) -> str | None:

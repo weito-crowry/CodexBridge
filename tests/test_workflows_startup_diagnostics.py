@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from codex_bridge.workflows import manager as manager_module
 from codex_bridge.workflows import service as service_module
+from codex_bridge.workflows import startup_diagnostics as diagnostics_module
 from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
 from codex_bridge.workflows.manager import WorkflowWorkerManager
 from codex_bridge.workflows.service import (
@@ -314,6 +317,7 @@ async def test_worker_spawn_cancellation_remains_uncertain_and_is_not_retried(
 @pytest.mark.asyncio
 async def test_successful_worker_start_does_not_create_startup_diagnostic(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -325,6 +329,7 @@ async def test_successful_worker_start_does_not_create_startup_diagnostic(
     assert snapshot.status == "running"
     assert len(manager.start_calls) == 1
     assert not (manager.start_calls[0] / "startup-diagnostic.json").exists()
+    assert capsys.readouterr().err == ""
 
 
 class _ExitedProcess:
@@ -384,24 +389,35 @@ async def test_readiness_timeout_is_diagnostic_and_keeps_reconciliation_status(
 async def test_diagnostic_write_failure_does_not_change_status_or_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    manager = _FakeWorkerManager(tmp_path / "state", workspace)
-    manager.start_error = RuntimeError(_SECRET_MARKER)
-    service = WorkflowService(manager, codex_bridge_port=18001)
+    service, manager = _real_service(tmp_path, workspace)
+    secret_text = f"api_key={_SECRET_MARKER} path={workspace} prompt={SAFE_CODEX_JOB_PROMPT}"
+
+    def fail_config_write(_path: Path, _value: object) -> None:
+        raise RuntimeError(secret_text)
+
+    monkeypatch.setattr(manager_module, "_write_private_json", fail_config_write)
     original_open = os.open
     write_attempts: list[str] = []
+    spawn_attempts: list[bool] = []
 
     def fail_diagnostic_write(path: object, flags: int, mode: int = 0o777) -> int:
         if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path).endswith(
             "startup-diagnostic.json"
         ):
             write_attempts.append("diagnostic")
-            raise OSError(_SECRET_MARKER)
+            raise OSError(errno.ENOSPC, secret_text)
         return original_open(path, flags, mode)
 
+    async def track_spawn(*_args: object, **_kwargs: object) -> object:
+        spawn_attempts.append(True)
+        raise AssertionError("configuration failure must precede process spawn")
+
     monkeypatch.setattr(os, "open", fail_diagnostic_write)
+    monkeypatch.setattr(manager_module.asyncio, "create_subprocess_exec", track_spawn)
     request = _request(workspace, "workflow409-diagnostic-write-0001")
 
     with pytest.raises(WorkflowReconciliationRequired) as raised:
@@ -409,8 +425,219 @@ async def test_diagnostic_write_failure_does_not_change_status_or_retry(
 
     assert raised.value.snapshot.status == "needs_reconciliation"
     assert write_attempts == ["diagnostic"]
+    assert spawn_attempts == []
+    run_dir = manager.state_root / raised.value.snapshot.run_id
+    assert not (run_dir / "startup-diagnostic.json").exists()
+    stderr_output = capsys.readouterr().err
+    assert stderr_output == (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=worker_config_write original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    )
+    assert _SECRET_MARKER not in stderr_output
+    assert str(workspace) not in stderr_output
+    assert SAFE_CODEX_JOB_PROMPT not in stderr_output
+
     replay = await service.start_workflow(**request)
     assert replay.status == "needs_reconciliation"
+    assert spawn_attempts == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_fsync_failure_falls_back_without_changing_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _FakeWorkerManager(tmp_path / "state", workspace)
+    manager.start_error = RuntimeError(
+        f"api_key={_SECRET_MARKER} path={workspace} prompt={SAFE_CODEX_JOB_PROMPT}"
+    )
+    service = WorkflowService(manager, codex_bridge_port=18001)
+    original_fsync = os.fsync
+    original_open = os.open
+    diagnostic_descriptors: set[int] = set()
+
+    def track_diagnostic_open(path: object, flags: int, mode: int = 0o777) -> int:
+        descriptor = original_open(path, flags, mode)
+        if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path).endswith(
+            "startup-diagnostic.json"
+        ):
+            diagnostic_descriptors.add(descriptor)
+        return descriptor
+
+    def fail_diagnostic_fsync(descriptor: int) -> None:
+        if descriptor in diagnostic_descriptors:
+            raise OSError(errno.ENOSPC, "fsync failed with diagnostic secret")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "open", track_diagnostic_open)
+    monkeypatch.setattr(os, "fsync", fail_diagnostic_fsync)
+    request = _request(workspace, "workflow409-diagnostic-fsync-0001")
+
+    with pytest.raises(WorkflowReconciliationRequired) as raised:
+        await service.start_workflow(**request)
+
+    assert raised.value.snapshot.status == "needs_reconciliation"
+    assert len(manager.start_calls) == 1
+    run_dir = manager.start_calls[0]
+    diagnostic_path = run_dir / "startup-diagnostic.json"
+    assert diagnostic_path.is_file()
+    document, raw = _read_diagnostic(run_dir)
+    assert document["failure"]["stage"] == "manager_validation"
+    assert document["failure"]["exception_class"] == "RuntimeError"
+    assert _SECRET_MARKER not in raw
+    assert str(workspace) not in raw
+    assert SAFE_CODEX_JOB_PROMPT not in raw
+    stderr_output = capsys.readouterr().err
+    assert stderr_output == (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=manager_validation original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    )
+    assert "diagnostic secret" not in stderr_output
+    assert _SECRET_MARKER not in stderr_output
+    assert str(workspace) not in stderr_output
+    assert SAFE_CODEX_JOB_PROMPT not in stderr_output
+
+    replay = await service.start_workflow(**request)
+    assert replay.status == "needs_reconciliation"
+    assert len(manager.start_calls) == 1
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_partial_diagnostic_write_falls_back_and_keeps_workflow_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _FakeWorkerManager(tmp_path / "state", workspace)
+    manager.start_error = RuntimeError(_SECRET_MARKER)
+    service = WorkflowService(manager, codex_bridge_port=18001)
+    original_open = os.open
+    original_fdopen = os.fdopen
+    diagnostic_descriptors: set[int] = set()
+    partial_payloads: list[bytes] = []
+
+    class _PartialWriter:
+        def __init__(self, stream: Any) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> _PartialWriter:
+            return self
+
+        def __exit__(
+            self,
+            _exception_type: object,
+            _exception: object,
+            _traceback: object,
+        ) -> None:
+            self._stream.close()
+
+        def write(self, payload: bytes) -> int:
+            partial = payload[:16]
+            written = self._stream.write(partial)
+            self._stream.flush()
+            partial_payloads.append(partial[:written])
+            raise OSError(errno.ENOSPC, "partial diagnostic write")
+
+    def track_diagnostic_open(path: object, flags: int, mode: int = 0o777) -> int:
+        descriptor = original_open(path, flags, mode)
+        if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path).endswith(
+            "startup-diagnostic.json"
+        ):
+            diagnostic_descriptors.add(descriptor)
+        return descriptor
+
+    def wrap_diagnostic_fdopen(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        stream = original_fdopen(descriptor, *args, **kwargs)
+        if descriptor in diagnostic_descriptors:
+            return _PartialWriter(stream)
+        return stream
+
+    monkeypatch.setattr(os, "open", track_diagnostic_open)
+    monkeypatch.setattr(os, "fdopen", wrap_diagnostic_fdopen)
+    request = _request(workspace, "workflow409-diagnostic-partial-0001")
+
+    with pytest.raises(WorkflowReconciliationRequired) as raised:
+        await service.start_workflow(**request)
+
+    assert raised.value.snapshot.status == "needs_reconciliation"
+    assert len(manager.start_calls) == 1
+    run_dir = manager.start_calls[0]
+    diagnostic_path = run_dir / "startup-diagnostic.json"
+    assert diagnostic_path.is_file()
+    partial_file = diagnostic_path.read_bytes()
+    assert partial_payloads == [partial_file]
+    assert partial_file
+    assert _SECRET_MARKER.encode() not in partial_file
+    assert capsys.readouterr().err == (
+        "workflow.startup_diagnostic.persistence_failed "
+        "stage=manager_validation original_exception=RuntimeError "
+        "persistence_exception=OSError\n"
+    )
+
+    replay = await service.start_workflow(**request)
+    assert replay.status == "needs_reconciliation"
+    assert len(manager.start_calls) == 1
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_stderr_failure_does_not_change_workflow_exception_or_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = _FakeWorkerManager(tmp_path / "state", workspace)
+    manager.start_error = RuntimeError(f"api_key={_SECRET_MARKER} path={workspace}")
+    service = WorkflowService(manager, codex_bridge_port=18001)
+    original_open = os.open
+    diagnostic_writes: list[bool] = []
+
+    def fail_diagnostic_open(path: object, flags: int, mode: int = 0o777) -> int:
+        if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path).endswith(
+            "startup-diagnostic.json"
+        ):
+            diagnostic_writes.append(True)
+            raise OSError(errno.ENOSPC, "diagnostic disk full")
+        return original_open(path, flags, mode)
+
+    class _BrokenStderr:
+        def __init__(self) -> None:
+            self.write_attempts = 0
+
+        def write(self, _message: str) -> int:
+            self.write_attempts += 1
+            raise OSError("stderr is unavailable")
+
+        def flush(self) -> None:
+            raise OSError("stderr is unavailable")
+
+    broken_stderr = _BrokenStderr()
+    monkeypatch.setattr(os, "open", fail_diagnostic_open)
+    monkeypatch.setattr(diagnostics_module.sys, "stderr", broken_stderr)
+    request = _request(workspace, "workflow409-diagnostic-stderr-0001")
+
+    with pytest.raises(WorkflowReconciliationRequired) as raised:
+        await service.start_workflow(**request)
+
+    assert raised.value.snapshot.status == "needs_reconciliation"
+    assert diagnostic_writes == [True]
+    assert broken_stderr.write_attempts == 1
+    assert len(manager.start_calls) == 1
+
+    replay = await service.start_workflow(**request)
+    assert replay.status == "needs_reconciliation"
+    assert diagnostic_writes == [True]
+    assert broken_stderr.write_attempts == 1
     assert len(manager.start_calls) == 1
 
 
@@ -420,6 +647,7 @@ async def test_diagnostic_does_not_overwrite_existing_file_or_follow_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     diagnostic_target: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -448,6 +676,7 @@ async def test_diagnostic_does_not_overwrite_existing_file_or_follow_symlink(
         await service.start_workflow(**_request(workspace, f"workflow409-{diagnostic_target}"))
 
     assert raised.value.snapshot.status == "needs_reconciliation"
+    assert capsys.readouterr().err == ""
     if diagnostic_target == "existing_file":
         assert diagnostic_path.read_text(encoding="utf-8") == protected_content
     else:
@@ -459,6 +688,7 @@ async def test_diagnostic_does_not_overwrite_existing_file_or_follow_symlink(
 async def test_diagnostic_symlink_detection_prevents_file_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -495,3 +725,4 @@ async def test_diagnostic_symlink_detection_prevents_file_open(
     assert raised.value.snapshot.status == "needs_reconciliation"
     assert diagnostic_opens == []
     assert not diagnostic_path.exists()
+    assert capsys.readouterr().err == ""
