@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,11 @@ from codex_bridge.workflows.codex_job_adapter import (
     CodexJobReconciliationRequiredError,
     CodexJobRequestError,
 )
-from codex_bridge.workflows.http_client import CONTROL_TOKEN_ENV
+from codex_bridge.workflows.http_client import (
+    CONTROL_TOKEN_ENV,
+    CodexHTTPClient,
+    CodexHTTPError,
+)
 from codex_bridge.workflows.interpreter import (
     SAFE_CODEX_JOB_PROMPT,
     OwsError,
@@ -235,6 +240,330 @@ class _NoPostClient:
             "turn_id": "turn-99999999",
             "state": "in_progress",
         }
+
+
+_OBSERVED_THREAD_ID = "thread-12345678"
+_OBSERVED_TURN_ID = "turn-12345678"
+
+
+class _ObservationClient:
+    port = 18001
+
+    def __init__(self, observations: list[dict[str, Any] | Exception]) -> None:
+        self.observations = list(observations)
+        self.observe_calls: list[tuple[str, str]] = []
+        self.post_calls = 0
+
+    def observe_thread(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        self.observe_calls.append((thread_id, turn_id))
+        observation = self.observations.pop(0)
+        if isinstance(observation, Exception):
+            raise observation
+        return observation
+
+    def create_thread(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.post_calls += 1
+        raise AssertionError("observe_job must not issue a Codex job POST")
+
+
+def _accepted_job_for_observation(tmp_path: Path) -> tuple[CodexJobAdapter, str]:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    adapter = CodexJobAdapter(state_root / "codex_jobs.sqlite")
+    job = adapter.prepare_job(
+        "workflow-12345678",
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        state_root,
+        port=18001,
+    )
+    assert adapter.claim_post(job["job_id"])
+    adapter.mark_accepted(job["job_id"], _OBSERVED_THREAD_ID, _OBSERVED_TURN_ID, "in_progress")
+    return adapter, job["job_id"]
+
+
+def _thread_observation(
+    status_state: str,
+    turn_state: str,
+    *,
+    include_turn: bool = True,
+    final_text: str | None = "settled result",
+) -> dict[str, Any]:
+    return {
+        "status": {
+            "thread_id": _OBSERVED_THREAD_ID,
+            "turn_id": _OBSERVED_TURN_ID,
+            "state": status_state,
+        },
+        "turns": ([{"id": _OBSERVED_TURN_ID, "status": turn_state}] if include_turn else []),
+        "items": (
+            [
+                {
+                    "turn_id": _OBSERVED_TURN_ID,
+                    "item": {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": final_text,
+                    },
+                }
+            ]
+            if final_text is not None
+            else []
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("first_status", "first_turn"),
+    [("in_progress", "completed"), ("completed", "in_progress")],
+)
+def test_observe_job_rechecks_only_transient_status_turn_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_status: str,
+    first_turn: str,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = _ObservationClient(
+        [
+            _thread_observation(first_status, first_turn),
+            _thread_observation("completed", "completed"),
+        ]
+    )
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "SUCCEEDED"
+    assert observed["state"] == "SUCCEEDED"
+    assert observed["receipt"] == {"result": {"final_text": "settled result"}}
+    assert client.observe_calls == [
+        (_OBSERVED_THREAD_ID, _OBSERVED_TURN_ID),
+        (_OBSERVED_THREAD_ID, _OBSERVED_TURN_ID),
+    ]
+    assert waits == [0.2]
+    assert client.post_calls == 0
+
+
+def test_observe_job_keeps_reconciliation_when_transient_mismatch_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    mismatch = _thread_observation("in_progress", "completed")
+    client = _ObservationClient([mismatch, mismatch, mismatch])
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert observed["adapter_marker"] == "NEEDS_RECONCILIATION"
+    assert observed["reconciliation"]["reason"] == "status and exact turn history disagree"
+    assert len(client.observe_calls) == 3
+    assert waits == [0.2, 0.2]
+    assert client.post_calls == 0
+
+
+def test_observe_job_does_not_retry_terminal_state_contradictions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = _ObservationClient([_thread_observation("completed", "failed")])
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert observed["state"] == "ACCEPTED"
+    assert len(client.observe_calls) == 1
+    assert waits == []
+    assert client.post_calls == 0
+
+
+@pytest.mark.parametrize("state", ["needs_approval", "needs_input"])
+def test_observe_job_keeps_interactive_states_in_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = _ObservationClient([_thread_observation(state, state, final_text=None)])
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert observed["state"] == "ACCEPTED"
+    assert len(client.observe_calls) == 1
+    assert waits == []
+    assert client.post_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status_thread_id", "status_turn_id"),
+    [
+        ("thread-87654321", _OBSERVED_TURN_ID),
+        (_OBSERVED_THREAD_ID, "turn-87654321"),
+    ],
+)
+def test_observe_job_does_not_retry_http_identity_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_thread_id: str,
+    status_turn_id: str,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = CodexHTTPClient(port=18001)
+    read_paths: list[str] = []
+
+    def fake_request_json(
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        assert method == "GET"
+        assert payload is None
+        read_paths.append(path)
+        return {
+            "thread_id": status_thread_id,
+            "turn_id": status_turn_id,
+            "state": "completed",
+        }
+
+    monkeypatch.setattr(client, "_request_json", fake_request_json)
+
+    observed = adapter.observe_job(job_id, client)
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert len(read_paths) == 3
+    assert read_paths[0] == ("/ui-api/threads/thread-12345678/status?turn_id=turn-12345678")
+    assert "/turns?" in read_paths[1]
+    assert "/items?" in read_paths[2]
+
+
+def test_observe_job_does_not_retry_malformed_http_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = CodexHTTPClient(port=18001)
+    read_paths: list[str] = []
+
+    def fake_request_json(
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        assert method == "GET"
+        assert payload is None
+        read_paths.append(path)
+        if "/status?" in path:
+            return {
+                "thread_id": _OBSERVED_THREAD_ID,
+                "turn_id": _OBSERVED_TURN_ID,
+                "state": "completed",
+            }
+        return {"thread_id": _OBSERVED_THREAD_ID, "turns": "invalid"}
+
+    monkeypatch.setattr(client, "_request_json", fake_request_json)
+
+    observed = adapter.observe_job(job_id, client)
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert len(read_paths) == 3
+    assert "/turns?" in read_paths[1]
+    assert "/items?" in read_paths[2]
+
+
+@pytest.mark.parametrize(
+    ("include_turn", "final_text"),
+    [(False, "settled result"), (True, None)],
+)
+def test_observe_job_still_requires_exact_completed_turn_and_final_answer(
+    tmp_path: Path,
+    include_turn: bool,
+    final_text: str | None,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = _ObservationClient(
+        [
+            _thread_observation(
+                "completed",
+                "completed",
+                include_turn=include_turn,
+                final_text=final_text,
+            )
+        ]
+    )
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert observed["state"] == "ACCEPTED"
+    assert client.post_calls == 0
+
+
+def test_observe_job_fails_closed_when_read_recheck_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = _ObservationClient(
+        [
+            _thread_observation("in_progress", "completed"),
+            CodexHTTPError("read failed"),
+        ]
+    )
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert observed["state"] == "ACCEPTED"
+    assert len(client.observe_calls) == 2
+    assert waits == [0.2]
+    assert client.post_calls == 0
+
+
+def test_observe_job_preserves_existing_reconciliation_without_reading_again(
+    tmp_path: Path,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    adapter.mark_reconciliation(job_id, "existing marker")
+    client = _ObservationClient([])
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert observed["reconciliation"]["reason"] == "existing marker"
+    assert client.observe_calls == []
+    assert client.post_calls == 0
+
+
+def test_observe_job_keeps_consistent_running_observation_without_waiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job_id = _accepted_job_for_observation(tmp_path)
+    client = _ObservationClient([_thread_observation("in_progress", "in_progress")])
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
+
+    observed = adapter.observe_job(job_id, client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "RUNNING"
+    assert observed["state"] == "RUNNING"
+    assert len(client.observe_calls) == 1
+    assert waits == []
+    assert client.post_calls == 0
 
 
 def test_preassigned_workflow_id_does_not_rewrite_immutable_manifest(

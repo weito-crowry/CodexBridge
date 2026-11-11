@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,8 @@ _BRIDGE_STATES = frozenset(
 )
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$")
 MAX_JOBS_PER_WORKFLOW = 16
+_OBSERVATION_RECHECK_LIMIT = 2
+_OBSERVATION_RECHECK_DELAY_SECONDS = 0.2
 _JOB_COLUMNS = (
     "job_id",
     "request_key",
@@ -989,19 +992,30 @@ class CodexJobAdapter:
                 job_id, "accepted job has no complete thread and turn identity"
             )
             return self.get_job_status(job_id=job_id)
-        try:
-            observation = client.observe_thread(job["thread_id"], job["turn_id"])
-        except CodexHTTPError:
-            self.mark_reconciliation(job_id, "thread status or history read failed")
-            return self.get_job_status(job_id=job_id)
+        rechecks = 0
+        while True:
+            try:
+                observation = client.observe_thread(job["thread_id"], job["turn_id"])
+            except CodexHTTPError:
+                self.mark_reconciliation(job_id, "thread status or history read failed")
+                return self.get_job_status(job_id=job_id)
 
-        status_state = observation["status"].get("state")
-        matching_turns = [
-            turn
-            for turn in observation["turns"]
-            if isinstance(turn, dict) and turn.get("id") == job["turn_id"]
-        ]
-        turn_state = matching_turns[0].get("status") if matching_turns else None
+            status_state = observation["status"].get("state")
+            matching_turns = [
+                turn
+                for turn in observation["turns"]
+                if isinstance(turn, dict) and turn.get("id") == job["turn_id"]
+            ]
+            turn_state = matching_turns[0].get("status") if matching_turns else None
+            transient_mismatch = (status_state, turn_state) in {
+                ("in_progress", "completed"),
+                ("completed", "in_progress"),
+            }
+            if not transient_mismatch or rechecks >= _OBSERVATION_RECHECK_LIMIT:
+                break
+            rechecks += 1
+            time.sleep(_OBSERVATION_RECHECK_DELAY_SECONDS)
+
         if status_state in {"not_loaded", "unknown"}:
             remote_state = turn_state if turn_state in _BRIDGE_STATES else status_state
         elif turn_state in _BRIDGE_STATES and turn_state != status_state:
