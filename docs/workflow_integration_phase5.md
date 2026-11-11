@@ -134,4 +134,19 @@ Phase 5Cでは、既存UI APIへ次のBearer認証付きrouteを追加した。�
 
 同じclient request IDと同じ正規化payloadは記録済みworkflow/runを返し、再spawnしない。異なるpayloadは`409`。起動中・結果不明の既存runも再投入せず、`MAYBE_SENT`は`needs_reconciliation`として扱う。異なるrequest IDの同時live実行は1件に制限する。run状態はBridge再起動後も読み取れるが、Workerのautostart/autorecoverはしない。shutdown時は永続request ledgerから確定可能なworkflow所有turnを読み取り、既存の所有turn除外へ加える。
 
-Console UIと自由prompt・複数job対応はPhase 5D/5Eの範囲である。今回の製品検証は隔離fake manager/APIのみとし、本番checkout・稼働中サービス・実Codex jobには接続しない。
+Console UIと自由prompt・複数job対応はPhase 5D/5Eの範囲である。5C実装時の製品検証は隔離fake manager/APIのみとし、本番checkout・稼働中サービス・実Codex jobには接続しなかった。
+
+## 13. Phase 5E-0 実測記録
+
+2026-11-11にWindows nativeの一時環境で固定fixture `codex_job_workflow.yaml` を1回実行した。Bridge/AppServerは検証用token、temp `LOCALAPPDATA`/`APPDATA`/`CODEX_HOME`、loopbackのみの別portで起動し、GitHub mountとCodex MCP設定は無効だった。初期preflightで1回BLOCKEDになったが、workflow POST前であり、証跡は [`phase5e-0-initial-preflight.json`](phase5e-0-initial-preflight.json) に残した。後続のread-only preflightはPASSした。
+
+- 初回 `POST /ui-api/control/workflows`: HTTP 202、client request `phase5e0-5b4bf65d67544bdba428363d8fe6988d`。
+- workflow/run/job/thread: `3f056c95-c0e4-4e93-ac4d-e024ef73762d` / `run-904bda7df9944ac5ad432fa944b28892` / `9ec76042-15e1-407e-8092-ff2cee6afda5` / `01a1c992-bd38-70d1-81b9-2ebb54e43f79`。
+- Worker exit 0、Codex job `SUCCEEDED`、DBOS `SUCCESS`、thread `completed`、永続結果 `final_text="4"`。実Codex jobは1件。
+- 初回pollingは一時的な`unknown`/`needs_reconciliation`で停止した。run-dirをread-onlyで照合し、完了済みstatus/resultを確認後に同じ隔離stateでBridgeを再起動した。再起動後のworkflow一覧・詳細・結果は同じIDで`succeeded`、結果`4`を返した。
+- 成功確認後の同一ID・同一payload replayはHTTP 202で同じworkflow/run IDを返した。job row 1件、job event 5件、`MAYBE_SENT` claim 1件、thread 1件は前後で不変。新しいCodex job POSTは0件、再起動後worker数は0。
+- 初回とreadback restartのloopback portは `62767/62768` と `61072/61073`。実行後のBridge 3プロセスと観測したdescendant 8プロセスは通常終了し、強制終了は0件。
+- sanitized runtime証跡は [`phase5e-0-evidence.json`](phase5e-0-evidence.json)。token、個人パス、生ログは含めない。稼働中本番checkout・Bridge・AppServer、既存workflow state、既存thread、18000/18001への接続・変更は行っていない。
+- `ruff check`, `ruff format --check`, `mypy src`, `compileall` はPASS。関連pytestは168 PASS / 2 SKIP（Windows symlink作成権限 `WinError 1314`）。Console関連テストは`QT_QPA_PLATFORM=offscreen`で実行したが、APIを表示する実GUI描画は未確認。
+
+残る確認事項: `workflow_requests`の保存行は`running`のままだが、read-only APIは完了済みrunから`succeeded`を投影した。5E後半へ進む前に、この保存状態の意味と完了後のreconciliation/updateタイミングを確認する。また追加診断として行った再起動後thread-status照会は`completed`以外を返したため受入条件には含めず、値は記録していない。workflow一覧・詳細・結果、thread IDの永続表示、job/DBOS状態、同ID replayはPASS。Consoleのoffscreen描画は未確認で、関連pytestに分離した。
