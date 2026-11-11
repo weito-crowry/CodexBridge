@@ -87,6 +87,10 @@ def build_main_window_ui(window: MainWindow) -> None:
     status_action.triggered.connect(lambda _checked=False: window._show_status())
     diagnostics_action = window.view_menu.addAction(tr("Diagnostics"))
     diagnostics_action.triggered.connect(lambda _checked=False: window.toggle_diagnostics())
+    window.workflow_management_action = window.view_menu.addAction(tr("Workflows…"))
+    window.workflow_management_action.triggered.connect(
+        lambda _checked=False: window._show_workflow_management_dialog()
+    )
     window.settings_menu = menu_bar.addMenu(tr("Settings"))
     window.diagnostics_toggle_button = QPushButton(tr("Diagnostics"))
     window.diagnostics_clear_button = QPushButton(tr("Clear"))

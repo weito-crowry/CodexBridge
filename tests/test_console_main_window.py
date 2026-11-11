@@ -87,6 +87,7 @@ def test_settings_menu_contains_config_actions_and_existing_appearance_modes() -
     assert [action.text() for action in top_level_menus[1].menu().actions()] == [
         "Status",
         "Diagnostics",
+        "Workflows…",
     ]
 
     actions = window.settings_menu.actions()

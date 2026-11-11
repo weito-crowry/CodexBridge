@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 
 from PySide6.QtCore import QObject, QUrl, QUrlQuery, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -11,6 +13,11 @@ from ..models import ApprovalDecision, RequestId
 from .sse import SseParser, SseProtocolError, parse_activity_event
 
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024
+_MAX_WORKFLOW_LIST_RESPONSE_BYTES = 64 * 1024
+_MAX_WORKFLOW_DETAIL_RESPONSE_BYTES = 4 * 1024
+_MAX_WORKFLOW_RESULT_RESPONSE_BYTES = 64 * 1024
+_MAX_WORKFLOW_REQUEST_BYTES = 128 * 1024
+_WORKFLOW_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
 _COMPOSER_VALIDATION_CATEGORIES = frozenset(
     {
@@ -67,6 +74,8 @@ class ApiClient(QObject):
     control_failed = Signal(str, str)
     composer_json_succeeded = Signal(str, object)
     composer_json_failed = Signal(str, str)
+    workflow_succeeded = Signal(str, int, object)
+    workflow_failed = Signal(str, int, str)
 
     def __init__(
         self,
@@ -86,6 +95,11 @@ class ApiClient(QObject):
         self._control_response_bodies: dict[str, bytearray] = {}
         self._control_kinds: dict[str, str] = {}
         self._composer_replies: dict[str, Any] = {}
+        self._workflow_replies: dict[str, Any] = {}
+        self._workflow_response_sizes: dict[str, int] = {}
+        self._workflow_response_bodies: dict[str, bytearray] = {}
+        self._workflow_response_limits: dict[str, int] = {}
+        self._workflow_success_statuses: dict[str, frozenset[int]] = {}
         self._stream_reply: Any | None = None
         self._stream_generation: int | None = None
         self._stream_parser: SseParser | None = None
@@ -219,6 +233,252 @@ class ApiClient(QObject):
         if not path.startswith("/ui-api/control/"):
             raise ValueError("control API path is required")
         return self._url(path)
+
+    def get_control_workflows(self, token: str, *, key: str) -> bool:
+        return self._start_workflow_request(
+            "GET",
+            self._url("/ui-api/control/workflows", {"limit": 50}),
+            token,
+            key=key,
+            response_limit=_MAX_WORKFLOW_LIST_RESPONSE_BYTES,
+            success_statuses=frozenset({200}),
+        )
+
+    def get_control_workflow_detail(self, workflow_id: str, token: str, *, key: str) -> bool:
+        safe_id = self._workflow_path_id(workflow_id)
+        if safe_id is None:
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        return self._start_workflow_request(
+            "GET",
+            self._url(f"/ui-api/control/workflows/{safe_id}"),
+            token,
+            key=key,
+            response_limit=_MAX_WORKFLOW_DETAIL_RESPONSE_BYTES,
+            success_statuses=frozenset({200}),
+        )
+
+    def get_control_workflow_result(self, workflow_id: str, token: str, *, key: str) -> bool:
+        safe_id = self._workflow_path_id(workflow_id)
+        if safe_id is None:
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        return self._start_workflow_request(
+            "GET",
+            self._url(f"/ui-api/control/workflows/{safe_id}/result"),
+            token,
+            key=key,
+            response_limit=_MAX_WORKFLOW_RESULT_RESPONSE_BYTES,
+            success_statuses=frozenset({200, 202}),
+        )
+
+    @staticmethod
+    def _workflow_path_id(workflow_id: object) -> str | None:
+        if (
+            not isinstance(workflow_id, str)
+            or not workflow_id
+            or len(workflow_id) > 256
+            or workflow_id in {".", ".."}
+            or any(character in workflow_id for character in "/\\?#")
+        ):
+            return None
+        return quote(workflow_id, safe="")
+
+    def post_control_workflow(
+        self,
+        token: str,
+        payload: Mapping[str, object],
+        *,
+        key: str,
+    ) -> bool:
+        if key in self._workflow_replies:
+            return False
+        if not isinstance(payload, Mapping):
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        try:
+            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        if len(body) > _MAX_WORKFLOW_REQUEST_BYTES:
+            self.workflow_failed.emit(key, 0, "request_too_large")
+            return False
+        request_url = self._url("/ui-api/control/workflows")
+        request = self._request(request_url)
+        try:
+            self._add_workflow_headers(request, token, json_body=True)
+            reply = self._manager.post(request, body)
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        return self._track_workflow_reply(
+            reply,
+            key=key,
+            response_limit=_MAX_WORKFLOW_DETAIL_RESPONSE_BYTES,
+            success_statuses=frozenset({202}),
+        )
+
+    @staticmethod
+    def _add_workflow_headers(request: QNetworkRequest, token: str, *, json_body: bool) -> None:
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("control token is unavailable")
+        request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
+        if json_body:
+            request.setRawHeader(b"Content-Type", b"application/json")
+        set_transfer_timeout = getattr(request, "setTransferTimeout", None)
+        if callable(set_transfer_timeout):
+            set_transfer_timeout(10_000)
+
+    def _start_workflow_request(
+        self,
+        method: str,
+        url: QUrl,
+        token: str,
+        *,
+        key: str,
+        response_limit: int,
+        success_statuses: frozenset[int],
+    ) -> bool:
+        if key in self._workflow_replies:
+            return False
+        request = self._request(url)
+        try:
+            self._add_workflow_headers(request, token, json_body=False)
+            reply = (
+                self._manager.get(request) if method == "GET" else self._manager.post(request, b"")
+            )
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        return self._track_workflow_reply(
+            reply,
+            key=key,
+            response_limit=response_limit,
+            success_statuses=success_statuses,
+        )
+
+    def _track_workflow_reply(
+        self,
+        reply: Any,
+        *,
+        key: str,
+        response_limit: int,
+        success_statuses: frozenset[int],
+    ) -> bool:
+        if key in self._workflow_replies:
+            reply.abort()
+            reply.deleteLater()
+            return False
+        self._workflow_replies[key] = reply
+        self._workflow_response_sizes[key] = 0
+        self._workflow_response_bodies[key] = bytearray()
+        self._workflow_response_limits[key] = response_limit
+        self._workflow_success_statuses[key] = success_statuses
+        reply.readyRead.connect(
+            lambda key=key, reply=reply: self._consume_workflow_data(key, reply)
+        )
+        reply.finished.connect(lambda key=key, reply=reply: self._finish_workflow_json(key, reply))
+        return True
+
+    def _fail_workflow_reply(self, key: str, reply: Any, status: int, code: str) -> None:
+        active_reply = self._workflow_replies.get(key)
+        if active_reply is None or active_reply is not reply:
+            return
+        self._drop_workflow_reply(key)
+        active_reply.abort()
+        active_reply.deleteLater()
+        self.workflow_failed.emit(key, status, code)
+
+    def _drop_workflow_reply(self, key: str) -> tuple[Any | None, bytes]:
+        reply = self._workflow_replies.pop(key, None)
+        self._workflow_response_sizes.pop(key, None)
+        body = bytes(self._workflow_response_bodies.pop(key, bytearray()))
+        self._workflow_response_limits.pop(key, None)
+        self._workflow_success_statuses.pop(key, None)
+        return reply, body
+
+    def _consume_workflow_data(self, key: str, reply: Any) -> bool:
+        active_reply = self._workflow_replies.get(key)
+        if active_reply is None or active_reply is not reply:
+            return False
+        status = self._status(active_reply)
+        limit = self._workflow_response_limits[key]
+        remaining = max(1, limit - self._workflow_response_sizes[key] + 1)
+        try:
+            chunk = bytes(active_reply.read(remaining))
+        except (AttributeError, TypeError, ValueError):
+            self._fail_workflow_reply(key, active_reply, status, "invalid_response")
+            return False
+        size = self._workflow_response_sizes[key] + len(chunk)
+        if size > limit:
+            self._fail_workflow_reply(key, active_reply, status, "response_too_large")
+            return False
+        self._workflow_response_sizes[key] = size
+        self._workflow_response_bodies[key].extend(chunk)
+        return True
+
+    @staticmethod
+    def _workflow_error_code(body: bytes) -> str:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return "http_error"
+        code = payload.get("error") if isinstance(payload, dict) else None
+        return (
+            code if isinstance(code, str) and _WORKFLOW_ERROR_CODE.fullmatch(code) else "http_error"
+        )
+
+    @staticmethod
+    def _workflow_network_error(reply: Any) -> str | None:
+        try:
+            error = reply.error()
+            error_value = getattr(error, "value", error)
+            if error_value == QNetworkReply.NetworkError.NoError.value:
+                return None
+            if error_value == QNetworkReply.NetworkError.TimeoutError.value:
+                return "timeout"
+            return "network_error"
+        except (AttributeError, TypeError):
+            return None
+
+    def _finish_workflow_json(self, key: str, reply: Any) -> None:
+        active_reply = self._workflow_replies.get(key)
+        if active_reply is None or active_reply is not reply:
+            return
+        if not self._consume_workflow_data(key, active_reply):
+            return
+        success_statuses = self._workflow_success_statuses.get(key, frozenset())
+        _, body = self._drop_workflow_reply(key)
+        status = self._status(active_reply)
+        try:
+            network_error = self._workflow_network_error(active_reply)
+            if network_error is not None or status == 0:
+                raise ApiClientError(network_error or "network_error")
+            if status not in success_statuses:
+                raise ApiClientError(self._workflow_error_code(body))
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, TypeError) as exc:
+                raise ApiClientError("invalid_json") from exc
+            if not isinstance(payload, dict):
+                raise ApiClientError("invalid_json")
+        except ApiClientError as exc:
+            self.workflow_failed.emit(key, status, str(exc))
+        else:
+            self.workflow_succeeded.emit(key, status, payload)
+        finally:
+            active_reply.deleteLater()
+
+    def abort_workflow_request(self, key: str) -> None:
+        reply, _body = self._drop_workflow_reply(key)
+        if reply is not None:
+            reply.abort()
+            reply.deleteLater()
+
+    def abort_workflow_requests(self) -> None:
+        for key in tuple(self._workflow_replies):
+            self.abort_workflow_request(key)
 
     def _finish_composer_json(self, key: str, reply: Any) -> None:
         if self._composer_replies.get(key) is not reply:
@@ -575,6 +835,7 @@ class ApiClient(QObject):
         self._control_response_sizes.clear()
         self._control_response_bodies.clear()
         self._control_kinds.clear()
+        self.abort_workflow_requests()
         composer_replies = tuple(self._composer_replies.values())
         self._composer_replies.clear()
         for reply in composer_replies:

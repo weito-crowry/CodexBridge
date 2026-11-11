@@ -115,6 +115,7 @@ from .widgets import (
     TimelineEntry,
     copy_to_clipboard,
 )
+from .workflow_controller import WorkflowManagementController
 
 _EXIT_TIMEOUT_SECONDS = 12.0
 
@@ -156,6 +157,7 @@ class MainWindow(QMainWindow):
     file_menu: QMenu
     view_menu: QMenu
     settings_menu: QMenu
+    workflow_management_action: QAction
     diagnostics_toggle_button: QPushButton
     diagnostics_clear_button: QPushButton
     diagnostics_filter_buttons: dict[str, QPushButton]
@@ -185,6 +187,7 @@ class MainWindow(QMainWindow):
     _appearance_actions: dict[str, QAction]
     _appearance_controller: AppearanceController
     _appearance_settings: QSettings
+    _workflow_management_controller: WorkflowManagementController
     _settings_controller: SettingsActionController
     _bridge_lifecycle_controller: BridgeLifecycleController
     _project_folder_actions_controller: ProjectFolderActionsController
@@ -353,6 +356,11 @@ class MainWindow(QMainWindow):
         self._bulk_thread_naming = BulkThreadNamingController(self)
         self._diagnostics_panel = DiagnosticsPanelController(self)
         self._connect_client()
+        self._workflow_management_controller = WorkflowManagementController(
+            self,
+            self._client,
+            config.allowed_roots,
+        )
         self._codex_update_controller = CodexUpdateController(self)
         self._bridge_managed_retry_coordinator = BridgeManagedRetryCoordinator(
             self.bridge_start_retry_timer,
@@ -657,6 +665,14 @@ class MainWindow(QMainWindow):
         self.status_dialog.raise_()
         self.status_dialog.activateWindow()
 
+    def _show_workflow_management_dialog(self) -> None:
+        self._workflow_management_controller.show()
+
+    def _notify_workflow_readiness(self) -> None:
+        controller = getattr(self, "_workflow_management_controller", None)
+        if controller is not None:
+            controller.notify_readiness_changed()
+
     def _show_notification_settings(self) -> None:
         dialog = NotificationSettingsDialog(self._appearance_settings, self)
         dialog.exec()
@@ -959,6 +975,7 @@ class MainWindow(QMainWindow):
         self._update_start_button()
         self._update_bridge_controls()
         self._sync_overall_status()
+        self._notify_workflow_readiness()
 
     def _request_usage(self, *, force: bool = False) -> None:
         self._usage_requests.request_usage(force=force)
@@ -1214,6 +1231,7 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_observation(self) -> None:
         self._bridge_runtime_observer.apply_runtime_observation()
+        self._notify_workflow_readiness()
 
     def _record_bridge_status_observation(
         self,
@@ -1468,6 +1486,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._notify_workflow_readiness()
+        self._workflow_management_controller.shutdown()
         self._bridge_runtime_observer.close()
         self._global_stream_retry_timer.stop()
         self._stop_external_thread_monitor()
