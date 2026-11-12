@@ -95,6 +95,12 @@ $issueSequenceInput = '{"issues":[{"number":17,"enabled":true},{"number":5,"enab
 
 このPoCはGitHub Issue API連携でも実Codex job loopでもありません。外部APIへ接続せず、既存mock-job serviceとDBOS checkpointだけで検証します。純Interpreterからmock-jobを直接呼ぶことは引き続き拒否されます。
 
+### Phase 5F-1A: 明示的な最大3件の逐次Codex job loop
+
+[`fixtures/three_codex_job_loop_workflow.yaml`](fixtures/three_codex_job_loop_workflow.yaml)は、`max_live_codex_jobs: 3`を明示した場合だけ受け付けます。synthetic inputのIssue番号を昇順にし、`enabled: true`だけを順番にCodex jobへ送り、disabled項目はskip結果にします。入力は`issues`配列0～4件、正の一意整数番号、厳密なboolean、enabled最大3件に限定し、prompt prefixと数値変換式、結果形状も固定しています。GitHub API、任意prompt/command、mock混在、追加taskや別のloop形状には接続しません。
+
+Phase 5F-1Aでは実Codex jobを発行しません。pytestのoffline検証はテストが起動するloopback fake APIだけを使い、3件の逐次POST/status/final receiptとresult/readback、入力不正時のPOST 0件を確認します。**実行CLI例はここでは実行しないでください。** Phase 5F-1BでWindows隔離環境のpreflightを通した後、一度限りの実E2Eを行います。
+
 ## DBOS checkpointと復旧
 
 通常CLI runは`.state/runs/run-<uuid>/`、Phase 4B mock runは`.state/phase4b-runs/run-<uuid>/`、Phase 4C durable-wait runは`.state/phase4c-runs/run-<uuid>/`を作ります。workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。mock runには`jobs.sqlite`、service/worker identity、service/worker logs、heartbeat、recovery evidenceも保存します。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。
