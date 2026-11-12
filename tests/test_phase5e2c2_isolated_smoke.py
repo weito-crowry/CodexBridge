@@ -154,6 +154,18 @@ def _install_evidence_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
         tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json",
         raising=False,
     )
+    monkeypatch.setattr(
+        module,
+        "R3_EVIDENCE_PATH",
+        tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "R4_EVIDENCE_PATH",
+        tmp_path / "phase5e-2c2-r4-evidence.json",
+        raising=False,
+    )
     return previous_path, retest_path
 
 
@@ -194,6 +206,78 @@ def _legacy_r2_evidence(previous_sha256: str) -> dict[str, Any]:
         "checks": {name: {"status": status} for name, status in checks.items()},
         "cleanup": {"status": "PRESERVED_ACTIVE_OR_UNKNOWN", "forced_termination": False},
     }
+
+
+def _r3_reconciliation_evidence(
+    original_sha256: str,
+    r2_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "phase": "5E-2C2-R3",
+        "status": "BLOCKED",
+        "reason": "workflow_api_requires_reconciliation",
+        "live_workflow_post_attempted": True,
+        "live_workflow_post_count": 1,
+        "same_id_replay_post_attempted": False,
+        "same_id_replay_post_count": 0,
+        "new_codex_job_count": 1,
+        "workflow": {
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "run_id": "run-0123456789abcdef0123456789abcdef",
+            "accepted_status": 202,
+        },
+        "previous_evidence": {
+            "original": {
+                "path": "docs/phase5e-2c2-evidence.json",
+                "sha256": original_sha256,
+            },
+            "r2": {
+                "path": "docs/phase5e-2c2-retest-evidence.json",
+                "sha256": r2_sha256,
+            },
+        },
+        "cleanup": {
+            "status": "PRESERVED_ACTIVE_OR_UNKNOWN",
+            "forced_termination": False,
+        },
+    }
+
+
+def _install_valid_r4_evidence_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[ModuleType, dict[str, Path], dict[str, str], dict[str, bytes]]:
+    module = _load_runner()
+    assert module is not None
+    original_path, r2_path = _install_evidence_paths(monkeypatch, tmp_path)
+    r3_path = tmp_path / "phase5e-2c2-diagnostic-retest-evidence.json"
+    r4_path = tmp_path / "phase5e-2c2-r4-evidence.json"
+    original_path.write_text(json.dumps(_legacy_evidence()), encoding="utf-8")
+    original_sha256, normalized_original_sha256 = module._validated_previous_evidence_hashes(
+        original_path
+    )
+    r2_path.write_text(
+        json.dumps(_legacy_r2_evidence(normalized_original_sha256)),
+        encoding="utf-8",
+    )
+    r2_sha256 = hashlib.sha256(r2_path.read_bytes()).hexdigest()
+    r3_path.write_text(
+        json.dumps(_r3_reconciliation_evidence(original_sha256, r2_sha256)),
+        encoding="utf-8",
+    )
+    paths = {
+        "original": original_path,
+        "r2": r2_path,
+        "r3": r3_path,
+        "r4": r4_path,
+    }
+    hashes = {
+        "original": original_sha256,
+        "r2": r2_sha256,
+        "r3": hashlib.sha256(r3_path.read_bytes()).hexdigest(),
+    }
+    original_bytes = {name: path.read_bytes() for name, path in paths.items() if name != "r4"}
+    return module, paths, hashes, original_bytes
 
 
 def _startup_diagnostic_document(
@@ -328,6 +412,309 @@ def test_diagnostic_retest_rejects_an_unexpected_r2_baseline_read_only(
     assert error.value.code == "retest_evidence_unexpected"
     assert previous_path.read_bytes() == previous_bytes
     assert r2_path.read_bytes() == r2_bytes
+
+
+def test_r4_selects_and_hashes_the_valid_three_generation_chain_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, paths, expected_hashes, previous_bytes = _install_valid_r4_evidence_chain(
+        monkeypatch, tmp_path
+    )
+
+    evidence_path, hashes = module._select_r4_evidence()
+
+    assert evidence_path == paths["r4"]
+    assert hashes == expected_hashes
+    assert json.loads(paths["r3"].read_text(encoding="utf-8"))["new_codex_job_count"] == 1
+    for name, original in previous_bytes.items():
+        assert paths[name].read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "phase",
+        "status",
+        "reason",
+        "post_attempted",
+        "post_count",
+        "boolean_post_count",
+        "accepted_status",
+        "workflow_id",
+        "run_id",
+        "replay",
+        "replay_count",
+        "cleanup_status",
+        "forced_termination",
+        "original_path",
+        "original_sha256",
+        "r2_path",
+        "r2_sha256",
+    ],
+)
+def test_r4_rejects_r3_evidence_with_invalid_identity_or_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    module, paths, _hashes, previous_bytes = _install_valid_r4_evidence_chain(monkeypatch, tmp_path)
+    r3 = json.loads(paths["r3"].read_text(encoding="utf-8"))
+    if mutation == "phase":
+        r3["phase"] = "5E-2C2-R2"
+    elif mutation == "status":
+        r3["status"] = "PASS"
+    elif mutation == "reason":
+        r3["reason"] = "unexpected_reason"
+    elif mutation == "post_attempted":
+        r3["live_workflow_post_attempted"] = False
+    elif mutation == "post_count":
+        r3["live_workflow_post_count"] = 2
+    elif mutation == "boolean_post_count":
+        r3["live_workflow_post_count"] = True
+    elif mutation == "accepted_status":
+        r3["workflow"]["accepted_status"] = 409
+    elif mutation == "workflow_id":
+        r3["workflow"]["workflow_id"] = "invalid-workflow-id"
+    elif mutation == "run_id":
+        r3["workflow"]["run_id"] = "invalid-run-id"
+    elif mutation == "replay":
+        r3["same_id_replay_post_attempted"] = True
+    elif mutation == "replay_count":
+        r3["same_id_replay_post_count"] = 1
+    elif mutation == "cleanup_status":
+        r3["cleanup"]["status"] = "CLEANED"
+    elif mutation == "forced_termination":
+        r3["cleanup"]["forced_termination"] = True
+    elif mutation == "original_path":
+        r3["previous_evidence"]["original"]["path"] = "other.json"
+    elif mutation == "original_sha256":
+        r3["previous_evidence"]["original"]["sha256"] = "0" * 64
+    elif mutation == "r2_path":
+        r3["previous_evidence"]["r2"]["path"] = "other.json"
+    else:
+        r3["previous_evidence"]["r2"]["sha256"] = "0" * 64
+    paths["r3"].write_text(json.dumps(r3), encoding="utf-8")
+    mutated_r3_bytes = paths["r3"].read_bytes()
+
+    with pytest.raises(module.SmokeAbort) as error:
+        module._select_r4_evidence()
+
+    assert error.value.code == "r3_evidence_unexpected"
+    assert paths["r3"].read_bytes() == mutated_r3_bytes
+    for name in ("original", "r2"):
+        original = previous_bytes[name]
+        assert paths[name].read_bytes() == original
+    assert not paths["r4"].exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_document",
+    [
+        pytest.param(b"{", id="malformed-json"),
+        pytest.param(b"x" * (64 * 1024 + 1), id="oversized"),
+    ],
+)
+def test_r4_rejects_malformed_or_oversized_r3_evidence_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid_document: bytes,
+) -> None:
+    module, paths, _hashes, previous_bytes = _install_valid_r4_evidence_chain(monkeypatch, tmp_path)
+    paths["r3"].write_bytes(invalid_document)
+    invalid_bytes = paths["r3"].read_bytes()
+
+    with pytest.raises(module.SmokeAbort) as error:
+        module._select_r4_evidence()
+
+    assert error.value.code == "r3_evidence_unexpected"
+    assert paths["r3"].read_bytes() == invalid_bytes
+    for name in ("original", "r2"):
+        original = previous_bytes[name]
+        assert paths[name].read_bytes() == original
+
+
+def test_r4_rejects_r3_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, paths, _hashes, _previous_bytes = _install_valid_r4_evidence_chain(
+        monkeypatch, tmp_path
+    )
+    target = tmp_path / "r3-target.json"
+    target.write_bytes(paths["r3"].read_bytes())
+    paths["r3"].unlink()
+    try:
+        paths["r3"].symlink_to(target)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"file symlink unavailable: {error}")
+
+    with pytest.raises(module.SmokeAbort) as error:
+        module._select_r4_evidence()
+
+    assert error.value.code == "r3_evidence_unexpected"
+    assert target.is_file()
+
+
+@pytest.mark.parametrize("existing_mode", ["--retest-once", "--diagnostic-retest-once"])
+def test_r4_cli_rejects_combining_existing_execution_modes(
+    existing_mode: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_runner()
+    assert module is not None
+
+    with pytest.raises(SystemExit) as error:
+        module.main(["--r4-once", existing_mode])
+
+    assert error.value.code == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_r4_existing_evidence_blocks_without_reading_or_overwriting_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_runner()
+    assert module is not None
+    _install_evidence_paths(monkeypatch, tmp_path)
+    evidence_path = tmp_path / "phase5e-2c2-r4-evidence.json"
+    original = b"preserve existing R4 evidence"
+    evidence_path.write_bytes(original)
+
+    def fail_if_live(_evidence: dict[str, Any]) -> int:
+        pytest.fail("existing R4 evidence must block before E2E")
+
+    monkeypatch.setattr(module, "_run_e2e", fail_if_live)
+
+    assert module.main(["--r4-once"]) == 2
+
+    assert evidence_path.read_bytes() == original
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "BLOCKED",
+        "reason": "r4_evidence_already_exists",
+    }
+
+
+@pytest.mark.parametrize("prompt_state", ["missing", "hash_mismatch"])
+def test_r4_prompt_preflight_does_not_claim_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    prompt_state: str,
+) -> None:
+    module, paths, _hashes, previous_bytes = _install_valid_r4_evidence_chain(monkeypatch, tmp_path)
+    run_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(module, "_run_e2e", run_calls.append)
+    if prompt_state == "missing":
+        monkeypatch.delenv(module.SECOND_PROMPT_ENVIRONMENT_VARIABLE, raising=False)
+    else:
+        monkeypatch.setenv(module.SECOND_PROMPT_ENVIRONMENT_VARIABLE, "unapproved test prompt")
+
+    assert module.main(["--r4-once"]) == 2
+
+    assert not paths["r4"].exists()
+    assert run_calls == []
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] in {
+        "approved_second_prompt_unavailable",
+        "second_prompt_hash_mismatch",
+    }
+    for name, original in previous_bytes.items():
+        assert paths[name].read_bytes() == original
+
+
+def test_r4_first_fixture_preflight_does_not_claim_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module, paths, _hashes, _previous_bytes = _install_valid_r4_evidence_chain(
+        monkeypatch, tmp_path
+    )
+    run_calls: list[dict[str, Any]] = []
+
+    def invalid_fixture() -> str:
+        raise module.SmokeAbort("BLOCKED", "fixed_first_job_fixture_changed_or_invalid")
+
+    monkeypatch.setattr(module, "_fixed_first_prompt", invalid_fixture)
+    monkeypatch.setattr(module, "approved_second_prompt", lambda _environ: "approved fake prompt")
+    monkeypatch.setattr(module, "_run_e2e", run_calls.append)
+
+    assert module.main(["--r4-once"]) == 2
+
+    assert not paths["r4"].exists()
+    assert run_calls == []
+    assert json.loads(capsys.readouterr().out)["reason"] == (
+        "fixed_first_job_fixture_changed_or_invalid"
+    )
+
+
+def test_r4_main_records_lineage_and_claims_once_without_live_e2e(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module, paths, hashes, previous_bytes = _install_valid_r4_evidence_chain(monkeypatch, tmp_path)
+    test_prompt = "approved fake prompt"
+    monkeypatch.setattr(
+        module,
+        "APPROVED_SECOND_PROMPT_SHA256",
+        hashlib.sha256(test_prompt.encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setenv(module.SECOND_PROMPT_ENVIRONMENT_VARIABLE, test_prompt)
+    run_calls: list[dict[str, Any]] = []
+
+    def stop_before_live(evidence: dict[str, Any]) -> int:
+        run_calls.append(evidence)
+        evidence["workflow"].update(
+            {"accepted_status": 202, "dbos_status": "SUCCESS", "final_texts": ["4", "5"]}
+        )
+        evidence["jobs"] = [{"state": "SUCCEEDED"}, {"state": "SUCCEEDED"}]
+        evidence["new_codex_job_count"] = 2
+        evidence["maximum_active_codex_jobs"] = 1
+        raise module.SmokeAbort("BLOCKED", "test_stopped_before_live")
+
+    monkeypatch.setattr(module, "_run_e2e", stop_before_live)
+
+    assert module.main(["--r4-once"]) == 2
+
+    evidence_bytes = paths["r4"].read_bytes()
+    evidence = json.loads(evidence_bytes)
+    assert evidence["phase"] == "5E-2C2-R4"
+    assert evidence["retry_of"] == "5E-2C2-R3"
+    assert evidence["retest_reason"] == "verify_transient_status_history_recheck_fix"
+    assert evidence["tested_fix_commit"] == "1e8255f1086e7fb5111450f2c5454c8f01f5d008"
+    assert evidence["previous_evidence"] == {
+        name: {
+            "path": paths[name].name.replace("phase5e-2c2-", "docs/phase5e-2c2-"),
+            "sha256": hashes[name],
+        }
+        for name in ("original", "r2", "r3")
+    }
+    assert evidence["workflow"]["dbos_status"] == "SUCCESS"
+    assert evidence["jobs"] == [{"state": "SUCCEEDED"}, {"state": "SUCCEEDED"}]
+    assert evidence["new_codex_job_count"] == 2
+    assert evidence["maximum_active_codex_jobs"] == 1
+    assert evidence["reason"] == "test_stopped_before_live"
+    assert test_prompt not in evidence_bytes.decode("utf-8")
+    assert len(run_calls) == 1
+    for name, original in previous_bytes.items():
+        assert paths[name].read_bytes() == original
+
+    monkeypatch.setattr(
+        module,
+        "_run_e2e",
+        lambda _evidence: pytest.fail("existing R4 evidence must block a second run"),
+    )
+    assert module.main(["--r4-once"]) == 2
+    assert paths["r4"].read_bytes() == evidence_bytes
+    assert len(run_calls) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["reason"] == (
+        "r4_evidence_already_exists"
+    )
 
 
 def test_diagnostic_retest_main_records_hashes_without_running_live_e2e(

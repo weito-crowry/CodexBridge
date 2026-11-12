@@ -60,9 +60,13 @@ RETEST_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5e-2c2-retest-evidence.j
 DIAGNOSTIC_RETEST_EVIDENCE_PATH = (
     REPOSITORY_ROOT / "docs" / "phase5e-2c2-diagnostic-retest-evidence.json"
 )
+R3_EVIDENCE_PATH = DIAGNOSTIC_RETEST_EVIDENCE_PATH
+R4_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5e-2c2-r4-evidence.json"
 FIRST_JOB_FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "codex_job_workflow.yaml"
 SECOND_PROMPT_ENVIRONMENT_VARIABLE = "CODEXBRIDGE_PHASE5E2C2_SECOND_PROMPT"
 APPROVED_SECOND_PROMPT_SHA256 = "0e12daed6b090fc7c47bf72ecb37e50a69d39e7b1e3bacf02793c453e31fcf05"
+R4_TESTED_FIX_COMMIT = "1e8255f1086e7fb5111450f2c5454c8f01f5d008"
+R4_RETEST_REASON = "verify_transient_status_history_recheck_fix"
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_START_TIMEOUT_SECONDS = 45.0
 WORKFLOW_TIMEOUT_SECONDS = 300.0
@@ -247,6 +251,7 @@ def _new_evidence(
     *,
     previous_evidence_sha256: str | None = None,
     diagnostic_retest_sha256: Mapping[str, str] | None = None,
+    r4_baseline_sha256: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     check_names = (
         "native_windows",
@@ -266,7 +271,9 @@ def _new_evidence(
     )
     evidence: dict[str, Any] = {
         "phase": (
-            "5E-2C2-R3"
+            "5E-2C2-R4"
+            if r4_baseline_sha256 is not None
+            else "5E-2C2-R3"
             if diagnostic_retest_sha256 is not None
             else "5E-2C2-R"
             if previous_evidence_sha256 is not None
@@ -309,6 +316,28 @@ def _new_evidence(
                     "r2": {
                         "path": "docs/phase5e-2c2-retest-evidence.json",
                         "sha256": diagnostic_retest_sha256["r2"],
+                    },
+                },
+            }
+        )
+    if r4_baseline_sha256 is not None:
+        evidence.update(
+            {
+                "retry_of": "5E-2C2-R3",
+                "retest_reason": R4_RETEST_REASON,
+                "tested_fix_commit": R4_TESTED_FIX_COMMIT,
+                "previous_evidence": {
+                    "original": {
+                        "path": "docs/phase5e-2c2-evidence.json",
+                        "sha256": r4_baseline_sha256["original"],
+                    },
+                    "r2": {
+                        "path": "docs/phase5e-2c2-retest-evidence.json",
+                        "sha256": r4_baseline_sha256["r2"],
+                    },
+                    "r3": {
+                        "path": "docs/phase5e-2c2-diagnostic-retest-evidence.json",
+                        "sha256": r4_baseline_sha256["r3"],
                     },
                 },
             }
@@ -490,6 +519,90 @@ def _select_diagnostic_retest_evidence() -> tuple[Path, dict[str, str]]:
         original_evidence_sha256=normalized_original_sha256,
     )
     return DIAGNOSTIC_RETEST_EVIDENCE_PATH, {"original": original_sha256, "r2": r2_sha256}
+
+
+def _validated_r3_evidence(
+    path: Path,
+    *,
+    original_evidence_sha256: str,
+    r2_evidence_sha256: str,
+) -> str:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError
+        if path.stat().st_size > MAX_PREVIOUS_EVIDENCE_BYTES:
+            raise OSError
+        with path.open("rb") as stream:
+            encoded = stream.read(MAX_PREVIOUS_EVIDENCE_BYTES + 1)
+        if len(encoded) > MAX_PREVIOUS_EVIDENCE_BYTES:
+            raise OSError
+        r3 = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SmokeAbort("BLOCKED", "r3_evidence_unexpected") from None
+
+    if not isinstance(r3, dict):
+        raise SmokeAbort("BLOCKED", "r3_evidence_unexpected")
+    workflow = r3.get("workflow")
+    cleanup = r3.get("cleanup")
+    previous_evidence = r3.get("previous_evidence")
+    if (
+        not isinstance(workflow, dict)
+        or not isinstance(cleanup, dict)
+        or not isinstance(previous_evidence, dict)
+    ):
+        raise SmokeAbort("BLOCKED", "r3_evidence_unexpected")
+    original = previous_evidence.get("original")
+    r2 = previous_evidence.get("r2")
+    if not isinstance(original, dict) or not isinstance(r2, dict):
+        raise SmokeAbort("BLOCKED", "r3_evidence_unexpected")
+
+    workflow_id = workflow.get("workflow_id")
+    run_id = workflow.get("run_id")
+    if (
+        r3.get("phase") != "5E-2C2-R3"
+        or r3.get("status") != "BLOCKED"
+        or r3.get("reason") != "workflow_api_requires_reconciliation"
+        or r3.get("live_workflow_post_attempted") is not True
+        or type(r3.get("live_workflow_post_count")) is not int
+        or r3.get("live_workflow_post_count") != 1
+        or type(workflow.get("accepted_status")) is not int
+        or workflow.get("accepted_status") != 202
+        or not isinstance(workflow_id, str)
+        or _WORKFLOW_ID.fullmatch(workflow_id) is None
+        or not isinstance(run_id, str)
+        or _RUN_ID.fullmatch(run_id) is None
+        or r3.get("same_id_replay_post_attempted") is not False
+        or type(r3.get("same_id_replay_post_count")) is not int
+        or r3.get("same_id_replay_post_count") != 0
+        or cleanup.get("status") != "PRESERVED_ACTIVE_OR_UNKNOWN"
+        or cleanup.get("forced_termination") is not False
+        or original.get("path") != "docs/phase5e-2c2-evidence.json"
+        or original.get("sha256") != original_evidence_sha256
+        or r2.get("path") != "docs/phase5e-2c2-retest-evidence.json"
+        or r2.get("sha256") != r2_evidence_sha256
+    ):
+        raise SmokeAbort("BLOCKED", "r3_evidence_unexpected")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _select_r4_evidence() -> tuple[Path, dict[str, str]]:
+    if R4_EVIDENCE_PATH.exists() or R4_EVIDENCE_PATH.is_symlink():
+        raise SmokeAbort("BLOCKED", "r4_evidence_already_exists")
+    original_sha256, normalized_original_sha256 = _validated_previous_evidence_hashes(EVIDENCE_PATH)
+    r2_sha256 = _validated_retest_evidence(
+        RETEST_EVIDENCE_PATH,
+        original_evidence_sha256=normalized_original_sha256,
+    )
+    r3_sha256 = _validated_r3_evidence(
+        R3_EVIDENCE_PATH,
+        original_evidence_sha256=original_sha256,
+        r2_evidence_sha256=r2_sha256,
+    )
+    return R4_EVIDENCE_PATH, {
+        "original": original_sha256,
+        "r2": r2_sha256,
+        "r3": r3_sha256,
+    }
 
 
 def _select_evidence_paths(*, retest_once: bool) -> tuple[Path, str | None]:
@@ -2715,13 +2828,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="claim the dedicated diagnostic retest evidence path after validating both baselines",
     )
+    parser.add_argument(
+        "--r4-once",
+        action="store_true",
+        help="claim the dedicated R4 evidence path after validating the original, R2, and R3 evidence",
+    )
     arguments = parser.parse_args(argv)
-    if arguments.retest_once and arguments.diagnostic_retest_once:
-        parser.error("--retest-once and --diagnostic-retest-once cannot be combined")
+    if sum((arguments.retest_once, arguments.diagnostic_retest_once, arguments.r4_once)) > 1:
+        parser.error("--retest-once, --diagnostic-retest-once, and --r4-once cannot be combined")
     previous_evidence_sha256: str | None = None
     diagnostic_retest_sha256: dict[str, str] | None = None
+    r4_baseline_sha256: dict[str, str] | None = None
     try:
-        if arguments.diagnostic_retest_once:
+        if arguments.r4_once:
+            evidence_path, r4_baseline_sha256 = _select_r4_evidence()
+            _fixed_first_prompt()
+            approved_second_prompt(os.environ)
+        elif arguments.diagnostic_retest_once:
             evidence_path, diagnostic_retest_sha256 = _select_diagnostic_retest_evidence()
         else:
             evidence_path, previous_evidence_sha256 = _select_evidence_paths(
@@ -2734,11 +2857,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     evidence = _new_evidence(
         previous_evidence_sha256=previous_evidence_sha256,
         diagnostic_retest_sha256=diagnostic_retest_sha256,
+        r4_baseline_sha256=r4_baseline_sha256,
     )
     try:
         claim_evidence_path(evidence_path, evidence)
     except FileExistsError:
-        if arguments.diagnostic_retest_once:
+        if arguments.r4_once:
+            reason = "r4_evidence_already_exists"
+        elif arguments.diagnostic_retest_once:
             reason = "diagnostic_retest_evidence_already_exists"
         else:
             reason = (
