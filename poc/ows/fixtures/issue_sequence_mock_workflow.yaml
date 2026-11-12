@@ -1,0 +1,39 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-issue-sequence-mock
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+input:
+  from: '${ {issues: (.issues | sort_by(.number))} }'
+do:
+  - processIssues:
+      for:
+        in: '${ .issues }'
+        each: issue
+        at: index
+      do:
+        - choose:
+            switch:
+              - enabled:
+                  when: '${ $issue.enabled == true }'
+                  then: dispatch
+              - disabled:
+                  then: skip
+        - dispatch:
+            input:
+              from: '${ {number: $issue.number} }'
+            call: mock-job
+            with:
+              operation: process
+              payload: '${ {issue_number: .number} }'
+              duration_ms: 20
+            output:
+              as: '${ {number: $input.number, status: .status, job_id: .job_id, request_key: .request_key} }'
+            then: exit
+        - skip:
+            set:
+              number: '${ $issue.number }'
+              status: skipped

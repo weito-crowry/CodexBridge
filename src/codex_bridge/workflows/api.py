@@ -65,8 +65,8 @@ def create_workflow_routes(
             if not isinstance(workspace_root, str):
                 raise WorkflowRequestError("workspace_root must be an absolute path")
             max_live_codex_jobs = payload.get("max_live_codex_jobs", 1)
-            if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
-                raise WorkflowRequestError("max_live_codex_jobs must be the integer 1 or 2")
+            if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2, 3}:
+                raise WorkflowRequestError("max_live_codex_jobs must be the integer 1, 2, or 3")
             if not ready():
                 return JSONResponse({"error": "bridge_not_ready"}, status_code=503)
             snapshot = await service.start_workflow(
@@ -259,8 +259,8 @@ def _snapshot_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
         result["job_id"] = snapshot.job_id
     if snapshot.thread_id is not None:
         result["thread_id"] = snapshot.thread_id
-    if snapshot.max_live_codex_jobs == 2:
-        result["max_live_codex_jobs"] = 2
+    if snapshot.max_live_codex_jobs in {2, 3}:
+        result["max_live_codex_jobs"] = snapshot.max_live_codex_jobs
         result["jobs"] = [
             {
                 "job_id": job.job_id,

@@ -965,6 +965,30 @@ def test_active_v1_ledger_stays_v1_and_reconciles_without_post(
             port=18001,
             max_jobs_per_workflow=2,
         )
+    with pytest.raises(
+        CodexJobConflictError,
+        match="max_jobs_per_workflow=3 requires a V2 job ledger",
+    ):
+        adapter.prepare_job(
+            row["workflow_id"],
+            "do[2].third",
+            "third prompt",
+            state_root,
+            port=18001,
+            max_jobs_per_workflow=3,
+        )
+    with pytest.raises(
+        CodexJobConflictError,
+        match="max_jobs_per_workflow=3 requires a V2 job ledger",
+    ):
+        adapter.prepare_job(
+            row["workflow_id"],
+            row["task_identity"],
+            _PRIVATE_PROMPT,
+            state_root,
+            port=18001,
+            max_jobs_per_workflow=3,
+        )
     status = adapter.get_job_status(job_id=row["job_id"])
     client = _NoPostClient()
 

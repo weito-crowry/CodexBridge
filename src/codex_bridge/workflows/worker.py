@@ -137,6 +137,53 @@ def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
         raise OwsError("workflow snapshot hash does not match manifest")
     if actual_input_hash != manifest.get("input_sha256"):
         raise OwsError("workflow input hash does not match manifest")
+    control = manifest.get("control")
+    if isinstance(control, dict) and control.get("max_live_codex_jobs") == 3:
+        bridge_port = control.get("codex_bridge_port")
+        from .interpreter import (
+            parse_workflow_text,
+            validate_three_live_codex_job_input,
+            validate_workflow,
+        )
+
+        if (
+            manifest.get("mode") != "codex-job-live"
+            or manifest.get("workflow_source") != "ui-api"
+            or set(control)
+            != {
+                "codex_job_live",
+                "codex_bridge_port",
+                "codex_job_max_polls",
+                "codex_job_poll_interval_seconds",
+                "max_live_codex_jobs",
+            }
+            or control.get("codex_job_live") is not True
+            or type(control.get("max_live_codex_jobs")) is not int
+            or control.get("max_live_codex_jobs") != 3
+            or type(bridge_port) is not int
+            or not 1 <= bridge_port <= 65535
+            or manifest.get("codex_bridge_port") != bridge_port
+            or control.get("codex_job_max_polls") != 600
+            or control.get("codex_job_poll_interval_seconds") != 0.2
+            or manifest.get("max_tasks") != 10_000
+        ):
+            raise OwsError("three-job workflow manifest control is invalid")
+        definition = parse_workflow_text(definition_text)
+        validate_workflow(definition, codex_job_live=True, max_live_codex_jobs=3)
+        validate_three_live_codex_job_input(input_data)
+        workspace_root = manifest.get("workspace_root")
+        if not isinstance(workspace_root, str) or not Path(workspace_root).is_absolute():
+            raise OwsError("three-job workflow manifest workspace is invalid")
+        request_digest = sha256_json(
+            {
+                "workflow": definition,
+                "input": input_data,
+                "workspace_root": workspace_root,
+                "max_live_codex_jobs": 3,
+            }
+        )
+        if request_digest != manifest.get("request_digest"):
+            raise OwsError("three-job request digest does not match the manifest")
     return manifest, definition_text, input_data
 
 
@@ -450,8 +497,8 @@ def _run_durable_codex_job(
     if not isinstance(workflow_id, str) or not workflow_id:
         raise OwsError("codex-job adapter requires an active DBOS workflow")
     max_live_codex_jobs = control.get("max_live_codex_jobs", 1)
-    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
-        raise OwsError("max_live_codex_jobs must be the integer 1 or 2")
+    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2, 3}:
+        raise OwsError("max_live_codex_jobs must be the integer 1, 2, or 3")
     port = control.get("codex_bridge_port")
     if type(port) is not int or not 1 <= port <= 65535:
         raise OwsError("codex_bridge_port must be an integer from 1 to 65535")
@@ -783,8 +830,8 @@ def execute_ows_workflow(
     if not isinstance(codex_job_live, bool):
         raise OwsError("codex_job_live must be a boolean")
     max_live_codex_jobs = control.get("max_live_codex_jobs", 1)
-    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
-        raise OwsError("max_live_codex_jobs must be the integer 1 or 2")
+    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2, 3}:
+        raise OwsError("max_live_codex_jobs must be the integer 1, 2, or 3")
     durable_wait = control.get("mock_job_durable_wait", False)
     if not isinstance(durable_wait, bool):
         raise OwsError("mock_job_durable_wait must be a boolean")
@@ -795,6 +842,10 @@ def execute_ows_workflow(
         codex_job_live=codex_job_live,
         max_live_codex_jobs=max_live_codex_jobs,
     )
+    if max_live_codex_jobs == 3:
+        from .interpreter import validate_three_live_codex_job_input
+
+        validate_three_live_codex_job_input(input_data)
 
     def run_named_step(
         identity: str,

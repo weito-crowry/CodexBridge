@@ -605,8 +605,8 @@ class CodexJobAdapter:
         allowed_roots: tuple[str, ...] = (),
         max_jobs_per_workflow: int = 1,
     ) -> dict[str, Any]:
-        if type(max_jobs_per_workflow) is not int or max_jobs_per_workflow not in {1, 2}:
-            raise CodexJobRequestError("max_jobs_per_workflow must be the integer 1 or 2")
+        if type(max_jobs_per_workflow) is not int or max_jobs_per_workflow not in {1, 2, 3}:
+            raise CodexJobRequestError("max_jobs_per_workflow must be the integer 1, 2, or 3")
         try:
             prompt = validate_codex_job_prompt(prompt)
         except OwsError as error:
@@ -638,6 +638,8 @@ class CodexJobAdapter:
         connection = _connect(self.database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if max_jobs_per_workflow == 3 and self._detect_schema_version(connection) != 2:
+                raise CodexJobConflictError("max_jobs_per_workflow=3 requires a V2 job ledger")
             existing = connection.execute(
                 "SELECT * FROM jobs WHERE request_key = ?", (request_key,)
             ).fetchone()
@@ -663,8 +665,10 @@ class CodexJobAdapter:
                 connection.execute("COMMIT")
                 return job
 
-            if max_jobs_per_workflow == 2 and self._detect_schema_version(connection) != 2:
-                raise CodexJobConflictError("max_jobs_per_workflow=2 requires a V2 job ledger")
+            if max_jobs_per_workflow in {2, 3} and self._detect_schema_version(connection) != 2:
+                raise CodexJobConflictError(
+                    f"max_jobs_per_workflow={max_jobs_per_workflow} requires a V2 job ledger"
+                )
 
             existing_count = int(
                 connection.execute(

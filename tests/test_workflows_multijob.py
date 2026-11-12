@@ -19,6 +19,8 @@ from codex_bridge.workflows.interpreter import (
     Interpreter,
     OwsError,
     compute_codex_job_request,
+    compute_task_action,
+    validate_three_live_codex_job_input,
     validate_workflow,
 )
 
@@ -45,6 +47,221 @@ def _two_job_workflow(prompt_from: str = "${ .result.final_text }") -> dict[str,
             },
         ],
     }
+
+
+def _three_job_workflow() -> dict[str, Any]:
+    fixture = (
+        Path(__file__).parents[1]
+        / "poc"
+        / "ows"
+        / "fixtures"
+        / ("three_codex_job_loop_workflow.yaml")
+    )
+    return yaml.safe_load(fixture.read_text(encoding="utf-8"))
+
+
+_THREE_JOB_INPUT = {
+    "issues": [
+        {"number": 17, "enabled": True},
+        {"number": 5, "enabled": False},
+        {"number": 9, "enabled": True},
+        {"number": 21, "enabled": True},
+    ]
+}
+
+
+def test_three_job_subset_requires_explicit_mode_and_pinned_schema() -> None:
+    definition = _three_job_workflow()
+
+    with pytest.raises(OwsError, match="may not be nested under for"):
+        validate_workflow(definition, codex_job_live=True)
+    with pytest.raises(OwsError, match="requires codex-job live mode"):
+        validate_workflow(definition, max_live_codex_jobs=3)
+
+    validate_workflow(definition, codex_job_live=True, max_live_codex_jobs=3)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda workflow: workflow["do"].append({"extra": {"set": {"x": 1}}}),
+        lambda workflow: workflow["do"][0]["processIssues"]["do"][1]["processIssue"].update(
+            {"call": "mock-job"}
+        ),
+        lambda workflow: workflow["do"][0]["processIssues"]["do"][1]["processIssue"].pop("then"),
+        lambda workflow: workflow["do"][0]["processIssues"]["do"][0]["choose"]["switch"][0][
+            "enabled"
+        ].update({"when": "${ true }"}),
+        lambda workflow: workflow["do"][0]["processIssues"]["for"].update({"while": "${ true }"}),
+        lambda workflow: workflow["do"][0]["processIssues"]["do"][1]["processIssue"].update(
+            {"call": "unsupported-target"}
+        ),
+        lambda workflow: workflow.update({"output": {"as": "${ . }"}}),
+        lambda workflow: workflow["do"][0]["processIssues"]["do"][1]["processIssue"][
+            "output"
+        ].update({"as": "${ . }"}),
+        lambda workflow: workflow["do"][0]["processIssues"]["do"][1]["processIssue"]["with"].update(
+            {"prompt_from": "${ .unsafe }"}
+        ),
+    ],
+    ids=[
+        "top-level-task",
+        "mock-mix",
+        "missing-exit",
+        "switch-shape",
+        "loop-while",
+        "other-call-target",
+        "top-level-output",
+        "output-expression",
+        "invalid-prompt-from",
+    ],
+)
+def test_three_job_subset_rejects_unapproved_shapes(mutate: Any) -> None:
+    definition = _three_job_workflow()
+    mutate(definition)
+
+    with pytest.raises(OwsError):
+        validate_workflow(definition, codex_job_live=True, max_live_codex_jobs=3)
+
+
+@pytest.mark.parametrize(
+    "input_data",
+    [
+        {"issues": [{"number": index + 1, "enabled": False} for index in range(5)]},
+        {"issues": [{"number": index + 1, "enabled": True} for index in range(4)]},
+        {"issues": [{"number": 1, "enabled": True}, {"number": 1, "enabled": False}]},
+        {"issues": [{"number": 0, "enabled": True}]},
+        {"issues": [{"number": -1, "enabled": True}]},
+        {"issues": [{"number": True, "enabled": True}]},
+        {"issues": [{"number": 1, "enabled": 1}]},
+        {"issues": [{"number": 1, "enabled": True, "prompt": "unsafe"}]},
+        {"issues": [], "prompt": "unsafe"},
+        {"issues": {}},
+        {"issues": [{"number": 1}]},
+    ],
+    ids=[
+        "five-items",
+        "four-enabled",
+        "duplicate-number",
+        "zero-number",
+        "negative-number",
+        "boolean-number",
+        "non-boolean-enabled",
+        "extra-item-key",
+        "extra-input-key",
+        "non-array-issues",
+        "missing-enabled",
+    ],
+)
+def test_three_job_input_validation_fails_closed(input_data: Any) -> None:
+    with pytest.raises(OwsError):
+        validate_three_live_codex_job_input(input_data)
+
+
+def test_three_job_interpreter_rechecks_input_before_first_step() -> None:
+    steps: list[str] = []
+
+    def step_runner(identity: str, *_args: Any) -> Any:
+        steps.append(identity)
+        return None
+
+    with pytest.raises(OwsError, match="at most four items"):
+        Interpreter(
+            _three_job_workflow(),
+            step_runner=step_runner,
+            codex_job_live=True,
+            max_live_codex_jobs=3,
+        ).run({"issues": [{"number": index + 1, "enabled": False} for index in range(5)]})
+
+    assert steps == []
+
+
+def test_three_job_interpreter_sorts_skips_and_builds_unique_prompts_and_identities() -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    def step_runner(
+        identity: str,
+        task_name: str,
+        operation: str,
+        task_spec: dict[str, Any],
+        task_input: Any,
+        variables: dict[str, Any],
+    ) -> Any:
+        if operation != "call":
+            return compute_task_action(operation, task_spec, task_input, variables)
+        assert task_name == "processIssue"
+        request = compute_codex_job_request(
+            task_spec,
+            task_input,
+            variables,
+            max_live_codex_jobs=3,
+        )
+        number = task_input["number"]
+        calls.append((identity, request["prompt"], f"workflow::{identity}"))
+        return {
+            "job_id": f"job-{number}",
+            "request_key": f"workflow::{identity}",
+            "status": "SUCCEEDED",
+            "result": {"final_text": str(number)},
+        }
+
+    result = Interpreter(
+        _three_job_workflow(),
+        step_runner=step_runner,
+        codex_job_live=True,
+        max_live_codex_jobs=3,
+    ).run(_THREE_JOB_INPUT)
+
+    assert [item["number"] for item in result] == [5, 9, 17, 21]
+    assert [item["status"] for item in result] == ["skipped", "SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
+    assert result[0] == {
+        "number": 5,
+        "status": "skipped",
+        "job_id": None,
+        "request_key": None,
+        "final_text": None,
+    }
+    assert [item["final_text"] for item in result[1:]] == ["9", "17", "21"]
+    assert [call[0] for call in calls] == [
+        "do[0].processIssues.iteration[1].do[1].processIssue",
+        "do[0].processIssues.iteration[2].do[1].processIssue",
+        "do[0].processIssues.iteration[3].do[1].processIssue",
+    ]
+    assert [call[1] for call in calls] == [
+        "Reply with only the synthetic issue number: 9",
+        "Reply with only the synthetic issue number: 17",
+        "Reply with only the synthetic issue number: 21",
+    ]
+    assert len({call[0] for call in calls}) == len({call[2] for call in calls}) == 3
+
+
+def test_three_job_input_allows_zero_enabled_and_empty_array() -> None:
+    calls: list[str] = []
+
+    def step_runner(*args: Any) -> Any:
+        identity, _, operation, task_spec, task_input, variables = args
+        if operation != "call":
+            return compute_task_action(operation, task_spec, task_input, variables)
+        calls.append(str(identity))
+        raise AssertionError("disabled issues must not dispatch")
+
+    definition = _three_job_workflow()
+    empty_result = Interpreter(
+        definition,
+        step_runner=step_runner,
+        codex_job_live=True,
+        max_live_codex_jobs=3,
+    ).run({"issues": []})
+    skipped_result = Interpreter(
+        definition,
+        step_runner=step_runner,
+        codex_job_live=True,
+        max_live_codex_jobs=3,
+    ).run({"issues": [{"number": 8, "enabled": False}, {"number": 3, "enabled": False}]})
+
+    assert empty_result == []
+    assert [item["number"] for item in skipped_result] == [3, 8]
+    assert calls == []
 
 
 def test_two_codex_jobs_require_explicit_opt_in_and_pass_pinned_schema() -> None:
@@ -135,7 +352,7 @@ def test_two_job_subset_rejects_invalid_prompt_from(prompt_from: Any) -> None:
         )
 
 
-@pytest.mark.parametrize("limit", [True, False, 0, 3, 9, "2", None])
+@pytest.mark.parametrize("limit", [True, False, 0, 4, 9, "2", None])
 def test_workflow_rejects_invalid_max_live_codex_jobs(limit: Any) -> None:
     with pytest.raises(OwsError, match="max_live_codex_jobs"):
         validate_workflow(
@@ -341,7 +558,66 @@ def test_v2_adapter_allows_two_jobs_only_with_explicit_limit(tmp_path: Path) -> 
         )
 
 
-@pytest.mark.parametrize("limit", [True, False, 0, 3, 7, "2", None])
+def test_v2_adapter_allows_three_jobs_with_stable_replay_and_capacity_limit(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run-three"
+    run_dir.mkdir()
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    workflow_id = "workflow-three-12345678"
+    identities = (
+        "do[0].processIssues.iteration[1].do[1].processIssue",
+        "do[0].processIssues.iteration[2].do[1].processIssue",
+        "do[0].processIssues.iteration[3].do[1].processIssue",
+    )
+    jobs = [
+        adapter.prepare_job(
+            workflow_id,
+            identity,
+            f"prompt {index}",
+            run_dir,
+            port=18001,
+            max_jobs_per_workflow=3,
+        )
+        for index, identity in enumerate(identities, start=1)
+    ]
+    replay = adapter.prepare_job(
+        workflow_id,
+        identities[1],
+        "prompt 2",
+        run_dir,
+        port=18001,
+        max_jobs_per_workflow=3,
+    )
+
+    assert replay["job_id"] == jobs[1]["job_id"]
+    assert replay["request_digest"] == jobs[1]["request_digest"]
+    assert len({job["job_id"] for job in jobs}) == 3
+    assert len({job["request_key"] for job in jobs}) == 3
+    assert [job["task_identity"] for job in adapter.get_jobs_for_workflow(workflow_id)] == list(
+        identities
+    )
+    with pytest.raises(CodexJobConflictError, match="workflow job limit"):
+        adapter.prepare_job(
+            workflow_id,
+            "do[0].processIssues.iteration[4].do[1].processIssue",
+            "prompt 4",
+            run_dir,
+            port=18001,
+            max_jobs_per_workflow=3,
+        )
+    with pytest.raises(CodexJobConflictError, match="request digest mismatch"):
+        adapter.prepare_job(
+            workflow_id,
+            identities[1],
+            "changed prompt",
+            run_dir,
+            port=18001,
+            max_jobs_per_workflow=3,
+        )
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, 4, 7, "2", None])
 def test_adapter_rejects_invalid_per_workflow_job_limit(tmp_path: Path, limit: Any) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -395,6 +671,15 @@ class _FakeDBOS:
     @staticmethod
     def sleep(seconds: float) -> None:
         del seconds
+
+    @staticmethod
+    def step(*, name: str):
+        del name
+
+        def decorate(function: Any) -> Any:
+            return function
+
+        return decorate
 
 
 class _FakeCodexHTTPClient:
@@ -490,16 +775,19 @@ def _run_fake_worker(
     workspace_root: Path,
     *,
     max_polls: int = 2,
+    max_live_codex_jobs: int = 2,
+    definition: dict[str, Any] | None = None,
+    input_data: Any = None,
     steps: _FakeDurableSteps | None = None,
     monkeypatch: pytest.MonkeyPatch,
     reset_http: bool = True,
 ) -> Any:
     from codex_bridge.workflows import worker
 
-    definition = _two_job_workflow()
+    definition = _two_job_workflow() if definition is None else definition
     definition_text = yaml.safe_dump(definition, allow_unicode=True, sort_keys=False)
     definition_sha256 = worker.sha256_text(definition_text)
-    input_sha256 = worker.sha256_json(None)
+    input_sha256 = worker.sha256_json(input_data)
     if reset_http:
         _FakeCodexHTTPClient.events = []
         _FakeCodexHTTPClient.threads = {}
@@ -510,7 +798,7 @@ def _run_fake_worker(
     monkeypatch.setattr(worker, "_durable_codex_job_step", selected_steps.factory)
     control = {
         "codex_job_live": True,
-        "max_live_codex_jobs": 2,
+        "max_live_codex_jobs": max_live_codex_jobs,
         "codex_bridge_port": 18001,
         "codex_job_max_polls": max_polls,
         "codex_job_poll_interval_seconds": 0.05,
@@ -520,7 +808,7 @@ def _run_fake_worker(
     return worker.execute_ows_workflow.__wrapped__(
         definition_text,
         definition_sha256,
-        None,
+        input_data,
         input_sha256,
         str(run_dir / "task-events.jsonl"),
         control,
@@ -591,6 +879,120 @@ def test_worker_completes_first_receipt_before_starting_second_and_replays_witho
     assert steps.cache_hits >= 4
 
 
+def test_worker_completes_three_sorted_jobs_and_replays_without_new_posts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_bridge.workflows import worker
+
+    run_dir = tmp_path / "state-three"
+    workspace_root = tmp_path / "workspace-three"
+    run_dir.mkdir()
+    workspace_root.mkdir()
+    _FakeCodexHTTPClient.outcomes = {
+        "Reply with only the synthetic issue number: 9": {"final_text": "9"},
+        "Reply with only the synthetic issue number: 17": {"final_text": "17"},
+        "Reply with only the synthetic issue number: 21": {"final_text": "21"},
+    }
+    steps = _FakeDurableSteps()
+    first_result = _run_fake_worker(
+        run_dir,
+        workspace_root,
+        definition=_three_job_workflow(),
+        input_data=_THREE_JOB_INPUT,
+        max_live_codex_jobs=3,
+        steps=steps,
+        monkeypatch=monkeypatch,
+    )
+    events = list(_FakeCodexHTTPClient.events)
+    replayed = _run_fake_worker(
+        run_dir,
+        workspace_root,
+        definition=_three_job_workflow(),
+        input_data=_THREE_JOB_INPUT,
+        max_live_codex_jobs=3,
+        steps=steps,
+        monkeypatch=monkeypatch,
+        reset_http=False,
+    )
+    adapter = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    jobs = adapter.get_jobs_for_workflow(_FakeDBOS.workflow_id)
+    job_statuses = [adapter.get_job_status(job_id=job["job_id"]) for job in jobs]
+    post_requests = [event for kind, event in events if kind == "POST"]
+    observe_indexes = [
+        index
+        for index, (kind, value) in enumerate(events)
+        if kind == "GET" and isinstance(value, tuple)
+    ]
+    post_indexes = [index for index, (kind, _value) in enumerate(events) if kind == "POST"]
+
+    assert [item["number"] for item in first_result] == [5, 9, 17, 21]
+    assert [item["status"] for item in first_result] == [
+        "skipped",
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "SUCCEEDED",
+    ]
+    assert [item["final_text"] for item in first_result[1:]] == ["9", "17", "21"]
+    assert [request["prompt"] for request in post_requests] == [
+        "Reply with only the synthetic issue number: 9",
+        "Reply with only the synthetic issue number: 17",
+        "Reply with only the synthetic issue number: 21",
+    ]
+    assert len({job["job_id"] for job in jobs}) == 3
+    assert len({job["request_key"] for job in job_statuses}) == 3
+    assert [job["task_identity"] for job in jobs] == [
+        "do[0].processIssues.iteration[1].do[1].processIssue",
+        "do[0].processIssues.iteration[2].do[1].processIssue",
+        "do[0].processIssues.iteration[3].do[1].processIssue",
+    ]
+    assert [job["state"] for job in jobs] == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
+    assert len(post_indexes) == len(observe_indexes) == 3
+    assert all(post_indexes[index] < observe_indexes[index] for index in range(3))
+    assert replayed == first_result
+    assert sum(kind == "POST" for kind, _event in _FakeCodexHTTPClient.events) == 3
+    assert steps.cache_hits >= 6
+
+
+def test_worker_does_not_dispatch_third_job_after_second_needs_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_bridge.workflows import worker
+
+    run_dir = tmp_path / "state-unknown-second"
+    workspace_root = tmp_path / "workspace-unknown-second"
+    run_dir.mkdir()
+    workspace_root.mkdir()
+    _FakeCodexHTTPClient.outcomes = {
+        "Reply with only the synthetic issue number: 9": {"final_text": "9"},
+        "Reply with only the synthetic issue number: 17": {"state": "needs_approval"},
+    }
+
+    with pytest.raises(CodexJobReconciliationRequiredError):
+        _run_fake_worker(
+            run_dir,
+            workspace_root,
+            definition=_three_job_workflow(),
+            input_data=_THREE_JOB_INPUT,
+            max_live_codex_jobs=3,
+            monkeypatch=monkeypatch,
+        )
+
+    jobs = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
+        _FakeDBOS.workflow_id
+    )
+    second_status = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_job_status(
+        job_id=jobs[1]["job_id"]
+    )
+    post_requests = [event for kind, event in _FakeCodexHTTPClient.events if kind == "POST"]
+    assert len(jobs) == 2
+    assert [job["state"] for job in jobs] == ["SUCCEEDED", "ACCEPTED"]
+    assert len(post_requests) == 2
+    assert "21" not in post_requests[-1]["prompt"]
+    assert second_status["status"] == "NEEDS_RECONCILIATION"
+
+
 @pytest.mark.parametrize(
     ("outcome", "expected_error", "expected_state"),
     [
@@ -631,7 +1033,7 @@ def test_worker_never_creates_second_job_when_first_is_not_succeeded(
     )
 
 
-@pytest.mark.parametrize("value", [True, 0, 3, 9, "2", None])
+@pytest.mark.parametrize("value", [True, 0, 4, 9, "2", None])
 def test_worker_rejects_invalid_max_live_codex_jobs_control(
     tmp_path: Path,
     value: Any,
@@ -656,9 +1058,10 @@ def test_worker_entry_defaults_manifest_limit_to_one_and_accepts_internal_two() 
 
     assert _max_live_codex_jobs({}) == 1
     assert _max_live_codex_jobs({"max_live_codex_jobs": 2}) == 2
+    assert _max_live_codex_jobs({"max_live_codex_jobs": 3}) == 3
 
 
-@pytest.mark.parametrize("value", [True, 0, 3, 10, "2", None])
+@pytest.mark.parametrize("value", [True, 0, 4, 10, "2", None])
 def test_worker_entry_rejects_invalid_manifest_job_limit(value: Any) -> None:
     from codex_bridge.workflows.worker_entry import (
         WorkflowWorkerEntryError,
@@ -681,3 +1084,16 @@ def test_public_worker_manager_rejects_internal_multijob_manifest_control() -> N
                 }
             }
         )
+
+    three_job_manifest = {
+        "control": {
+            "codex_job_live": True,
+            "codex_bridge_port": 18001,
+            "codex_job_max_polls": 600,
+            "codex_job_poll_interval_seconds": 0.2,
+            "max_live_codex_jobs": 3,
+        },
+        "codex_bridge_port": 18001,
+        "max_tasks": 10_000,
+    }
+    assert _codex_job_live(three_job_manifest, max_live_codex_jobs=3)

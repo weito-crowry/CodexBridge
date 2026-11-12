@@ -151,9 +151,114 @@ def _validate_dataflow_config(
 
 
 def _validate_max_live_codex_jobs(value: object) -> int:
-    if type(value) is not int or value not in {1, 2}:
-        raise OwsError("max_live_codex_jobs must be the integer 1 or 2")
+    if type(value) is not int or value not in {1, 2, 3}:
+        raise OwsError("max_live_codex_jobs must be the integer 1, 2, or 3")
     return value
+
+
+_THREE_JOB_INPUT_FROM = "${ {issues: (.issues | sort_by(.number))} }"
+_THREE_JOB_PROMPT_PREFIX = "Reply with only the synthetic issue number: "
+_THREE_JOB_PROMPT_FROM = "${ .number | tostring }"
+_THREE_JOB_OUTPUT_AS = (
+    "${ {number: $input.number, status: .status, job_id: .job_id, "
+    "request_key: .request_key, final_text: .result.final_text} }"
+)
+
+
+def validate_three_live_codex_job_input(input_data: Any) -> tuple[dict[str, Any], ...]:
+    """Validate and sort the bounded synthetic input used by the three-job mode."""
+    if not isinstance(input_data, dict) or set(input_data) != {"issues"}:
+        raise OwsError("three-job input must contain only an issues array")
+    issues = input_data["issues"]
+    if not isinstance(issues, list) or len(issues) > 4:
+        raise OwsError("three-job input issues must be an array with at most four items")
+
+    numbers: set[int] = set()
+    enabled_count = 0
+    normalized: list[dict[str, Any]] = []
+    for issue in issues:
+        if not isinstance(issue, dict) or set(issue) != {"number", "enabled"}:
+            raise OwsError("each three-job issue must contain only number and enabled")
+        number = issue["number"]
+        enabled = issue["enabled"]
+        if type(number) is not int or number <= 0 or number in numbers:
+            raise OwsError("three-job issue numbers must be unique positive integers")
+        if type(enabled) is not bool:
+            raise OwsError("three-job issue enabled values must be booleans")
+        numbers.add(number)
+        enabled_count += int(enabled)
+        normalized.append({"number": number, "enabled": enabled})
+    if enabled_count > 3:
+        raise OwsError("three-job input may enable at most three issues")
+    return tuple(sorted(normalized, key=lambda issue: issue["number"]))
+
+
+def _validate_three_live_codex_job_shape(
+    definition: dict[str, Any], tasks: list[Any]
+) -> tuple[str, str]:
+    if set(definition) != {"document", "evaluate", "input", "do"}:
+        raise OwsError("three-job live mode requires only document, evaluate, input, and do")
+    if definition.get("input") != {"from": _THREE_JOB_INPUT_FROM}:
+        raise OwsError("three-job live mode requires the fixed ascending issue-number input sort")
+    if len(tasks) != 1 or not isinstance(tasks[0], dict) or len(tasks[0]) != 1:
+        raise OwsError("three-job live mode requires one top-level for task")
+    for_name, for_task = next(iter(tasks[0].items()))
+    if not isinstance(for_name, str) or not for_name or not isinstance(for_task, dict):
+        raise OwsError("three-job live mode requires a named top-level for task")
+    if set(for_task) != {"for", "do"}:
+        raise OwsError("three-job live for task may contain only for and do")
+    if for_task.get("for") != {"in": "${ .issues }", "each": "issue", "at": "index"}:
+        raise OwsError("three-job live mode requires the fixed issue loop")
+    body = for_task.get("do")
+    if not isinstance(body, list) or len(body) != 3:
+        raise OwsError("three-job live loop requires switch, codex-job, and skip tasks")
+    if any(not isinstance(item, dict) or len(item) != 1 for item in body):
+        raise OwsError("three-job live loop requires three named tasks")
+    body_names = [next(iter(item)) for item in body]
+    if (
+        any(not isinstance(name, str) or not name for name in body_names)
+        or len(set(body_names)) != 3
+    ):
+        raise OwsError("three-job live loop task names must be distinct non-empty strings")
+    switch_name, dispatch_name, skip_name = body_names
+    switch_task = body[0][switch_name]
+    dispatch_task = body[1][dispatch_name]
+    skip_task = body[2][skip_name]
+    if not isinstance(switch_task, dict) or set(switch_task) != {"switch"}:
+        raise OwsError("three-job live loop must start with one switch task")
+    if switch_task["switch"] != [
+        {"enabled": {"when": "${ $issue.enabled == true }", "then": dispatch_name}},
+        {"disabled": {"then": skip_name}},
+    ]:
+        raise OwsError("three-job live switch must dispatch enabled issues and skip the rest")
+    if not isinstance(dispatch_task, dict) or set(dispatch_task) != {
+        "input",
+        "call",
+        "with",
+        "output",
+        "then",
+    }:
+        raise OwsError("three-job live dispatch task has an unsupported shape")
+    if (
+        dispatch_task.get("input") != {"from": "${ {number: $issue.number} }"}
+        or dispatch_task.get("call") != "codex-job"
+        or dispatch_task.get("with")
+        != {"prompt": _THREE_JOB_PROMPT_PREFIX, "prompt_from": _THREE_JOB_PROMPT_FROM}
+        or dispatch_task.get("output") != {"as": _THREE_JOB_OUTPUT_AS}
+        or dispatch_task.get("then") != "exit"
+    ):
+        raise OwsError("three-job live dispatch must use its fixed prompt, output, and exit flow")
+    if not isinstance(skip_task, dict) or set(skip_task) != {"set"}:
+        raise OwsError("three-job live loop must end with one skip set task")
+    if skip_task["set"] != {
+        "number": "${ $issue.number }",
+        "status": "skipped",
+        "job_id": None,
+        "request_key": None,
+        "final_text": None,
+    }:
+        raise OwsError("three-job live skip output has an unsupported shape")
+    return for_name, dispatch_name
 
 
 def _validate_two_live_codex_job_shape(definition: dict[str, Any], tasks: list[Any]) -> None:
@@ -190,8 +295,8 @@ def _validate_subset(
     max_live_codex_jobs: int = 1,
 ) -> None:
     max_live_codex_jobs = _validate_max_live_codex_jobs(max_live_codex_jobs)
-    if max_live_codex_jobs == 2 and not codex_job_live:
-        raise OwsError("max_live_codex_jobs=2 requires codex-job live mode")
+    if max_live_codex_jobs in {2, 3} and not codex_job_live:
+        raise OwsError(f"max_live_codex_jobs={max_live_codex_jobs} requires codex-job live mode")
     if not isinstance(definition, dict):
         raise OwsError("workflow definition must be an object")
 
@@ -241,9 +346,15 @@ def _validate_subset(
             _validate_two_live_codex_job_shape(definition, tasks)
             if len(codex_calls) != 2:
                 raise OwsError("two-job live mode requires exactly two codex-job calls")
+        if max_live_codex_jobs == 3:
+            _validate_three_live_codex_job_shape(definition, tasks)
+            if len(codex_calls) != 1 or not looped_codex_calls:
+                raise OwsError(
+                    "three-job live mode requires one codex-job call inside its fixed loop"
+                )
         if mock_calls:
             raise OwsError("codex-job live mode cannot be mixed with mock-job")
-        if looped_codex_calls:
+        if looped_codex_calls and max_live_codex_jobs != 3:
             raise OwsError("codex-job may not be nested under for")
     _validate_task_list(
         tasks,
@@ -441,7 +552,7 @@ def _validate_action(
             if not isinstance(arguments, dict):
                 raise OwsError("codex-job with must be an argument map")
             allowed_arguments = {"prompt"}
-            if max_live_codex_jobs == 2:
+            if max_live_codex_jobs in {2, 3}:
                 allowed_arguments.add("prompt_from")
             unsupported = set(arguments) - allowed_arguments
             if unsupported:
@@ -452,8 +563,8 @@ def _validate_action(
             if "prompt_from" not in arguments:
                 validate_codex_job_prompt(arguments["prompt"])
             else:
-                if max_live_codex_jobs != 2:
-                    raise OwsError("codex-job prompt_from requires max_live_codex_jobs=2")
+                if max_live_codex_jobs not in {2, 3}:
+                    raise OwsError("codex-job prompt_from requires max_live_codex_jobs=2 or 3")
                 if not isinstance(arguments["prompt"], str):
                     raise OwsError("second codex-job prompt must be a literal string prefix")
                 _compile_required_expression(
@@ -507,6 +618,7 @@ def _validate_action(
             f"{task_path}.do",
             jq_variables,
             codex_job_live=codex_job_live,
+            max_live_codex_jobs=max_live_codex_jobs,
         )
         return
     if operation == "for":
@@ -544,6 +656,7 @@ def _validate_action(
             f"{task_path}.do",
             jq_variables.union({each_name, at_name}),
             codex_job_live=codex_job_live,
+            max_live_codex_jobs=max_live_codex_jobs,
         )
         return
     if operation == "switch":
@@ -779,8 +892,8 @@ def compute_codex_job_request(
         raise OwsError("codex-job with must be an argument map")
     if set(arguments) == {"prompt"}:
         return {"prompt": validate_codex_job_prompt(arguments["prompt"])}
-    if max_live_codex_jobs != 2 or set(arguments) != {"prompt", "prompt_from"}:
-        raise OwsError("codex-job prompt_from requires the two-job live subset")
+    if max_live_codex_jobs not in {2, 3} or set(arguments) != {"prompt", "prompt_from"}:
+        raise OwsError("codex-job prompt_from requires the two-job or three-job live subset")
     prefix = arguments["prompt"]
     if not isinstance(prefix, str):
         raise OwsError("second codex-job prompt must be a literal string prefix")
@@ -818,6 +931,8 @@ class Interpreter:
 
     def run(self, input_data: Any) -> Any:
         self._task_count = 0
+        if self.max_live_codex_jobs == 3:
+            validate_three_live_codex_job_input(input_data)
         workflow_input = input_data
         workflow_input_config = self.definition.get("input", {})
         if "from" in workflow_input_config:

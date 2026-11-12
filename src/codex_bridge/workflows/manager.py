@@ -555,7 +555,7 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
         ):
             complete = False
             continue
-        if declared_limit == 2 and manifest.get("workflow_source") != "ui-api":
+        if declared_limit in {2, 3} and manifest.get("workflow_source") != "ui-api":
             complete = False
             continue
         persisted.append(resolved)
@@ -590,16 +590,16 @@ def _codex_job_live(
     control = manifest.get("control", {})
     if not isinstance(control, dict):
         raise WorkflowManagerError("workflow manifest control must be an object")
-    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2}:
-        raise WorkflowManagerError("worker max_live_codex_jobs must be the integer 1 or 2")
+    if type(max_live_codex_jobs) is not int or max_live_codex_jobs not in {1, 2, 3}:
+        raise WorkflowManagerError("worker max_live_codex_jobs must be the integer 1, 2, or 3")
     declared_limit = control.get("max_live_codex_jobs", 1)
-    if type(declared_limit) is not int or declared_limit not in {1, 2}:
+    if type(declared_limit) is not int or declared_limit not in {1, 2, 3}:
         raise WorkflowManagerError("workflow manifest max_live_codex_jobs is invalid")
     if declared_limit != max_live_codex_jobs:
         raise WorkflowManagerError("worker max_live_codex_jobs does not match the manifest")
     if declared_limit == 1 and "max_live_codex_jobs" in control:
         raise WorkflowManagerError("single-job manifests must omit max_live_codex_jobs")
-    if declared_limit == 2:
+    if declared_limit in {2, 3}:
         expected_control = {
             "codex_job_live",
             "codex_bridge_port",
@@ -618,7 +618,12 @@ def _codex_job_live(
             or control.get("codex_job_poll_interval_seconds") != 0.2
             or manifest.get("max_tasks") != 10_000
         ):
-            raise WorkflowManagerError("two-job workflow manifest control is invalid")
+            message = (
+                "two-job workflow manifest control is invalid"
+                if declared_limit == 2
+                else "three-job workflow manifest control is invalid"
+            )
+            raise WorkflowManagerError(message)
     live = control.get("codex_job_live", False)
     if not isinstance(live, bool):
         raise WorkflowManagerError("workflow manifest codex_job_live must be a boolean")

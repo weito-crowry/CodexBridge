@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx2 as httpx
 import pytest
+import yaml
 
 from codex_bridge.activity import ActivityStore
 from codex_bridge.config import BridgeConfig
@@ -55,6 +59,153 @@ do:
 """
 
 
+def _three_job_yaml() -> str:
+    fixture = (
+        Path(__file__).parents[1]
+        / "poc"
+        / "ows"
+        / "fixtures"
+        / ("three_codex_job_loop_workflow.yaml")
+    )
+    return fixture.read_text(encoding="utf-8")
+
+
+_THREE_JOB_INPUT = {
+    "issues": [
+        {"number": 17, "enabled": True},
+        {"number": 5, "enabled": False},
+        {"number": 9, "enabled": True},
+        {"number": 21, "enabled": True},
+    ]
+}
+
+
+class _LoopbackAPIState:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str]] = []
+        self.posts: list[dict[str, Any]] = []
+        self.jobs: dict[str, dict[str, Any]] = {}
+        self.unknown_after_job: int | None = None
+
+
+class _LoopbackAPIHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        del format, args
+
+    @property
+    def state(self) -> _LoopbackAPIState:
+        return self.server.state  # type: ignore[attr-defined, no-any-return]
+
+    def _reply(self, status: int, value: dict[str, Any]) -> None:
+        body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self.state.requests.append((self.command, self.path))
+        parsed = urlsplit(self.path)
+        if parsed.path == "/healthz":
+            self._reply(200, {"status": "ok"})
+            return
+        if parsed.path == "/ui-api/status":
+            self._reply(200, {"app_server": "ready"})
+            return
+        if parsed.path == "/ui-api/control/capabilities":
+            self._reply(200, {"models": []})
+            return
+        segments = parsed.path.split("/")
+        if len(segments) >= 5 and segments[1:3] == ["ui-api", "threads"]:
+            job = self.state.jobs.get(segments[3])
+            if job is None:
+                self._reply(404, {"error": "not_found"})
+                return
+            state = (
+                "needs_approval" if self.state.unknown_after_job == job["index"] else "completed"
+            )
+            resource = segments[4]
+            if resource == "status":
+                self._reply(
+                    200,
+                    {
+                        "thread_id": segments[3],
+                        "turn_id": job["turn_id"],
+                        "state": state,
+                    },
+                )
+            elif resource == "turns":
+                self._reply(
+                    200,
+                    {
+                        "thread_id": segments[3],
+                        "turns": [{"id": job["turn_id"], "status": state}],
+                    },
+                )
+            elif resource == "items":
+                items = []
+                if state == "completed":
+                    items = [
+                        {
+                            "turn_id": job["turn_id"],
+                            "item": {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": job["final_text"],
+                            },
+                        }
+                    ]
+                self._reply(200, {"thread_id": segments[3], "items": items})
+            else:
+                self._reply(404, {"error": "not_found"})
+            return
+        self._reply(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        self.state.requests.append((self.command, self.path))
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        self.state.posts.append(payload)
+        index = len(self.state.posts)
+        thread_id = f"thread_{index:08d}"
+        turn_id = f"turn_{index:08d}"
+        final_text = payload["prompt"].rsplit(" ", 1)[-1]
+        self.state.jobs[thread_id] = {
+            "index": index,
+            "turn_id": turn_id,
+            "final_text": final_text,
+        }
+        self._reply(
+            201,
+            {"thread_id": thread_id, "turn_id": turn_id, "state": "in_progress"},
+        )
+
+
+class _LoopbackAPIServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        del request, client_address
+
+
+@pytest.fixture
+def fake_codex_api(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CODEX_BRIDGE_CONTROL_TOKEN", _TOKEN)
+    server = _LoopbackAPIServer(("127.0.0.1", 0), _LoopbackAPIHandler)
+    server.state = _LoopbackAPIState()  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 class _Bridge:
     app_server_ready = True
     app_server_os_pid = 4567
@@ -98,6 +249,62 @@ class _FakeManager:
         return object()
 
 
+class _ImmediateDBOS:
+    workflow_id = ""
+    step_names: list[str] = []
+
+    @classmethod
+    def step(cls, *, name: str):
+        def decorate(function: Any):
+            def run(*args: Any, **kwargs: Any):
+                cls.step_names.append(name)
+                return function(*args, **kwargs)
+
+            return run
+
+        return decorate
+
+    @staticmethod
+    def sleep(seconds: float) -> None:
+        del seconds
+
+
+def _execute_three_job_worker(
+    run_dir: Path,
+    workspace: Path,
+    manifest: dict[str, Any],
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    from codex_bridge.workflows import worker
+
+    _ImmediateDBOS.workflow_id = str(manifest["workflow_id"])
+    _ImmediateDBOS.step_names = []
+    worker._named_step.cache_clear()
+    worker._durable_codex_job_step.cache_clear()
+    monkeypatch.setattr(worker, "DBOS", _ImmediateDBOS)
+    loaded_manifest, definition_text, input_data = worker.load_run_request(run_dir)
+    assert loaded_manifest == manifest
+    control = {
+        **manifest["control"],
+        "workspace_root": str(workspace.resolve()),
+        "allowed_roots": [str(workspace.parent.resolve())],
+    }
+    try:
+        return worker.execute_ows_workflow.__wrapped__(
+            definition_text,
+            manifest["definition_sha256"],
+            input_data,
+            manifest["input_sha256"],
+            str(run_dir / "task-events.jsonl"),
+            control,
+            manifest["max_tasks"],
+        )
+    finally:
+        worker._named_step.cache_clear()
+        worker._durable_codex_job_step.cache_clear()
+
+
 def _settings(root: Path, token: str | None = _TOKEN) -> BridgeConfig:
     return BridgeConfig(
         host="127.0.0.1",
@@ -121,13 +328,14 @@ def _app(
     ready: bool = True,
     workspace: Path | None = None,
     allowed_root: Path | None = None,
+    codex_bridge_port: int = 18001,
 ):
     root.mkdir(parents=True, exist_ok=True)
     workspace = workspace or root / "workspace"
     workspace.parent.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(exist_ok=True)
     manager = _FakeManager(root / "state" / "workflows", allowed_root or root)
-    service = WorkflowService(manager, codex_bridge_port=18001)
+    service = WorkflowService(manager, codex_bridge_port=codex_bridge_port)
     bridge = _Bridge()
     bridge.app_server_ready = ready
     app = create_ui_app(
@@ -291,7 +499,7 @@ async def test_startup_exception_diagnostic_preserves_http_classification_and_no
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", [True, False, None, 0, 3, "2"])
+@pytest.mark.parametrize("value", [True, False, None, 0, 4, "2"])
 async def test_invalid_two_job_limit_is_rejected_before_worker_start(
     tmp_path: Path, value: Any
 ) -> None:
@@ -308,6 +516,137 @@ async def test_invalid_two_job_limit_is_rejected_before_worker_start(
 
     assert response.status_code == 400
     assert manager.start_calls == []
+
+
+@pytest.mark.asyncio
+async def test_three_job_fixture_requires_explicit_api_limit(tmp_path: Path) -> None:
+    app, _service, manager, workspace = _app(tmp_path)
+    payload = _payload(workspace, request_id="phase5f1a-no-three-opt-in")
+    payload.update({"workflow_yaml": _three_job_yaml(), "input": _THREE_JOB_INPUT})
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert manager.start_calls == []
+    assert not manager.state_root.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_data",
+    [
+        {"issues": [{"number": index + 1, "enabled": False} for index in range(5)]},
+        {"issues": [{"number": index + 1, "enabled": True} for index in range(4)]},
+        {"issues": [{"number": 1, "enabled": True}, {"number": 1, "enabled": False}]},
+        {"issues": [{"number": 0, "enabled": True}]},
+        {"issues": [{"number": -2, "enabled": True}]},
+        {"issues": [{"number": True, "enabled": True}]},
+        {"issues": [{"number": 4, "enabled": 1}]},
+        {"issues": [{"number": 4, "enabled": True, "prompt": "unsafe"}]},
+        {"issues": [], "prompt": "unsafe"},
+        {"issues": "not-an-array"},
+    ],
+    ids=[
+        "five-items",
+        "four-enabled",
+        "duplicate-number",
+        "zero-number",
+        "negative-number",
+        "boolean-number",
+        "integer-enabled",
+        "extra-issue-key",
+        "extra-input-key",
+        "issues-not-array",
+    ],
+)
+async def test_three_job_invalid_input_is_rejected_before_run_or_codex_post(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    input_data: Any,
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f1a-invalid-input")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": input_data,
+            "max_live_codex_jobs": 3,
+        }
+    )
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert manager.start_calls == []
+    assert not manager.state_root.exists()
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+    assert fake_codex_api.state.requests == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["invalid-prompt-from", "extra-task", "extra-call", "nested-for"],
+)
+async def test_three_job_invalid_static_shape_is_rejected_before_run_or_codex_post(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    mutation: str,
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    definition = yaml.safe_load(_three_job_yaml())
+    if mutation == "invalid-prompt-from":
+        definition["do"][0]["processIssues"]["do"][1]["processIssue"]["with"]["prompt_from"] = (
+            "${ .unsafe }"
+        )
+    elif mutation == "extra-task":
+        definition["do"].append({"extra": {"set": {"value": 1}}})
+    elif mutation == "extra-call":
+        definition["do"][0]["processIssues"]["do"].append(
+            {"secondCall": {"call": "codex-job", "with": {"prompt": "unsafe"}}}
+        )
+    else:
+        definition["do"][0]["processIssues"]["do"][1]["processIssue"] = {
+            "for": {"in": "${ . }"},
+            "do": [{"nestedCall": {"call": "codex-job", "with": {"prompt": "unsafe"}}}],
+        }
+    payload = _payload(workspace, request_id=f"phase5f1a-invalid-{mutation}")
+    payload.update(
+        {
+            "workflow_yaml": yaml.safe_dump(definition, allow_unicode=True, sort_keys=False),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert manager.start_calls == []
+    assert not manager.state_root.exists()
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+    assert fake_codex_api.state.requests == []  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -585,6 +924,197 @@ def _write_worker_state(run_dir: Path, state: str) -> None:
         json.dumps({"state": state, "exit_code": 0 if state == "completed" else None}),
         encoding="utf-8",
     )
+
+
+@pytest.mark.asyncio
+async def test_three_job_loop_runs_against_fake_loopback_and_reads_back_result(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f1a-three-success")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        accepted = await client.post(_PATH, headers=headers, json=payload)
+    assert accepted.status_code == 202
+    run_dir = manager.start_calls[0][0]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    definition = json.loads((run_dir / "workflow.yaml").read_text(encoding="utf-8"))
+    input_data = json.loads((run_dir / "input.json").read_text(encoding="utf-8"))
+    assert manager.start_calls[0][1]["max_live_codex_jobs"] == 3
+    assert manifest["control"]["max_live_codex_jobs"] == 3
+    digest_payload = {
+        "workflow": definition,
+        "input": input_data,
+        "workspace_root": str(workspace.resolve()),
+        "max_live_codex_jobs": 3,
+    }
+    assert (
+        manifest["request_digest"]
+        == hashlib.sha256(_canonical_json(digest_payload).encode("utf-8")).hexdigest()
+    )
+    result = _execute_three_job_worker(
+        run_dir,
+        workspace,
+        manifest,
+        monkeypatch=monkeypatch,
+    )
+    _write_worker_state(run_dir, "completed")
+    _write_dbos_status(run_dir, manifest["workflow_id"], "SUCCESS")
+    stored_result = {
+        "workflow_id": manifest["workflow_id"],
+        "definition_sha256": manifest["definition_sha256"],
+        "input_sha256": manifest["input_sha256"],
+        "result": result,
+    }
+    (run_dir / "result.json").write_text(json.dumps(stored_result), encoding="utf-8")
+
+    jobs = CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
+        manifest["workflow_id"]
+    )
+    assert len(fake_codex_api.state.posts) == 3  # type: ignore[attr-defined]
+    assert [item["number"] for item in result] == [5, 9, 17, 21]
+    assert [item["status"] for item in result] == [
+        "skipped",
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "SUCCEEDED",
+    ]
+    assert [item["final_text"] for item in result[1:]] == ["9", "17", "21"]
+    assert [job["state"] for job in jobs] == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
+    assert [job["task_identity"] for job in jobs] == [
+        "do[0].processIssues.iteration[1].do[1].processIssue",
+        "do[0].processIssues.iteration[2].do[1].processIssue",
+        "do[0].processIssues.iteration[3].do[1].processIssue",
+    ]
+    assert _ImmediateDBOS.step_names
+    assert len(_ImmediateDBOS.step_names) == len(set(_ImmediateDBOS.step_names))
+
+    workflow_id = str(manifest["workflow_id"])
+    readback = await service.get_result(workflow_id)
+    assert readback.workflow.status == "succeeded"
+    assert readback.result == stored_result
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        detail = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        result_response = await client.get(f"{_PATH}/{workflow_id}/result", headers=headers)
+        replay = await client.post(_PATH, headers=headers, json=payload)
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "succeeded"
+    assert detail.json()["max_live_codex_jobs"] == 3
+    assert len(detail.json()["jobs"]) == 3
+    assert result_response.status_code == 200
+    assert result_response.json() == stored_result
+    assert replay.status_code == 202
+    assert replay.json()["workflow_id"] == workflow_id
+    assert len(manager.start_calls) == 1
+    assert len(fake_codex_api.state.posts) == 3  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_three_job_loop_stops_after_second_job_requires_reconciliation(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_codex_api.state.unknown_after_job = 2  # type: ignore[attr-defined]
+    app, service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f1a-three-unknown")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        accepted = await client.post(_PATH, headers=headers, json=payload)
+    run_dir = manager.start_calls[0][0]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    from codex_bridge.workflows.codex_job_adapter import CodexJobReconciliationRequiredError
+
+    with pytest.raises(CodexJobReconciliationRequiredError):
+        _execute_three_job_worker(
+            run_dir,
+            workspace,
+            manifest,
+            monkeypatch=monkeypatch,
+        )
+
+    assert accepted.status_code == 202
+    assert len(fake_codex_api.state.posts) == 2  # type: ignore[attr-defined]
+    snapshot = await service.get_workflow(str(manifest["workflow_id"]))
+    assert snapshot.status == "needs_reconciliation"
+    assert len(snapshot.jobs) == 2
+    assert [job.state for job in snapshot.jobs] == ["SUCCEEDED", "ACCEPTED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["input-hash", "request-digest", "max-live-limit"])
+async def test_three_job_worker_rechecks_saved_hashes_before_any_codex_post(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id=f"phase5f1a-tampered-{mutation}")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        accepted = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+    assert accepted.status_code == 202
+    run_dir = manager.start_calls[0][0]
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "input-hash":
+        input_data = json.loads((run_dir / "input.json").read_text(encoding="utf-8"))
+        input_data["issues"][0]["number"] = 18
+        (run_dir / "input.json").write_text(json.dumps(input_data), encoding="utf-8")
+    elif mutation == "request-digest":
+        manifest["request_digest"] = "f" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        manifest["control"]["max_live_codex_jobs"] = 3.0
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    from codex_bridge.workflows.interpreter import OwsError
+    from codex_bridge.workflows.worker import load_run_request
+
+    with pytest.raises(OwsError):
+        load_run_request(run_dir)
+
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+    assert not (run_dir / "codex_jobs.sqlite").exists()
+    assert not (run_dir / "dbos.sqlite").exists()
 
 
 @pytest.mark.asyncio
