@@ -1530,8 +1530,24 @@ def _project_three_job_run(
             jobs=jobs,
         )
 
-    if reconciliation_marker or any(job["state"] == "MAYBE_SENT" for job in records):
+    if reconciliation_marker:
         return inspection("needs_reconciliation")
+    maybe_sent_indexes = [
+        index for index, job in enumerate(records) if job["state"] == "MAYBE_SENT"
+    ]
+    if maybe_sent_indexes:
+        transient_last_maybe_sent = (
+            len(maybe_sent_indexes) == 1
+            and maybe_sent_indexes[0] == len(records) - 1
+            and 1 <= len(records) <= expected_job_count
+            and all(job["state"] == "SUCCEEDED" for job in records[:-1])
+            and worker_state == "running"
+            and result_value is None
+            and not dbos_invalid
+            and not result_invalid
+            and dbos_status not in {"SUCCESS", "SUCCEEDED", "ERROR", "CANCELLED", "FAILED"}
+        )
+        return inspection("running" if transient_last_maybe_sent else "needs_reconciliation")
     if any(job["state"] == "FAILED" for job in records) or dbos_status in {
         "ERROR",
         "CANCELLED",

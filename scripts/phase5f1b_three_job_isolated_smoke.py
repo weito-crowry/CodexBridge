@@ -34,8 +34,12 @@ r4: Any = import_module("scripts.phase5e2c2_isolated_smoke")
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "three_codex_job_loop_workflow.yaml"
 EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f1b-three-job-e2e-evidence.json"
+R1_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f1b-three-job-e2e-r1-evidence.json"
 FIXTURE_SHA256 = "a813cbdf5534039ead421c33571b44719e0576b2fe791b3fff8f5f5430a7bbb0"
 R4_FIX_COMMIT = "1e8255f1086e7fb5111450f2c5454c8f01f5d008"
+MAX_WORKFLOW_STATE_OBSERVATIONS = 32
+MAX_OBSERVED_WORKFLOWS = 8
+MAX_OBSERVED_JOBS = 8
 FIXED_INPUT: dict[str, Any] = {
     "issues": [
         {"number": 17, "enabled": True},
@@ -74,6 +78,22 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _select_evidence_path(*, retest_once: bool) -> Path:
+    initial_exists = EVIDENCE_PATH.exists() or EVIDENCE_PATH.is_symlink()
+    r1_exists = R1_EVIDENCE_PATH.exists() or R1_EVIDENCE_PATH.is_symlink()
+    if retest_once:
+        if EVIDENCE_PATH.is_symlink() or not EVIDENCE_PATH.is_file():
+            raise SmokeAbort("BLOCKED", "initial_evidence_required_for_r1")
+        if r1_exists:
+            raise SmokeAbort("BLOCKED", "r1_evidence_path_already_exists")
+        return R1_EVIDENCE_PATH
+    if initial_exists:
+        raise SmokeAbort("BLOCKED", "initial_evidence_path_already_exists")
+    if r1_exists:
+        raise SmokeAbort("BLOCKED", "r1_evidence_path_already_exists")
+    return EVIDENCE_PATH
 
 
 def load_fixed_workflow(
@@ -261,18 +281,31 @@ def _preflight_negative_cases(definition: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(rejected)
 
 
-def _existing_evidence_hashes() -> dict[str, str]:
-    names = (
+def _existing_evidence_hashes(*, require_phase5f1b_evidence: bool = False) -> dict[str, str]:
+    required_names = (
         "phase5e-0-evidence.json",
         "phase5e-2c2-evidence.json",
         "phase5e-2c2-retest-evidence.json",
         "phase5e-2c2-diagnostic-retest-evidence.json",
         "phase5e-2c2-r4-evidence.json",
     )
+    phase5f1b_names = (
+        "phase5f1b-three-job-e2e-evidence.json",
+        "phase5f1b-postmortem-addendum.json",
+    )
     hashes: dict[str, str] = {}
     try:
-        for name in names:
+        for name in required_names:
             path = REPOSITORY_ROOT / "docs" / name
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:
+                raise OSError
+            hashes[f"docs/{name}"] = _sha256(path.read_bytes())
+        for name in phase5f1b_names:
+            path = REPOSITORY_ROOT / "docs" / name
+            if not path.exists() and not path.is_symlink():
+                if require_phase5f1b_evidence:
+                    raise OSError
+                continue
             if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:
                 raise OSError
             hashes[f"docs/{name}"] = _sha256(path.read_bytes())
@@ -349,7 +382,103 @@ def _record_bridge_owner(process: subprocess.Popen[bytes]) -> dict[str, Any]:
     }
 
 
-def _counted_http_json(original: Any, counts: dict[str, int]) -> Any:
+def _bounded_observation_state(
+    value: Any, allowed: set[str], *, uppercase: bool = False
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.upper() if uppercase else value.lower()
+    if candidate in allowed:
+        return candidate
+    return "OTHER" if uppercase else "other"
+
+
+def _record_workflow_get_observation(
+    observations: dict[str, Any],
+    *,
+    route: str,
+    http_status: Any,
+    payload: Any,
+) -> None:
+    items = observations.get("items")
+    if not isinstance(items, list):
+        return
+    if len(items) >= MAX_WORKFLOW_STATE_OBSERVATIONS:
+        observations["dropped"] = min(
+            MAX_WORKFLOW_STATE_OBSERVATIONS,
+            int(observations.get("dropped", 0)) + 1,
+        )
+        return
+
+    base_route = "/ui-api/control/workflows"
+    route_path = route.split("?", 1)[0]
+    if route_path == base_route:
+        endpoint = "list"
+    elif route_path.endswith("/result"):
+        endpoint = "result"
+    elif route_path.startswith(f"{base_route}/"):
+        endpoint = "detail"
+    else:
+        endpoint = "other"
+    status_code = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+    observation: dict[str, Any] = {
+        "observed_at_utc": datetime.now(UTC).isoformat(timespec="milliseconds"),
+        "endpoint": endpoint,
+        "http_status": status_code,
+    }
+    workflow_states = {
+        "queued",
+        "starting",
+        "running",
+        "succeeded",
+        "failed",
+        "failed_to_start",
+        "needs_reconciliation",
+        "unknown",
+    }
+    worker_states = {"running", "completed", "failed", "not_started", "unknown"}
+    job_states = {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
+    if endpoint == "list":
+        workflows = payload.get("workflows") if isinstance(payload, dict) else None
+        if isinstance(workflows, list):
+            observation["workflow_count"] = len(workflows)
+            observation["workflow_statuses"] = [
+                _bounded_observation_state(
+                    item.get("status") if isinstance(item, dict) else None,
+                    workflow_states,
+                )
+                for item in workflows[:MAX_OBSERVED_WORKFLOWS]
+            ]
+            observation["truncated_workflow_count"] = max(
+                0, len(workflows) - MAX_OBSERVED_WORKFLOWS
+            )
+    elif endpoint == "detail" and isinstance(payload, dict):
+        observation["workflow_status"] = _bounded_observation_state(
+            payload.get("status"), workflow_states
+        )
+        observation["worker_state"] = _bounded_observation_state(
+            payload.get("worker_state"), worker_states
+        )
+        jobs = payload.get("jobs")
+        if isinstance(jobs, list):
+            observation["job_count"] = len(jobs)
+            observation["job_statuses"] = [
+                _bounded_observation_state(
+                    item.get("state") if isinstance(item, dict) else None,
+                    job_states,
+                    uppercase=True,
+                )
+                for item in jobs[:MAX_OBSERVED_JOBS]
+            ]
+            observation["truncated_job_count"] = max(0, len(jobs) - MAX_OBSERVED_JOBS)
+    items.append(observation)
+
+
+def _counted_http_json(
+    original: Any,
+    counts: dict[str, int],
+    observations: dict[str, Any] | None = None,
+) -> Any:
     def counted(
         ui_port: int,
         method: str,
@@ -372,7 +501,30 @@ def _counted_http_json(original: Any, counts: dict[str, int]) -> Any:
                 counts["shutdown_post"] += 1
             else:
                 counts["other_http_post"] += 1
-        return cast(tuple[int, Any], original(ui_port, method, route, *args, **kwargs))
+        try:
+            response = cast(tuple[int, Any], original(ui_port, method, route, *args, **kwargs))
+        except SmokeAbort:
+            if (
+                observations is not None
+                and normalized_method == "GET"
+                and route.startswith("/ui-api/control/workflows")
+            ):
+                _record_workflow_get_observation(
+                    observations, route=route, http_status=None, payload=None
+                )
+            raise
+        if (
+            observations is not None
+            and normalized_method == "GET"
+            and route.startswith("/ui-api/control/workflows")
+        ):
+            _record_workflow_get_observation(
+                observations,
+                route=route,
+                http_status=response[0],
+                payload=response[1],
+            )
+        return response
 
     return counted
 
@@ -630,6 +782,20 @@ def _verify_console_qt_get(
         detail_status, detail = r4._qt_get(client, detail_path, token, f"phase5f1b:{label}:detail")
         result_status, result = r4._qt_get(client, result_path, token, f"phase5f1b:{label}:result")
         evidence["http_counts"]["qt_get"] += 2
+        observations = evidence.get("workflow_state_observations")
+        if isinstance(observations, dict):
+            _record_workflow_get_observation(
+                observations,
+                route=detail_path,
+                http_status=detail_status,
+                payload=detail,
+            )
+            _record_workflow_get_observation(
+                observations,
+                route=result_path,
+                http_status=result_status,
+                payload=result,
+            )
         jobs_in_detail = detail.get("jobs") if isinstance(detail, dict) else None
         if (
             detail_status != 200
@@ -673,6 +839,29 @@ def _remove_owned_temp_root(temp_root: Path) -> bool:
         return not temp_root.exists()
     except OSError:
         return False
+
+
+def _owned_children_reaped(
+    isolated_processes: Sequence[Mapping[str, Any]],
+    stop_records: Sequence[Mapping[str, Any]],
+) -> bool:
+    process_states: dict[tuple[int, float], bool] = {}
+    for process in isolated_processes:
+        pid = process.get("pid")
+        created_at = process.get("created_at_epoch")
+        if type(pid) is int and isinstance(created_at, (int, float)):
+            process_states[(pid, float(created_at))] = False
+    for record in stop_records:
+        pid = record.get("pid")
+        created_at = record.get("created_at_epoch")
+        identity = (
+            (pid, float(created_at))
+            if type(pid) is int and isinstance(created_at, (int, float))
+            else None
+        )
+        if identity in process_states and record.get("reaped") is True:
+            process_states[identity] = True
+    return bool(process_states) and all(process_states.values())
 
 
 def _new_evidence(commit_sha: str | None) -> dict[str, Any]:
@@ -729,6 +918,7 @@ def _new_evidence(commit_sha: str | None) -> dict[str, Any]:
         "production_side_effect_count": 0,
         "production_side_effect_basis": "dedicated_loopback_config_and_isolated_state",
         "previous_evidence_sha256": {},
+        "workflow_state_observations": {"items": [], "dropped": 0},
         "cleanup": {
             "status": "NOT_RUN",
             "forced_termination": False,
@@ -738,9 +928,8 @@ def _new_evidence(commit_sha: str | None) -> dict[str, Any]:
     }
 
 
-def _run_e2e(evidence: dict[str, Any]) -> int:
+def _run_e2e(evidence: dict[str, Any], *, evidence_path: Path) -> int:
     base_environ = dict(os.environ)
-    evidence_path = EVIDENCE_PATH
     temp_root: Path | None = None
     workspace_root: Path | None = None
     state_root: Path | None = None
@@ -758,10 +947,14 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
     prompt_material: tuple[str, ...] = ()
     safe_to_stop = True
     final_success = False
-    cleanup_reaped = True
+    cleanup_reaped = False
     original_http_json = r4._http_json
     counters = evidence["http_counts"]
-    r4._http_json = _counted_http_json(original_http_json, counters)
+    r4._http_json = _counted_http_json(
+        original_http_json,
+        counters,
+        evidence["workflow_state_observations"],
+    )
     try:
         if os.name != "nt" or not sys.platform.startswith("win"):
             raise SmokeAbort("BLOCKED", "windows_native_execution_required")
@@ -769,7 +962,9 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
             raise SmokeAbort("BLOCKED", "workflow_checkout_commit_unavailable")
         if evidence_path.exists() or evidence_path.is_symlink():
             raise SmokeAbort("BLOCKED", "phase5f1b_evidence_path_already_exists")
-        old_evidence_hashes = _existing_evidence_hashes()
+        old_evidence_hashes = _existing_evidence_hashes(
+            require_phase5f1b_evidence=evidence_path == R1_EVIDENCE_PATH
+        )
         evidence["previous_evidence_sha256"] = old_evidence_hashes
         fixture_bytes = FIXTURE_PATH.read_bytes()
         evidence["fixture_raw_sha256"] = _sha256(fixture_bytes)
@@ -1129,7 +1324,14 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
             raise SmokeAbort("BLOCKED", "initial_isolated_bridge_process_identity_changed")
         r4._owned_listener_pids(process.pid, ports)
         first_stop = r4._stop_bridge(process, ui_port=ui_port, token=token)
-        process_records.append({"role": "initial", **first_stop})
+        process_records.append(
+            {
+                "role": "initial",
+                "pid": process.pid,
+                "created_at_epoch": float(bridge_owner["created_at_epoch"]),
+                **first_stop,
+            }
+        )
         cleanup_reaped = bool(first_stop.get("reaped"))
         if stderr_relay is not None:
             stderr_relay.finish_after_bridge(bridge_reaped=cleanup_reaped)
@@ -1245,7 +1447,14 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
                     if evidence.get("status") == "PASS":
                         evidence["status"] = error.status
                         evidence["reason"] = error.code
-                process_records.append({"role": "final", **stopped})
+                process_records.append(
+                    {
+                        "role": "final",
+                        "pid": process.pid,
+                        "created_at_epoch": float(owner_records[-1]["created_at_epoch"]),
+                        **stopped,
+                    }
+                )
                 cleanup_reaped = cleanup_reaped and bool(stopped.get("reaped"))
                 if (
                     evidence["live_workflow_post_attempted"]
@@ -1266,6 +1475,7 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
                 cleanup_reaped = False
                 if stderr_relay is not None:
                     stderr_relay.finish_after_bridge(bridge_reaped=False)
+        cleanup_reaped = _owned_children_reaped(evidence["isolated_processes"], process_records)
         evidence["cleanup"]["bridge_processes"] = process_records
         evidence["cleanup"]["forced_termination"] = False
         evidence["cleanup"]["owned_children_reaped"] = cleanup_reaped
@@ -1310,22 +1520,26 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the isolated Phase 5F-1B three-job E2E once")
-    parser.parse_args(argv)
-    if EVIDENCE_PATH.exists() or EVIDENCE_PATH.is_symlink():
-        print(
-            json.dumps(
-                {"phase": "5F-1B", "status": "BLOCKED", "reason": "evidence_path_already_exists"}
-            )
-        )
+    parser.add_argument(
+        "--retest-once",
+        action="store_true",
+        help="write one explicit retest to the separate R1 evidence path",
+    )
+    args = parser.parse_args(argv)
+    try:
+        evidence_path = _select_evidence_path(retest_once=args.retest_once)
+    except SmokeAbort as error:
+        print(json.dumps({"phase": "5F-1B", "status": error.status, "reason": error.code}))
         return 2
     try:
         commit_sha = _current_commit()
     except SmokeAbort:
         commit_sha = None
     evidence = _new_evidence(commit_sha)
-    status_code = _run_e2e(evidence)
+    evidence["run_attempt"] = "R1" if evidence_path == R1_EVIDENCE_PATH else "initial"
+    status_code = _run_e2e(evidence, evidence_path=evidence_path)
     try:
-        r4.claim_evidence_path(EVIDENCE_PATH, evidence)
+        r4.claim_evidence_path(evidence_path, evidence)
     except OSError:
         print(
             json.dumps({"phase": "5F-1B", "status": "BLOCKED", "reason": "evidence_write_failed"})
@@ -1337,7 +1551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "phase": evidence["phase"],
                 "status": evidence["status"],
                 "reason": evidence["reason"],
-                "evidence": "docs/phase5f1b-three-job-e2e-evidence.json",
+                "evidence": evidence_path.relative_to(REPOSITORY_ROOT).as_posix(),
                 "live_workflow_post_count": evidence["live_workflow_post_count"],
                 "same_id_replay_post_count": evidence["same_id_replay_post_count"],
                 "new_codex_job_count": evidence["new_codex_job_count"],

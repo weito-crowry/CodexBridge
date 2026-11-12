@@ -926,6 +926,52 @@ def _write_worker_state(run_dir: Path, state: str) -> None:
     )
 
 
+def _prepare_three_job_projection_rows(
+    adapter: CodexJobAdapter,
+    workflow_id: str,
+    workspace: Path,
+    states: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    task_identities = (
+        "do[0].processIssues.iteration[1].do[1].processIssue",
+        "do[0].processIssues.iteration[2].do[1].processIssue",
+        "do[0].processIssues.iteration[3].do[1].processIssue",
+    )
+    jobs: list[dict[str, Any]] = []
+    assert len(states) <= len(task_identities)
+    for index, state in enumerate(states):
+        task_identity = task_identities[index]
+        job = adapter.prepare_job(
+            workflow_id,
+            task_identity,
+            f"synthetic prompt {index + 1}",
+            workspace,
+            port=18001,
+            max_jobs_per_workflow=3,
+        )
+        jobs.append(job)
+        if state == "PREPARED":
+            continue
+        assert adapter.claim_post(job["job_id"])
+        if state == "MAYBE_SENT":
+            continue
+        adapter.mark_accepted(
+            job["job_id"],
+            f"synthetic-thread-{index + 1}",
+            f"synthetic-turn-{index + 1}",
+            "in_progress",
+        )
+        if state == "RUNNING":
+            adapter._mark_running(job["job_id"], "in_progress")
+        elif state == "SUCCEEDED":
+            adapter._mark_succeeded(job["job_id"], str((9, 17, 21)[index]))
+        elif state == "FAILED":
+            adapter._mark_failed(job["job_id"], "synthetic failure")
+        else:
+            assert state == "ACCEPTED"
+    return jobs
+
+
 @pytest.mark.asyncio
 async def test_three_job_loop_runs_against_fake_loopback_and_reads_back_result(
     tmp_path: Path,
@@ -1063,6 +1109,254 @@ async def test_three_job_loop_stops_after_second_job_requires_reconciliation(
     assert snapshot.status == "needs_reconciliation"
     assert len(snapshot.jobs) == 2
     assert [job.state for job in snapshot.jobs] == ["SUCCEEDED", "ACCEPTED"]
+
+
+@pytest.mark.asyncio
+async def test_three_job_transient_last_maybe_sent_projects_running_until_completion(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f1b-transient-maybe-sent")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        started = await client.post(_PATH, headers=headers, json=payload)
+    assert started.status_code == 202
+    workflow_id = started.json()["workflow_id"]
+    run_dir = manager.start_calls[0][0]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    jobs = _prepare_three_job_projection_rows(
+        adapter,
+        workflow_id,
+        workspace,
+        ("SUCCEEDED", "SUCCEEDED", "MAYBE_SENT"),
+    )
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        detail = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        listing = await client.get(_PATH, headers=headers)
+        assert detail.json()["status"] == "running"
+        assert [job["state"] for job in detail.json()["jobs"]] == [
+            "SUCCEEDED",
+            "SUCCEEDED",
+            "MAYBE_SENT",
+        ]
+        assert listing.json()["workflows"][0]["status"] == "running"
+
+        adapter.mark_accepted(
+            jobs[2]["job_id"], "synthetic-thread-3", "synthetic-turn-3", "in_progress"
+        )
+        accepted = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        assert accepted.json()["status"] == "running"
+        assert accepted.json()["jobs"][-1]["state"] == "ACCEPTED"
+
+        adapter._mark_running(jobs[2]["job_id"], "in_progress")
+        running = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        assert running.json()["status"] == "running"
+        assert running.json()["jobs"][-1]["state"] == "RUNNING"
+
+        adapter._mark_succeeded(jobs[2]["job_id"], "21")
+        all_jobs_succeeded = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        assert all_jobs_succeeded.json()["status"] == "running"
+
+        records = adapter.get_jobs_for_workflow(workflow_id)
+        result_value = {
+            "workflow_id": workflow_id,
+            "definition_sha256": manifest["definition_sha256"],
+            "input_sha256": manifest["input_sha256"],
+            "result": [
+                {
+                    "number": 5,
+                    "status": "skipped",
+                    "job_id": None,
+                    "request_key": None,
+                    "final_text": None,
+                },
+                *[
+                    {
+                        "number": number,
+                        "status": "SUCCEEDED",
+                        "job_id": record["job_id"],
+                        "request_key": f"{workflow_id}::{record['task_identity']}",
+                        "final_text": str(number),
+                    }
+                    for number, record in zip((9, 17, 21), records, strict=True)
+                ],
+            ],
+        }
+        (run_dir / "result.json").write_text(json.dumps(result_value), encoding="utf-8")
+        _write_dbos_status(run_dir, workflow_id, "SUCCESS")
+        _write_worker_state(run_dir, "completed")
+
+        completed = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        completed_listing = await client.get(_PATH, headers=headers)
+        result = await client.get(f"{_PATH}/{workflow_id}/result", headers=headers)
+
+    assert completed.json()["status"] == "succeeded"
+    assert completed.json()["terminal"] is True
+    assert completed_listing.json()["workflows"][0]["status"] == "succeeded"
+    assert result.status_code == 200
+    assert result.json() == result_value
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_three_job_first_maybe_sent_projects_running_before_first_acceptance(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f1b-first-maybe-sent")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        started = await client.post(_PATH, headers=headers, json=payload)
+    assert started.status_code == 202
+    workflow_id = started.json()["workflow_id"]
+    run_dir = manager.start_calls[0][0]
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    _prepare_three_job_projection_rows(adapter, workflow_id, workspace, ("MAYBE_SENT",))
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        detail = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        listing = await client.get(_PATH, headers=headers)
+
+    assert detail.json()["status"] == "running"
+    assert [job["state"] for job in detail.json()["jobs"]] == ["MAYBE_SENT"]
+    assert listing.json()["workflows"][0]["status"] == "running"
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "worker-completed",
+        "worker-failed",
+        "worker-not-started",
+        "worker-unknown",
+        "reconciliation-marker",
+        "preceding-job-incomplete",
+        "multiple-maybe-sent",
+        "dbos-invalid",
+        "dbos-success",
+        "dbos-error",
+        "result-invalid",
+        "identity-mismatch",
+    ],
+)
+async def test_three_job_maybe_sent_fail_closed_without_following_job_posts(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    scenario: str,
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id=f"phase5f1b-{scenario}")
+    payload.update(
+        {
+            "workflow_yaml": _three_job_yaml(),
+            "input": _THREE_JOB_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        started = await client.post(_PATH, headers=headers, json=payload)
+    assert started.status_code == 202
+    workflow_id = started.json()["workflow_id"]
+    run_dir = manager.start_calls[0][0]
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    states = ("SUCCEEDED", "SUCCEEDED", "MAYBE_SENT")
+    if scenario == "preceding-job-incomplete":
+        states = ("ACCEPTED", "SUCCEEDED", "MAYBE_SENT")
+    elif scenario == "multiple-maybe-sent":
+        states = ("MAYBE_SENT", "SUCCEEDED", "MAYBE_SENT")
+    jobs = _prepare_three_job_projection_rows(adapter, workflow_id, workspace, states)
+
+    if scenario == "worker-completed":
+        _write_worker_state(run_dir, "completed")
+    elif scenario == "worker-failed":
+        _write_worker_state(run_dir, "failed")
+    elif scenario == "worker-not-started":
+        (run_dir / "worker-entry-status.json").unlink()
+    elif scenario == "worker-unknown":
+        (run_dir / "worker-entry-status.json").write_text(
+            json.dumps({"state": "unknown"}), encoding="utf-8"
+        )
+    elif scenario == "reconciliation-marker":
+        adapter.mark_reconciliation(jobs[-1]["job_id"], "synthetic reconciliation marker")
+    elif scenario == "dbos-invalid":
+        (run_dir / "dbos.sqlite").write_text("invalid sqlite", encoding="utf-8")
+    elif scenario in {"dbos-success", "dbos-error"}:
+        _write_dbos_status(run_dir, workflow_id, scenario.removeprefix("dbos-").upper())
+    elif scenario == "result-invalid":
+        (run_dir / "result.json").write_text("{", encoding="utf-8")
+    elif scenario == "identity-mismatch":
+        with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+            connection.execute(
+                "UPDATE jobs SET workflow_id = ? WHERE job_id = ?",
+                (str(uuid.uuid4()), jobs[-1]["job_id"]),
+            )
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        detail = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "needs_reconciliation"
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_single_job_maybe_sent_remains_needs_reconciliation(tmp_path: Path) -> None:
+    app, _service, manager, workspace = _app(tmp_path)
+    payload = _payload(workspace, request_id="phase5f1b-single-maybe-sent")
+    payload["workflow_yaml"] = _SINGLE_YAML
+    payload.pop("max_live_codex_jobs", None)
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        started = await client.post(_PATH, headers=headers, json=payload)
+    assert started.status_code == 202
+    workflow_id = started.json()["workflow_id"]
+    run_dir = manager.start_calls[0][0]
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    job = adapter.prepare_job(
+        workflow_id,
+        "do[0].answer",
+        "synthetic prompt",
+        workspace,
+        port=18001,
+        max_jobs_per_workflow=1,
+    )
+    assert adapter.claim_post(job["job_id"])
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        detail = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "needs_reconciliation"
 
 
 @pytest.mark.asyncio

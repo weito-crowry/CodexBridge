@@ -182,3 +182,241 @@ def test_event_order_rejects_unknown_states_and_invalid_transitions(smoke: Modul
     for invalid_events in (unknown_state, invalid_transition):
         with pytest.raises(smoke.SmokeAbort):
             smoke.validate_job_event_order(invalid_events, jobs)
+
+
+def test_r1_evidence_path_is_separate_and_requires_an_explicit_retest(
+    smoke: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_path = tmp_path / "phase5f1b-three-job-e2e-evidence.json"
+    r1_path = tmp_path / "phase5f1b-three-job-e2e-r1-evidence.json"
+    monkeypatch.setattr(smoke, "EVIDENCE_PATH", initial_path)
+    monkeypatch.setattr(smoke, "R1_EVIDENCE_PATH", r1_path)
+
+    assert smoke._select_evidence_path(retest_once=False) == initial_path
+    with pytest.raises(smoke.SmokeAbort):
+        smoke._select_evidence_path(retest_once=True)
+
+    initial_path.write_text("original evidence", encoding="utf-8")
+    assert smoke._select_evidence_path(retest_once=True) == r1_path
+    with pytest.raises(smoke.SmokeAbort):
+        smoke._select_evidence_path(retest_once=False)
+
+    r1_path.write_text("first R1 evidence", encoding="utf-8")
+    with pytest.raises(smoke.SmokeAbort):
+        smoke._select_evidence_path(retest_once=True)
+    initial_path.unlink()
+    with pytest.raises(smoke.SmokeAbort):
+        smoke._select_evidence_path(retest_once=False)
+    assert not initial_path.exists()
+    assert r1_path.read_text(encoding="utf-8") == "first R1 evidence"
+
+
+def test_r1_workflow_get_observations_are_bounded_and_redacted(smoke: ModuleType) -> None:
+    token = "secret-token-value"
+    prompt = "private prompt body"
+    payload = {
+        "status": "running",
+        "worker_state": "running",
+        "jobs": [
+            {"state": "SUCCEEDED", "prompt": prompt},
+            {"state": "MAYBE_SENT", "prompt": prompt},
+        ],
+        "result": {"final_text": prompt},
+    }
+    counters = {
+        "http_get": 0,
+        "workflow_http_get": 0,
+        "other_http_get": 0,
+        "qt_get": 0,
+        "http_post": 0,
+        "workflow_post": 0,
+        "shutdown_post": 0,
+        "other_http_post": 0,
+    }
+    observations = {"items": [], "dropped": 0}
+    wrapped = smoke._counted_http_json(
+        lambda *_args, **_kwargs: (200, payload), counters, observations
+    )
+
+    for _ in range(smoke.MAX_WORKFLOW_STATE_OBSERVATIONS + 2):
+        status, response = wrapped(
+            12345,
+            "GET",
+            "/ui-api/control/workflows/private-workflow-id",
+            token=token,
+        )
+        assert status == 200
+        assert response is payload
+
+    assert counters["http_get"] == smoke.MAX_WORKFLOW_STATE_OBSERVATIONS + 2
+    assert counters["workflow_http_get"] == smoke.MAX_WORKFLOW_STATE_OBSERVATIONS + 2
+    assert len(observations["items"]) == smoke.MAX_WORKFLOW_STATE_OBSERVATIONS
+    assert observations["dropped"] == 2
+    first = observations["items"][0]
+    assert first["endpoint"] == "detail"
+    assert first["http_status"] == 200
+    assert first["workflow_status"] == "running"
+    assert first["worker_state"] == "running"
+    assert first["job_statuses"] == ["SUCCEEDED", "MAYBE_SENT"]
+    encoded = json.dumps(observations)
+    assert token not in encoded
+    assert prompt not in encoded
+    assert "private-workflow-id" not in encoded
+
+
+def test_r1_workflow_listing_observation_keeps_only_bounded_statuses(
+    smoke: ModuleType,
+) -> None:
+    counters = {"http_get": 0, "workflow_http_get": 0, "other_http_get": 0}
+    observations = {"items": [], "dropped": 0}
+    payload = {
+        "workflows": [
+            {"workflow_id": "private-workflow-id", "status": "needs_reconciliation"},
+            {"workflow_id": "another-id", "status": "running"},
+        ]
+    }
+    wrapped = smoke._counted_http_json(
+        lambda *_args, **_kwargs: (200, payload), counters, observations
+    )
+
+    wrapped(12345, "GET", "/ui-api/control/workflows?limit=50", token="secret-token")
+
+    assert len(observations["items"]) == 1
+    item = observations["items"][0]
+    assert item["observed_at_utc"].endswith("+00:00")
+    assert item["endpoint"] == "list"
+    assert item["http_status"] == 200
+    assert item["workflow_count"] == 2
+    assert item["workflow_statuses"] == ["needs_reconciliation", "running"]
+    assert item["truncated_workflow_count"] == 0
+    serialized = json.dumps(observations)
+    assert "private-workflow-id" not in serialized
+    assert "secret-token" not in serialized
+
+
+def test_main_blocks_existing_initial_or_r1_evidence_without_running_e2e(
+    smoke: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    initial_path = tmp_path / "phase5f1b-three-job-e2e-evidence.json"
+    r1_path = tmp_path / "phase5f1b-three-job-e2e-r1-evidence.json"
+    initial_path.write_text("original evidence", encoding="utf-8")
+    r1_path.write_text("first R1 evidence", encoding="utf-8")
+    monkeypatch.setattr(smoke, "EVIDENCE_PATH", initial_path)
+    monkeypatch.setattr(smoke, "R1_EVIDENCE_PATH", r1_path)
+    monkeypatch.setattr(
+        smoke,
+        "_run_e2e",
+        lambda *_args, **_kwargs: pytest.fail("the live E2E runner must not start"),
+    )
+
+    assert smoke.main([]) == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "BLOCKED"
+    assert smoke.main(["--retest-once"]) == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "BLOCKED"
+    assert initial_path.read_text(encoding="utf-8") == "original evidence"
+    assert r1_path.read_text(encoding="utf-8") == "first R1 evidence"
+
+
+def test_r1_preflight_hashes_initial_and_postmortem_evidence(
+    smoke: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(smoke, "REPOSITORY_ROOT", tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    names = {
+        "phase5e-0-evidence.json",
+        "phase5e-2c2-evidence.json",
+        "phase5e-2c2-retest-evidence.json",
+        "phase5e-2c2-diagnostic-retest-evidence.json",
+        "phase5e-2c2-r4-evidence.json",
+        "phase5f1b-three-job-e2e-evidence.json",
+        "phase5f1b-postmortem-addendum.json",
+    }
+    for name in names:
+        (docs / name).write_text(name, encoding="utf-8")
+
+    hashes = smoke._existing_evidence_hashes()
+
+    assert set(hashes) == {f"docs/{name}" for name in names}
+
+
+def test_r1_preflight_requires_both_initial_and_postmortem_evidence(
+    smoke: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(smoke, "REPOSITORY_ROOT", tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    required_names = (
+        "phase5e-0-evidence.json",
+        "phase5e-2c2-evidence.json",
+        "phase5e-2c2-retest-evidence.json",
+        "phase5e-2c2-diagnostic-retest-evidence.json",
+        "phase5e-2c2-r4-evidence.json",
+        "phase5f1b-three-job-e2e-evidence.json",
+    )
+    for name in required_names:
+        (docs / name).write_text(name, encoding="utf-8")
+
+    with pytest.raises(smoke.SmokeAbort):
+        smoke._existing_evidence_hashes(require_phase5f1b_evidence=True)
+
+    addendum = docs / "phase5f1b-postmortem-addendum.json"
+    addendum.write_text("postmortem evidence", encoding="utf-8")
+    hashes = smoke._existing_evidence_hashes(require_phase5f1b_evidence=True)
+
+    assert "docs/phase5f1b-three-job-e2e-evidence.json" in hashes
+    assert "docs/phase5f1b-postmortem-addendum.json" in hashes
+
+
+def test_cleanup_reports_reaped_only_for_known_process_identities(
+    smoke: ModuleType,
+) -> None:
+    initial = {"pid": 1234, "created_at_epoch": 1794482814.016682}
+    restart = {"pid": 4400, "created_at_epoch": 1794483000.0}
+
+    assert smoke._owned_children_reaped([], []) is False
+    assert smoke._owned_children_reaped([initial], []) is False
+    assert (
+        smoke._owned_children_reaped(
+            [initial],
+            [
+                {
+                    "pid": initial["pid"],
+                    "created_at_epoch": initial["created_at_epoch"],
+                    "reaped": False,
+                }
+            ],
+        )
+        is False
+    )
+    assert smoke._owned_children_reaped(
+        [initial],
+        [{"pid": initial["pid"], "created_at_epoch": initial["created_at_epoch"], "reaped": True}],
+    )
+    assert (
+        smoke._owned_children_reaped(
+            [initial, restart],
+            [
+                {
+                    "pid": initial["pid"],
+                    "created_at_epoch": initial["created_at_epoch"],
+                    "reaped": True,
+                },
+                {
+                    "pid": restart["pid"],
+                    "created_at_epoch": restart["created_at_epoch"],
+                    "reaped": False,
+                },
+            ],
+        )
+        is False
+    )
