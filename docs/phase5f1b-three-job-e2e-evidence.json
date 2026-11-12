@@ -1,0 +1,151 @@
+{
+  "checks": {
+    "bridge_owner_readiness_and_authentication": {
+      "appserver_ready": true,
+      "capabilities_authenticated": true,
+      "incorrect_token_rejected": true,
+      "missing_token_rejected": true,
+      "owner_matches_current_user": true,
+      "ports_owned_by_bridge": true,
+      "process_identity_matches": true,
+      "status": "PASS"
+    },
+    "bridge_restart_get_readback": {
+      "status": "NOT_RUN"
+    },
+    "console_qt_get_readback": {
+      "status": "NOT_RUN"
+    },
+    "dedicated_loopback_ports": {
+      "loopback_only": true,
+      "production_ports_avoided": true,
+      "status": "PASS"
+    },
+    "existing_evidence_unchanged": {
+      "status": "NOT_RUN"
+    },
+    "expected_result_and_final_texts": {
+      "status": "NOT_RUN"
+    },
+    "fixture_and_negative_preflight": {
+      "enabled_jobs": 3,
+      "negative_cases_rejected": [
+        "five_issues",
+        "four_enabled",
+        "duplicate_number",
+        "wrong_type",
+        "extra_task"
+      ],
+      "status": "PASS"
+    },
+    "immutable_hashes_and_v2_ledger": {
+      "status": "NOT_RUN"
+    },
+    "isolated_environment_and_roots": {
+      "allowlist_is_workspace_only": true,
+      "auth_copied_to_isolated_home": true,
+      "github_mcp_disabled": true,
+      "state_and_workspace_separate": true,
+      "status": "PASS",
+      "workspace_new_and_empty": true
+    },
+    "native_windows": {
+      "platform": "windows_native",
+      "status": "PASS"
+    },
+    "production_side_effects": {
+      "basis": "dedicated_loopback_config_and_isolated_state",
+      "count": 0,
+      "status": "PASS"
+    },
+    "r4_transient_history_recheck": {
+      "commit": "1e8255f1086e7fb5111450f2c5454c8f01f5d008",
+      "status": "PASS"
+    },
+    "same_id_replay": {
+      "status": "NOT_RUN"
+    },
+    "sequential_dispatch_and_concurrency": {
+      "status": "NOT_RUN"
+    },
+    "single_live_workflow_post": {
+      "status": "NOT_RUN"
+    },
+    "workflow_api_identity_and_jobs": {
+      "status": "NOT_RUN"
+    }
+  },
+  "cleanup": {
+    "bridge_processes": [],
+    "forced_termination": false,
+    "isolated_root_label": "codexbridge-phase5f1b-pye1ydvp",
+    "isolated_temp_state_removed": false,
+    "owned_children_reaped": true,
+    "status": "PRESERVED_ACTIVE_OR_UNKNOWN"
+  },
+  "commit_sha": "30f15b365ebd766877919c84ab3e617de6e2f1b4",
+  "finished_at_utc": "2026-11-12T11:27:07+00:00",
+  "fixture_path": "poc/ows/fixtures/three_codex_job_loop_workflow.yaml",
+  "fixture_raw_sha256": "023f2697eb2d4407113b2a8c6901a07e9303358177a1014910d60dc1aa2a2300",
+  "fixture_sha256": "a813cbdf5534039ead421c33571b44719e0576b2fe791b3fff8f5f5430a7bbb0",
+  "http_counts": {
+    "http_get": 15,
+    "http_post": 1,
+    "other_http_get": 6,
+    "other_http_post": 0,
+    "qt_get": 0,
+    "shutdown_post": 0,
+    "workflow_http_get": 9,
+    "workflow_post": 1
+  },
+  "input_sha256": "882bbc49818597ba4de691c461983aff711e51d560173dd9aea8a6f2b4c095a8",
+  "isolated_processes": [
+    {
+      "created_at_epoch": 1794482814.016682,
+      "created_at_utc": "2026-11-12T11:26:54+00:00",
+      "identity_verified": true,
+      "owner_matches_current_user": true,
+      "pid": 3584,
+      "role": "initial"
+    }
+  ],
+  "jobs": [],
+  "live_workflow_post_attempted": true,
+  "live_workflow_post_count": 1,
+  "maximum_active_codex_jobs": null,
+  "new_codex_job_count": null,
+  "new_codex_thread_count": null,
+  "phase": "5F-1B",
+  "ports": {
+    "loopback_only": true,
+    "mcp": 50247,
+    "ui": 50248
+  },
+  "previous_evidence_sha256": {
+    "docs/phase5e-0-evidence.json": "ef8606f3929b138cdc5d9618e53b275d4206f8c623b22ef1c9dc7c20fb80a4bf",
+    "docs/phase5e-2c2-diagnostic-retest-evidence.json": "ede76c2334f362765ff136619f9a393fd592bb514ab9b707374598a5bd4152b5",
+    "docs/phase5e-2c2-evidence.json": "0644f26e79828a6da4644cd5fe49a34eb876fda9cc4ece8a9cd4f7aa85742662",
+    "docs/phase5e-2c2-r4-evidence.json": "9fc47e74ea21854af1a8e1157da72496f5a5cf30480880a713ca4497fd311742",
+    "docs/phase5e-2c2-retest-evidence.json": "06d804d8141b2a7cce8494170687c221c118575ac2a8058f2a16d73a6abaa459"
+  },
+  "production_side_effect_basis": "dedicated_loopback_config_and_isolated_state",
+  "production_side_effect_count": 0,
+  "reason": "workflow_api_requires_reconciliation",
+  "same_id_replay_post_attempted": false,
+  "same_id_replay_post_count": 0,
+  "started_at_utc": "2026-11-12T11:26:53+00:00",
+  "status": "BLOCKED",
+  "workflow": {
+    "accepted_status": 202,
+    "client_request_id": "phase5f1b-5d58e9b140b24127894de7fdbef70c04",
+    "max_live_codex_jobs": 3,
+    "request_body_sha256": "c78b3e6c855813dcba9cd992cce528ed9c3ed6dc9b41018fd0ae234a628065cc",
+    "run_id": "run-74c6860d38f142e5a9cba862aa43eeb8",
+    "workflow_id": "584577db-cc80-4df6-adaf-e699ba846aee",
+    "workflow_yaml_sha256": "a813cbdf5534039ead421c33571b44719e0576b2fe791b3fff8f5f5430a7bbb0",
+    "workspace_preflight": {
+      "allowed_root_isolated_workspace": true,
+      "workspace_exists": true
+    }
+  }
+}
