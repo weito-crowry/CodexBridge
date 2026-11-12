@@ -7,6 +7,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -70,12 +71,30 @@ def _three_job_yaml() -> str:
     return fixture.read_text(encoding="utf-8")
 
 
+def _three_item_yaml() -> str:
+    fixture = (
+        Path(__file__).parents[1]
+        / "poc"
+        / "ows"
+        / "fixtures"
+        / "conditional_items_codex_workflow.yaml"
+    )
+    return fixture.read_text(encoding="utf-8")
+
+
 _THREE_JOB_INPUT = {
     "issues": [
         {"number": 17, "enabled": True},
         {"number": 5, "enabled": False},
         {"number": 9, "enabled": True},
         {"number": 21, "enabled": True},
+    ]
+}
+_THREE_ITEM_INPUT = {
+    "items": [
+        {"id": "gamma", "enabled": True, "prompt": "reply gamma"},
+        {"id": "beta", "enabled": False, "prompt": "reply beta"},
+        {"id": "alpha", "enabled": True, "prompt": "reply alpha"},
     ]
 }
 
@@ -267,6 +286,90 @@ class _ImmediateDBOS:
     @staticmethod
     def sleep(seconds: float) -> None:
         del seconds
+
+
+def _execute_three_item_worker_entrypoint(
+    run_dir: Path,
+    workspace: Path,
+    manifest: dict[str, Any],
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    from types import SimpleNamespace
+
+    from codex_bridge.workflows import worker
+
+    class _EntrypointDBOS(_ImmediateDBOS):
+        result: Any = None
+
+        def __init__(self, *, config: Any) -> None:
+            del config
+
+        @classmethod
+        def launch(cls) -> None:
+            return None
+
+        @classmethod
+        def start_workflow(cls, workflow_function: Any, *args: Any) -> Any:
+            runner = getattr(workflow_function, "__wrapped__", workflow_function)
+            cls.result = runner(*args)
+            return SimpleNamespace(workflow_id=cls.workflow_id)
+
+        @classmethod
+        def destroy(cls) -> None:
+            return None
+
+    class _SetWorkflowID:
+        def __init__(self, workflow_id: str) -> None:
+            self.workflow_id = workflow_id
+
+        def __enter__(self) -> None:
+            _EntrypointDBOS.workflow_id = self.workflow_id
+
+        def __exit__(self, *_args: Any) -> bool:
+            return False
+
+    _EntrypointDBOS.workflow_id = str(manifest["workflow_id"])
+    _EntrypointDBOS.step_names = []
+    _EntrypointDBOS.result = None
+    worker._named_step.cache_clear()
+    worker._durable_codex_job_step.cache_clear()
+    monkeypatch.setattr(worker, "DBOS", _EntrypointDBOS)
+    monkeypatch.setattr(worker, "SetWorkflowID", _SetWorkflowID)
+    monkeypatch.setattr(
+        worker,
+        "get_process_identity",
+        lambda pid: {
+            "active": True,
+            "pid": pid,
+            "parent_pid": 1,
+            "creation_time_100ns": 1,
+            "image_path": "C:\\test\\python.exe",
+        },
+    )
+    monkeypatch.setattr(
+        worker,
+        "_wait_for_result",
+        lambda *_args, **_kwargs: _EntrypointDBOS.result,
+    )
+    try:
+        exit_code = worker.main(
+            [
+                "--mode",
+                "start",
+                "--run-dir",
+                str(run_dir),
+                "--workspace-root",
+                str(workspace),
+                "--allowed-root",
+                str(workspace.parent),
+            ]
+        )
+        assert exit_code == 0
+        return json.loads((run_dir / "result.json").read_text(encoding="utf-8"))["result"]
+    finally:
+        worker._named_step.cache_clear()
+        worker._durable_codex_job_step.cache_clear()
 
 
 def _execute_three_job_worker(
@@ -1066,6 +1169,325 @@ async def test_three_job_loop_runs_against_fake_loopback_and_reads_back_result(
     assert replay.json()["workflow_id"] == workflow_id
     assert len(manager.start_calls) == 1
     assert len(fake_codex_api.state.posts) == 3  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_three_item_workflow_posts_sequentially_and_reads_back_aggregated_result(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f3-items-success")
+    payload.update(
+        {
+            "workflow_yaml": _three_item_yaml(),
+            "input": _THREE_ITEM_INPUT,
+            "max_live_codex_jobs": 3,
+        }
+    )
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        accepted = await client.post(_PATH, headers=headers, json=payload)
+    assert accepted.status_code == 202
+    run_dir = manager.start_calls[0][0]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    result = _execute_three_item_worker_entrypoint(
+        run_dir,
+        workspace,
+        manifest,
+        monkeypatch=monkeypatch,
+    )
+    _write_worker_state(run_dir, "completed")
+    _write_dbos_status(run_dir, manifest["workflow_id"], "SUCCESS")
+    stored_result = {
+        "workflow_id": manifest["workflow_id"],
+        "definition_sha256": manifest["definition_sha256"],
+        "input_sha256": manifest["input_sha256"],
+        "result": result,
+    }
+    assert json.loads((run_dir / "result.json").read_text(encoding="utf-8")) == stored_result
+
+    jobs = CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
+        manifest["workflow_id"]
+    )
+    assert [post["prompt"] for post in fake_codex_api.state.posts] == [
+        "reply gamma",
+        "reply alpha",
+    ]  # type: ignore[attr-defined]
+    assert [job["task_identity"] for job in jobs] == [
+        "do[0].processItems.iteration[0].do[1].processItem",
+        "do[0].processItems.iteration[2].do[1].processItem",
+    ]
+    assert result == {
+        "results": [
+            {
+                "id": "gamma",
+                "status": "SUCCEEDED",
+                "job_id": jobs[0]["job_id"],
+                "request_key": f"{manifest['workflow_id']}::{jobs[0]['task_identity']}",
+                "final_text": "gamma",
+            },
+            {
+                "id": "beta",
+                "status": "skipped",
+                "job_id": None,
+                "request_key": None,
+                "final_text": None,
+            },
+            {
+                "id": "alpha",
+                "status": "SUCCEEDED",
+                "job_id": jobs[1]["job_id"],
+                "request_key": f"{manifest['workflow_id']}::{jobs[1]['task_identity']}",
+                "final_text": "alpha",
+            },
+        ],
+        "summary": {"total": 3, "succeeded": 2, "skipped": 1},
+    }
+
+    workflow_id = str(manifest["workflow_id"])
+    readback = await service.get_result(workflow_id)
+    assert readback.workflow.status == "succeeded"
+    assert readback.result == stored_result
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        detail = await client.get(f"{_PATH}/{workflow_id}", headers=headers)
+        result_response = await client.get(f"{_PATH}/{workflow_id}/result", headers=headers)
+        replay = await client.post(_PATH, headers=headers, json=payload)
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "succeeded"
+    assert detail.json()["max_live_codex_jobs"] == 3
+    assert len(detail.json()["jobs"]) == 2
+    assert result_response.status_code == 200
+    assert result_response.json() == stored_result
+    assert replay.status_code == 202
+    assert replay.json()["workflow_id"] == workflow_id
+    assert len(manager.start_calls) == 1
+    assert len(fake_codex_api.state.posts) == 2  # type: ignore[attr-defined]
+
+    assert (run_dir / "bridge-lifecycle.jsonl").exists()
+    assert (run_dir / "worker-lifecycle.jsonl").exists()
+    for log_name in ("bridge-lifecycle.jsonl", "worker-lifecycle.jsonl"):
+        log_path = run_dir / log_name
+        if log_path.exists():
+            log_text = log_path.read_text(encoding="utf-8")
+            assert "reply gamma" not in log_text
+            assert "reply beta" not in log_text
+            assert "reply alpha" not in log_text
+            assert '"final_text":"gamma"' not in log_text
+            assert '"final_text":"alpha"' not in log_text
+
+
+def _three_item_projection_fixture() -> tuple[Any, tuple[dict[str, Any], ...], dict[str, Any]]:
+    workflow_id = "12345678-1234-1234-1234-123456789abc"
+    identities = (
+        "do[0].processItems.iteration[0].do[1].processItem",
+        "do[0].processItems.iteration[2].do[1].processItem",
+    )
+    records = tuple(
+        {
+            "state": "SUCCEEDED",
+            "job_id": f"job-{item_id}",
+            "task_identity": identity,
+            "receipt": {"result": {"final_text": f"{item_id} answer"}},
+        }
+        for item_id, identity in zip(("gamma", "alpha"), identities, strict=True)
+    )
+    result_value = {
+        "workflow_id": workflow_id,
+        "definition_sha256": "a" * 64,
+        "input_sha256": "b" * 64,
+        "result": {
+            "results": [
+                {
+                    "id": "gamma",
+                    "status": "SUCCEEDED",
+                    "job_id": "job-gamma",
+                    "request_key": f"{workflow_id}::{identities[0]}",
+                    "final_text": "gamma answer",
+                },
+                {
+                    "id": "beta",
+                    "status": "skipped",
+                    "job_id": None,
+                    "request_key": None,
+                    "final_text": None,
+                },
+                {
+                    "id": "alpha",
+                    "status": "SUCCEEDED",
+                    "job_id": "job-alpha",
+                    "request_key": f"{workflow_id}::{identities[1]}",
+                    "final_text": "alpha answer",
+                },
+            ],
+            "summary": {"total": 3, "succeeded": 2, "skipped": 1},
+        },
+    }
+    return SimpleNamespace(workflow_id=workflow_id), records, result_value
+
+
+def test_three_item_result_projection_matches_receipts_and_exact_aggregate() -> None:
+    from codex_bridge.workflows.service import _three_job_result_matches
+
+    row, records, result_value = _three_item_projection_fixture()
+
+    assert _three_job_result_matches(
+        row,
+        records,
+        _THREE_ITEM_INPUT,
+        result_value,
+        input_kind="items",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda result: result["result"]["summary"].update({"total": 2}),
+        lambda result: result["result"]["summary"].update({"succeeded": True}),
+        lambda result: result["result"]["summary"].update({"skipped": 0}),
+        lambda result: result["result"]["summary"].update({"extra": 1}),
+        lambda result: result["result"]["results"][0].update({"id": "alpha"}),
+        lambda result: result["result"]["results"][0].update({"job_id": "wrong"}),
+        lambda result: result["result"]["results"][0].update({"request_key": "wrong"}),
+        lambda result: result["result"]["results"][0].update({"final_text": "tampered"}),
+        lambda result: result["result"]["results"][0].update({"unexpected": "value"}),
+        lambda result: result["result"]["results"].reverse(),
+        lambda result: result.update({"unexpected": "value"}),
+        lambda result: result.update({"workflow_id": "87654321-4321-4321-4321-cba987654321"}),
+    ],
+    ids=[
+        "summary-total",
+        "summary-type",
+        "summary-skipped",
+        "summary-extra-key",
+        "row-id",
+        "job-id",
+        "request-key",
+        "final-text",
+        "row-extra-key",
+        "row-order",
+        "envelope-extra-key",
+        "envelope-workflow-id",
+    ],
+)
+def test_three_item_result_projection_rejects_tampered_rows_and_summary(
+    mutation: Any,
+) -> None:
+    from codex_bridge.workflows.service import _three_job_result_matches
+
+    row, records, result_value = _three_item_projection_fixture()
+    tampered = json.loads(json.dumps(result_value))
+    mutation(tampered)
+
+    assert not _three_job_result_matches(
+        row,
+        records,
+        _THREE_ITEM_INPUT,
+        tampered,
+        input_kind="items",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "input_data"),
+    [
+        (_three_job_yaml(), _THREE_ITEM_INPUT),
+        (_three_item_yaml(), _THREE_JOB_INPUT),
+    ],
+    ids=["issues-template-with-items-input", "items-template-with-issues-input"],
+)
+async def test_three_job_template_rejects_the_other_input_contract_before_start(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    workflow_yaml: str,
+    input_data: dict[str, Any],
+) -> None:
+    app, _service, manager, _workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(_workspace, request_id="phase5f3-mixed-contract")
+    payload.update(
+        {
+            "workflow_yaml": workflow_yaml,
+            "input": input_data,
+            "max_live_codex_jobs": 3,
+        }
+    )
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert manager.start_calls == []
+    assert not manager.state_root.exists()
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_data",
+    [
+        {
+            "items": [
+                {"id": "duplicate", "enabled": True, "prompt": "one"},
+                {"id": "duplicate", "enabled": False, "prompt": "two"},
+            ]
+        },
+        {"items": [{"id": str(index), "enabled": True, "prompt": "prompt"} for index in range(4)]},
+        {"items": [{"id": "disabled", "enabled": False, "prompt": "  \t"}]},
+        {"items": [{"id": "x", "enabled": True, "prompt": "p" * (16 * 1024 + 1)}]},
+        {"items": [{"id": "x", "enabled": True, "prompt": "safe", "extra": True}]},
+    ],
+    ids=[
+        "duplicate-id",
+        "four-enabled",
+        "disabled-prompt-required",
+        "prompt-too-long",
+        "extra-key",
+    ],
+)
+async def test_three_item_invalid_input_is_rejected_before_run_or_codex_post(
+    tmp_path: Path,
+    fake_codex_api: _LoopbackAPIServer,
+    input_data: dict[str, Any],
+) -> None:
+    app, _service, manager, workspace = _app(
+        tmp_path,
+        codex_bridge_port=fake_codex_api.server_address[1],
+    )
+    payload = _payload(workspace, request_id="phase5f3-items-invalid")
+    payload.update(
+        {
+            "workflow_yaml": _three_item_yaml(),
+            "input": input_data,
+            "max_live_codex_jobs": 3,
+        }
+    )
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.post(
+            _PATH,
+            headers={"authorization": f"Bearer {_TOKEN}"},
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert manager.start_calls == []
+    assert not manager.state_root.exists()
+    assert fake_codex_api.state.posts == []  # type: ignore[attr-defined]
+    assert fake_codex_api.state.requests == []  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

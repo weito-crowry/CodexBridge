@@ -145,6 +145,7 @@ def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
         bridge_port = control.get("codex_bridge_port")
         from .interpreter import (
             parse_workflow_text,
+            three_live_codex_job_input_kind,
             validate_three_live_codex_job_input,
             validate_workflow,
         )
@@ -173,7 +174,8 @@ def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
             raise OwsError("three-job workflow manifest control is invalid")
         definition = parse_workflow_text(definition_text)
         validate_workflow(definition, codex_job_live=True, max_live_codex_jobs=3)
-        validate_three_live_codex_job_input(input_data)
+        input_kind = three_live_codex_job_input_kind(definition)
+        validate_three_live_codex_job_input(input_data, input_kind=input_kind)
         workspace_root = manifest.get("workspace_root")
         if not isinstance(workspace_root, str) or not Path(workspace_root).is_absolute():
             raise OwsError("three-job workflow manifest workspace is invalid")
@@ -846,9 +848,13 @@ def execute_ows_workflow(
         max_live_codex_jobs=max_live_codex_jobs,
     )
     if max_live_codex_jobs == 3:
-        from .interpreter import validate_three_live_codex_job_input
+        from .interpreter import (
+            three_live_codex_job_input_kind,
+            validate_three_live_codex_job_input,
+        )
 
-        validate_three_live_codex_job_input(input_data)
+        input_kind = three_live_codex_job_input_kind(definition)
+        validate_three_live_codex_job_input(input_data, input_kind=input_kind)
 
     def run_named_step(
         identity: str,

@@ -662,6 +662,7 @@ class WorkflowService:
         from .interpreter import (
             OwsError,
             parse_workflow_text,
+            three_live_codex_job_input_kind,
             validate_three_live_codex_job_input,
             validate_workflow,
         )
@@ -675,7 +676,8 @@ class WorkflowService:
                     max_live_codex_jobs=max_live_codex_jobs,
                 )
             if max_live_codex_jobs == 3:
-                validate_three_live_codex_job_input(input_data)
+                input_kind = three_live_codex_job_input_kind(definition)
+                validate_three_live_codex_job_input(input_data, input_kind=input_kind)
             definition_text = _canonical_json(definition)
             input_text = _canonical_json(input_data)
         except (OwsError, TypeError, ValueError, RecursionError):
@@ -726,6 +728,7 @@ class WorkflowService:
     def _validate_prepared_request(prepared: _PreparedRequest) -> None:
         from .interpreter import (
             OwsError,
+            three_live_codex_job_input_kind,
             validate_three_live_codex_job_input,
             validate_workflow,
         )
@@ -738,7 +741,8 @@ class WorkflowService:
                 max_live_codex_jobs=prepared.max_live_codex_jobs,
             )
             if prepared.max_live_codex_jobs == 3:
-                validate_three_live_codex_job_input(prepared.input_data)
+                input_kind = three_live_codex_job_input_kind(definition)
+                validate_three_live_codex_job_input(prepared.input_data, input_kind=input_kind)
         except (OwsError, TypeError, ValueError, RecursionError):
             raise WorkflowRequestError("workflow YAML or input is invalid") from None
 
@@ -1185,9 +1189,11 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
         )
         definition = _strict_json(definition_text.encode("utf-8"))
         expected_task_identities: tuple[str, ...] = ()
+        three_job_input_kind = "issues"
         if max_live_codex_jobs in {2, 3}:
             from .interpreter import (
                 OwsError,
+                three_live_codex_job_input_kind,
                 validate_three_live_codex_job_input,
                 validate_workflow,
             )
@@ -1199,7 +1205,8 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
                     max_live_codex_jobs=max_live_codex_jobs,
                 )
                 if max_live_codex_jobs == 3:
-                    validate_three_live_codex_job_input(input_data)
+                    three_job_input_kind = three_live_codex_job_input_kind(definition)
+                    validate_three_live_codex_job_input(input_data, input_kind=three_job_input_kind)
             except (OwsError, TypeError, ValueError, RecursionError):
                 raise ValueError("multi-job workflow definition or input is invalid") from None
             if max_live_codex_jobs == 2:
@@ -1361,6 +1368,7 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
             jobs=public_jobs,
             records=job_records,
             expected_job_count=len(expected_task_identities),
+            input_kind=three_job_input_kind,
             input_data=input_data,
             reconciliation_marker=reconciliation_marker,
             dbos_invalid=dbos_invalid,
@@ -1423,7 +1431,10 @@ def _two_job_task_identities(definition: Any) -> tuple[str, str]:
 
 
 def _three_job_task_identities(definition: Any, input_data: Any) -> tuple[str, ...]:
-    from .interpreter import validate_three_live_codex_job_input
+    from .interpreter import (
+        three_live_codex_job_input_kind,
+        validate_three_live_codex_job_input,
+    )
 
     tasks = definition.get("do") if isinstance(definition, dict) else None
     if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
@@ -1436,11 +1447,12 @@ def _three_job_task_identities(definition: Any, input_data: Any) -> tuple[str, .
     dispatch_name = next(iter(body[1]))
     if not isinstance(for_name, str) or not isinstance(dispatch_name, str):
         raise ValueError("three-job workflow task names are invalid")
-    issues = validate_three_live_codex_job_input(input_data)
+    input_kind = three_live_codex_job_input_kind(definition)
+    items = validate_three_live_codex_job_input(input_data, input_kind=input_kind)
     return tuple(
         f"do[0].{for_name}.iteration[{index}].do[1].{dispatch_name}"
-        for index, issue in enumerate(issues)
-        if issue["enabled"]
+        for index, item in enumerate(items)
+        if item["enabled"]
     )
 
 
@@ -1687,6 +1699,7 @@ def _project_three_job_run(
     jobs: tuple[WorkflowJobSnapshot, ...],
     records: tuple[dict[str, Any], ...],
     expected_job_count: int,
+    input_kind: str,
     input_data: Any,
     reconciliation_marker: bool,
     dbos_invalid: bool,
@@ -1745,7 +1758,7 @@ def _project_three_job_run(
     )
     if all_expected_jobs_succeeded:
         if result_value is not None and not _three_job_result_matches(
-            row, records, input_data, result_value
+            row, records, input_data, result_value, input_kind=input_kind
         ):
             return inspection("unknown")
         if (
@@ -1786,16 +1799,77 @@ def _three_job_result_matches(
     records: tuple[dict[str, Any], ...],
     input_data: Any,
     result_value: dict[str, Any],
+    *,
+    input_kind: str = "issues",
 ) -> bool:
     from .interpreter import OwsError, validate_three_live_codex_job_input
 
     try:
-        issues = validate_three_live_codex_job_input(input_data)
+        items = validate_three_live_codex_job_input(input_data, input_kind=input_kind)
     except OwsError:
         return False
+    if input_kind == "items":
+        if (
+            set(result_value)
+            != {
+                "workflow_id",
+                "definition_sha256",
+                "input_sha256",
+                "result",
+            }
+            or result_value.get("workflow_id") != row.workflow_id
+        ):
+            return False
+        expected_rows: list[dict[str, Any]] = []
+        record_index = 0
+        for item in items:
+            if not item["enabled"]:
+                expected_rows.append(
+                    {
+                        "id": item["id"],
+                        "status": "skipped",
+                        "job_id": None,
+                        "request_key": None,
+                        "final_text": None,
+                    }
+                )
+                continue
+            if record_index >= len(records):
+                return False
+            record = records[record_index]
+            receipt = record.get("receipt")
+            job_result = receipt.get("result") if isinstance(receipt, dict) else None
+            final_text = job_result.get("final_text") if isinstance(job_result, dict) else None
+            if record.get("state") != "SUCCEEDED" or not isinstance(final_text, str):
+                return False
+            expected_rows.append(
+                {
+                    "id": item["id"],
+                    "status": "SUCCEEDED",
+                    "job_id": record["job_id"],
+                    "request_key": f"{row.workflow_id}::{record['task_identity']}",
+                    "final_text": final_text,
+                }
+            )
+            record_index += 1
+        if record_index != len(records):
+            return False
+        expected_result = {
+            "results": expected_rows,
+            "summary": {
+                "total": len(items),
+                "succeeded": record_index,
+                "skipped": len(items) - record_index,
+            },
+        }
+        try:
+            return _canonical_json(result_value.get("result")) == _canonical_json(expected_result)
+        except (TypeError, ValueError):
+            return False
+
     expected: list[dict[str, Any]] = []
     record_index = 0
-    for issue in issues:
+    for issue in items:
         if not issue["enabled"]:
             expected.append(
                 {

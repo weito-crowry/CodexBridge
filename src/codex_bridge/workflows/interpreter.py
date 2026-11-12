@@ -163,10 +163,40 @@ _THREE_JOB_OUTPUT_AS = (
     "${ {number: $input.number, status: .status, job_id: .job_id, "
     "request_key: .request_key, final_text: .result.final_text} }"
 )
+_THREE_ITEM_INPUT_FROM = "${ {items: .items} }"
+_THREE_ITEM_PROMPT_FROM = "${ .prompt }"
+_THREE_ITEM_OUTPUT_AS = (
+    "${ {id: $input.id, status: .status, job_id: .job_id, "
+    "request_key: .request_key, final_text: .result.final_text} }"
+)
+_THREE_ITEM_RESULT_AS = (
+    "${ {results: ., summary: {total: length, "
+    'succeeded: ([.[] | select(.status == "SUCCEEDED")] | length), '
+    'skipped: ([.[] | select(.status == "skipped")] | length)}} }'
+)
+_THREE_ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z", re.ASCII)
 
 
-def validate_three_live_codex_job_input(input_data: Any) -> tuple[dict[str, Any], ...]:
+def three_live_codex_job_input_kind(definition: Any) -> str:
+    """Return the fixed three-job input contract selected by a template."""
+    if not isinstance(definition, dict):
+        raise OwsError("three-job workflow definition must be an object")
+    input_config = definition.get("input")
+    if input_config == {"from": _THREE_JOB_INPUT_FROM}:
+        return "issues"
+    if input_config == {"from": _THREE_ITEM_INPUT_FROM}:
+        return "items"
+    raise OwsError("three-job workflow must select the fixed issues or items input shape")
+
+
+def validate_three_live_codex_job_input(
+    input_data: Any, *, input_kind: str = "issues"
+) -> tuple[dict[str, Any], ...]:
     """Validate and sort the bounded synthetic input used by the three-job mode."""
+    if input_kind == "items":
+        return validate_three_live_codex_items_input(input_data)
+    if input_kind != "issues":
+        raise OwsError("three-job input kind must be issues or items")
     if not isinstance(input_data, dict) or set(input_data) != {"issues"}:
         raise OwsError("three-job input must contain only an issues array")
     issues = input_data["issues"]
@@ -193,9 +223,44 @@ def validate_three_live_codex_job_input(input_data: Any) -> tuple[dict[str, Any]
     return tuple(sorted(normalized, key=lambda issue: issue["number"]))
 
 
+def validate_three_live_codex_items_input(input_data: Any) -> tuple[dict[str, Any], ...]:
+    """Validate bounded item input while preserving its submitted order."""
+    if not isinstance(input_data, dict) or set(input_data) != {"items"}:
+        raise OwsError("three-job items input must contain only an items array")
+    items = input_data["items"]
+    if not isinstance(items, list) or len(items) > 4:
+        raise OwsError("three-job items input must be an array with at most four items")
+
+    identifiers: set[str] = set()
+    enabled_count = 0
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"id", "enabled", "prompt"}:
+            raise OwsError("each three-job item must contain only id, enabled, and prompt")
+        identifier = item["id"]
+        enabled = item["enabled"]
+        if (
+            not isinstance(identifier, str)
+            or _THREE_ITEM_ID.fullmatch(identifier) is None
+            or identifier in identifiers
+        ):
+            raise OwsError("three-job item ids must be unique ASCII stable identifiers")
+        if type(enabled) is not bool:
+            raise OwsError("three-job item enabled values must be booleans")
+        prompt = validate_codex_job_prompt(item["prompt"])
+        identifiers.add(identifier)
+        enabled_count += int(enabled)
+        normalized.append({"id": identifier, "enabled": enabled, "prompt": prompt})
+    if enabled_count > 3:
+        raise OwsError("three-job items input may enable at most three items")
+    return tuple(normalized)
+
+
 def _validate_three_live_codex_job_shape(
     definition: dict[str, Any], tasks: list[Any]
 ) -> tuple[str, str]:
+    if three_live_codex_job_input_kind(definition) == "items":
+        return _validate_three_live_codex_items_shape(definition, tasks)
     if set(definition) != {"document", "evaluate", "input", "do"}:
         raise OwsError("three-job live mode requires only document, evaluate, input, and do")
     if definition.get("input") != {"from": _THREE_JOB_INPUT_FROM}:
@@ -258,6 +323,73 @@ def _validate_three_live_codex_job_shape(
         "final_text": None,
     }:
         raise OwsError("three-job live skip output has an unsupported shape")
+    return for_name, dispatch_name
+
+
+def _validate_three_live_codex_items_shape(
+    definition: dict[str, Any], tasks: list[Any]
+) -> tuple[str, str]:
+    if set(definition) != {"document", "evaluate", "input", "output", "do"}:
+        raise OwsError("three-job items mode requires document, evaluate, input, output, and do")
+    if definition.get("output") != {"as": _THREE_ITEM_RESULT_AS}:
+        raise OwsError("three-job items mode requires the fixed results and summary projection")
+    if len(tasks) != 1 or not isinstance(tasks[0], dict) or len(tasks[0]) != 1:
+        raise OwsError("three-job items mode requires one top-level for task")
+    for_name, for_task = next(iter(tasks[0].items()))
+    if not isinstance(for_name, str) or not for_name or not isinstance(for_task, dict):
+        raise OwsError("three-job items mode requires a named top-level for task")
+    if set(for_task) != {"for", "do"}:
+        raise OwsError("three-job items for task may contain only for and do")
+    if for_task.get("for") != {"in": "${ .items }", "each": "item", "at": "index"}:
+        raise OwsError("three-job items mode requires the fixed input-order item loop")
+    body = for_task.get("do")
+    if not isinstance(body, list) or len(body) != 3:
+        raise OwsError("three-job items loop requires switch, codex-job, and skip tasks")
+    if any(not isinstance(item, dict) or len(item) != 1 for item in body):
+        raise OwsError("three-job items loop requires three named tasks")
+    body_names = [next(iter(item)) for item in body]
+    if (
+        any(not isinstance(name, str) or not name for name in body_names)
+        or len(set(body_names)) != 3
+    ):
+        raise OwsError("three-job items loop task names must be distinct non-empty strings")
+    switch_name, dispatch_name, skip_name = body_names
+    switch_task = body[0][switch_name]
+    dispatch_task = body[1][dispatch_name]
+    skip_task = body[2][skip_name]
+    if not isinstance(switch_task, dict) or set(switch_task) != {"switch"}:
+        raise OwsError("three-job items loop must start with one switch task")
+    if switch_task["switch"] != [
+        {"enabled": {"when": "${ $item.enabled == true }", "then": dispatch_name}},
+        {"disabled": {"then": skip_name}},
+    ]:
+        raise OwsError("three-job items switch must dispatch enabled items and skip the rest")
+    if not isinstance(dispatch_task, dict) or set(dispatch_task) != {
+        "input",
+        "call",
+        "with",
+        "output",
+        "then",
+    }:
+        raise OwsError("three-job items dispatch task has an unsupported shape")
+    if (
+        dispatch_task.get("input") != {"from": "${ {id: $item.id, prompt: $item.prompt} }"}
+        or dispatch_task.get("call") != "codex-job"
+        or dispatch_task.get("with") != {"prompt": "", "prompt_from": _THREE_ITEM_PROMPT_FROM}
+        or dispatch_task.get("output") != {"as": _THREE_ITEM_OUTPUT_AS}
+        or dispatch_task.get("then") != "exit"
+    ):
+        raise OwsError("three-job items dispatch must use the fixed prompt and output flow")
+    if not isinstance(skip_task, dict) or set(skip_task) != {"set"}:
+        raise OwsError("three-job items loop must end with one skip set task")
+    if skip_task["set"] != {
+        "id": "${ $item.id }",
+        "status": "skipped",
+        "job_id": None,
+        "request_key": None,
+        "final_text": None,
+    }:
+        raise OwsError("three-job items skip output has an unsupported shape")
     return for_name, dispatch_name
 
 
@@ -932,7 +1064,10 @@ class Interpreter:
     def run(self, input_data: Any) -> Any:
         self._task_count = 0
         if self.max_live_codex_jobs == 3:
-            validate_three_live_codex_job_input(input_data)
+            validate_three_live_codex_job_input(
+                input_data,
+                input_kind=three_live_codex_job_input_kind(self.definition),
+            )
         workflow_input = input_data
         workflow_input_config = self.definition.get("input", {})
         if "from" in workflow_input_config:

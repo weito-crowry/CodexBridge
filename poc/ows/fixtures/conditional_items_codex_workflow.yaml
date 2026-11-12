@@ -1,0 +1,43 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: conditional-items-codex-workflow
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+input:
+  from: '${ {items: .items} }'
+output:
+  as: '${ {results: ., summary: {total: length, succeeded: ([.[] | select(.status == "SUCCEEDED")] | length), skipped: ([.[] | select(.status == "skipped")] | length)}} }'
+do:
+  - processItems:
+      for:
+        in: '${ .items }'
+        each: item
+        at: index
+      do:
+        - choose:
+            switch:
+              - enabled:
+                  when: '${ $item.enabled == true }'
+                  then: processItem
+              - disabled:
+                  then: skipItem
+        - processItem:
+            input:
+              from: '${ {id: $item.id, prompt: $item.prompt} }'
+            call: codex-job
+            with:
+              prompt: ''
+              prompt_from: '${ .prompt }'
+            output:
+              as: '${ {id: $input.id, status: .status, job_id: .job_id, request_key: .request_key, final_text: .result.final_text} }'
+            then: exit
+        - skipItem:
+            set:
+              id: '${ $item.id }'
+              status: skipped
+              job_id: null
+              request_key: null
+              final_text: null

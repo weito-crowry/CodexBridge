@@ -20,6 +20,7 @@ from codex_bridge.workflows.interpreter import (
     OwsError,
     compute_codex_job_request,
     compute_task_action,
+    validate_official_schema,
     validate_three_live_codex_job_input,
     validate_workflow,
 )
@@ -60,6 +61,17 @@ def _three_job_workflow() -> dict[str, Any]:
     return yaml.safe_load(fixture.read_text(encoding="utf-8"))
 
 
+def _three_item_workflow() -> dict[str, Any]:
+    fixture = (
+        Path(__file__).parents[1]
+        / "poc"
+        / "ows"
+        / "fixtures"
+        / "conditional_items_codex_workflow.yaml"
+    )
+    return yaml.safe_load(fixture.read_text(encoding="utf-8"))
+
+
 _THREE_JOB_INPUT = {
     "issues": [
         {"number": 17, "enabled": True},
@@ -68,6 +80,266 @@ _THREE_JOB_INPUT = {
         {"number": 21, "enabled": True},
     ]
 }
+
+_THREE_ITEM_INPUT = {
+    "items": [
+        {"id": "gamma", "enabled": True, "prompt": "reply gamma"},
+        {"id": "beta", "enabled": False, "prompt": "reply beta"},
+        {"id": "alpha", "enabled": True, "prompt": "reply alpha"},
+    ]
+}
+
+
+def test_conditional_items_fixture_uses_official_ows_schema() -> None:
+    schema_path = Path(__file__).parents[1] / "poc" / "ows" / "schema" / "workflow.yaml"
+    validate_official_schema(_three_job_workflow(), schema_path=schema_path)
+    validate_official_schema(_three_item_workflow(), schema_path=schema_path)
+
+
+def test_three_item_subset_requires_explicit_mode_and_exact_template() -> None:
+    definition = _three_item_workflow()
+
+    with pytest.raises(OwsError):
+        validate_workflow(definition, codex_job_live=True)
+    with pytest.raises(OwsError):
+        validate_workflow(definition, max_live_codex_jobs=3)
+
+    validate_workflow(definition, codex_job_live=True, max_live_codex_jobs=3)
+
+
+def test_three_item_interpreter_preserves_order_skips_and_builds_item_prompts() -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    def step_runner(
+        identity: str,
+        task_name: str,
+        operation: str,
+        task_spec: dict[str, Any],
+        task_input: Any,
+        variables: dict[str, Any],
+    ) -> Any:
+        if operation != "call":
+            return compute_task_action(operation, task_spec, task_input, variables)
+        assert task_name == "processItem"
+        request = compute_codex_job_request(
+            task_spec,
+            task_input,
+            variables,
+            max_live_codex_jobs=3,
+        )
+        request_key = f"workflow::{identity}"
+        calls.append((identity, request["prompt"], request_key))
+        return {
+            "job_id": f"job-{task_input['id']}",
+            "request_key": request_key,
+            "status": "SUCCEEDED",
+            "result": {"final_text": f"done-{task_input['id']}"},
+        }
+
+    result = Interpreter(
+        _three_item_workflow(),
+        step_runner=step_runner,
+        codex_job_live=True,
+        max_live_codex_jobs=3,
+    ).run(_THREE_ITEM_INPUT)
+
+    assert result == {
+        "results": [
+            {
+                "id": "gamma",
+                "status": "SUCCEEDED",
+                "job_id": "job-gamma",
+                "request_key": calls[0][2],
+                "final_text": "done-gamma",
+            },
+            {
+                "id": "beta",
+                "status": "skipped",
+                "job_id": None,
+                "request_key": None,
+                "final_text": None,
+            },
+            {
+                "id": "alpha",
+                "status": "SUCCEEDED",
+                "job_id": "job-alpha",
+                "request_key": calls[1][2],
+                "final_text": "done-alpha",
+            },
+        ],
+        "summary": {"total": 3, "succeeded": 2, "skipped": 1},
+    }
+    assert [call[0] for call in calls] == [
+        "do[0].processItems.iteration[0].do[1].processItem",
+        "do[0].processItems.iteration[2].do[1].processItem",
+    ]
+    assert [call[1] for call in calls] == ["reply gamma", "reply alpha"]
+
+
+@pytest.mark.parametrize(
+    ("items", "summary", "expected_ids"),
+    [
+        ([], {"total": 0, "succeeded": 0, "skipped": 0}, []),
+        (
+            [{"id": "only", "enabled": False, "prompt": "keep required"}],
+            {"total": 1, "succeeded": 0, "skipped": 1},
+            ["only"],
+        ),
+        (
+            [{"id": "one", "enabled": True, "prompt": "one"}],
+            {"total": 1, "succeeded": 1, "skipped": 0},
+            ["one"],
+        ),
+        (
+            [
+                {"id": "one", "enabled": True, "prompt": "one"},
+                {"id": "two", "enabled": True, "prompt": "two"},
+            ],
+            {"total": 2, "succeeded": 2, "skipped": 0},
+            ["one", "two"],
+        ),
+        (
+            [
+                {"id": "one", "enabled": True, "prompt": "one"},
+                {"id": "two", "enabled": True, "prompt": "two"},
+                {"id": "three", "enabled": True, "prompt": "three"},
+                {"id": "four", "enabled": False, "prompt": "four"},
+            ],
+            {"total": 4, "succeeded": 3, "skipped": 1},
+            ["one", "two", "three", "four"],
+        ),
+    ],
+    ids=["empty", "skip-only", "one-enabled", "two-enabled", "max-four-items"],
+)
+def test_three_item_interpreter_aggregates_bounded_enabled_counts(
+    items: list[dict[str, Any]], summary: dict[str, int], expected_ids: list[str]
+) -> None:
+    dispatched: list[str] = []
+
+    def step_runner(
+        identity: str,
+        _task_name: str,
+        operation: str,
+        task_spec: dict[str, Any],
+        task_input: Any,
+        variables: dict[str, Any],
+    ) -> Any:
+        if operation != "call":
+            return compute_task_action(operation, task_spec, task_input, variables)
+        dispatched.append(task_input["id"])
+        return {
+            "job_id": f"job-{task_input['id']}",
+            "request_key": f"workflow::{identity}",
+            "status": "SUCCEEDED",
+            "result": {"final_text": task_input["id"]},
+        }
+
+    result = Interpreter(
+        _three_item_workflow(),
+        step_runner=step_runner,
+        codex_job_live=True,
+        max_live_codex_jobs=3,
+    ).run({"items": items})
+
+    assert [row["id"] for row in result["results"]] == expected_ids
+    assert result["summary"] == summary
+    assert result["summary"]["total"] == (
+        result["summary"]["succeeded"] + result["summary"]["skipped"]
+    )
+    assert dispatched == [item["id"] for item in items if item["enabled"]]
+
+
+@pytest.mark.parametrize(
+    "input_data",
+    [
+        {"items": [{"id": "x", "enabled": True, "prompt": "p"}] * 5},
+        {"items": [{"id": str(index), "enabled": index < 4, "prompt": "p"} for index in range(5)]},
+        {
+            "items": [
+                {"id": "duplicate", "enabled": False, "prompt": "p"},
+                {"id": "duplicate", "enabled": True, "prompt": "p"},
+            ]
+        },
+        {"items": [{"id": "_bad", "enabled": True, "prompt": "p"}]},
+        {"items": [{"id": "bad id", "enabled": True, "prompt": "p"}]},
+        {"items": [{"id": "x" * 65, "enabled": True, "prompt": "p"}]},
+        {"items": [{"id": "x", "enabled": 1, "prompt": "p"}]},
+        {"items": [{"id": "x", "enabled": True, "prompt": ""}]},
+        {"items": [{"id": "x", "enabled": False, "prompt": " \t "}]},
+        {"items": [{"id": "x", "enabled": True, "prompt": "p" * (16 * 1024 + 1)}]},
+        {"items": [{"id": "x", "enabled": True, "prompt": "bad\x01prompt"}]},
+        {"items": [{"id": "x", "enabled": True, "prompt": "p", "extra": 1}]},
+        {"items": [{"id": "x", "enabled": True}]},
+        {"items": [], "issues": []},
+        {"issues": []},
+        {"items": "not-an-array"},
+        {"items": [], "extra": True},
+    ],
+    ids=[
+        "five-items",
+        "four-enabled",
+        "duplicate-id",
+        "invalid-leading-character",
+        "invalid-character",
+        "id-too-long",
+        "non-boolean-enabled",
+        "empty-prompt",
+        "whitespace-prompt",
+        "prompt-too-long",
+        "prompt-control-character",
+        "extra-item-key",
+        "missing-prompt",
+        "mixed-issues-and-items",
+        "issues-input-to-items-template",
+        "non-array-items",
+        "extra-input-key",
+    ],
+)
+def test_three_item_input_validation_fails_before_any_step(input_data: Any) -> None:
+    steps: list[str] = []
+
+    def step_runner(identity: str, *_args: Any) -> Any:
+        steps.append(identity)
+        return None
+
+    with pytest.raises(OwsError):
+        Interpreter(
+            _three_item_workflow(),
+            step_runner=step_runner,
+            codex_job_live=True,
+            max_live_codex_jobs=3,
+        ).run(input_data)
+
+    assert steps == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda workflow: workflow["do"][0]["processItems"]["do"][0]["choose"]["switch"][0][
+            "enabled"
+        ].update({"when": "${ true }"}),
+        lambda workflow: workflow["do"][0]["processItems"]["do"][1]["processItem"]["with"].update(
+            {"prompt_from": "${ .unsafe }"}
+        ),
+        lambda workflow: workflow["do"][0]["processItems"]["do"][1]["processItem"]["output"].update(
+            {"as": "${ . }"}
+        ),
+        lambda workflow: workflow["output"].update({"as": "${ .results }"}),
+        lambda workflow: workflow["do"][0]["processItems"]["do"][2]["skipItem"]["set"].update(
+            {"unexpected": True}
+        ),
+    ],
+    ids=["condition", "prompt-expression", "row-expression", "aggregate-expression", "skip-shape"],
+)
+def test_three_item_subset_rejects_unapproved_condition_and_result_shapes(
+    mutate: Any,
+) -> None:
+    definition = _three_item_workflow()
+    mutate(definition)
+
+    with pytest.raises(OwsError):
+        validate_workflow(definition, codex_job_live=True, max_live_codex_jobs=3)
 
 
 def test_three_job_subset_requires_explicit_mode_and_pinned_schema() -> None:
@@ -952,6 +1224,145 @@ def test_worker_completes_three_sorted_jobs_and_replays_without_new_posts(
     assert replayed == first_result
     assert sum(kind == "POST" for kind, _event in _FakeCodexHTTPClient.events) == 3
     assert steps.cache_hits >= 6
+
+
+def test_worker_completes_three_items_in_input_order_and_replays_without_new_posts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_bridge.workflows import worker
+
+    run_dir = tmp_path / "state-items"
+    workspace_root = tmp_path / "workspace-items"
+    run_dir.mkdir()
+    workspace_root.mkdir()
+    _FakeCodexHTTPClient.outcomes = {
+        "reply gamma": {"final_text": "gamma answer"},
+        "reply alpha": {"final_text": "alpha answer"},
+    }
+    steps = _FakeDurableSteps()
+
+    first_result = _run_fake_worker(
+        run_dir,
+        workspace_root,
+        definition=_three_item_workflow(),
+        input_data=_THREE_ITEM_INPUT,
+        max_live_codex_jobs=3,
+        steps=steps,
+        monkeypatch=monkeypatch,
+    )
+    post_count = sum(kind == "POST" for kind, _event in _FakeCodexHTTPClient.events)
+    replayed = _run_fake_worker(
+        run_dir,
+        workspace_root,
+        definition=_three_item_workflow(),
+        input_data=_THREE_ITEM_INPUT,
+        max_live_codex_jobs=3,
+        steps=steps,
+        monkeypatch=monkeypatch,
+        reset_http=False,
+    )
+    jobs = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
+        _FakeDBOS.workflow_id
+    )
+    events = list(_FakeCodexHTTPClient.events)
+    post_requests = [event for kind, event in _FakeCodexHTTPClient.events if kind == "POST"]
+    post_indexes = [index for index, (kind, _event) in enumerate(events) if kind == "POST"]
+    observe_indexes = [
+        index
+        for index, (kind, event) in enumerate(events)
+        if kind == "GET" and isinstance(event, tuple)
+    ]
+
+    assert first_result == {
+        "results": [
+            {
+                "id": "gamma",
+                "status": "SUCCEEDED",
+                "job_id": jobs[0]["job_id"],
+                "request_key": f"{_FakeDBOS.workflow_id}::{jobs[0]['task_identity']}",
+                "final_text": "gamma answer",
+            },
+            {
+                "id": "beta",
+                "status": "skipped",
+                "job_id": None,
+                "request_key": None,
+                "final_text": None,
+            },
+            {
+                "id": "alpha",
+                "status": "SUCCEEDED",
+                "job_id": jobs[1]["job_id"],
+                "request_key": f"{_FakeDBOS.workflow_id}::{jobs[1]['task_identity']}",
+                "final_text": "alpha answer",
+            },
+        ],
+        "summary": {"total": 3, "succeeded": 2, "skipped": 1},
+    }
+    assert [request["prompt"] for request in post_requests] == ["reply gamma", "reply alpha"]
+    assert len(post_indexes) == len(observe_indexes) == 2
+    assert post_indexes[0] < observe_indexes[0] < post_indexes[1] < observe_indexes[1]
+    assert [job["task_identity"] for job in jobs] == [
+        "do[0].processItems.iteration[0].do[1].processItem",
+        "do[0].processItems.iteration[2].do[1].processItem",
+    ]
+    assert replayed == first_result
+    assert sum(kind == "POST" for kind, _event in _FakeCodexHTTPClient.events) == post_count == 2
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_error", "expected_state"),
+    [
+        ({"state": "needs_approval"}, CodexJobReconciliationRequiredError, "ACCEPTED"),
+        ({"state": "failed"}, CodexJobFailedError, "FAILED"),
+        ({"post_error": True}, CodexJobReconciliationRequiredError, "MAYBE_SENT"),
+    ],
+    ids=["needs-approval", "failed", "maybe-sent"],
+)
+def test_worker_does_not_post_later_item_after_second_item_is_not_succeeded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: dict[str, Any],
+    expected_error: type[Exception],
+    expected_state: str,
+) -> None:
+    from codex_bridge.workflows import worker
+
+    run_dir = tmp_path / "state-items-stop"
+    workspace_root = tmp_path / "workspace-items-stop"
+    run_dir.mkdir()
+    workspace_root.mkdir()
+    input_data = {
+        "items": [
+            {"id": "first", "enabled": True, "prompt": "reply first"},
+            {"id": "second", "enabled": True, "prompt": "reply second"},
+            {"id": "third", "enabled": True, "prompt": "reply third"},
+        ]
+    }
+    _FakeCodexHTTPClient.outcomes = {
+        "reply first": {"final_text": "first done"},
+        "reply second": outcome,
+    }
+
+    with pytest.raises(expected_error):
+        _run_fake_worker(
+            run_dir,
+            workspace_root,
+            definition=_three_item_workflow(),
+            input_data=input_data,
+            max_live_codex_jobs=3,
+            monkeypatch=monkeypatch,
+        )
+
+    jobs = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
+        _FakeDBOS.workflow_id
+    )
+    post_requests = [event for kind, event in _FakeCodexHTTPClient.events if kind == "POST"]
+    assert len(jobs) == 2
+    assert [job["state"] for job in jobs] == ["SUCCEEDED", expected_state]
+    assert [request["prompt"] for request in post_requests] == ["reply first", "reply second"]
+    assert "reply third" not in [request["prompt"] for request in post_requests]
 
 
 @pytest.mark.parametrize(
