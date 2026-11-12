@@ -1262,8 +1262,10 @@ def _run_e2e(evidence: dict[str, Any]) -> int:
                         r4._assert_ports_free(ports)
                     except SmokeAbort:
                         cleanup_reaped = False
-            elif stderr_relay is not None:
-                stderr_relay.finish_after_bridge(bridge_reaped=False)
+            else:
+                cleanup_reaped = False
+                if stderr_relay is not None:
+                    stderr_relay.finish_after_bridge(bridge_reaped=False)
         evidence["cleanup"]["bridge_processes"] = process_records
         evidence["cleanup"]["forced_termination"] = False
         evidence["cleanup"]["owned_children_reaped"] = cleanup_reaped
