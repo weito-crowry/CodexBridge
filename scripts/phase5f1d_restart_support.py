@@ -91,9 +91,13 @@ def replay_history_is_unknown(checks: Any) -> bool:
 
 def _contains_sensitive_field(value: Any) -> bool:
     sensitive_parts = ("token", "password", "secret", "prompt", "authorization", "api_key")
+    safe_status_fields = {"missing_token_http", "malformed_token_http"}
     if isinstance(value, Mapping):
         for key, child in value.items():
-            if any(part in str(key).casefold() for part in sensitive_parts):
+            normalized_key = str(key).casefold()
+            if normalized_key not in safe_status_fields and any(
+                part in normalized_key for part in sensitive_parts
+            ):
                 return True
             if _contains_sensitive_field(child):
                 return True

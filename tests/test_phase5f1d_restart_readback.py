@@ -97,6 +97,21 @@ def test_evidence_writer_rejects_credential_or_prompt_fields(tmp_path: Path) -> 
     assert not evidence_path.exists()
 
 
+def test_evidence_writer_allows_only_token_check_http_status_fields(tmp_path: Path) -> None:
+    restart_script = load_restart_script()
+    assert restart_script is not None, "the Phase 5F-1D restart runner is not implemented"
+    evidence_path = tmp_path / "evidence.json"
+
+    restart_script.write_evidence_once(
+        evidence_path,
+        {"preflight": {"auth": {"missing_token_http": 403, "malformed_token_http": 403}}},
+        sensitive_values=("actual-control-token",),
+    )
+
+    assert evidence_path.is_file()
+    assert "actual-control-token" not in evidence_path.read_text(encoding="utf-8")
+
+
 def test_saved_state_requires_exact_request_job_and_result_projection() -> None:
     restart_script = load_restart_script()
     assert restart_script is not None, "the Phase 5F-1D restart runner is not implemented"
