@@ -78,6 +78,23 @@ Phase 4Cのworker kill/restart実験は、Phase 4Bと同じschema-valid recovery
 
 Phase 4B/4Cのmock-job pathは非同期job APIとdurable workflow sleepのPoCです。`DBOS.sleep()`がDBOS workflow threadを必ず解放するとは主張せず、完全なevent-driven/zero-pollingでもありません。Phase 4Dは固定CodexBridge HTTP API contractだけを扱い、DBOS `recv`、SSE、MCP、GUIは接続しません。外部処理一般に対するexactly-once保証も主張しません。
 
+### Phase 5F-0: Issue番号順の条件分岐・反復mock-job PoC
+
+[`fixtures/issue_sequence_mock_workflow.yaml`](fixtures/issue_sequence_mock_workflow.yaml)は`issues`をjqの`sort_by(.number)`で整列し、各Issueを順次処理します。`enabled: true`だけが`mock-job`を実行し、それ以外は`skipped`を返します。結果はIssue番号順で、jobを実行した項目には`job_id`と`request_key`を含みます。通常modeと`--mock-job-durable-wait`はそれぞれ`.state/phase4b-runs/`、`.state/phase4c-runs/`へ保存されます。
+
+```powershell
+$issueSequenceInput = '{"issues":[{"number":17,"enabled":true},{"number":5,"enabled":false},{"number":9,"enabled":true}]}'
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
+  --workflow .\poc\ows\fixtures\issue_sequence_mock_workflow.yaml `
+  --input-json $issueSequenceInput
+& .\poc\ows\.venv\Scripts\python.exe .\poc\ows\cli.py run `
+  --workflow .\poc\ows\fixtures\issue_sequence_mock_workflow.yaml `
+  --input-json $issueSequenceInput `
+  --mock-job-durable-wait
+```
+
+このPoCはGitHub Issue API連携でも実Codex job loopでもありません。外部APIへ接続せず、既存mock-job serviceとDBOS checkpointだけで検証します。純Interpreterからmock-jobを直接呼ぶことは引き続き拒否されます。
+
 ## DBOS checkpointと復旧
 
 通常CLI runは`.state/runs/run-<uuid>/`、Phase 4B mock runは`.state/phase4b-runs/run-<uuid>/`、Phase 4C durable-wait runは`.state/phase4c-runs/run-<uuid>/`を作ります。workflow YAMLと入力の固定コピー、SHA-256、manifest、DBOS SQLite、task JSONL、worker log、最終JSON結果を置きます。mock runには`jobs.sqlite`、service/worker identity、service/worker logs、heartbeat、recovery evidenceも保存します。`.state/`はGit ignore対象です。`resume`は固定copyとmanifestのhashを照合し、既存workflow IDを必須として`DBOS.launch()`から復旧します。resume処理は`start_workflow()`を呼びません。

@@ -17,6 +17,7 @@ from interpreter import (
 
 OWS_DIR = Path(__file__).resolve().parents[1]
 FIXTURE = OWS_DIR / "fixtures" / "workflow.yaml"
+ISSUE_SEQUENCE_FIXTURE = OWS_DIR / "fixtures" / "issue_sequence_mock_workflow.yaml"
 
 
 def minimal(*tasks: dict[str, Any]) -> dict[str, Any]:
@@ -52,6 +53,23 @@ def test_mock_job_fixture_is_official_schema_valid_but_standalone_call_has_no_ad
 
     with pytest.raises(OwsError, match="call requires the mock-job DBOS adapter"):
         Interpreter(definition).run({"values": [3, 5]})
+
+
+def test_issue_sequence_fixture_is_schema_and_subset_valid_but_needs_dbos_adapter() -> None:
+    definition = load_workflow(ISSUE_SEQUENCE_FIXTURE)
+    validate_workflow(definition)
+    validate_official_schema(definition)
+
+    with pytest.raises(OwsError, match="call requires the mock-job DBOS adapter"):
+        Interpreter(definition).run(
+            {
+                "issues": [
+                    {"number": 17, "enabled": True},
+                    {"number": 5, "enabled": False},
+                    {"number": 9, "enabled": True},
+                ]
+            }
+        )
 
 
 def test_nested_do_set_dataflow_switch_and_for_output() -> None:

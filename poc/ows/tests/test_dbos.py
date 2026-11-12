@@ -13,6 +13,164 @@ import pytest
 
 OWS_DIR = Path(__file__).resolve().parents[1]
 STATE_DIR = OWS_DIR / ".state"
+ISSUE_SEQUENCE_FIXTURE = OWS_DIR / "fixtures" / "issue_sequence_mock_workflow.yaml"
+
+
+def _run_issue_sequence(
+    issues: list[dict[str, Any]], *, durable_wait: bool = False
+) -> dict[str, Any]:
+    arguments = [
+        str(OWS_DIR / "cli.py"),
+        "run",
+        "--workflow",
+        str(ISSUE_SEQUENCE_FIXTURE),
+        "--input-json",
+        json.dumps({"issues": issues}, separators=(",", ":")),
+    ]
+    if durable_wait:
+        arguments.append("--mock-job-durable-wait")
+    return _invoke(*arguments, timeout=180)
+
+
+def _issue_jobs(run_dir: Path) -> list[tuple[Any, ...]]:
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        return connection.execute(
+            "SELECT job_id, request_key, workflow_id, task_identity, state, "
+            "dispatch_count, service_execution_count, request_json "
+            "FROM jobs ORDER BY task_identity"
+        ).fetchall()
+
+
+def _assert_issue_jobs_are_sequential(run_dir: Path, jobs: list[tuple[Any, ...]]) -> None:
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        events = connection.execute(
+            "SELECT job_id, state FROM job_events ORDER BY event_id"
+        ).fetchall()
+
+    job_ids = {row[0] for row in jobs}
+    assert {job_id for job_id, _ in events} == job_ids
+    started: set[str] = set()
+    finished: set[str] = set()
+    active = 0
+    maximum_active = 0
+    for job_id, state in events:
+        if state == "RUNNING" and job_id not in started:
+            started.add(job_id)
+            active += 1
+            maximum_active = max(maximum_active, active)
+        elif state in {"SUCCEEDED", "FAILED"} and job_id not in finished:
+            finished.add(job_id)
+            active -= 1
+    assert active == 0
+    assert maximum_active == 1
+
+
+def _assert_successful_issue_workflow(output: dict[str, Any]) -> None:
+    run_dir = Path(output["run_dir"])
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        status = connection.execute(
+            "SELECT status FROM workflow_status WHERE workflow_uuid = ?",
+            (output["workflow_id"],),
+        ).fetchone()
+    assert status == ("SUCCESS",)
+
+
+@pytest.mark.parametrize("durable_wait", [False, True], ids=["normal", "durable-wait"])
+def test_issue_sequence_runs_enabled_issues_in_number_order_and_skips_disabled(
+    durable_wait: bool,
+) -> None:
+    issues = [
+        {"number": 17, "enabled": True},
+        {"number": 5, "enabled": False},
+        {"number": 9, "enabled": True},
+    ]
+    output = _run_issue_sequence(issues, durable_wait=durable_wait)
+    result = output["result"]
+    run_dir = Path(output["run_dir"])
+    expected_parent = STATE_DIR / ("phase4c-runs" if durable_wait else "phase4b-runs")
+
+    assert run_dir.parent == expected_parent
+    assert [item["number"] for item in result] == [5, 9, 17]
+    assert result[0] == {"number": 5, "status": "skipped"}
+    assert [item["status"] for item in result[1:]] == ["SUCCEEDED", "SUCCEEDED"]
+
+    jobs = _issue_jobs(run_dir)
+    assert len(jobs) == 2
+    assert len({row[0] for row in jobs}) == 2
+    assert len({row[1] for row in jobs}) == 2
+    assert len({row[3] for row in jobs}) == 2
+    assert all(row[2] == output["workflow_id"] for row in jobs)
+    assert all(row[4:7] == ("SUCCEEDED", 1, 1) for row in jobs)
+    assert [json.loads(row[7])["payload"] for row in jobs] == [
+        {"issue_number": 9},
+        {"issue_number": 17},
+    ]
+    assert [(item["job_id"], item["request_key"]) for item in result[1:]] == [
+        (row[0], row[1]) for row in jobs
+    ]
+    _assert_issue_jobs_are_sequential(run_dir, jobs)
+    _assert_successful_issue_workflow(output)
+
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        event_count_before_resume = connection.execute(
+            "SELECT COUNT(*) FROM job_events"
+        ).fetchone()[0]
+    resumed = _invoke(str(OWS_DIR / "cli.py"), "resume", "--run-dir", str(run_dir))
+    assert resumed["workflow_id"] == output["workflow_id"]
+    assert resumed["result"] == output["result"]
+    assert _issue_jobs(run_dir) == jobs
+    with sqlite3.connect(run_dir / "jobs.sqlite") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM job_events").fetchone() == (
+            event_count_before_resume,
+        )
+    _assert_successful_issue_workflow(resumed)
+
+
+def test_issue_sequence_output_is_deterministic_for_different_input_orders() -> None:
+    forward = [
+        {"number": 17, "enabled": True},
+        {"number": 5, "enabled": False},
+        {"number": 9, "enabled": True},
+    ]
+    reverse = list(reversed(forward))
+    outputs = [_run_issue_sequence(issues) for issues in (forward, reverse)]
+
+    normalized_results = []
+    for output in outputs:
+        result = output["result"]
+        jobs_by_id = {row[0]: json.loads(row[7]) for row in _issue_jobs(Path(output["run_dir"]))}
+        normalized_results.append(
+            [
+                (
+                    item["number"],
+                    item["status"],
+                    jobs_by_id[item["job_id"]]["payload"] if "job_id" in item else None,
+                )
+                for item in result
+            ]
+        )
+
+    assert normalized_results == [
+        [
+            (5, "skipped", None),
+            (9, "SUCCEEDED", {"issue_number": 9}),
+            (17, "SUCCEEDED", {"issue_number": 17}),
+        ],
+        [
+            (5, "skipped", None),
+            (9, "SUCCEEDED", {"issue_number": 9}),
+            (17, "SUCCEEDED", {"issue_number": 17}),
+        ],
+    ]
+
+
+def test_issue_sequence_empty_input_returns_no_jobs() -> None:
+    output = _run_issue_sequence([])
+    run_dir = Path(output["run_dir"])
+
+    assert output["result"] == []
+    assert _issue_jobs(run_dir) == []
+    _assert_successful_issue_workflow(output)
 
 
 def _invoke(*args: str, timeout: int = 120) -> dict[str, Any]:
