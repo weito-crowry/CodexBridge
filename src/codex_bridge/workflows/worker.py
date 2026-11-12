@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -24,6 +25,7 @@ from .codex_job_adapter import (
     CodexJobReconciliationRequiredError,
     CodexJobTimeoutError,
 )
+from .diagnostic_log import append_lifecycle_event
 from .http_client import CodexHTTPClient
 from .interpreter import (
     Interpreter,
@@ -46,6 +48,7 @@ from .process_identity import get_process_identity
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
 APPLICATION_VERSION = "1.0.3-subset"
 EXECUTOR_ID = "codexbridge-ows-phase3-executor"
+_SHUTDOWN_LAUNCH_ID = re.compile(r"worker-shutdown-([0-9a-f]{32})\.request\Z", re.ASCII)
 
 
 def canonical_json(value: Any) -> str:
@@ -987,8 +990,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise OwsError("codex-job live mode does not match the run manifest")
     if manifest.get("mode") == "codex-job-live" and not codex_job_live:
         raise OwsError("codex-job live mode is missing from manifest control")
+    manifest_workflow_id = manifest.get("workflow_id")
+    workflow_id: str | None = (
+        manifest_workflow_id if isinstance(manifest_workflow_id, str) else None
+    )
     if codex_job_live:
-        workflow_id = manifest.get("workflow_id")
         if not isinstance(workflow_id, str) or not workflow_id:
             raise OwsError("codex-job live mode requires a pre-generated workflow_id")
         if args.workspace_root is not None:
@@ -1021,6 +1027,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if shutdown_file.is_symlink():
             raise OwsError("--shutdown-file may not be a symlink")
 
+    launch_id: str | None = None
+    if shutdown_file is not None:
+        launch_match = _SHUTDOWN_LAUNCH_ID.fullmatch(shutdown_file.name)
+        if launch_match is not None:
+            launch_id = launch_match.group(1)
+
     worker_identity = get_process_identity(os.getpid())
     if worker_identity is None or not worker_identity["active"]:
         raise OwsError("DBOS worker could not confirm its Windows process identity")
@@ -1041,11 +1053,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _write_json(identity_path, identity_record)
 
-    DBOS(config=_dbos_config(database_path))
+    append_lifecycle_event(
+        run_dir,
+        source="worker",
+        event="worker_bootstrap",
+        run_id=run_dir.name,
+        workflow_id=workflow_id,
+        launch_id=launch_id,
+        mode=args.mode,
+        pid=worker_identity["pid"],
+    )
+
     heartbeat_stop: threading.Event | None = None
     heartbeat_thread: threading.Thread | None = None
+    dbos_configured = False
+    stage = "dbos_configure"
     try:
+        DBOS(config=_dbos_config(database_path))
+        dbos_configured = True
+        stage = "dbos_launch"
         DBOS.launch()
+        append_lifecycle_event(
+            run_dir,
+            source="worker",
+            event="dbos_ready",
+            run_id=run_dir.name,
+            workflow_id=workflow_id,
+            launch_id=launch_id,
+            mode=args.mode,
+            pid=worker_identity["pid"],
+        )
         if args.mode == "start":
             heartbeat_stop = threading.Event()
             heartbeat_thread = threading.Thread(
@@ -1064,6 +1101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 control,
                 int(manifest.get("max_tasks", 10_000)),
             )
+            stage = "workflow_start"
             if codex_job_live:
                 requested_workflow_id = str(manifest["workflow_id"])
                 with SetWorkflowID(requested_workflow_id):
@@ -1079,9 +1117,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             _persist_workflow_id(run_dir, manifest, workflow_id)
             startup_path = run_dir / "start-worker.json"
         else:
-            workflow_id = manifest.get("workflow_id")
-            if not isinstance(workflow_id, str) or not workflow_id:
+            stage = "workflow_recovery"
+            recovered_workflow_id = manifest.get("workflow_id")
+            if not isinstance(recovered_workflow_id, str) or not recovered_workflow_id:
                 raise OwsError("recover mode requires the persisted workflow_id")
+            workflow_id = recovered_workflow_id
             startup_path = run_dir / "recovery-worker.json"
 
         startup_path = startup_override if startup_override is not None else startup_path
@@ -1090,21 +1130,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             {**identity_record, "workflow_id": workflow_id},
         )
 
-        if args.mode == "start":
-            result = _wait_for_result(
-                database_path,
-                workflow_id,
-                args.timeout_seconds,
-                shutdown_file,
-            )
-        else:
-            result = _wait_for_result(
-                database_path,
-                workflow_id,
-                args.timeout_seconds,
-                shutdown_file,
-            )
+        append_lifecycle_event(
+            run_dir,
+            source="worker",
+            event=("workflow_started" if args.mode == "start" else "workflow_recovery_attached"),
+            run_id=run_dir.name,
+            workflow_id=workflow_id,
+            launch_id=launch_id,
+            mode=args.mode,
+            pid=worker_identity["pid"],
+        )
 
+        stage = "workflow_wait"
+        try:
+            result = _wait_for_result(
+                database_path,
+                workflow_id,
+                args.timeout_seconds,
+                shutdown_file,
+            )
+        except WorkerShutdownRequested:
+            append_lifecycle_event(
+                run_dir,
+                source="worker",
+                event="shutdown_observed",
+                run_id=run_dir.name,
+                workflow_id=workflow_id,
+                launch_id=launch_id,
+                mode=args.mode,
+                pid=worker_identity["pid"],
+                reason_code="shutdown_requested",
+            )
+            raise
+
+        stage = "result_persist"
         _write_json(
             run_dir / "result.json",
             {
@@ -1114,14 +1173,70 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "input_sha256": manifest["input_sha256"],
             },
         )
+        append_lifecycle_event(
+            run_dir,
+            source="worker",
+            event="result_persisted",
+            run_id=run_dir.name,
+            workflow_id=workflow_id,
+            launch_id=launch_id,
+            mode=args.mode,
+            pid=worker_identity["pid"],
+        )
+        stage = "result_output"
         print(json.dumps({"workflow_id": workflow_id, "result": result}, ensure_ascii=False))
         return 0
+    except WorkerShutdownRequested:
+        raise
+    except Exception as error:
+        append_lifecycle_event(
+            run_dir,
+            source="worker",
+            event="worker_failed",
+            run_id=run_dir.name,
+            workflow_id=workflow_id,
+            launch_id=launch_id,
+            mode=args.mode,
+            pid=worker_identity["pid"],
+            reason_code=_worker_failure_reason(stage),
+            exception_class=type(error).__name__,
+        )
+        raise
     finally:
         if heartbeat_stop is not None:
             heartbeat_stop.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=1.0)
-        DBOS.destroy()
+        if dbos_configured:
+            try:
+                DBOS.destroy()
+            except Exception as error:
+                append_lifecycle_event(
+                    run_dir,
+                    source="worker",
+                    event="worker_failed",
+                    run_id=run_dir.name,
+                    workflow_id=workflow_id,
+                    launch_id=launch_id,
+                    mode=args.mode,
+                    pid=worker_identity["pid"],
+                    reason_code="dbos_destroy_failed",
+                    exception_class=type(error).__name__,
+                )
+                raise
+
+
+def _worker_failure_reason(stage: str) -> str:
+    reasons = {
+        "dbos_configure": "dbos_configure_failed",
+        "dbos_launch": "dbos_launch_failed",
+        "workflow_start": "workflow_start_failed",
+        "workflow_recovery": "workflow_recovery_failed",
+        "workflow_wait": "workflow_wait_failed",
+        "result_persist": "result_persist_failed",
+        "result_output": "result_output_failed",
+    }
+    return reasons.get(stage, "workflow_wait_failed")
 
 
 if __name__ == "__main__":

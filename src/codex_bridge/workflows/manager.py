@@ -14,6 +14,7 @@ from typing import Literal
 
 from ..paths import AllowedPathPolicy, PathPolicyError
 from ..runtime_mode import WORKFLOW_WORKER_FLAG
+from .diagnostic_log import append_lifecycle_event
 from .http_client import CONTROL_TOKEN_ENV
 from .startup_diagnostics import (
     WorkflowStartupStage,
@@ -65,6 +66,8 @@ class _ManagedWorker:
     mode: WorkerMode
     live: bool
     shutdown_file: Path
+    launch_id: str
+    workflow_id: str | None
     process: asyncio.subprocess.Process | None = None
     exit_task: asyncio.Task[int] | None = None
     state: Literal["running", "completed", "failed", "stopped", "shutdown_failed"] = "running"
@@ -204,11 +207,17 @@ class WorkflowWorkerManager:
                 if diagnostic is not None:
                     diagnostic.complete_if_active(WorkflowStartupStage.WORKER_CONFIG_WRITE)
                     diagnostic.begin(WorkflowStartupStage.WORKER_SPAWN)
+                manifest_workflow_id = manifest.get("workflow_id")
+                workflow_id = (
+                    manifest_workflow_id if isinstance(manifest_workflow_id, str) else None
+                )
                 record = _ManagedWorker(
                     run_dir=canonical_run_dir,
                     mode=mode,
                     live=live,
                     shutdown_file=shutdown_file,
+                    launch_id=launch_id,
+                    workflow_id=workflow_id,
                 )
                 self._records[run_id] = record
                 command = self._command(mode, canonical_run_dir, config_path)
@@ -218,6 +227,15 @@ class WorkflowWorkerManager:
                 )
                 if diagnostic is not None:
                     diagnostic.mark_worker_spawned(None)
+                append_lifecycle_event(
+                    canonical_run_dir,
+                    source="bridge",
+                    event="worker_launch_requested",
+                    run_id=run_id,
+                    workflow_id=record.workflow_id,
+                    launch_id=launch_id,
+                    mode=mode,
+                )
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *command,
@@ -228,13 +246,62 @@ class WorkflowWorkerManager:
                         stderr=asyncio.subprocess.DEVNULL,
                     )
                 except (OSError, ValueError) as error:
+                    append_lifecycle_event(
+                        canonical_run_dir,
+                        source="bridge",
+                        event="worker_spawn_failed",
+                        run_id=run_id,
+                        workflow_id=record.workflow_id,
+                        launch_id=launch_id,
+                        mode=mode,
+                        reason_code=(
+                            "spawn_os_error" if isinstance(error, OSError) else "spawn_value_error"
+                        ),
+                        exception_class=type(error).__name__,
+                    )
                     if diagnostic is not None:
                         diagnostic.mark_worker_spawned(False)
                         diagnostic.fail(error)
                     record.state = "failed"
                     record.error = "workflow worker process could not be started"
                     raise WorkflowManagerError(record.error) from None
+                except asyncio.CancelledError as error:
+                    append_lifecycle_event(
+                        canonical_run_dir,
+                        source="bridge",
+                        event="worker_spawn_outcome_unknown",
+                        run_id=run_id,
+                        workflow_id=record.workflow_id,
+                        launch_id=launch_id,
+                        mode=mode,
+                        reason_code="spawn_cancelled_outcome_unknown",
+                        exception_class=type(error).__name__,
+                    )
+                    raise
+                except Exception as error:
+                    append_lifecycle_event(
+                        canonical_run_dir,
+                        source="bridge",
+                        event="worker_spawn_outcome_unknown",
+                        run_id=run_id,
+                        workflow_id=record.workflow_id,
+                        launch_id=launch_id,
+                        mode=mode,
+                        reason_code="spawn_exception_outcome_unknown",
+                        exception_class=type(error).__name__,
+                    )
+                    raise
                 record.process = process
+                append_lifecycle_event(
+                    canonical_run_dir,
+                    source="bridge",
+                    event="worker_spawn_succeeded",
+                    run_id=run_id,
+                    workflow_id=record.workflow_id,
+                    launch_id=launch_id,
+                    mode=mode,
+                    pid=process.pid,
+                )
                 if diagnostic is not None:
                     diagnostic.mark_worker_spawned(True)
                     diagnostic.complete_if_active(WorkflowStartupStage.WORKER_SPAWN)
@@ -278,31 +345,135 @@ class WorkflowWorkerManager:
             record.shutdown_requested = True
             try:
                 _write_shutdown_signal(record.shutdown_file)
-            except OSError:
+            except OSError as error:
                 record.error = "workflow worker shutdown signal could not be written"
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="shutdown_signal_failed",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=None if record.process is None else record.process.pid,
+                    reason_code="shutdown_signal_write_failed",
+                    exception_class=type(error).__name__,
+                )
+            else:
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="shutdown_signal_requested",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=None if record.process is None else record.process.pid,
+                )
 
         tasks = [record.exit_task for record in running if record.exit_task is not None]
         pending = await _wait_tasks(tasks, self._graceful_shutdown_seconds)
         for record in running:
             if record.exit_task not in pending or record.process is None:
                 continue
+            append_lifecycle_event(
+                record.run_dir,
+                source="bridge",
+                event="worker_terminate_requested",
+                run_id=record.run_dir.name,
+                workflow_id=record.workflow_id,
+                launch_id=record.launch_id,
+                mode=record.mode,
+                pid=record.process.pid,
+            )
             try:
                 record.process.terminate()
-            except ProcessLookupError:
-                continue
+            except ProcessLookupError as error:
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="worker_terminate_failed",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=record.process.pid,
+                    reason_code="process_already_exited",
+                    exception_class=type(error).__name__,
+                )
+            except Exception as error:
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="worker_terminate_failed",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=record.process.pid,
+                    reason_code="terminate_failed",
+                    exception_class=type(error).__name__,
+                )
+                raise
         pending = await _wait_tasks(pending, min(1.0, self._graceful_shutdown_seconds))
         for record in running:
             if record.exit_task not in pending or record.process is None:
                 continue
+            append_lifecycle_event(
+                record.run_dir,
+                source="bridge",
+                event="worker_kill_requested",
+                run_id=record.run_dir.name,
+                workflow_id=record.workflow_id,
+                launch_id=record.launch_id,
+                mode=record.mode,
+                pid=record.process.pid,
+            )
             try:
                 record.process.kill()
-            except ProcessLookupError:
-                continue
+            except ProcessLookupError as error:
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="worker_kill_failed",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=record.process.pid,
+                    reason_code="process_already_exited",
+                    exception_class=type(error).__name__,
+                )
+            except Exception as error:
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="worker_kill_failed",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=record.process.pid,
+                    reason_code="kill_failed",
+                    exception_class=type(error).__name__,
+                )
+                raise
         pending = await _wait_tasks(pending, 1.0)
         for record in running:
             if record.exit_task in pending:
                 record.state = "shutdown_failed"
                 record.error = "workflow worker did not exit after terminate and kill"
+                append_lifecycle_event(
+                    record.run_dir,
+                    source="bridge",
+                    event="worker_shutdown_failed",
+                    run_id=record.run_dir.name,
+                    workflow_id=record.workflow_id,
+                    launch_id=record.launch_id,
+                    mode=record.mode,
+                    pid=None if record.process is None else record.process.pid,
+                    reason_code="worker_did_not_exit",
+                )
 
         owned_turns: set[tuple[str, str]] = set()
         ownership_complete = True
@@ -354,6 +525,19 @@ class WorkflowWorkerManager:
             record.state = "failed"
         if returncode != 0 and record.error is None:
             record.error = f"workflow worker exited with code {returncode}"
+        append_lifecycle_event(
+            record.run_dir,
+            source="bridge",
+            event="worker_exited",
+            run_id=record.run_dir.name,
+            workflow_id=record.workflow_id,
+            launch_id=record.launch_id,
+            mode=record.mode,
+            pid=process.pid,
+            returncode=returncode,
+            shutdown_requested=record.shutdown_requested,
+            state=record.state,
+        )
         return returncode
 
     def _validate_run_directory(self, run_dir: Path) -> Path:

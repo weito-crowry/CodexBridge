@@ -152,6 +152,16 @@ async def test_starting_state_exception_is_saved_without_secret_text_or_retry(
     assert str(workspace) not in diagnostic_text
     assert SAFE_CODEX_JOB_PROMPT not in diagnostic_text
     assert len(diagnostic_path.read_bytes()) <= 4096
+    lifecycle_text = (run_dir / "bridge-lifecycle.jsonl").read_text(encoding="utf-8")
+    lifecycle_events = [json.loads(line) for line in lifecycle_text.splitlines()]
+    reconciliation_transition = next(
+        event
+        for event in lifecycle_events
+        if event["event"] == "workflow_state_changed" and event["state"] == "needs_reconciliation"
+    )
+    assert "previous_state" not in reconciliation_transition
+    assert _SECRET_MARKER not in lifecycle_text
+    assert str(workspace) not in lifecycle_text
 
     replay = await service.start_workflow(**request)
     assert replay.status == "needs_reconciliation"

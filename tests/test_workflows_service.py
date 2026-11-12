@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter
 from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
 from codex_bridge.workflows.service import (
     WorkflowConcurrencyConflict,
@@ -110,6 +111,106 @@ async def test_same_request_id_reuses_durable_run_after_service_recreation(
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_log_tracks_reservation_state_and_replay_without_poll_records(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+) -> None:
+    service, manager, workspace = service_fixture
+    arguments = {
+        "client_request_id": "phase5f2b-lifecycle-0001",
+        "workflow_yaml": _workflow_yaml(),
+        "input_data": {"answer": 4},
+        "workspace_root": str(workspace),
+    }
+
+    accepted = await service.start_workflow(**arguments)
+    log_path = manager.state_root / accepted.run_id / "bridge-lifecycle.jsonl"
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event"] for event in events] == [
+        "request_reserved",
+        "workflow_state_changed",
+        "workflow_state_changed",
+    ]
+    with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
+        reserved_digest = connection.execute(
+            "SELECT request_digest FROM workflow_requests WHERE run_id = ?",
+            (accepted.run_id,),
+        ).fetchone()[0]
+    assert events[0]["request_digest"] == reserved_digest
+    assert [(event.get("previous_state"), event.get("state")) for event in events[1:]] == [
+        ("queued", "starting"),
+        ("starting", "running"),
+    ]
+    assert all(event["run_id"] == accepted.run_id for event in events)
+    assert all(event["workflow_id"] == accepted.workflow_id for event in events)
+
+    before_reads = log_path.read_bytes()
+    assert (await service.get_workflow(accepted.workflow_id)).status == "running"
+    await service.list_workflows()
+    assert log_path.read_bytes() == before_reads
+
+    run_dir = manager.state_root / accepted.run_id
+    job_adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    prepared_job = job_adapter.prepare_job(
+        accepted.workflow_id,
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+        port=18001,
+    )
+    assert job_adapter.claim_post(prepared_job["job_id"])
+    with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+        job_trace = connection.execute(
+            "SELECT j.workflow_id, j.job_id, j.request_key, j.task_identity, "
+            "e.event_id, e.state FROM jobs AS j JOIN job_events AS e USING (job_id) "
+            "WHERE j.workflow_id = ? ORDER BY e.event_id",
+            (accepted.workflow_id,),
+        ).fetchall()
+    assert [row[5] for row in job_trace] == ["PREPARED", "MAYBE_SENT"]
+    assert [row[4] for row in job_trace] == sorted(row[4] for row in job_trace)
+    assert all(row[0] == events[0]["workflow_id"] for row in job_trace)
+    assert all(row[1] == prepared_job["job_id"] for row in job_trace)
+
+    replay_manager = FakeWorkerManager(manager.state_root, workspace)
+    replay_service = WorkflowService(replay_manager, codex_bridge_port=18001)
+    replayed = await replay_service.start_workflow(**arguments)
+    assert replayed.run_id == accepted.run_id
+    assert replay_manager.start_calls == []
+    replay_events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert replay_events[-1]["event"] == "request_replayed"
+    assert replay_events[-1]["reason_code"] == "same_request_id"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_write_failure_does_not_change_workflow_acceptance(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_bridge.workflows import diagnostic_log
+
+    service, manager, workspace = service_fixture
+
+    def fail_open(_run_dir: Path, _log_path: Path) -> int:
+        raise PermissionError("test-only diagnostic failure")
+
+    monkeypatch.setattr(diagnostic_log, "_open_append_file", fail_open)
+    accepted = await service.start_workflow(
+        client_request_id="phase5f2b-write-failure-0001",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"answer": 4},
+        workspace_root=str(workspace),
+    )
+
+    assert accepted.status == "running"
+    assert len(manager.start_calls) == 1
+    assert not (manager.state_root / accepted.run_id / "bridge-lifecycle.jsonl").exists()
+    with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
+        state = connection.execute(
+            "SELECT state FROM workflow_requests WHERE run_id = ?", (accepted.run_id,)
+        ).fetchone()[0]
+    assert state == "running"
+
+
+@pytest.mark.asyncio
 async def test_queued_reservation_after_service_interruption_is_not_respawned(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -146,6 +247,21 @@ async def test_queued_reservation_after_service_interruption_is_not_respawned(
 
     assert replay.status == "failed_to_start"
     assert restarted_manager.start_calls == []
+    events = [
+        json.loads(line)
+        for line in (manager.state_root / replay.run_id / "bridge-lifecycle.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "request_reserved",
+        "request_replayed",
+        "workflow_state_changed",
+    ]
+    assert events[1]["state"] == "queued"
+    assert events[1]["reason_code"] == "queued_replay_failed_to_start"
+    assert events[2]["previous_state"] == "queued"
+    assert events[2]["state"] == "failed_to_start"
 
 
 @pytest.mark.asyncio
@@ -169,6 +285,15 @@ async def test_request_id_with_different_payload_conflicts_without_second_spawn(
         )
 
     assert len(manager.start_calls) == 1
+    run_dir = manager.start_calls[0][0]
+    events = [
+        json.loads(line)
+        for line in (run_dir / "bridge-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    conflict = events[-1]
+    assert conflict["event"] == "request_conflict"
+    assert conflict["state"] == "running"
+    assert conflict["reason_code"] == "request_digest_mismatch"
 
 
 @pytest.mark.asyncio
@@ -264,6 +389,22 @@ async def test_uncertain_worker_start_is_persisted_and_never_retried(
     assert replay.status == "needs_reconciliation"
     assert len(manager.start_calls) == 1
     assert restarted_manager.start_calls == []
+    events = [
+        json.loads(line)
+        for line in (manager.state_root / replay.run_id / "bridge-lifecycle.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    failure = next(event for event in events if event["event"] == "request_start_failed")
+    assert failure["state"] == "needs_reconciliation"
+    assert failure["reason_code"] == "unexpected_start_failure"
+    assert failure["exception_class"] == "WorkflowStartTestError"
+    transition = next(
+        event
+        for event in events
+        if event["event"] == "workflow_state_changed" and event["state"] == "needs_reconciliation"
+    )
+    assert transition["previous_state"] == "starting"
 
 
 @pytest.mark.asyncio
@@ -288,6 +429,16 @@ async def test_confirmed_manager_failure_is_durable_without_retry(
 
     assert replay.status == "failed_to_start"
     assert len(manager.start_calls) == 1
+    events = [
+        json.loads(line)
+        for line in (manager.state_root / replay.run_id / "bridge-lifecycle.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    failure = next(event for event in events if event["event"] == "request_start_failed")
+    assert failure["state"] == "failed_to_start"
+    assert failure["reason_code"] == "manager_start_failed"
+    assert failure["exception_class"] == "WorkflowManagerError"
 
 
 @pytest.mark.asyncio

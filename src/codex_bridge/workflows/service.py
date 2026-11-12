@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..paths import AllowedPathPolicy, PathPolicyError
+from .diagnostic_log import append_lifecycle_event
 from .manager import WorkflowManagerError, missing_workflow_dependencies
 from .startup_diagnostics import (
     WorkflowStartupDiagnostic,
@@ -217,6 +218,16 @@ class WorkflowService:
                 raise WorkflowServiceUnavailable("workflow request ledger is unavailable") from None
             if existing is not None:
                 if existing.request_digest != prepared.request_digest:
+                    append_lifecycle_event(
+                        self._state_root / existing.run_id,
+                        source="bridge",
+                        event="request_conflict",
+                        run_id=existing.run_id,
+                        workflow_id=existing.workflow_id,
+                        request_digest=prepared.request_digest,
+                        state=existing.state,
+                        reason_code="request_digest_mismatch",
+                    )
                     raise WorkflowRequestConflict(
                         "request ID is already bound to different workflow content"
                     )
@@ -259,6 +270,15 @@ class WorkflowService:
             if not inserted:
                 return await self._replay(row, prepared.request_digest)
 
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_reserved",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                request_digest=row.request_digest,
+            )
+
             diagnostic = WorkflowStartupDiagnostic(
                 row.workflow_id,
                 row.run_id,
@@ -275,9 +295,16 @@ class WorkflowService:
         prepared: _PreparedRequest,
         diagnostic: WorkflowStartupDiagnostic,
     ) -> WorkflowSnapshot:
+        starting_state_persisted = False
         try:
             diagnostic.begin(WorkflowStartupStage.STARTING_STATE_PERSISTED)
-            await self._set_state(row.run_id, "starting")
+            await self._transition_state(
+                row.run_id,
+                "starting",
+                previous_state=row.state,
+                workflow_id=row.workflow_id,
+            )
+            starting_state_persisted = True
             diagnostic.complete_if_active(WorkflowStartupStage.STARTING_STATE_PERSISTED)
             diagnostic.begin(WorkflowStartupStage.MANAGER_VALIDATION)
             if prepared.max_live_codex_jobs in {2, 3}:
@@ -296,20 +323,80 @@ class WorkflowService:
             diagnostic.complete_if_active(WorkflowStartupStage.MANAGER_VALIDATION)
         except WorkflowStartFailed as error:
             diagnostic.fail(error)
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_start_failed",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                state=error.snapshot.status,
+                reason_code="manager_start_failed",
+                exception_class=type(error).__name__,
+            )
             raise
         except WorkflowManagerError as error:
             diagnostic.fail(error)
-            await self._set_state(row.run_id, "failed_to_start")
+            await self._transition_state(
+                row.run_id,
+                "failed_to_start",
+                previous_state="starting",
+                workflow_id=row.workflow_id,
+                reason_code="manager_start_failed",
+            )
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_start_failed",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                state="failed_to_start",
+                reason_code="manager_start_failed",
+                exception_class=type(error).__name__,
+            )
             raise WorkflowStartFailed(
                 await self._snapshot_for_row(row, forced_state="failed_to_start")
             ) from None
         except asyncio.CancelledError as error:
             diagnostic.fail(error)
-            await asyncio.shield(self._set_state(row.run_id, "needs_reconciliation"))
+            await asyncio.shield(
+                self._transition_state(
+                    row.run_id,
+                    "needs_reconciliation",
+                    previous_state=("starting" if starting_state_persisted else None),
+                    workflow_id=row.workflow_id,
+                    reason_code="request_start_cancelled",
+                )
+            )
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_start_failed",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                state="needs_reconciliation",
+                reason_code="request_start_cancelled",
+                exception_class=type(error).__name__,
+            )
             raise
         except BaseException as error:
             diagnostic.fail(error)
-            await self._set_state(row.run_id, "needs_reconciliation")
+            await self._transition_state(
+                row.run_id,
+                "needs_reconciliation",
+                previous_state=("starting" if starting_state_persisted else None),
+                workflow_id=row.workflow_id,
+                reason_code="unexpected_start_failure",
+            )
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_start_failed",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                state="needs_reconciliation",
+                reason_code="unexpected_start_failure",
+                exception_class=type(error).__name__,
+            )
             raise WorkflowReconciliationRequired(
                 await self._snapshot_for_row(row, forced_state="needs_reconciliation")
             ) from None
@@ -319,23 +406,73 @@ class WorkflowService:
             startup_state = await self._wait_for_worker_start(row)
         except BaseException as error:
             diagnostic.fail(error)
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_start_failed",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                state="starting",
+                reason_code="readiness_wait_failed",
+                exception_class=type(error).__name__,
+            )
             raise
         if startup_state == "running":
             diagnostic.complete_if_active(WorkflowStartupStage.WORKER_READINESS_WAIT)
-            await self._set_state(row.run_id, "running")
+            await self._transition_state(
+                row.run_id,
+                "running",
+                previous_state="starting",
+                workflow_id=row.workflow_id,
+            )
             return await self._snapshot_for_row(row)
         if startup_state in {"succeeded", "failed"}:
             diagnostic.complete_if_active(WorkflowStartupStage.WORKER_READINESS_WAIT)
-            await self._set_state(row.run_id, startup_state)
+            await self._transition_state(
+                row.run_id,
+                startup_state,
+                previous_state="starting",
+                workflow_id=row.workflow_id,
+            )
             return await self._snapshot_for_row(row)
         if startup_state == "failed_to_start":
             diagnostic.fail(None, reason=WorkflowStartupFailureReason.WORKER_FAILED)
-            await self._set_state(row.run_id, "failed_to_start")
+            await self._transition_state(
+                row.run_id,
+                "failed_to_start",
+                previous_state="starting",
+                workflow_id=row.workflow_id,
+                reason_code="worker_failed_before_ready",
+            )
+            append_lifecycle_event(
+                self._run_directory(row.run_id),
+                source="bridge",
+                event="request_start_failed",
+                run_id=row.run_id,
+                workflow_id=row.workflow_id,
+                state="failed_to_start",
+                reason_code="worker_failed_before_ready",
+            )
             raise WorkflowStartFailed(
                 await self._snapshot_for_row(row, forced_state="failed_to_start")
             )
         diagnostic.fail(None, reason=WorkflowStartupFailureReason.READINESS_UNCONFIRMED)
-        await self._set_state(row.run_id, "needs_reconciliation")
+        await self._transition_state(
+            row.run_id,
+            "needs_reconciliation",
+            previous_state="starting",
+            workflow_id=row.workflow_id,
+            reason_code="readiness_unconfirmed",
+        )
+        append_lifecycle_event(
+            self._run_directory(row.run_id),
+            source="bridge",
+            event="request_start_failed",
+            run_id=row.run_id,
+            workflow_id=row.workflow_id,
+            state="needs_reconciliation",
+            reason_code="readiness_unconfirmed",
+        )
         raise WorkflowReconciliationRequired(
             await self._snapshot_for_row(row, forced_state="needs_reconciliation")
         )
@@ -385,8 +522,27 @@ class WorkflowService:
             raise WorkflowRequestConflict(
                 "request ID is already bound to different workflow content"
             )
+        replay_reason = (
+            "queued_replay_failed_to_start" if row.state == "queued" else "same_request_id"
+        )
+        append_lifecycle_event(
+            self._run_directory(row.run_id),
+            source="bridge",
+            event="request_replayed",
+            run_id=row.run_id,
+            workflow_id=row.workflow_id,
+            request_digest=request_digest,
+            state=row.state,
+            reason_code=replay_reason,
+        )
         if row.state == "queued":
-            await self._set_state(row.run_id, "failed_to_start")
+            await self._transition_state(
+                row.run_id,
+                "failed_to_start",
+                previous_state="queued",
+                workflow_id=row.workflow_id,
+                reason_code="queued_replay_failed_to_start",
+            )
             return await self._snapshot_for_row(row, forced_state="failed_to_start")
         return await self._snapshot_for_row(row)
 
@@ -449,6 +605,27 @@ class WorkflowService:
                 if diagnostic is not None:
                     diagnostic.fail(error)
             raise WorkflowServiceUnavailable("workflow request state could not be saved") from None
+
+    async def _transition_state(
+        self,
+        run_id: str,
+        state: str,
+        *,
+        previous_state: str | None,
+        workflow_id: str,
+        reason_code: str | None = None,
+    ) -> None:
+        await self._set_state(run_id, state)
+        append_lifecycle_event(
+            self._run_directory(run_id),
+            source="bridge",
+            event="workflow_state_changed",
+            run_id=run_id,
+            workflow_id=workflow_id,
+            previous_state=previous_state,
+            state=state,
+            reason_code=reason_code,
+        )
 
     def _run_directory(self, run_id: str) -> Path:
         if _RUN_ID.fullmatch(run_id) is None:

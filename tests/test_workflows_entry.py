@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from codex_bridge import console_entry
 from codex_bridge.runtime_mode import WORKFLOW_WORKER_FLAG
+from codex_bridge.workflows import worker as worker_module
 from codex_bridge.workflows import worker_entry
 from codex_bridge.workflows.worker import canonical_json, sha256_json, sha256_text
 
@@ -121,3 +124,204 @@ async def test_source_worker_entry_runs_an_offline_fixed_workflow(tmp_path: Path
         "items": [3, 5],
         "total": 7,
     }
+    lifecycle_events = [
+        json.loads(line)
+        for line in (run_dir / "worker-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in lifecycle_events] == [
+        "worker_bootstrap",
+        "dbos_ready",
+        "workflow_started",
+        "result_persisted",
+    ]
+    assert all(event["run_id"] == run_dir.name for event in lifecycle_events)
+    assert all("workflow_id" not in event for event in lifecycle_events[:2])
+    assert all(event["workflow_id"] == result["workflow_id"] for event in lifecycle_events[2:])
+    assert all(event["launch_id"] == "a" * 32 for event in lifecycle_events)
+
+
+def test_worker_failure_log_keeps_exception_class_and_omits_exception_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _config_path = _make_run(tmp_path)
+    secret = "sk-secret-token prompt input result body"
+
+    class FailingDBOS:
+        def __init__(self, *, config: object) -> None:
+            del config
+
+        @staticmethod
+        def launch() -> None:
+            raise RuntimeError(secret)
+
+        @staticmethod
+        def destroy() -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "DBOS", FailingDBOS)
+    monkeypatch.setattr(worker_module, "_dbos_config", lambda _path: object())
+    monkeypatch.setattr(
+        worker_module,
+        "get_process_identity",
+        lambda _pid: {
+            "active": True,
+            "pid": 1234,
+            "parent_pid": 100,
+            "creation_time_100ns": 1,
+            "image_path": "python.exe",
+        },
+    )
+    shutdown_file = run_dir / f"worker-shutdown-{'b' * 32}.request"
+
+    with pytest.raises(RuntimeError, match="sk-secret-token"):
+        worker_module.main(
+            [
+                "--mode",
+                "start",
+                "--run-dir",
+                str(run_dir),
+                "--shutdown-file",
+                str(shutdown_file),
+            ]
+        )
+
+    log_text = (run_dir / "worker-lifecycle.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in log_text.splitlines()]
+    assert [event["event"] for event in events] == ["worker_bootstrap", "worker_failed"]
+    assert events[-1]["reason_code"] == "dbos_launch_failed"
+    assert events[-1]["exception_class"] == "RuntimeError"
+    assert secret not in log_text
+
+
+def test_worker_records_shutdown_observed_without_result_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _config_path = _make_run(tmp_path)
+
+    class FakeDBOS:
+        def __init__(self, *, config: object) -> None:
+            del config
+
+        @staticmethod
+        def launch() -> None:
+            return None
+
+        @staticmethod
+        def start_workflow(*_args: object) -> SimpleNamespace:
+            return SimpleNamespace(workflow_id="01234567-89ab-4cde-8012-3456789abcde")
+
+        @staticmethod
+        def destroy() -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "DBOS", FakeDBOS)
+    monkeypatch.setattr(worker_module, "_dbos_config", lambda _path: object())
+    monkeypatch.setattr(
+        worker_module,
+        "get_process_identity",
+        lambda _pid: {
+            "active": True,
+            "pid": 1234,
+            "parent_pid": 100,
+            "creation_time_100ns": 1,
+            "image_path": "python.exe",
+        },
+    )
+
+    def shutdown_requested(*_args: object) -> object:
+        raise worker_module.WorkerShutdownRequested("test-only shutdown")
+
+    monkeypatch.setattr(worker_module, "_wait_for_result", shutdown_requested)
+    shutdown_file = run_dir / f"worker-shutdown-{'c' * 32}.request"
+    with pytest.raises(worker_module.WorkerShutdownRequested):
+        worker_module.main(
+            [
+                "--mode",
+                "start",
+                "--run-dir",
+                str(run_dir),
+                "--shutdown-file",
+                str(shutdown_file),
+            ]
+        )
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "worker-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "worker_bootstrap",
+        "dbos_ready",
+        "workflow_started",
+        "shutdown_observed",
+    ]
+    assert events[-1]["reason_code"] == "shutdown_requested"
+    assert not (run_dir / "result.json").exists()
+
+
+def test_worker_recovery_records_attached_workflow_and_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _config_path = _make_run(tmp_path)
+    workflow_id = str(uuid.uuid4())
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["workflow_id"] = workflow_id
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    class FakeDBOS:
+        def __init__(self, *, config: object) -> None:
+            del config
+
+        @staticmethod
+        def launch() -> None:
+            return None
+
+        @staticmethod
+        def destroy() -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "DBOS", FakeDBOS)
+    monkeypatch.setattr(worker_module, "_dbos_config", lambda _path: object())
+    monkeypatch.setattr(
+        worker_module,
+        "get_process_identity",
+        lambda _pid: {
+            "active": True,
+            "pid": 1234,
+            "parent_pid": 100,
+            "creation_time_100ns": 1,
+            "image_path": "python.exe",
+        },
+    )
+    monkeypatch.setattr(worker_module, "_wait_for_result", lambda *_args: {"recovered": True})
+    shutdown_file = run_dir / f"worker-shutdown-{'d' * 32}.request"
+
+    assert (
+        worker_module.main(
+            [
+                "--mode",
+                "recover",
+                "--run-dir",
+                str(run_dir),
+                "--shutdown-file",
+                str(shutdown_file),
+            ]
+        )
+        == 0
+    )
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "worker-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "worker_bootstrap",
+        "dbos_ready",
+        "workflow_recovery_attached",
+        "result_persisted",
+    ]
+    assert all(event["workflow_id"] == workflow_id for event in events[1:])

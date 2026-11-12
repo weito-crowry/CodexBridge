@@ -137,8 +137,12 @@ def test_default_state_root_uses_localappdata_without_eager_directory_creation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("exit_code", "expected_state"), [(0, "completed"), (7, "failed")])
 async def test_worker_starts_only_on_explicit_call_and_reports_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    expected_state: str,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -163,7 +167,7 @@ async def test_worker_starts_only_on_explicit_call_and_reports_exit(
     assert calls == []
 
     handle = await manager.start_worker(run_dir, mode="start")
-    process.returncode = 0
+    process.returncode = exit_code
     process._exited.set()
     status = await handle.wait()
 
@@ -172,8 +176,22 @@ async def test_worker_starts_only_on_explicit_call_and_reports_exit(
     assert command[:3] == (sys.executable, "-m", "codex_bridge.workflows.worker_entry")
     assert _DUMMY_TOKEN not in repr(command)
     assert status.pid == process.pid
-    assert status.returncode == 0
-    assert status.state == "completed"
+    assert status.returncode == exit_code
+    assert status.state == expected_state
+    events = [
+        json.loads(line)
+        for line in (run_dir / "bridge-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "worker_launch_requested",
+        "worker_spawn_succeeded",
+        "worker_exited",
+    ]
+    launch_ids = {event["launch_id"] for event in events}
+    assert len(launch_ids) == 1 and len(next(iter(launch_ids))) == 32
+    assert events[1]["pid"] == process.pid
+    assert events[2]["returncode"] == exit_code
+    assert events[2]["state"] == expected_state
 
 
 @pytest.mark.asyncio
@@ -287,6 +305,101 @@ async def test_shutdown_is_bounded_and_terminates_only_managed_worker(
     assert report.ownership_complete
     assert list(run_dir.glob("worker-shutdown-*.request"))
     assert manager.get_status(run_dir.name).state == "stopped"
+    events = [
+        json.loads(line)
+        for line in (run_dir / "bridge-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert "shutdown_signal_requested" in [event["event"] for event in events]
+    assert "worker_terminate_requested" in [event["event"] for event in events]
+    exited = next(event for event in events if event["event"] == "worker_exited")
+    assert exited["shutdown_requested"] is True
+    assert exited["state"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_kill_escalation_and_unknown_exit_are_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StubbornProcess(FakeProcess):
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    process = StubbornProcess()
+
+    async def create_process(*_args: object, **_kwargs: object) -> StubbornProcess:
+        return process
+
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager.asyncio.create_subprocess_exec", create_process
+    )
+    manager = WorkflowWorkerManager(
+        state_root=tmp_path / "state",
+        allowed_roots=(str(workspace),),
+        graceful_shutdown_seconds=0.05,
+    )
+    run_dir = manager.create_run_directory()
+    _write_manifest(run_dir)
+    await manager.start_worker(run_dir, mode="start")
+
+    await manager.shutdown()
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "bridge-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    event_names = [event["event"] for event in events]
+    assert process.terminated and process.killed
+    assert "worker_terminate_requested" in event_names
+    assert "worker_kill_requested" in event_names
+    shutdown_failed = next(event for event in events if event["event"] == "worker_shutdown_failed")
+    assert shutdown_failed["reason_code"] == "worker_did_not_exit"
+    assert "worker_exited" not in event_names
+
+
+@pytest.mark.asyncio
+async def test_shutdown_signal_failure_is_recorded_before_terminate_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "shutdown signal path token"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    process = FakeProcess()
+
+    async def create_process(*_args: object, **_kwargs: object) -> FakeProcess:
+        return process
+
+    def fail_signal(_path: Path) -> None:
+        raise OSError(secret)
+
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager.asyncio.create_subprocess_exec", create_process
+    )
+    monkeypatch.setattr("codex_bridge.workflows.manager._write_shutdown_signal", fail_signal)
+    manager = WorkflowWorkerManager(
+        state_root=tmp_path / "state",
+        allowed_roots=(str(workspace),),
+        graceful_shutdown_seconds=0.05,
+    )
+    run_dir = manager.create_run_directory()
+    _write_manifest(run_dir)
+    await manager.start_worker(run_dir, mode="start")
+
+    await manager.shutdown()
+
+    log_text = (run_dir / "bridge-lifecycle.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in log_text.splitlines()]
+    failure = next(event for event in events if event["event"] == "shutdown_signal_failed")
+    assert failure["reason_code"] == "shutdown_signal_write_failed"
+    assert failure["exception_class"] == "OSError"
+    assert "worker_terminate_requested" in [event["event"] for event in events]
+    assert events[-1]["event"] == "worker_exited"
+    assert events[-1]["state"] == "stopped"
+    assert secret not in log_text
 
 
 @pytest.mark.asyncio
@@ -535,3 +648,13 @@ async def test_worker_start_failure_has_bounded_status_without_error_text_leak(
     status = manager.get_status(run_dir.name)
     assert status is not None and status.state == "failed"
     assert _DUMMY_TOKEN not in repr(status)
+    log_path = run_dir / "bridge-lifecycle.jsonl"
+    log_text = log_path.read_text(encoding="utf-8")
+    events = [json.loads(line) for line in log_text.splitlines()]
+    assert [event["event"] for event in events] == [
+        "worker_launch_requested",
+        "worker_spawn_failed",
+    ]
+    assert events[-1]["exception_class"] == "OSError"
+    assert events[-1]["reason_code"] == "spawn_os_error"
+    assert _DUMMY_TOKEN not in log_text
