@@ -954,9 +954,32 @@ def test_worker_completes_three_sorted_jobs_and_replays_without_new_posts(
     assert steps.cache_hits >= 6
 
 
-def test_worker_does_not_dispatch_third_job_after_second_needs_reconciliation(
+@pytest.mark.parametrize(
+    ("second_outcome", "expected_error", "expected_state", "expected_status"),
+    [
+        (
+            {"state": "needs_approval"},
+            CodexJobReconciliationRequiredError,
+            "ACCEPTED",
+            "NEEDS_RECONCILIATION",
+        ),
+        ({"state": "failed"}, CodexJobFailedError, "FAILED", "FAILED"),
+        (
+            {"post_error": True},
+            CodexJobReconciliationRequiredError,
+            "MAYBE_SENT",
+            "NEEDS_RECONCILIATION",
+        ),
+    ],
+    ids=["second-needs-reconciliation", "second-failed", "second-post-ambiguous"],
+)
+def test_worker_does_not_dispatch_third_job_after_second_is_not_succeeded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    second_outcome: dict[str, Any],
+    expected_error: type[Exception],
+    expected_state: str,
+    expected_status: str,
 ) -> None:
     from codex_bridge.workflows import worker
 
@@ -966,10 +989,10 @@ def test_worker_does_not_dispatch_third_job_after_second_needs_reconciliation(
     workspace_root.mkdir()
     _FakeCodexHTTPClient.outcomes = {
         "Reply with only the synthetic issue number: 9": {"final_text": "9"},
-        "Reply with only the synthetic issue number: 17": {"state": "needs_approval"},
+        "Reply with only the synthetic issue number: 17": second_outcome,
     }
 
-    with pytest.raises(CodexJobReconciliationRequiredError):
+    with pytest.raises(expected_error):
         _run_fake_worker(
             run_dir,
             workspace_root,
@@ -987,10 +1010,10 @@ def test_worker_does_not_dispatch_third_job_after_second_needs_reconciliation(
     )
     post_requests = [event for kind, event in _FakeCodexHTTPClient.events if kind == "POST"]
     assert len(jobs) == 2
-    assert [job["state"] for job in jobs] == ["SUCCEEDED", "ACCEPTED"]
+    assert [job["state"] for job in jobs] == ["SUCCEEDED", expected_state]
     assert len(post_requests) == 2
     assert "21" not in post_requests[-1]["prompt"]
-    assert second_status["status"] == "NEEDS_RECONCILIATION"
+    assert second_status["status"] == expected_status
 
 
 @pytest.mark.parametrize(

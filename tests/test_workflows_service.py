@@ -110,6 +110,45 @@ async def test_same_request_id_reuses_durable_run_after_service_recreation(
 
 
 @pytest.mark.asyncio
+async def test_queued_reservation_after_service_interruption_is_not_respawned(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, manager, workspace = service_fixture
+    arguments = {
+        "client_request_id": "phase5f2a-queued-interruption",
+        "workflow_yaml": _workflow_yaml(),
+        "input_data": {"answer": 4},
+        "workspace_root": str(workspace),
+    }
+
+    async def interrupt_before_manager(
+        _row: object, _prepared: object, _diagnostic: object
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(service, "_start_reserved_workflow", interrupt_before_manager)
+    with pytest.raises(asyncio.CancelledError):
+        await service.start_workflow(**arguments)
+
+    with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
+        reserved_state = connection.execute(
+            "SELECT state FROM workflow_requests WHERE client_request_id = ?",
+            (arguments["client_request_id"],),
+        ).fetchone()
+    assert reserved_state == ("queued",)
+    assert manager.start_calls == []
+
+    restarted_manager = FakeWorkerManager(manager.state_root, workspace)
+    replay = await WorkflowService(restarted_manager, codex_bridge_port=18001).start_workflow(
+        **arguments
+    )
+
+    assert replay.status == "failed_to_start"
+    assert restarted_manager.start_calls == []
+
+
+@pytest.mark.asyncio
 async def test_request_id_with_different_payload_conflicts_without_second_spawn(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
 ) -> None:
@@ -501,8 +540,14 @@ async def test_maybe_sent_and_tampered_snapshot_require_reconciliation(
 
 
 @pytest.mark.asyncio
-async def test_completed_worker_without_result_is_not_reported_as_success(
+@pytest.mark.parametrize(
+    "result_payload",
+    [None, "{"],
+    ids=["missing", "corrupt"],
+)
+async def test_completed_worker_without_valid_result_is_not_reported_as_success(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    result_payload: str | None,
 ) -> None:
     service, manager, workspace = service_fixture
     accepted = await service.start_workflow(
@@ -523,6 +568,8 @@ async def test_completed_worker_without_result_is_not_reported_as_success(
         connection.execute(
             "INSERT INTO workflow_status VALUES (?, 'SUCCESS')", (accepted.workflow_id,)
         )
+    if result_payload is not None:
+        (run_dir / "result.json").write_text(result_payload, encoding="utf-8")
 
     status = await service.get_workflow(accepted.workflow_id)
     result = await service.get_result(accepted.workflow_id)
@@ -530,6 +577,23 @@ async def test_completed_worker_without_result_is_not_reported_as_success(
     assert status.status == "unknown"
     assert result.workflow.status == "unknown"
     assert result.result is None
+
+
+def test_interrupted_atomic_result_write_preserves_existing_result(tmp_path: Path) -> None:
+    from codex_bridge.workflows.worker import _write_json
+
+    result_path = tmp_path / "result.json"
+    saved_result = '{"result":{"final_text":"saved"}}\n'
+    result_path.write_text(saved_result, encoding="utf-8")
+
+    with pytest.raises(TypeError):
+        _write_json(
+            result_path,
+            {"first": "partial write", "unserializable": object()},
+        )
+
+    assert result_path.read_text(encoding="utf-8") == saved_result
+    assert result_path.with_suffix(".json.tmp").is_file()
 
 
 @pytest.mark.asyncio

@@ -242,6 +242,113 @@ class _NoPostClient:
         }
 
 
+class _AmbiguousStartClient:
+    port = 18001
+
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+        self.preflight_calls = 0
+        self.create_thread_calls = 0
+
+    def preflight(self) -> None:
+        self.preflight_calls += 1
+
+    def create_thread(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.create_thread_calls += 1
+        if self.outcome == "response-lost":
+            raise CodexHTTPError("synthetic response loss")
+        assert self.outcome == "unknown-identity"
+        return {"thread_id": "thread-12345678", "turn_id": None, "state": "in_progress"}
+
+
+def test_prepared_job_posts_once_after_recreation_and_replay_does_not_post(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "prepared-run"
+    run_dir.mkdir()
+    database_path = run_dir / "codex_jobs.sqlite"
+    adapter = CodexJobAdapter(database_path)
+    prepared = adapter.prepare_job(
+        "workflow-12345678",
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+        port=18001,
+    )
+    assert prepared["state"] == "PREPARED"
+
+    client = _NoPostClient()
+    recovered = CodexJobAdapter(database_path)
+    accepted = recovered.start_job(
+        "workflow-12345678",
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+        client,  # type: ignore[arg-type]
+    )
+    assert accepted["state"] == "ACCEPTED"
+    assert client.preflight_calls == 1
+    assert client.create_thread_calls == 1
+
+    replayed = CodexJobAdapter(database_path).start_job(
+        "workflow-12345678",
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+        client,  # type: ignore[arg-type]
+    )
+
+    assert replayed["state"] == "ACCEPTED"
+    assert client.preflight_calls == 1
+    assert client.create_thread_calls == 1
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["claimed", "response-lost", "unknown-identity"],
+    ids=["claimed-before-send", "response-lost", "thread-or-turn-id-unknown"],
+)
+def test_maybe_sent_post_is_never_retried_after_recreation(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    run_dir = tmp_path / f"maybe-sent-{outcome}"
+    run_dir.mkdir()
+    database_path = run_dir / "codex_jobs.sqlite"
+    adapter = CodexJobAdapter(database_path)
+    arguments = (
+        "workflow-12345678",
+        "do[0].calculate",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+    )
+
+    if outcome == "claimed":
+        prepared = adapter.prepare_job(
+            *arguments[:3],
+            arguments[3],
+            port=18001,
+        )
+        assert adapter.claim_post(prepared["job_id"])
+    else:
+        first_client = _AmbiguousStartClient(outcome)
+        with pytest.raises(CodexJobReconciliationRequiredError):
+            adapter.start_job(*arguments, first_client)  # type: ignore[arg-type]
+        assert first_client.preflight_calls == 1
+        assert first_client.create_thread_calls == 1
+
+    recovered = CodexJobAdapter(database_path)
+    retry_client = _NoPostClient()
+    with pytest.raises(CodexJobReconciliationRequiredError):
+        recovered.start_job(*arguments, retry_client)  # type: ignore[arg-type]
+
+    status = recovered.get_job_status(request_key="workflow-12345678::do[0].calculate")
+    assert status["state"] == "MAYBE_SENT"
+    assert status["status"] == "NEEDS_RECONCILIATION"
+    assert retry_client.preflight_calls == 0
+    assert retry_client.create_thread_calls == 0
+
+
 _OBSERVED_THREAD_ID = "thread-12345678"
 _OBSERVED_TURN_ID = "turn-12345678"
 
