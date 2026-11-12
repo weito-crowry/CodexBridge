@@ -1,1 +1,3 @@
 src/codex_bridge/workflows/schema/workflow.yaml whitespace=-blank-at-eol
+src/codex_bridge/workflows/schema/workflow.yaml text eol=lf
+poc/ows/schema/workflow.yaml text eol=lf
