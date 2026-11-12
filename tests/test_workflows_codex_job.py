@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,11 @@ from codex_bridge.workflows.codex_job_adapter import (
     CodexJobReconciliationRequiredError,
     CodexJobRequestError,
 )
-from codex_bridge.workflows.http_client import CONTROL_TOKEN_ENV
+from codex_bridge.workflows.http_client import (
+    CONTROL_TOKEN_ENV,
+    CodexHTTPError,
+    CodexProtocolError,
+)
 from codex_bridge.workflows.interpreter import (
     SAFE_CODEX_JOB_PROMPT,
     OwsError,
@@ -235,6 +240,222 @@ class _NoPostClient:
             "turn_id": "turn-99999999",
             "state": "in_progress",
         }
+
+
+class _FakeObservationClient:
+    port = 18001
+
+    def __init__(self, observations: list[dict[str, Any] | CodexHTTPError]) -> None:
+        self.observations = list(observations)
+        self.observe_calls: list[tuple[str, str]] = []
+        self.post_calls = 0
+
+    def observe_thread(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        self.observe_calls.append((thread_id, turn_id))
+        response = self.observations.pop(0)
+        if isinstance(response, CodexHTTPError):
+            raise response
+        return response
+
+    def create_thread(self, _request: dict[str, Any]) -> dict[str, Any]:
+        self.post_calls += 1
+        raise AssertionError("observe_job must not POST")
+
+
+def _accepted_job_for_observation(tmp_path: Path) -> tuple[CodexJobAdapter, dict[str, Any]]:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    job = adapter.prepare_job(
+        "workflow-12345678",
+        "do[0].observe",
+        SAFE_CODEX_JOB_PROMPT,
+        run_dir,
+        port=18001,
+    )
+    assert adapter.claim_post(job["job_id"])
+    adapter.mark_accepted(job["job_id"], "thread-12345678", "turn-12345678", "in_progress")
+    return adapter, adapter.get_job_status(job_id=job["job_id"])
+
+
+def _observation(status_state: str, turn_state: str) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    if turn_state == "completed":
+        items.append(
+            {
+                "turn_id": "turn-12345678",
+                "item": {"type": "agentMessage", "phase": "final_answer", "text": "done"},
+            }
+        )
+    return {
+        "status": {"state": status_state},
+        "turns": [{"id": "turn-12345678", "status": turn_state}],
+        "items": items,
+    }
+
+
+def _assert_observation_keeps_job(
+    adapter: CodexJobAdapter,
+    job: dict[str, Any],
+    client: _FakeObservationClient,
+) -> None:
+    current = adapter.get_job_status(job_id=job["job_id"])
+    assert current["job_id"] == job["job_id"]
+    assert current["request_key"] == job["request_key"]
+    assert all(call == ("thread-12345678", "turn-12345678") for call in client.observe_calls)
+    with sqlite3.connect(adapter.database_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM jobs WHERE workflow_id = ?", (job["workflow_id"],)
+        ).fetchone()[0]
+    assert count == 1
+    assert client.post_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("transient", "stable", "expected_state"),
+    [
+        (("in_progress", "completed"), ("completed", "completed"), "SUCCEEDED"),
+        (("completed", "in_progress"), ("in_progress", "in_progress"), "RUNNING"),
+    ],
+)
+def test_observe_job_rechecks_transient_state_mismatch_until_consistent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transient: tuple[str, str],
+    stable: tuple[str, str],
+    expected_state: str,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    client = _FakeObservationClient([_observation(*transient), _observation(*stable)])
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["state"] == expected_state
+    assert len(client.observe_calls) == 2
+    assert sleeps == [0.2]
+    _assert_observation_keeps_job(adapter, job, client)
+
+
+def test_observe_job_marks_reconciliation_after_two_transient_rechecks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    mismatch = _observation("in_progress", "completed")
+    client = _FakeObservationClient([mismatch, mismatch, mismatch])
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert len(client.observe_calls) == 3
+    assert sleeps == [0.2, 0.2]
+    _assert_observation_keeps_job(adapter, job, client)
+
+
+def test_observe_job_fails_closed_when_recheck_get_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    client = _FakeObservationClient(
+        [_observation("in_progress", "completed"), CodexHTTPError("fake GET failure")]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert len(client.observe_calls) == 2
+    assert sleeps == [0.2]
+    _assert_observation_keeps_job(adapter, job, client)
+
+
+@pytest.mark.parametrize("scenario", ["invalid-id", "malformed-history"])
+def test_observe_job_does_not_retry_invalid_identity_or_malformed_history(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    if scenario == "invalid-id":
+        with sqlite3.connect(adapter.database_path) as connection:
+            connection.execute(
+                "UPDATE jobs SET turn_id = 'invalid' WHERE job_id = ?", (job["job_id"],)
+            )
+        client = _FakeObservationClient([])
+        expected_calls = 0
+    else:
+        client = _FakeObservationClient([CodexProtocolError("malformed history")])
+        expected_calls = 1
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert len(client.observe_calls) == expected_calls
+    _assert_observation_keeps_job(adapter, job, client)
+
+
+def test_observe_job_does_not_retry_when_target_turn_is_missing_from_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    client = _FakeObservationClient(
+        [
+            {
+                "status": {"state": "in_progress"},
+                "turns": [{"id": "turn-87654321", "status": "completed"}],
+                "items": [],
+            }
+        ]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["state"] == "RUNNING"
+    assert len(client.observe_calls) == 1
+    assert sleeps == []
+    _assert_observation_keeps_job(adapter, job, client)
+
+
+@pytest.mark.parametrize("state", ["needs_approval", "needs_input"])
+def test_observe_job_does_not_retry_approval_or_input_required(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    client = _FakeObservationClient([_observation(state, state)])
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["status"] == "NEEDS_RECONCILIATION"
+    assert len(client.observe_calls) == 1
+    _assert_observation_keeps_job(adapter, job, client)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_state"),
+    [("in_progress", "RUNNING"), ("completed", "SUCCEEDED"), ("failed", "FAILED")],
+)
+def test_observe_job_observes_consistent_states_once(
+    tmp_path: Path,
+    state: str,
+    expected_state: str,
+) -> None:
+    adapter, job = _accepted_job_for_observation(tmp_path)
+    client = _FakeObservationClient([_observation(state, state)])
+
+    observed = adapter.observe_job(job["job_id"], client)  # type: ignore[arg-type]
+
+    assert observed["state"] == expected_state
+    assert len(client.observe_calls) == 1
+    _assert_observation_keeps_job(adapter, job, client)
 
 
 def test_preassigned_workflow_id_does_not_rewrite_immutable_manifest(
