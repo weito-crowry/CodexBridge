@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
+
+from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "phase5f1b_three_job_isolated_smoke.py"
@@ -420,3 +424,249 @@ def test_cleanup_reports_reaped_only_for_known_process_identities(
         )
         is False
     )
+
+
+def _write_valid_saved_state(
+    smoke: ModuleType,
+    root: Path,
+    *,
+    request_state: str = "succeeded",
+    identity_mismatch: str | None = None,
+) -> dict[str, Any]:
+    state_root = root / "localappdata" / "CodexBridge" / "workflows"
+    state_root.mkdir(parents=True)
+    workspace_root = root / "workspace"
+    workspace_root.mkdir()
+    workflow_id = "11111111-2222-4333-8444-555555555555"
+    run_id = "run-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    client_request_id = "phase5f1b-offline-request"
+    ui_port = 62806
+    run_dir = state_root / run_id
+    run_dir.mkdir()
+
+    _fixture_text, definition, _issues = smoke.load_fixed_workflow()
+    definition_text = (
+        json.dumps(
+            definition, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+        + "\n"
+    )
+    input_data = smoke.FIXED_INPUT
+    workspace = str(workspace_root.resolve(strict=True))
+
+    def canonical(value: object) -> str:
+        return json.dumps(
+            value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+
+    request_digest = hashlib.sha256(
+        canonical(
+            {
+                "workflow": definition,
+                "input": input_data,
+                "workspace_root": workspace,
+                "max_live_codex_jobs": 3,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    definition_sha256 = hashlib.sha256(definition_text.encode("utf-8")).hexdigest()
+    input_sha256 = hashlib.sha256(canonical(input_data).encode("utf-8")).hexdigest()
+    manifest = {
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "request_digest": request_digest,
+        "workspace_root": workspace,
+        "workflow_source": "ui-api",
+        "mode": "codex-job-live",
+        "definition_sha256": definition_sha256,
+        "input_sha256": input_sha256,
+        "control": {
+            "codex_job_live": True,
+            "max_live_codex_jobs": 3,
+            "codex_job_max_polls": 600,
+            "codex_job_poll_interval_seconds": 0.2,
+        },
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (run_dir / "workflow.yaml").write_text(definition_text, encoding="utf-8")
+    (run_dir / "input.json").write_text(json.dumps(input_data), encoding="utf-8")
+    (run_dir / "worker-entry-status.json").write_text(
+        json.dumps({"state": "completed", "exit_code": 0}), encoding="utf-8"
+    )
+
+    requests_db = state_root / "requests.sqlite"
+    with sqlite3.connect(requests_db) as connection:
+        connection.execute(
+            "CREATE TABLE workflow_requests ("
+            "client_request_id TEXT NOT NULL UNIQUE, workflow_id TEXT NOT NULL UNIQUE, "
+            "run_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, state TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        request_row = {
+            "client_request_id": client_request_id,
+            "workflow_id": workflow_id,
+            "run_id": run_id,
+            "request_digest": request_digest,
+            "state": request_state,
+        }
+        if identity_mismatch is not None:
+            request_row[identity_mismatch] = f"mismatched-{identity_mismatch}"
+        connection.execute(
+            "INSERT INTO workflow_requests VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                request_row["client_request_id"],
+                request_row["workflow_id"],
+                request_row["run_id"],
+                request_digest,
+                request_state,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    jobs_db = run_dir / "codex_jobs.sqlite"
+    adapter = CodexJobAdapter(jobs_db)
+    job_rows: list[dict[str, str]] = []
+    with sqlite3.connect(jobs_db) as connection:
+        connection.row_factory = sqlite3.Row
+        for number, task_identity in zip((9, 17, 21), smoke.EXPECTED_TASK_IDENTITIES, strict=True):
+            job_id = f"job-{number}"
+            request_key = f"{workflow_id}::{task_identity}"
+            thread_id = f"thread-{number}"
+            turn_id = f"turn-id-{number}"
+            job_request = {
+                "client_request_id": f"phase5f1b-offline-{number}",
+                "cwd": workspace,
+                "prompt": f"Reply with only the synthetic issue number: {number}",
+                "title": f"phase5f1b-offline-{number}",
+                "sandbox_mode": "inherit",
+                "confirm_full_access": False,
+            }
+            job_digest = hashlib.sha256(
+                canonical(
+                    {
+                        "host": smoke.r4.BRIDGE_HOST,
+                        "port": ui_port,
+                        "body": job_request,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO jobs (job_id, request_key, workflow_id, task_identity, "
+                "request_digest, request_json, state, client_request_id, title_marker, "
+                "agent_cwd, created_at, updated_at, thread_id, turn_id, remote_state, "
+                "receipt_json, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    request_key,
+                    workflow_id,
+                    task_identity,
+                    job_digest,
+                    canonical(job_request),
+                    "SUCCEEDED",
+                    job_request["client_request_id"],
+                    job_request["title"],
+                    workspace,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                    thread_id,
+                    turn_id,
+                    "completed",
+                    canonical({"result": {"final_text": str(number)}}),
+                    None,
+                ),
+            )
+            for state in ("PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED"):
+                connection.execute(
+                    "INSERT INTO job_events (job_id, state, timestamp, payload_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (job_id, state, "2026-01-01T00:00:00+00:00", "{}"),
+                )
+            job_rows.append(
+                {
+                    "job_id": job_id,
+                    "task_identity": task_identity,
+                    "request_key": request_key,
+                }
+            )
+        adapter._validate_ledger_data(connection)
+
+    dbos_db = run_dir / "dbos.sqlite"
+    with sqlite3.connect(dbos_db) as connection:
+        connection.execute(
+            "CREATE TABLE workflow_status (workflow_uuid TEXT NOT NULL, status TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO workflow_status VALUES (?, ?)", (workflow_id, "SUCCESS"))
+    result = {
+        "workflow_id": workflow_id,
+        "definition_sha256": definition_sha256,
+        "input_sha256": input_sha256,
+        "result": [
+            {
+                "number": 5,
+                "status": "skipped",
+                "job_id": None,
+                "request_key": None,
+                "final_text": None,
+            },
+            *(
+                {
+                    "number": number,
+                    "status": "SUCCEEDED",
+                    "job_id": job["job_id"],
+                    "request_key": job["request_key"],
+                    "final_text": str(number),
+                }
+                for number, job in zip((9, 17, 21), job_rows, strict=True)
+            ),
+        ],
+    }
+    (run_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    return {
+        "state_root": state_root,
+        "client_request_id": client_request_id,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "workspace_root": workspace_root,
+        "ui_port": ui_port,
+    }
+
+
+@pytest.mark.parametrize("request_state", ("running", "succeeded"))
+def test_saved_state_accepts_running_or_succeeded_request_row_only_with_durable_success(
+    smoke: ModuleType, tmp_path: Path, request_state: str
+) -> None:
+    saved = smoke._read_three_job_saved_state(
+        **_write_valid_saved_state(smoke, tmp_path, request_state=request_state)
+    )
+
+    assert [row["state"] for row in saved["jobs"]] == ["SUCCEEDED"] * 3
+    assert [row["remote_state"] for row in saved["jobs"]] == ["completed"] * 3
+    assert saved["dbos_status"] == "SUCCESS"
+    assert saved["worker_status"] == {"state": "completed", "exit_code": 0}
+    assert saved["final_texts"] == ["9", "17", "21"]
+    assert len(saved["events"]) == 15
+
+
+@pytest.mark.parametrize("request_state", ("queued", "starting", "failed", "needs_reconciliation"))
+def test_saved_state_rejects_non_running_and_non_succeeded_request_rows(
+    smoke: ModuleType, tmp_path: Path, request_state: str
+) -> None:
+    with pytest.raises(smoke.SmokeAbort) as error:
+        smoke._read_three_job_saved_state(
+            **_write_valid_saved_state(smoke, tmp_path, request_state=request_state)
+        )
+
+    assert error.value.code == "three_job_request_ledger_identity_or_state_mismatch"
+
+
+@pytest.mark.parametrize("identity", ("client_request_id", "workflow_id", "run_id"))
+def test_saved_state_rejects_each_request_ledger_identity_mismatch(
+    smoke: ModuleType, tmp_path: Path, identity: str
+) -> None:
+    with pytest.raises(smoke.SmokeAbort) as error:
+        smoke._read_three_job_saved_state(
+            **_write_valid_saved_state(smoke, tmp_path, identity_mismatch=identity)
+        )
+
+    assert error.value.code == "three_job_request_ledger_identity_or_state_mismatch"

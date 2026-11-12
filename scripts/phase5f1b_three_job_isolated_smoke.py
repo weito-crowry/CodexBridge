@@ -574,7 +574,7 @@ def _read_three_job_saved_state(
         request.get("client_request_id") != client_request_id
         or request.get("workflow_id") != workflow_id
         or request.get("run_id") != run_id
-        or request.get("state") != "succeeded"
+        or request.get("state") not in {"running", "succeeded"}
     ):
         raise SmokeAbort("BLOCKED", "three_job_request_ledger_identity_or_state_mismatch")
 
