@@ -2831,11 +2831,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--r4-once",
         action="store_true",
-        help="claim the dedicated R4 evidence path after validating the original, R2, and R3 evidence",
+        help=(
+            "claim the dedicated R4 evidence path after validating the original, "
+            "R2, and R3 evidence"
+        ),
     )
     arguments = parser.parse_args(argv)
     if sum((arguments.retest_once, arguments.diagnostic_retest_once, arguments.r4_once)) > 1:
-        parser.error("--retest-once, --diagnostic-retest-once, and --r4-once cannot be combined")
+        parser.error(
+            "--retest-once, --diagnostic-retest-once, and --r4-once cannot be combined",
+        )
     previous_evidence_sha256: str | None = None
     diagnostic_retest_sha256: dict[str, str] | None = None
     r4_baseline_sha256: dict[str, str] | None = None
