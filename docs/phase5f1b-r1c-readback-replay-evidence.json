@@ -1,0 +1,295 @@
+{
+  "schema_version": "codexbridge.phase5f1b.r1c-readback-replay.v1",
+  "phase": "Phase5F-1B-R1C",
+  "recorded_at_utc": "2026-11-12T18:18:52Z",
+  "status": "BLOCKED",
+  "scope": {
+    "existing_r1_jobs_reexecuted": false,
+    "new_workflow_created": false,
+    "restart_shutdown_or_cleanup_performed": false
+  },
+  "checks": {
+    "status": "BLOCKED",
+    "replay_post_outcome": "UNKNOWN_NO_RETRY",
+    "replay_post_count": null,
+    "possible_replay_post_count_range": [
+      0,
+      1
+    ],
+    "replay_post_attempted": "UNKNOWN",
+    "failure_classification": "replay_invocation_output_missing_no_retry",
+    "final_api_get_status": "NOT_RUN",
+    "checkout": {
+      "branch": "codex/phase5f1b-three-job-e2e",
+      "head": "9ef1c1a5efede0f81d5462ba8e5bd191ab70a1a4",
+      "tracked_clean": true,
+      "protected_untracked_paths": [
+        "docs/phase5e-2c2-diagnostic-retest-evidence.json",
+        "docs/phase5e-2c2-r4-evidence.json"
+      ]
+    },
+    "protected_evidence_sha256_before": {
+      "docs/phase5f1b-postmortem-addendum.json": "8298326e05c6779bd41de01c74c93b1eafe06adb7e295510ab3f01f458f81c3d",
+      "docs/phase5f1b-r1-postmortem-addendum.json": "8ac77f67e8723c6c548f0509b2bbfaf7825fabb6372081e57dc9bc10d95aefd8",
+      "docs/phase5f1b-three-job-e2e-evidence.json": "1af75fcb89ad314be79f35f5e06b2eca777a1c877e150d6e683c0f88a435bdc5",
+      "docs/phase5f1b-three-job-e2e-r1-evidence.json": "a9572b879933808c813b1f96eaad0852ca55722dfd3f01c899944e74b4b17176",
+      "docs/phase5e-2c2-diagnostic-retest-evidence.json": "ede76c2334f362765ff136619f9a393fd592bb514ab9b707374598a5bd4152b5",
+      "docs/phase5e-2c2-r4-evidence.json": "9fc47e74ea21854af1a8e1157da72496f5a5cf30480880a713ca4497fd311742"
+    },
+    "r1_bridge": {
+      "pid": 14208,
+      "owner": "WEITO-PC\\weito",
+      "creation_epoch": 1794500465.809399,
+      "executable": "D:\\CodexBridge-Workflow409\\.venv\\Scripts\\python.exe",
+      "descendant_count": 18,
+      "listener_pid": 10308,
+      "listener_parent_pid": 14208,
+      "listener_executable": "C:\\Users\\weito\\AppData\\Roaming\\uv\\python\\cpython-3.14.10-windows-x86_64-none\\python.exe",
+      "listener_creation_epoch": 1794500465.841188,
+      "listener_bind_addresses": {
+        "62806": "127.0.0.1",
+        "62807": "127.0.0.1"
+      },
+      "r4_owned_listener_check": "PASS",
+      "worker_process_count": 0
+    },
+    "original_r1": {
+      "historical_e2e_status": "BLOCKED",
+      "accepted_http_status": 202,
+      "source_evidence_sha256": "a9572b879933808c813b1f96eaad0852ca55722dfd3f01c899944e74b4b17176",
+      "saved_state_postmortem_status": "PASS"
+    },
+    "saved_state_reconciliation": {
+      "status": "PASS",
+      "workflow_id": "bca46292-4ea0-4ab1-b80b-e45b924f5ecf",
+      "run_id": "run-14e085cffd6443a484533a985dcbe135",
+      "client_request_id": "phase5f1b-cfa1c2cd73334624bbf14f03fce1dece",
+      "request_rows": 1,
+      "request_state": "running",
+      "run_directories": 1,
+      "job_rows": 3,
+      "job_states": [
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "SUCCEEDED"
+      ],
+      "events": 15,
+      "dbos_status": "SUCCESS",
+      "worker_state": "completed",
+      "worker_exit_code": 0,
+      "maximum_active_jobs": 1,
+      "final_texts": [
+        "9",
+        "17",
+        "21"
+      ],
+      "reconciliation_marker_rows": 0,
+      "job_id_set_sha256": "766da5364e468d9f12e67700751dff590488fb0c0f4de8576fa46252b0b1a66c",
+      "thread_id_set_sha256": "f7afaa1f0f34f7b092a064c1768f45165c33e39ffe20cbea0e05213b9a131a6c",
+      "turn_id_set_sha256": "811769dccf5e4e7713d05a095a2ace6c6e93a6b400bbeee96350cf2ad660fb07",
+      "matches_step_a_ids": true
+    },
+    "readback": {
+      "status": "PASS",
+      "initial_canonical_get_count": 3,
+      "initial_canonical_get_status": "PASS",
+      "qt_get_count": 2,
+      "qt_get_status": "PASS",
+      "read_only_reconciliation_get_count": 6,
+      "read_only_reconciliation_http_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "workflow_status": "succeeded",
+      "worker_state": "completed",
+      "job_states": [
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "SUCCEEDED"
+      ],
+      "result_numbers": [
+        5,
+        9,
+        17,
+        21
+      ],
+      "final_texts": [
+        "9",
+        "17",
+        "21"
+      ],
+      "current_api_matches_saved_state": true,
+      "confirmed_total_canonical_gets": 9,
+      "confirmed_total_qt_gets": 2,
+      "additional_get_count_in_unobserved_invocation": "UNKNOWN"
+    },
+    "request_reconstruction": {
+      "status": "PASS",
+      "workflow_yaml_sha256": "a813cbdf5534039ead421c33571b44719e0576b2fe791b3fff8f5f5430a7bbb0",
+      "input_sha256": "882bbc49818597ba4de691c461983aff711e51d560173dd9aea8a6f2b4c095a8",
+      "definition_sha256": "e34b3bd2c2e1cf573cf751c73ccb5b107ab3e5579275905268d0be857eee5cb1",
+      "workspace_root_label": "codexbridge-phase5f1b-_xwln6v5",
+      "workspace_root_sha256": "fdca997260ee1196d0504b45d172d487ea35f23e4771659842884772bca1251f",
+      "request_digest": "6f7f53b2267012da9d3c0b2d20f22cc35d82386969b36437bd88f2b3b0e12c61",
+      "source_payload_sha256": "a4e44bb9de44c0dfdfd047fc4b0d7e9ce4245da48e369ab720fca1462f7de5d5",
+      "reconstructed_body_sha256": "a4e44bb9de44c0dfdfd047fc4b0d7e9ce4245da48e369ab720fca1462f7de5d5",
+      "exact_match": true
+    },
+    "replay": {
+      "status": "BLOCKED",
+      "outcome": "UNKNOWN_NO_RETRY",
+      "post_attempted": "UNKNOWN",
+      "post_count": null,
+      "possible_post_count_range": [
+        0,
+        1
+      ],
+      "accepted_http_status": null,
+      "response_identity": "UNKNOWN",
+      "retry_count": 0,
+      "new_workflow_post_count": 0,
+      "new_workflow_count": 0,
+      "new_codex_job_count": 0,
+      "new_codex_thread_count": 0,
+      "state_after_reconciliation_unchanged": true,
+      "api_projection_identical_before_and_after": "UNKNOWN",
+      "failure_classification": "replay_invocation_returned_no_console_output"
+    },
+    "sqlite_read_only": {
+      "step_a_initial_snapshot": {
+        "requests": {
+          "db": {
+            "exists": true,
+            "sha256": "40c0f4c0973655ac459ca91655fb102194c1d8dc18a4f8c7f548feee2cb61788"
+          },
+          "wal": {
+            "exists": false,
+            "sha256": null
+          },
+          "shm": {
+            "exists": false,
+            "sha256": null
+          }
+        },
+        "jobs": {
+          "db": {
+            "exists": true,
+            "sha256": "b28dbafb55108646c8b20883175a3b6417c6805ccc0d107659df640667446741"
+          },
+          "wal": {
+            "exists": false,
+            "sha256": null
+          },
+          "shm": {
+            "exists": false,
+            "sha256": null
+          }
+        },
+        "dbos": {
+          "db": {
+            "exists": true,
+            "sha256": "db7624ef2c86991f563f0edc0267419f942301c15f6f48a5d8c129380b86afc3"
+          },
+          "wal": {
+            "exists": false,
+            "sha256": null
+          },
+          "shm": {
+            "exists": false,
+            "sha256": null
+          }
+        }
+      },
+      "latest_snapshot": {
+        "requests": {
+          "db": {
+            "exists": true,
+            "sha256": "40c0f4c0973655ac459ca91655fb102194c1d8dc18a4f8c7f548feee2cb61788"
+          },
+          "wal": {
+            "exists": true,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          "shm": {
+            "exists": true,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          }
+        },
+        "jobs": {
+          "db": {
+            "exists": true,
+            "sha256": "b28dbafb55108646c8b20883175a3b6417c6805ccc0d107659df640667446741"
+          },
+          "wal": {
+            "exists": true,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          "shm": {
+            "exists": true,
+            "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb"
+          }
+        },
+        "dbos": {
+          "db": {
+            "exists": true,
+            "sha256": "db7624ef2c86991f563f0edc0267419f942301c15f6f48a5d8c129380b86afc3"
+          },
+          "wal": {
+            "exists": false,
+            "sha256": null
+          },
+          "shm": {
+            "exists": false,
+            "sha256": null
+          }
+        }
+      },
+      "historical_manifest_hashes": {
+        "requests.sqlite": "40c0f4c0973655ac459ca91655fb102194c1d8dc18a4f8c7f548feee2cb61788",
+        "codex_jobs.sqlite": "b28dbafb55108646c8b20883175a3b6417c6805ccc0d107659df640667446741",
+        "dbos.sqlite": "db7624ef2c86991f563f0edc0267419f942301c15f6f48a5d8c129380b86afc3",
+        "manifest.json": "2659023533936831c8eb363d3b78af45aae609be81609970220a62ea5d4590c2",
+        "workflow.yaml": "e34b3bd2c2e1cf573cf751c73ccb5b107ab3e5579275905268d0be857eee5cb1",
+        "input.json": "49c56c5cd2dab0ab4b3685befb2e8486b84b1c55136f7be49dc6cea565b961c3",
+        "result.json": "250478c20131a857d671dab93408b757a919eb7c23b7dd7ac45de8df93d1011d"
+      },
+      "main_db_hashes_match_historical": true,
+      "sidecar_observation": "WAL/SHM were absent in the initial current-turn pre-read snapshot and present by the pre-replay snapshot; exact appearance time is unknown. Current hashes are included.",
+      "agent_sqlite_writes_performed": false
+    },
+    "side_effects": {
+      "production_side_effect_count": 0,
+      "new_workflow_post_count": 0,
+      "same_id_replay_post_count": "UNKNOWN",
+      "new_codex_jobs": 0,
+      "new_codex_threads": 0,
+      "shutdown_request_count": 0,
+      "restart_count": 0,
+      "process_signal_count": 0,
+      "cleanup_performed": false,
+      "old_initial_bridge_pid": 3584,
+      "old_initial_bridge_touched": false,
+      "credentials_prompts_or_general_agent_text_included": false
+    },
+    "verification": {
+      "source_replay_behavior": "PASS: same-digest state=running follows WorkflowService._replay to _snapshot_for_row; runtime worker count 0.",
+      "offline_tests": "NOT_RUN (no source code changes)",
+      "restart_status": "NOT_RUN",
+      "cleanup_status": "NOT_RUN"
+    },
+    "protected_evidence_sha256_after": {
+      "docs/phase5f1b-postmortem-addendum.json": "8298326e05c6779bd41de01c74c93b1eafe06adb7e295510ab3f01f458f81c3d",
+      "docs/phase5f1b-r1-postmortem-addendum.json": "8ac77f67e8723c6c548f0509b2bbfaf7825fabb6372081e57dc9bc10d95aefd8",
+      "docs/phase5f1b-three-job-e2e-evidence.json": "1af75fcb89ad314be79f35f5e06b2eca777a1c877e150d6e683c0f88a435bdc5",
+      "docs/phase5f1b-three-job-e2e-r1-evidence.json": "a9572b879933808c813b1f96eaad0852ca55722dfd3f01c899944e74b4b17176",
+      "docs/phase5e-2c2-diagnostic-retest-evidence.json": "ede76c2334f362765ff136619f9a393fd592bb514ab9b707374598a5bd4152b5",
+      "docs/phase5e-2c2-r4-evidence.json": "9fc47e74ea21854af1a8e1157da72496f5a5cf30480880a713ca4497fd311742"
+    },
+    "protected_evidence_unchanged": true
+  },
+  "secrets_prompts_and_general_agent_text_included": false
+}
