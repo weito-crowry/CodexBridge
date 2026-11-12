@@ -56,6 +56,8 @@ ORDER BY e.event_id;
 | Worker | `shutdown_observed` | Workerがshutdown要求を検知した時。`workflow_id`, `mode`, `pid`, 固定`reason_code` |
 | Worker | `worker_failed` | Worker内例外時。`workflow_id`、`mode`, `pid`, `exception_class`, 固定`reason_code` |
 
+`worker_setup_failed`はDBOS ready後、heartbeat準備やworkflow引数組立などの初期化失敗です。`workflow_metadata_persist_failed`はworkflow ID確定後のmanifestまたはstart/recovery identity保存失敗です。workflow開始呼出し自体の失敗は`workflow_start_failed`のままです。
+
 同じrunでstartとrecoverが行われた場合、`launch_id`で各起動を分けます。shutdown signalの後に`worker_exited`がなくManagerも終了している場合、終了結果は不明です。exit行がないことを「worker終了」と解釈しません。
 
 ## 記録内容、上限、失敗時

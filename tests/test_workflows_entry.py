@@ -194,6 +194,117 @@ def test_worker_failure_log_keeps_exception_class_and_omits_exception_text(
     assert secret not in log_text
 
 
+def test_worker_setup_failure_after_dbos_launch_has_setup_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _config_path = _make_run(tmp_path)
+
+    class FakeDBOS:
+        def __init__(self, *, config: object) -> None:
+            del config
+
+        @staticmethod
+        def launch() -> None:
+            return None
+
+        @staticmethod
+        def destroy() -> None:
+            return None
+
+    def fail_event() -> object:
+        raise RuntimeError("worker setup injection")
+
+    monkeypatch.setattr(worker_module, "DBOS", FakeDBOS)
+    monkeypatch.setattr(worker_module, "_dbos_config", lambda _path: object())
+    monkeypatch.setattr(
+        worker_module,
+        "get_process_identity",
+        lambda _pid: {
+            "active": True,
+            "pid": 1234,
+            "parent_pid": 100,
+            "creation_time_100ns": 1,
+            "image_path": "python.exe",
+        },
+    )
+    monkeypatch.setattr(worker_module, "threading", SimpleNamespace(Event=fail_event))
+
+    with pytest.raises(RuntimeError, match="worker setup injection"):
+        worker_module.main(["--mode", "start", "--run-dir", str(run_dir)])
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "worker-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "worker_bootstrap",
+        "dbos_ready",
+        "worker_failed",
+    ]
+    assert events[-1]["reason_code"] == "worker_setup_failed"
+
+
+def test_worker_metadata_persist_failure_after_start_workflow_has_metadata_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _config_path = _make_run(tmp_path)
+    workflow_id = "01234567-89ab-4cde-8012-3456789abcde"
+    started_workflows: list[str] = []
+
+    class FakeDBOS:
+        def __init__(self, *, config: object) -> None:
+            del config
+
+        @staticmethod
+        def launch() -> None:
+            return None
+
+        @staticmethod
+        def start_workflow(*_args: object) -> SimpleNamespace:
+            started_workflows.append(workflow_id)
+            return SimpleNamespace(workflow_id=workflow_id)
+
+        @staticmethod
+        def destroy() -> None:
+            return None
+
+    def fail_persist(_run_dir: Path, _manifest: dict[str, object], actual_id: str) -> None:
+        assert actual_id == workflow_id
+        raise OSError("worker metadata persistence injection")
+
+    monkeypatch.setattr(worker_module, "DBOS", FakeDBOS)
+    monkeypatch.setattr(worker_module, "_dbos_config", lambda _path: object())
+    monkeypatch.setattr(worker_module, "_persist_workflow_id", fail_persist)
+    monkeypatch.setattr(
+        worker_module,
+        "get_process_identity",
+        lambda _pid: {
+            "active": True,
+            "pid": 1234,
+            "parent_pid": 100,
+            "creation_time_100ns": 1,
+            "image_path": "python.exe",
+        },
+    )
+
+    with pytest.raises(OSError, match="worker metadata persistence injection"):
+        worker_module.main(["--mode", "start", "--run-dir", str(run_dir)])
+
+    events = [
+        json.loads(line)
+        for line in (run_dir / "worker-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert started_workflows == [workflow_id]
+    assert [event["event"] for event in events] == [
+        "worker_bootstrap",
+        "dbos_ready",
+        "worker_failed",
+    ]
+    assert events[-1]["reason_code"] == "workflow_metadata_persist_failed"
+
+
 def test_worker_records_shutdown_observed_without_result_persisted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

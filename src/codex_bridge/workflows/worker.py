@@ -1083,6 +1083,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode=args.mode,
             pid=worker_identity["pid"],
         )
+        stage = "worker_setup"
         if args.mode == "start":
             heartbeat_stop = threading.Event()
             heartbeat_thread = threading.Thread(
@@ -1114,6 +1115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 handle = DBOS.start_workflow(execute_ows_workflow, *workflow_arguments)
             workflow_id = handle.workflow_id
+            stage = "workflow_metadata_persist"
             _persist_workflow_id(run_dir, manifest, workflow_id)
             startup_path = run_dir / "start-worker.json"
         else:
@@ -1122,6 +1124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not isinstance(recovered_workflow_id, str) or not recovered_workflow_id:
                 raise OwsError("recover mode requires the persisted workflow_id")
             workflow_id = recovered_workflow_id
+            stage = "workflow_metadata_persist"
             startup_path = run_dir / "recovery-worker.json"
 
         startup_path = startup_override if startup_override is not None else startup_path
@@ -1230,8 +1233,10 @@ def _worker_failure_reason(stage: str) -> str:
     reasons = {
         "dbos_configure": "dbos_configure_failed",
         "dbos_launch": "dbos_launch_failed",
+        "worker_setup": "worker_setup_failed",
         "workflow_start": "workflow_start_failed",
         "workflow_recovery": "workflow_recovery_failed",
+        "workflow_metadata_persist": "workflow_metadata_persist_failed",
         "workflow_wait": "workflow_wait_failed",
         "result_persist": "result_persist_failed",
         "result_output": "result_output_failed",
