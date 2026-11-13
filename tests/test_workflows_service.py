@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from pathlib import Path
@@ -21,10 +23,18 @@ from codex_bridge.workflows.service import (
 
 
 class FakeWorkerManager:
-    def __init__(self, state_root: Path, workspace: Path) -> None:
+    def __init__(
+        self,
+        state_root: Path,
+        workspace: Path,
+        *,
+        allowed_roots: tuple[Path, ...] | None = None,
+    ) -> None:
         self.state_root = state_root
-        self.allowed_roots = (str(workspace),)
-        self.start_calls: list[tuple[Path, Path | None]] = []
+        self.allowed_roots = tuple(
+            str(root) for root in (allowed_roots if allowed_roots is not None else (workspace,))
+        )
+        self.start_calls: list[tuple[Path, Path | None, int]] = []
         self.start_error: Exception | None = None
 
     def create_run_directory(self) -> Path:
@@ -39,9 +49,10 @@ class FakeWorkerManager:
         *,
         mode: str,
         workspace_root: Path | None = None,
+        max_live_codex_jobs: int = 1,
     ) -> object:
         assert mode == "start"
-        self.start_calls.append((run_dir, workspace_root))
+        self.start_calls.append((run_dir, workspace_root, max_live_codex_jobs))
         if self.start_error is not None:
             raise self.start_error
         (run_dir / "worker-entry-status.json").write_text(
@@ -68,6 +79,32 @@ def _workflow_yaml(prompt: str = SAFE_CODEX_JOB_PROMPT) -> str:
             "      call: codex-job",
             "      with:",
             f"        prompt: {prompt_value}",
+            "",
+        )
+    )
+
+
+def _two_job_workflow_yaml() -> str:
+    return "\n".join(
+        (
+            "document:",
+            '  dsl: "1.0.3"',
+            "  namespace: codexbridge",
+            "  name: two-sequential-jobs",
+            '  version: "1.0.0"',
+            "evaluate:",
+            "  language: jq",
+            "  mode: strict",
+            "do:",
+            "  - first:",
+            "      call: codex-job",
+            "      with:",
+            '        prompt: "first prompt"',
+            "  - second:",
+            "      call: codex-job",
+            "      with:",
+            '        prompt: "translate: "',
+            "        prompt_from: '${ .result.final_text }'",
             "",
         )
     )
@@ -337,7 +374,7 @@ async def test_concurrent_identical_requests_start_exactly_one_worker(
 
 
 @pytest.mark.asyncio
-async def test_different_live_request_ids_share_one_active_slot(
+async def test_different_live_request_ids_cannot_share_one_workspace(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
 ) -> None:
     service, manager, workspace = service_fixture
@@ -359,6 +396,413 @@ async def test_different_live_request_ids_share_one_active_slot(
     assert sum(not isinstance(value, BaseException) for value in outcomes) == 1
     assert sum(isinstance(value, WorkflowConcurrencyConflict) for value in outcomes) == 1
     assert len(manager.start_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_independent_workspaces_run_and_third_workflow_is_rejected(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+) -> None:
+    service, manager, workspace_a = service_fixture
+    workspace_b = workspace_a.parent / "workspace-b"
+    workspace_c = workspace_a.parent / "workspace-c"
+    workspace_b.mkdir()
+    workspace_c.mkdir()
+    manager.allowed_roots = (str(workspace_a.parent),)
+    service = WorkflowService(manager, codex_bridge_port=18001)
+
+    first = await service.start_workflow(
+        client_request_id="phase5f4-workspace-a-0001",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"answer": "A"},
+        workspace_root=str(workspace_a),
+    )
+    second = await service.start_workflow(
+        client_request_id="phase5f4-workspace-b-0001",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"answer": "B"},
+        workspace_root=str(workspace_b),
+    )
+
+    assert first.status == second.status == "running"
+    assert first.workflow_id != second.workflow_id
+    assert first.run_id != second.run_id
+    assert len(manager.start_calls) == 2
+    assert {call[1] for call in manager.start_calls} == {workspace_a, workspace_b}
+
+    replayed = await service.start_workflow(
+        client_request_id="phase5f4-workspace-a-0001",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"answer": "A"},
+        workspace_root=str(workspace_a),
+    )
+    assert (replayed.workflow_id, replayed.run_id) == (first.workflow_id, first.run_id)
+    with pytest.raises(WorkflowRequestConflict):
+        await service.start_workflow(
+            client_request_id="phase5f4-workspace-a-0001",
+            workflow_yaml=_workflow_yaml(),
+            input_data={"answer": "changed"},
+            workspace_root=str(workspace_a),
+        )
+    assert {snapshot.workflow_id for snapshot in await service.list_workflows()} == {
+        first.workflow_id,
+        second.workflow_id,
+    }
+    assert (await service.get_workflow(first.workflow_id)).run_id == first.run_id
+    assert (await service.get_workflow(second.workflow_id)).run_id == second.run_id
+
+    with pytest.raises(WorkflowConcurrencyConflict):
+        await service.start_workflow(
+            client_request_id="phase5f4-workspace-c-0001",
+            workflow_yaml=_workflow_yaml(),
+            input_data={"answer": "C"},
+            workspace_root=str(workspace_c),
+        )
+    assert len(manager.start_calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_is_child", "second_kind"),
+    [
+        (False, "same"),
+        (False, "child"),
+        (True, "parent"),
+        pytest.param(
+            False, "case", marks=pytest.mark.skipif(os.name != "nt", reason="Windows path case")
+        ),
+    ],
+)
+async def test_active_workspace_identity_and_parent_child_roots_conflict(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    first_is_child: bool,
+    second_kind: str,
+) -> None:
+    _service, manager, workspace = service_fixture
+    child = workspace / "child"
+    child.mkdir()
+    manager.allowed_roots = (str(workspace.parent),)
+    service = WorkflowService(manager, codex_bridge_port=18001)
+    first_workspace = child if first_is_child else workspace
+    second_workspace = {
+        "same": first_workspace,
+        "child": child,
+        "parent": workspace,
+        "case": Path(str(workspace).upper()),
+    }[second_kind]
+
+    await service.start_workflow(
+        client_request_id="phase5f4-workspace-overlap-01",
+        workflow_yaml=_workflow_yaml(),
+        input_data={},
+        workspace_root=str(first_workspace),
+    )
+    with pytest.raises(WorkflowConcurrencyConflict):
+        await service.start_workflow(
+            client_request_id="phase5f4-workspace-overlap-02",
+            workflow_yaml=_workflow_yaml(),
+            input_data={},
+            workspace_root=str(second_workspace),
+        )
+    assert len(manager.start_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_target", ["missing", "state_root"])
+async def test_active_workspace_path_that_cannot_be_safely_isolated_fails_closed(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    workspace_target: str,
+) -> None:
+    _service, manager, workspace = service_fixture
+    manager.allowed_roots = (str(workspace.parent),)
+    service = WorkflowService(manager, codex_bridge_port=18001)
+    workspace_c = workspace.parent / "workspace-c"
+    workspace_c.mkdir()
+    accepted = await service.start_workflow(
+        client_request_id="phase5f4-workspace-unknown-01",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"value": 1},
+        workspace_root=str(workspace),
+    )
+    run_dir = manager.start_calls[0][0]
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["workspace_root"] = str(
+        manager.state_root if workspace_target == "state_root" else workspace.parent / "missing"
+    )
+    definition = json.loads((run_dir / "workflow.yaml").read_text(encoding="utf-8"))
+    input_data = json.loads((run_dir / "input.json").read_text(encoding="utf-8"))
+    digest_payload = {
+        "workflow": definition,
+        "input": input_data,
+        "workspace_root": manifest["workspace_root"],
+    }
+    manifest["request_digest"] = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
+        connection.execute(
+            "UPDATE workflow_requests SET request_digest = ? WHERE run_id = ?",
+            (manifest["request_digest"], accepted.run_id),
+        )
+
+    manifest_before = manifest_path.read_bytes()
+    with pytest.raises(WorkflowConcurrencyConflict):
+        await service.start_workflow(
+            client_request_id="phase5f4-workspace-unknown-02",
+            workflow_yaml=_workflow_yaml(),
+            input_data={},
+            workspace_root=str(workspace_c),
+        )
+
+    assert manifest_path.read_bytes() == manifest_before
+    assert len(manager.start_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_service_instances_enforce_capacity_two_atomically(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+) -> None:
+    _service, manager, workspace_a = service_fixture
+    workspace_b = workspace_a.parent / "workspace-b"
+    workspace_c = workspace_a.parent / "workspace-c"
+    workspace_b.mkdir()
+    workspace_c.mkdir()
+    manager.allowed_roots = (str(workspace_a.parent),)
+    manager_two = FakeWorkerManager(
+        manager.state_root,
+        workspace_a,
+        allowed_roots=(workspace_a.parent,),
+    )
+    service_one = WorkflowService(manager, codex_bridge_port=18001)
+    service_two = WorkflowService(manager_two, codex_bridge_port=18001)
+
+    async def start(service: WorkflowService, request_id: str, path: Path):
+        return await service.start_workflow(
+            client_request_id=request_id,
+            workflow_yaml=_workflow_yaml(),
+            input_data={"workspace": path.name},
+            workspace_root=str(path),
+        )
+
+    outcomes = await asyncio.gather(
+        start(service_one, "phase5f4-atomic-slot-01", workspace_a),
+        start(service_two, "phase5f4-atomic-slot-02", workspace_b),
+        start(service_one, "phase5f4-atomic-slot-03", workspace_c),
+        return_exceptions=True,
+    )
+    accepted = [value for value in outcomes if not isinstance(value, BaseException)]
+
+    assert len(accepted) == 2
+    assert sum(isinstance(value, WorkflowConcurrencyConflict) for value in outcomes) == 1
+    assert len(manager.start_calls) + len(manager_two.start_calls) == 2
+    assert len({snapshot.run_id for snapshot in accepted}) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effective_state", ["queued", "needs_reconciliation", "unknown"])
+async def test_nonterminal_effective_states_keep_a_workflow_slot(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    effective_state: str,
+) -> None:
+    _service, manager, workspace_a = service_fixture
+    workspace_b = workspace_a.parent / "workspace-b"
+    workspace_c = workspace_a.parent / "workspace-c"
+    workspace_b.mkdir()
+    workspace_c.mkdir()
+    manager.allowed_roots = (str(workspace_a.parent),)
+    service_one = WorkflowService(manager, codex_bridge_port=18001)
+
+    if effective_state == "queued":
+
+        async def interrupt_before_start(
+            _row: object, _prepared: object, _diagnostic: object
+        ) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(service_one, "_start_reserved_workflow", interrupt_before_start)
+        with pytest.raises(asyncio.CancelledError):
+            await service_one.start_workflow(
+                client_request_id="phase5f4-queued-active-01",
+                workflow_yaml=_workflow_yaml(),
+                input_data={},
+                workspace_root=str(workspace_a),
+            )
+    elif effective_state == "needs_reconciliation":
+        manager.start_error = RuntimeError("uncertain test start")
+        with pytest.raises(WorkflowReconciliationRequired):
+            await service_one.start_workflow(
+                client_request_id="phase5f4-reconcile-active-01",
+                workflow_yaml=_workflow_yaml(),
+                input_data={},
+                workspace_root=str(workspace_a),
+            )
+        manager.start_error = None
+    else:
+        accepted = await service_one.start_workflow(
+            client_request_id="phase5f4-unknown-active-01",
+            workflow_yaml=_workflow_yaml(),
+            input_data={},
+            workspace_root=str(workspace_a),
+        )
+        (manager.state_root / accepted.run_id / "worker-entry-status.json").write_text(
+            json.dumps({"state": "completed", "exit_code": 0, "error_code": None}),
+            encoding="utf-8",
+        )
+        assert (await service_one.get_workflow(accepted.workflow_id)).status == "unknown"
+
+    service_two = WorkflowService(manager, codex_bridge_port=18001)
+    second = await service_two.start_workflow(
+        client_request_id="phase5f4-nonterminal-second-01",
+        workflow_yaml=_workflow_yaml(),
+        input_data={},
+        workspace_root=str(workspace_b),
+    )
+    assert second.status == "running"
+    with pytest.raises(WorkflowConcurrencyConflict):
+        await service_two.start_workflow(
+            client_request_id="phase5f4-nonterminal-third-01",
+            workflow_yaml=_workflow_yaml(),
+            input_data={},
+            workspace_root=str(workspace_c),
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_to_start_is_terminal_and_does_not_consume_capacity(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+) -> None:
+    _service, manager, workspace_a = service_fixture
+    workspace_b = workspace_a.parent / "workspace-b"
+    workspace_b.mkdir()
+    manager.allowed_roots = (str(workspace_a.parent),)
+    service = WorkflowService(manager, codex_bridge_port=18001)
+    from codex_bridge.workflows.manager import WorkflowManagerError
+
+    manager.start_error = WorkflowManagerError("worker not started")
+    with pytest.raises(WorkflowStartFailed):
+        await service.start_workflow(
+            client_request_id="phase5f4-failed-to-start-01",
+            workflow_yaml=_workflow_yaml(),
+            input_data={},
+            workspace_root=str(workspace_a),
+        )
+    manager.start_error = None
+
+    accepted = await service.start_workflow(
+        client_request_id="phase5f4-after-failed-start-01",
+        workflow_yaml=_workflow_yaml(),
+        input_data={},
+        workspace_root=str(workspace_b),
+    )
+    assert accepted.status == "running"
+    with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
+        failed_state = connection.execute(
+            "SELECT state FROM workflow_requests WHERE client_request_id = ?",
+            ("phase5f4-failed-to-start-01",),
+        ).fetchone()[0]
+    assert failed_state == "failed_to_start"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template", ["one", "two", "three", "items"])
+async def test_external_two_run_capacity_is_independent_of_sequential_job_template(
+    service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    template: str,
+) -> None:
+    _service, manager, workspace_a = service_fixture
+    workspace_b = workspace_a.parent / "workspace-b"
+    workspace_c = workspace_a.parent / "workspace-c"
+    workspace_b.mkdir()
+    workspace_c.mkdir()
+    manager.allowed_roots = (str(workspace_a.parent),)
+    service = WorkflowService(manager, codex_bridge_port=18001)
+
+    if template == "one":
+        definition, input_data, job_limit = _workflow_yaml(), {}, 1
+    elif template == "two":
+        definition, input_data, job_limit = _two_job_workflow_yaml(), {}, 2
+    elif template == "three":
+        definition = (
+            Path(__file__).parents[1]
+            / "poc"
+            / "ows"
+            / "fixtures"
+            / "three_codex_job_loop_workflow.yaml"
+        ).read_text(encoding="utf-8")
+        input_data = {
+            "issues": [
+                {"number": 17, "enabled": True},
+                {"number": 5, "enabled": False},
+                {"number": 9, "enabled": True},
+                {"number": 21, "enabled": True},
+            ]
+        }
+        job_limit = 3
+    else:
+        definition = (
+            Path(__file__).parents[1]
+            / "poc"
+            / "ows"
+            / "fixtures"
+            / "conditional_items_codex_workflow.yaml"
+        ).read_text(encoding="utf-8")
+        input_data = {
+            "items": [
+                {"id": "gamma", "enabled": True, "prompt": "reply gamma"},
+                {"id": "beta", "enabled": False, "prompt": "reply beta"},
+                {"id": "alpha", "enabled": True, "prompt": "reply alpha"},
+            ]
+        }
+        job_limit = 3
+
+    first = await service.start_workflow(
+        client_request_id=f"phase5f4-{template}-capacity-01",
+        workflow_yaml=definition,
+        input_data=input_data,
+        workspace_root=str(workspace_a),
+        max_live_codex_jobs=job_limit,
+    )
+    second = await service.start_workflow(
+        client_request_id=f"phase5f4-{template}-capacity-02",
+        workflow_yaml=definition,
+        input_data=input_data,
+        workspace_root=str(workspace_b),
+        max_live_codex_jobs=job_limit,
+    )
+
+    assert first.status == second.status == "running"
+    assert len(manager.start_calls) == 2
+    assert [call[2] for call in manager.start_calls] == [job_limit, job_limit]
+    for snapshot in (first, second):
+        manifest = json.loads(
+            (manager.state_root / snapshot.run_id / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["request_digest"]
+        assert manifest["control"].get("max_live_codex_jobs", 1) == job_limit
+        with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
+            ledger_digest = connection.execute(
+                "SELECT request_digest FROM workflow_requests WHERE run_id = ?",
+                (snapshot.run_id,),
+            ).fetchone()[0]
+        assert manifest["request_digest"] == ledger_digest
+
+    with pytest.raises(WorkflowConcurrencyConflict):
+        await service.start_workflow(
+            client_request_id=f"phase5f4-{template}-capacity-03",
+            workflow_yaml=definition,
+            input_data=input_data,
+            workspace_root=str(workspace_c),
+            max_live_codex_jobs=job_limit,
+        )
+    assert len(manager.start_calls) == 2
 
 
 class WorkflowStartTestError(RuntimeError):

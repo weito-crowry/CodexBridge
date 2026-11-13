@@ -271,6 +271,57 @@ async def test_workflow_post_returns_durable_run_and_status_is_redacted(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_workflow_http_api_accepts_two_runs_and_returns_409_for_third(
+    tmp_path: Path,
+) -> None:
+    app, manager, workspace_a = _app(tmp_path)
+    workspace_b = tmp_path / "workspace-b"
+    workspace_c = tmp_path / "workspace-c"
+    workspace_b.mkdir()
+    workspace_c.mkdir()
+    headers = {"authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        first_payload = _valid_payload(workspace_a)
+        first_payload["client_request_id"] = "phase5f4-api-workflow-a"
+        second_payload = _valid_payload(workspace_b)
+        second_payload["client_request_id"] = "phase5f4-api-workflow-b"
+        third_payload = _valid_payload(workspace_c)
+        third_payload["client_request_id"] = "phase5f4-api-workflow-c"
+
+        first = await client.post(_PATH, headers=headers, json=first_payload)
+        second = await client.post(_PATH, headers=headers, json=second_payload)
+        third = await client.post(_PATH, headers=headers, json=third_payload)
+        first_id = first.json()["workflow_id"]
+        second_id = second.json()["workflow_id"]
+        details = [
+            await client.get(_PATH + "/" + workflow_id, headers=headers)
+            for workflow_id in (first_id, second_id)
+        ]
+        results = [
+            await client.get(_PATH + "/" + workflow_id + "/result", headers=headers)
+            for workflow_id in (first_id, second_id)
+        ]
+        listing = await client.get(_PATH, headers=headers)
+
+    assert first.status_code == second.status_code == 202
+    assert third.status_code == 409
+    assert third.json() == {"error": "workflow_capacity_reached"}
+    assert first_id != second_id
+    assert [response.status_code for response in details] == [200, 200]
+    assert [response.json()["workflow_id"] for response in details] == [first_id, second_id]
+    assert [response.status_code for response in results] == [202, 202]
+    assert [response.json()["workflow_id"] for response in results] == [first_id, second_id]
+    assert listing.status_code == 200
+    assert {item["workflow_id"] for item in listing.json()["workflows"]} == {
+        first_id,
+        second_id,
+    }
+    assert len(manager.start_calls) == 2
+    for response in (first, second, third, *details, *results, listing):
+        assert _TOKEN not in response.text
+
+
+@pytest.mark.asyncio
 async def test_result_route_covers_running_reconciliation_success_and_missing(
     tmp_path: Path,
 ) -> None:

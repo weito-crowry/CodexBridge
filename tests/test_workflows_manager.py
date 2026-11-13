@@ -19,8 +19,8 @@ _DUMMY_TOKEN = "phase5b-test-token-never-persist"
 
 
 class FakeProcess:
-    def __init__(self, *, exit_code: int | None = None) -> None:
-        self.pid = 43210
+    def __init__(self, *, exit_code: int | None = None, pid: int = 43210) -> None:
+        self.pid = pid
         self.returncode = exit_code
         self._exited = asyncio.Event()
         self.terminated = False
@@ -314,6 +314,89 @@ async def test_shutdown_is_bounded_and_terminates_only_managed_worker(
     exited = next(event for event in events if event["event"] == "worker_exited")
     assert exited["shutdown_requested"] is True
     assert exited["state"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_tracks_two_owned_runs_and_their_distinct_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    workflow_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
+    spawned_processes = [FakeProcess(pid=51001), FakeProcess(pid=51002)]
+    process_iter = iter(spawned_processes)
+
+    async def create_process(*_args: object, **_kwargs: object) -> FakeProcess:
+        return next(process_iter)
+
+    monkeypatch.setattr(
+        "codex_bridge.workflows.manager.asyncio.create_subprocess_exec", create_process
+    )
+    manager = WorkflowWorkerManager(
+        state_root=tmp_path / "state",
+        allowed_roots=(str(tmp_path),),
+        control_token=_DUMMY_TOKEN,
+        python_executable=sys.executable,
+        frozen=False,
+        graceful_shutdown_seconds=0.05,
+    )
+    run_dirs = [manager.create_run_directory(), manager.create_run_directory()]
+    turns = (
+        ("thread-id-a", "turn-id-a"),
+        ("thread-id-b", "turn-id-b"),
+    )
+    for run_dir, workflow_id, workspace, (thread_id, turn_id) in zip(
+        run_dirs, workflow_ids, (workspace_a, workspace_b), turns, strict=True
+    ):
+        (run_dir / "manifest.json").write_text(
+            json.dumps({"workflow_id": workflow_id, "control": {"codex_job_live": True}}),
+            encoding="utf-8",
+        )
+        adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+        prepared = adapter.prepare_job(
+            workflow_id,
+            "do[0].calculate",
+            SAFE_CODEX_JOB_PROMPT,
+            run_dir,
+            port=18001,
+        )
+        assert adapter.claim_post(prepared["job_id"])
+        adapter.mark_accepted(prepared["job_id"], thread_id, turn_id, "in_progress")
+        await manager.start_worker(run_dir, mode="start", workspace_root=workspace)
+
+    report = await asyncio.wait_for(manager.shutdown(), timeout=2.0)
+
+    assert report.ownership_complete
+    assert report.owned_turns == set(turns)
+    launch_ids: set[str] = set()
+    observed_pids: set[int] = set()
+    for run_dir, workflow_id, process in zip(
+        run_dirs, workflow_ids, spawned_processes, strict=True
+    ):
+        events = [
+            json.loads(line)
+            for line in (run_dir / "bridge-lifecycle.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        launched = next(event for event in events if event["event"] == "worker_spawn_succeeded")
+        signal = next(event for event in events if event["event"] == "shutdown_signal_requested")
+        exited = next(event for event in events if event["event"] == "worker_exited")
+        assert launched["workflow_id"] == signal["workflow_id"] == workflow_id
+        assert launched["run_id"] == signal["run_id"] == exited["run_id"] == run_dir.name
+        assert launched["launch_id"] == signal["launch_id"]
+        assert launched["pid"] == signal["pid"] == exited["pid"] == process.pid
+        assert exited["state"] == "stopped"
+        assert process.terminated
+        launch_ids.add(launched["launch_id"])
+        observed_pids.add(launched["pid"])
+        assert len(list(run_dir.glob("worker-shutdown-*.request"))) == 1
+
+    assert len(launch_ids) == 2
+    assert observed_pids == {51001, 51002}
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ _WORKFLOW_STATES = frozenset(
 )
 _ACTIVE_STATES = frozenset({"queued", "starting", "running", "needs_reconciliation", "unknown"})
 _TERMINAL_STATES = frozenset({"succeeded", "failed", "failed_to_start"})
+_MAX_ACTIVE_WORKFLOWS = 2
 _MAX_WORKFLOW_YAML_BYTES = 64 * 1024
 _MAX_RESULT_BYTES = 64 * 1024
 _MAX_RUN_FILE_BYTES = 2 * 1024 * 1024
@@ -73,7 +74,7 @@ class WorkflowRequestConflict(RuntimeError):
 
 
 class WorkflowConcurrencyConflict(RuntimeError):
-    """A different live workflow already occupies the single-job slot."""
+    """Workflow capacity is full or its workspace overlaps an active workflow."""
 
 
 class WorkflowNotFoundError(LookupError):
@@ -949,16 +950,15 @@ def _reserve_request(
         candidates = connection.execute(
             "SELECT client_request_id, workflow_id, run_id, request_digest, state, "
             "created_at, updated_at FROM workflow_requests "
-            "WHERE state IN ('queued','starting','running','needs_reconciliation') "
+            "WHERE state IN ('queued','starting','running','needs_reconciliation','unknown') "
             "ORDER BY created_at DESC LIMIT ?",
             (_MAX_ACTIVE_CHECKS + 1,),
         ).fetchall()
         if len(candidates) > _MAX_ACTIVE_CHECKS:
             raise WorkflowConcurrencyConflict("workflow capacity is occupied")
+        active_workspaces: list[Path] = []
         for candidate_sql in candidates:
             candidate = _row_from_sql(candidate_sql)
-            if candidate.state == "queued":
-                raise WorkflowConcurrencyConflict("workflow capacity is occupied")
             inspection = _inspect_run(state_root, candidate)
             if inspection.status in _TERMINAL_STATES:
                 connection.execute(
@@ -966,7 +966,21 @@ def _reserve_request(
                     (inspection.status, _utc_now(), candidate.run_id),
                 )
             elif inspection.status in _ACTIVE_STATES:
+                workspace = _verified_active_workspace(
+                    state_root,
+                    candidate,
+                    worker_manager.allowed_roots,
+                )
+                if any(_paths_overlap(workspace, active) for active in active_workspaces):
+                    raise WorkflowConcurrencyConflict("workflow workspace is already occupied")
+                if _paths_overlap(workspace, Path(prepared.workspace_root)):
+                    raise WorkflowConcurrencyConflict("workflow workspace is already occupied")
+                active_workspaces.append(workspace)
+            else:
                 raise WorkflowConcurrencyConflict("workflow capacity is occupied")
+
+        if len(active_workspaces) >= _MAX_ACTIVE_WORKFLOWS:
+            raise WorkflowConcurrencyConflict("workflow capacity is occupied")
 
         workflow_id = str(uuid.uuid4())
         run_dir = Path(worker_manager.create_run_directory())
@@ -1034,6 +1048,94 @@ def _reserve_request(
         raise
     finally:
         connection.close()
+
+
+def _verified_active_workspace(
+    state_root: Path,
+    row: _RequestRow,
+    allowed_roots: tuple[str, ...],
+) -> Path:
+    """Return the canonical workspace only when the active run snapshot verifies."""
+    try:
+        run_dir = _validated_run_directory(state_root, row.run_id)
+        manifest = _strict_json(_read_regular_file(run_dir / "manifest.json", limit=32 * 1024))
+        if not isinstance(manifest, dict):
+            raise ValueError("workflow manifest is invalid")
+        if (
+            manifest.get("workflow_id") != row.workflow_id
+            or manifest.get("run_id") != row.run_id
+            or manifest.get("request_digest") != row.request_digest
+            or manifest.get("mode") != "codex-job-live"
+            or manifest.get("workflow_source") != "ui-api"
+            or manifest.get("max_tasks") != 10_000
+        ):
+            raise ValueError("workflow manifest identity is invalid")
+
+        control = manifest.get("control")
+        if not isinstance(control, dict):
+            raise ValueError("workflow manifest control is invalid")
+        max_live_codex_jobs = control.get("max_live_codex_jobs", 1)
+        if (
+            type(max_live_codex_jobs) is not int
+            or max_live_codex_jobs not in {1, 2, 3}
+            or control.get("codex_job_live") is not True
+        ):
+            raise ValueError("workflow manifest job limit is invalid")
+
+        workspace_value = manifest.get("workspace_root")
+        if not isinstance(workspace_value, str) or not Path(workspace_value).is_absolute():
+            raise ValueError("workflow manifest workspace is invalid")
+        definition_text = _read_regular_file(
+            run_dir / "workflow.yaml", limit=_MAX_WORKFLOW_YAML_BYTES
+        ).decode("utf-8")
+        definition = _strict_json(definition_text.encode("utf-8"))
+        input_data = _strict_json(
+            _read_regular_file(run_dir / "input.json", limit=_MAX_RUN_FILE_BYTES)
+        )
+        digest_payload = {
+            "workflow": definition,
+            "input": input_data,
+            "workspace_root": workspace_value,
+        }
+        if max_live_codex_jobs in {2, 3}:
+            digest_payload["max_live_codex_jobs"] = max_live_codex_jobs
+        if (
+            hashlib.sha256(_canonical_json(digest_payload).encode("utf-8")).hexdigest()
+            != row.request_digest
+            or hashlib.sha256(definition_text.encode("utf-8")).hexdigest()
+            != manifest.get("definition_sha256")
+            or hashlib.sha256(_canonical_json(input_data).encode("utf-8")).hexdigest()
+            != manifest.get("input_sha256")
+        ):
+            raise ValueError("workflow manifest digest is invalid")
+
+        workspace = Path(AllowedPathPolicy(allowed_roots).validate_cwd(workspace_value))
+        if os.path.normcase(os.fspath(workspace)) != os.path.normcase(workspace_value):
+            raise ValueError("workflow manifest workspace is not canonical")
+        canonical_state_root = state_root.resolve(strict=False)
+        if _paths_overlap(workspace, canonical_state_root):
+            raise ValueError("workflow state and workspace overlap")
+        return workspace
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        RuntimeError,
+        WorkflowServiceUnavailable,
+    ):
+        raise WorkflowConcurrencyConflict("active workflow workspace cannot be verified") from None
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    first_value = os.path.normcase(os.path.abspath(os.fspath(first)))
+    second_value = os.path.normcase(os.path.abspath(os.fspath(second)))
+    try:
+        common = os.path.commonpath((first_value, second_value))
+    except ValueError:
+        return False
+    return common in {first_value, second_value}
 
 
 def _write_new_file(path: Path, payload: bytes) -> None:
