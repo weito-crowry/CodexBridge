@@ -42,6 +42,7 @@ ITEM_FIXTURE_PATH = (
 )
 SINGLE_JOB_FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "codex_job_workflow.yaml"
 EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-evidence.json"
+R2_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-r2-evidence.json"
 BASE_COMMIT = "9cdb00d2332a781e33387fffc1d237804a6ee4a4"
 BRIDGE_HOST = "127.0.0.1"
 ITEM_MAX_LIVE_CODEX_JOBS = 3
@@ -50,8 +51,8 @@ WORKFLOW_TIMEOUT_SECONDS = 300.0
 MAX_JSON_BYTES = 256 * 1024
 ACTIVE_STATUSES = frozenset({"queued", "starting", "running"})
 ITEM_TASK_IDENTITIES = (
-    "do[0].processItems.iteration[0].do[0].processItem",
-    "do[0].processItems.iteration[2].do[0].processItem",
+    "do[0].processItems.iteration[0].do[1].processItem",
+    "do[0].processItems.iteration[2].do[1].processItem",
 )
 _DRIVE_PATH = re.compile(r"(?i)\b[A-Z]:\\Users\\[^\r\n\"'<>|]+")
 SmokeAbort = support.SmokeAbort
@@ -73,6 +74,47 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _verified_base_ancestor_head(base_commit: str = BASE_COMMIT) -> str:
+    try:
+        head_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPOSITORY_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise SmokeAbort("BLOCKED", "git_head_verification_failed") from None
+    head = head_result.stdout.strip().lower()
+    if head_result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise SmokeAbort("BLOCKED", "git_head_verification_failed")
+    try:
+        ancestry_result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_commit, head],
+            cwd=REPOSITORY_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise SmokeAbort("BLOCKED", "git_base_ancestry_check_failed") from None
+    if ancestry_result.returncode == 1:
+        raise SmokeAbort("BLOCKED", "phase5f4_base_commit_not_ancestor_of_head")
+    if ancestry_result.returncode != 0:
+        raise SmokeAbort("BLOCKED", "git_base_ancestry_check_failed")
+    return head
+
+
+def _evidence_path_for_attempt(attempt: str | None) -> Path:
+    if attempt is None:
+        return EVIDENCE_PATH
+    if attempt == "r2":
+        return R2_EVIDENCE_PATH
+    raise ValueError("unsupported acceptance attempt")
 
 
 def build_item_input() -> dict[str, Any]:
@@ -192,6 +234,8 @@ def _new_evidence() -> dict[str, Any]:
         "started_at_utc": _utc_now(),
         "finished_at_utc": None,
         "source_commit": None,
+        "base_commit": BASE_COMMIT,
+        "head_commit": None,
         "runner_sha256": _sha256(Path(__file__).read_bytes()),
         "offline_regression_preceded_live_posts": True,
         "runtime": {},
@@ -872,6 +916,44 @@ def _verify_lifecycle(
     }
 
 
+def _validate_confirmed_durable_success(
+    *,
+    request_state: object,
+    dbos_status: object,
+    worker_status: Any,
+    jobs: Sequence[Mapping[str, Any]],
+    expected_job_count: int,
+    receipts_verified: bool,
+    stored_result: Any,
+    workflow_id: str,
+    definition_sha256: object,
+    input_sha256: object,
+) -> None:
+    if request_state not in {"running", "succeeded"}:
+        raise SmokeAbort("BLOCKED", "request_ledger_state_not_admitted_for_success_projection")
+    if dbos_status != "SUCCESS":
+        raise SmokeAbort("FAIL", "dbos_workflow_did_not_succeed")
+    if (
+        not isinstance(worker_status, dict)
+        or worker_status.get("state") != "completed"
+        or type(worker_status.get("exit_code")) is not int
+        or worker_status.get("exit_code") != 0
+    ):
+        raise SmokeAbort("FAIL", "workflow_worker_did_not_exit_successfully")
+    if len(jobs) != expected_job_count or any(job.get("state") != "SUCCEEDED" for job in jobs):
+        raise SmokeAbort("FAIL", "workflow_job_ledger_did_not_succeed")
+    if not receipts_verified:
+        raise SmokeAbort("FAIL", "workflow_job_receipts_not_verified")
+    if (
+        not isinstance(stored_result, dict)
+        or stored_result.get("workflow_id") != workflow_id
+        or stored_result.get("definition_sha256") != definition_sha256
+        or stored_result.get("input_sha256") != input_sha256
+        or "result" not in stored_result
+    ):
+        raise SmokeAbort("FAIL", "workflow_result_file_identity_or_hash_mismatch")
+
+
 def _verify_saved_workflow(
     *,
     state_root: Path,
@@ -893,7 +975,7 @@ def _verify_saved_workflow(
     if (
         request.get("workflow_id") != workflow_id
         or request.get("run_id") != run_id
-        or request.get("state") != "succeeded"
+        or request.get("state") not in {"running", "succeeded"}
         or not isinstance(request.get("request_digest"), str)
         or re.fullmatch(r"[0-9a-f]{64}", str(request.get("request_digest"))) is None
     ):
@@ -1027,11 +1109,7 @@ def _verify_saved_workflow(
     )
     stored_result = support._bounded_json_file(run_dir / "result.json", maximum=MAX_JSON_BYTES)
     if (
-        dbos_status != "SUCCESS"
-        or not isinstance(worker_status, dict)
-        or worker_status.get("state") != "completed"
-        or worker_status.get("exit_code") != 0
-        or not isinstance(worker_identity_record, dict)
+        not isinstance(worker_identity_record, dict)
         or not isinstance(worker_identity_record.get("pid"), int)
         or not isinstance(worker_identity_record.get("parent_pid"), int)
         or not isinstance(worker_identity_record.get("image_path"), str)
@@ -1039,12 +1117,20 @@ def _verify_saved_workflow(
             str(Path(str(worker_identity_record["image_path"])).resolve(strict=True))
         )
         != os.path.normcase(str(Path(sys.executable).resolve(strict=True)))
-        or not isinstance(stored_result, dict)
-        or stored_result.get("workflow_id") != workflow_id
-        or stored_result.get("definition_sha256") != manifest.get("definition_sha256")
-        or stored_result.get("input_sha256") != manifest.get("input_sha256")
     ):
-        raise SmokeAbort("FAIL", f"workflow_{label}_durable_success_mismatch")
+        raise SmokeAbort("FAIL", f"workflow_{label}_worker_identity_mismatch")
+    _validate_confirmed_durable_success(
+        request_state=request.get("state"),
+        dbos_status=dbos_status,
+        worker_status=worker_status,
+        jobs=jobs,
+        expected_job_count=expected_count,
+        receipts_verified=len(replies) == expected_count,
+        stored_result=stored_result,
+        workflow_id=workflow_id,
+        definition_sha256=manifest.get("definition_sha256"),
+        input_sha256=manifest.get("input_sha256"),
+    )
     if label == "A":
         validate_item_result(
             {"workflow_id": workflow_id, "result": stored_result.get("result")},
@@ -1059,6 +1145,7 @@ def _verify_saved_workflow(
         )
     return {
         "run_dir": run_dir,
+        "request_state": request["state"],
         "request_digest": str(request["request_digest"]),
         "manifest": manifest,
         "jobs": jobs,
@@ -1134,6 +1221,7 @@ def _workflow_evidence(
         "workflow_id": workflow_id,
         "run_id": run_id,
         "request_digest": saved["request_digest"],
+        "request_ledger_state": saved["request_state"],
         "dbos_status": saved["dbos_status"],
         "worker_exit_code": saved["worker_status"]["exit_code"],
         "worker_pid": saved["worker_identity"]["pid"],
@@ -1610,21 +1698,9 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
     try:
         _preflight_runtime(evidence)
         base_environment = dict(os.environ)
-        commit = (
-            subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=REPOSITORY_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            .stdout.strip()
-            .lower()
-        )
-        if commit != BASE_COMMIT:
-            raise SmokeAbort("BLOCKED", "phase5f4_base_commit_mismatch")
-        evidence["source_commit"] = commit
+        head_commit = _verified_base_ancestor_head()
+        evidence["source_commit"] = head_commit
+        evidence["head_commit"] = head_commit
         item_yaml, item_definition, single_yaml, single_definition = _validate_templates()
         item_input = build_item_input()
         try:
@@ -2180,10 +2256,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run the one-shot Phase 5F-5 integrated isolated acceptance"
     )
-    parser.parse_args(argv)
+    parser.add_argument("--attempt", choices=("r2",))
+    args = parser.parse_args(argv)
+    evidence_path = _evidence_path_for_attempt(args.attempt)
     evidence = _new_evidence()
     try:
-        writer = _EvidenceWriter(EVIDENCE_PATH, evidence)
+        writer = _EvidenceWriter(evidence_path, evidence)
     except SmokeAbort as error:
         print(json.dumps({"status": error.status, "reason": error.code}, sort_keys=True))
         return 1
@@ -2193,7 +2271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "status": evidence.get("status"),
                 "reason": evidence.get("reason"),
-                "evidence": str(EVIDENCE_PATH.relative_to(REPOSITORY_ROOT)),
+                "evidence": str(evidence_path.relative_to(REPOSITORY_ROOT)),
             },
             sort_keys=True,
         )

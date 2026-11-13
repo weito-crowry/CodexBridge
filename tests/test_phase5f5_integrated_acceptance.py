@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -56,6 +56,114 @@ def test_repository_workflow_fixtures_pass_the_runner_preflight() -> None:
     assert single_definition["do"][0]["calculate"]["with"]["prompt"] == ("Reply with exactly BRAVO")
 
 
+def test_runner_item_task_identities_match_the_workflow_service_contract() -> None:
+    from codex_bridge.workflows.service import _three_job_task_identities
+
+    runner = _load_runner()
+    _item_yaml, item_definition, _single_yaml, _single_definition = runner._validate_templates()
+    expected = _three_job_task_identities(item_definition, runner.build_item_input())
+
+    assert (
+        runner.ITEM_TASK_IDENTITIES
+        == expected
+        == (
+            "do[0].processItems.iteration[0].do[1].processItem",
+            "do[0].processItems.iteration[2].do[1].processItem",
+        )
+    )
+
+
+def test_git_preflight_accepts_base_ancestor_of_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _load_runner()
+    head = "8e90588d1cf09d0a8a832fdd9cf70f7ef5e7ccf7"
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        calls.append(command)
+        if command == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout=f"{head}\n")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    assert runner._verified_base_ancestor_head() == head
+    assert calls == [
+        ["git", "rev-parse", "HEAD"],
+        ["git", "merge-base", "--is-ancestor", runner.BASE_COMMIT, head],
+    ]
+
+
+def test_git_preflight_rejects_unrelated_base_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _load_runner()
+
+    def fake_run(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        if command == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout="f" * 40)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    with pytest.raises(runner.SmokeAbort) as error:
+        runner._verified_base_ancestor_head()
+    assert error.value.code == "phase5f4_base_commit_not_ancestor_of_head"
+
+
+def test_running_request_row_can_project_to_confirmed_success() -> None:
+    runner = _load_runner()
+    workflow_id = "9cf8fa22-19f7-42e2-a5d1-49f839973820"
+    definition_sha256 = "a" * 64
+    input_sha256 = "b" * 64
+    jobs = [{"state": "SUCCEEDED"}, {"state": "SUCCEEDED"}]
+    stored_result = {
+        "workflow_id": workflow_id,
+        "definition_sha256": definition_sha256,
+        "input_sha256": input_sha256,
+        "result": {"results": ["ALPHA", "GAMMA"]},
+    }
+
+    runner._validate_confirmed_durable_success(
+        request_state="running",
+        dbos_status="SUCCESS",
+        worker_status={"state": "completed", "exit_code": 0},
+        jobs=jobs,
+        expected_job_count=2,
+        receipts_verified=True,
+        stored_result=stored_result,
+        workflow_id=workflow_id,
+        definition_sha256=definition_sha256,
+        input_sha256=input_sha256,
+    )
+
+    with pytest.raises(runner.SmokeAbort):
+        runner._validate_confirmed_durable_success(
+            request_state="running",
+            dbos_status="SUCCESS",
+            worker_status={"state": "completed", "exit_code": 0},
+            jobs=jobs,
+            expected_job_count=2,
+            receipts_verified=False,
+            stored_result=stored_result,
+            workflow_id=workflow_id,
+            definition_sha256=definition_sha256,
+            input_sha256=input_sha256,
+        )
+
+
+def test_attempt_selector_uses_only_canonical_and_r2_evidence_paths(tmp_path: Path) -> None:
+    runner = _load_runner()
+
+    assert runner._evidence_path_for_attempt(None) == runner.EVIDENCE_PATH
+    assert runner._evidence_path_for_attempt("r2") == runner.R2_EVIDENCE_PATH
+    with pytest.raises(ValueError):
+        runner._evidence_path_for_attempt("r3")
+
+    occupied = tmp_path / "occupied-evidence.json"
+    occupied.write_text("preserve", encoding="utf-8")
+    with pytest.raises(runner.SmokeAbort):
+        runner._EvidenceWriter(occupied, {})
+    assert occupied.read_text(encoding="utf-8") == "preserve"
+
+
 def test_isolation_preflight_allows_state_under_its_dedicated_temp_root(tmp_path: Path) -> None:
     runner = _load_runner()
     temp_root = tmp_path / "isolated"
@@ -76,8 +184,8 @@ def test_isolation_preflight_allows_state_under_its_dedicated_temp_root(tmp_path
 def test_item_result_checks_skip_summary_order_and_job_projection() -> None:
     runner = _load_runner()
     workflow_id = "9cf8fa22-19f7-42e2-a5d1-49f839973820"
-    alpha_key = f"{workflow_id}::do[0].processItems.iteration[0].do[0].processItem"
-    gamma_key = f"{workflow_id}::do[0].processItems.iteration[2].do[0].processItem"
+    alpha_key = f"{workflow_id}::do[0].processItems.iteration[0].do[1].processItem"
+    gamma_key = f"{workflow_id}::do[0].processItems.iteration[2].do[1].processItem"
     jobs: list[dict[str, Any]] = [
         {"job_id": "job-alpha", "request_key": alpha_key},
         {"job_id": "job-gamma", "request_key": gamma_key},
