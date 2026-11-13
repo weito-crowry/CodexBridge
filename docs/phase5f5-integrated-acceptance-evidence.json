@@ -1,0 +1,65 @@
+{
+  "checks": {
+    "bridge_owner_ports_and_control_auth": "NOT_RUN",
+    "console_offscreen_readback": "NOT_RUN",
+    "graceful_shutdown": "NOT_RUN",
+    "isolated_auth_config_roots_and_empty_state": "NOT_RUN",
+    "lifecycle_logs": "NOT_RUN",
+    "native_runtime_and_dependencies": "PASS",
+    "restart_read_only_get": "NOT_RUN",
+    "same_id_replay": "NOT_RUN",
+    "simultaneous_capacity_409": "NOT_OBSERVED",
+    "workflow_A_items_result": "NOT_RUN",
+    "workflow_B_single_result": "NOT_RUN"
+  },
+  "finished_at_utc": "2026-11-13T01:29:38.726+00:00",
+  "isolation": {
+    "status": "NOT_RUN",
+    "temp_root_label": "codexbridge-phase5f5-kcejntv1",
+    "temp_root_retained": true
+  },
+  "offline_regression_preceded_live_posts": true,
+  "phase": "5F-5",
+  "ports": {},
+  "posts": {
+    "accepted_initial_workflows": 0,
+    "capacity_probe_attempts": 0,
+    "same_id_replay_attempts": 0,
+    "unique_initial_attempts": 0,
+    "workflow_post_total_attempts": 0
+  },
+  "processes": {
+    "bridge_initial": null,
+    "bridge_restart": null,
+    "existing_processes_touched": 0,
+    "orphan_processes": null,
+    "shutdowns": [],
+    "worker_snapshots": []
+  },
+  "reason": "isolated_temp_root_overlaps_state_or_repository",
+  "runner_sha256": "392af7e966dabea530eb594474452e3cb0ea9e0ea0f8230b6c422da88017424b",
+  "runtime": {
+    "platform": "windows_native",
+    "python_version": "3.14.10",
+    "repository_venv": true,
+    "workflow_and_console_dependencies": {
+      "PySide6": "6.11.2",
+      "PyYAML": "6.0.3",
+      "dbos": "3.4.0",
+      "jq": "1.13.0",
+      "jsonschema": "4.25.1",
+      "psutil": "7.2.2"
+    }
+  },
+  "schema_version": 1,
+  "source_commit": "9cdb00d2332a781e33387fffc1d237804a6ee4a4",
+  "started_at_utc": "2026-11-13T01:29:37.338+00:00",
+  "status": "BLOCKED",
+  "workflows": {
+    "A": {},
+    "B": {},
+    "C": {
+      "status": "NOT_RUN"
+    }
+  }
+}
