@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, cast
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer
@@ -115,6 +116,14 @@ def test_main_window_wrapper_passes_current_exit_timeout_to_timer_and_deadline(
     window._history_requests = type("HistoryRequests", (), {"reset": lambda self: None})()
     window._codex_probe = type("CodexProbe", (), {"abort": lambda self: None})()
     window._tunnel = type("Tunnel", (), {"close": lambda self, *, on_finished: None})()
+    exit_calls: list[str] = []
+    window._notify_workflow_readiness = lambda: exit_calls.append("readiness")
+    window._workflow_management_controller = SimpleNamespace(
+        shutdown=lambda: exit_calls.append("workflow_shutdown")
+    )
+    window._bridge_runtime_observer = SimpleNamespace(
+        close=lambda: exit_calls.append("observer_close")
+    )
     window._on_exit_tunnel_stopped = lambda: None
     window._global_stream_retry_timer.start(30_000)
     monkeypatch.setattr(main_window_module, "_EXIT_TIMEOUT_SECONDS", 8.25)
@@ -127,6 +136,7 @@ def test_main_window_wrapper_passes_current_exit_timeout_to_timer_and_deadline(
     assert window._exit_deadline == 108.25
     assert not window._global_stream_retry_timer.isActive()
     assert window._composer_controller.control_availability == [False]
+    assert exit_calls == ["readiness", "workflow_shutdown", "observer_close"]
 
     for timer_name, _interval, _single_shot, _active, _callback_name in TIMER_SPECS:
         getattr(window, timer_name).stop()
