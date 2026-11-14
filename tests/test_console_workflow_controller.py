@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from codex_bridge.console.workflow_controller import WorkflowManagementController
@@ -80,6 +82,35 @@ def _controller() -> tuple[FakeWindow, FakeWorkflowClient, WorkflowManagementCon
     return window, client, controller
 
 
+ControllerFactory = Callable[
+    [], tuple[FakeWindow, FakeWorkflowClient, WorkflowManagementController]
+]
+
+
+@pytest.fixture
+def managed_controller() -> Iterator[ControllerFactory]:
+    app = _app()
+    created: list[tuple[FakeWindow, WorkflowManagementController]] = []
+
+    def create() -> tuple[FakeWindow, FakeWorkflowClient, WorkflowManagementController]:
+        result = _controller()
+        created.append((result[0], result[2]))
+        return result
+
+    yield create
+
+    try:
+        for _window, controller in reversed(created):
+            controller.shutdown()
+    finally:
+        for window, _controller_instance in reversed(created):
+            window.close()
+            window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+        created.clear()
+
+
 def _list_payload(*workflow_ids: str) -> dict[str, object]:
     return {
         "workflows": [
@@ -110,8 +141,10 @@ def _detail(workflow_id: str, status: str = "running") -> dict[str, object]:
     }
 
 
-def test_workflow_controller_loads_list_detail_and_result_in_order() -> None:
-    _window, client, controller = _controller()
+def test_workflow_controller_loads_list_detail_and_result_in_order(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
     assert [call[0] for call in client.calls] == ["list"]
     client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
     assert [call[0] for call in client.calls] == ["list", "detail"]
@@ -128,8 +161,10 @@ def test_workflow_controller_loads_list_detail_and_result_in_order() -> None:
     controller.shutdown()
 
 
-def test_workflow_controller_ignores_old_detail_after_selection_changes() -> None:
-    _window, client, controller = _controller()
+def test_workflow_controller_ignores_old_detail_after_selection_changes(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
     client.succeed(client.calls[-1], 200, _list_payload("workflow-one", "workflow-two"))
     old_detail = client.calls[-1]
     assert old_detail[0] == "detail" and old_detail[3] == "workflow-one"
@@ -146,8 +181,10 @@ def test_workflow_controller_ignores_old_detail_after_selection_changes() -> Non
     controller.shutdown()
 
 
-def test_workflow_controller_clears_jobs_when_selection_changes() -> None:
-    _window, client, controller = _controller()
+def test_workflow_controller_clears_jobs_when_selection_changes(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
     client.succeed(client.calls[-1], 200, _list_payload("workflow-one", "workflow-two"))
     first_detail = client.calls[-1]
     first = _detail("workflow-one")
@@ -174,8 +211,10 @@ def test_workflow_controller_clears_jobs_when_selection_changes() -> None:
     controller.shutdown()
 
 
-def test_workflow_controller_keeps_communication_failures_separate_from_run_state() -> None:
-    _window, client, controller = _controller()
+def test_workflow_controller_keeps_communication_failures_separate_from_run_state(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
     client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
     detail_call = client.calls[-1]
     client.fail(detail_call, 503, "workflow_service_unavailable")
@@ -192,8 +231,10 @@ def test_workflow_controller_keeps_communication_failures_separate_from_run_stat
     controller.shutdown()
 
 
-def test_workflow_controller_aborts_requests_on_readiness_change_and_close() -> None:
-    window, client, controller = _controller()
+def test_workflow_controller_aborts_requests_on_readiness_change_and_close(
+    managed_controller: ControllerFactory,
+) -> None:
+    window, client, controller = managed_controller()
     old_list = client.calls[-1]
     window._ready = False
     controller.notify_readiness_changed()
@@ -220,9 +261,10 @@ def test_workflow_controller_aborts_requests_on_readiness_change_and_close() -> 
 
 
 def test_workflow_controller_suppresses_overlapping_poll_and_retries_same_start_id(
+    managed_controller: ControllerFactory,
     tmp_path: Path,
 ) -> None:
-    _window, client, controller = _controller()
+    _window, client, controller = managed_controller()
     controller._refresh_if_ready()
     assert len(client.calls) == 1
     client.succeed(client.calls[-1], 200, _list_payload())
@@ -262,8 +304,10 @@ def test_workflow_controller_suppresses_overlapping_poll_and_retries_same_start_
     controller.shutdown()
 
 
-def test_workflow_controller_does_not_auto_retry_authentication_failure() -> None:
-    _window, client, controller = _controller()
+def test_workflow_controller_does_not_auto_retry_authentication_failure(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
     first_list = client.calls[-1]
     client.fail(first_list, 403, "forbidden")
     assert controller.dialog.start_button.isEnabled() is False
@@ -279,9 +323,10 @@ def test_workflow_controller_does_not_auto_retry_authentication_failure() -> Non
 
 
 def test_workflow_controller_preserves_unknown_start_across_bridge_transition(
+    managed_controller: ControllerFactory,
     tmp_path: Path,
 ) -> None:
-    window, client, controller = _controller()
+    window, client, controller = managed_controller()
     client.succeed(client.calls[-1], 200, _list_payload())
     controller.dialog.start_button.click()
     start_dialog = controller._active_start_dialog
@@ -325,10 +370,11 @@ def test_workflow_controller_preserves_unknown_start_across_bridge_transition(
 
 
 def test_workflow_controller_can_close_unknown_start_without_posting_again(
+    managed_controller: ControllerFactory,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    _window, client, controller = _controller()
+    _window, client, controller = managed_controller()
     client.succeed(client.calls[-1], 200, _list_payload())
     controller.dialog.start_button.click()
     start_dialog = controller._active_start_dialog
