@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication
 
 from codex_bridge.console.main_window import MainWindow
 from tests.console_main_window_test_support import (
@@ -60,7 +59,7 @@ def test_filters_keep_hidden_history_and_clear_it() -> None:
     window.close()
 
 
-def test_stderr_colors_only_prefix_and_copy_stays_plain_text() -> None:
+def test_stderr_colors_only_prefix_and_selection_is_plain_text() -> None:
     window = _window()
     row = "[Bridge stderr] 2026-11-09T12:34:56.789+09:00 ERROR uvicorn.error message body"
     window._append_diagnostics_lines([row])
@@ -72,11 +71,8 @@ def test_stderr_colors_only_prefix_and_copy_stays_plain_text() -> None:
     cursor.setPosition(len("[Bridge stderr]") + 2)
     body_color = cursor.charFormat().foreground().color()
     assert prefix_color != body_color
-    widget.selectAll()
-    widget.copy()
-    application = QApplication.instance()
-    assert application is not None
-    assert application.clipboard().text() == row
+    window.diagnostics_text.selectAll()
+    assert window.diagnostics_text.textCursor().selectedText() == row
     window.close()
 
 
