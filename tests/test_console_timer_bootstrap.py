@@ -4,18 +4,21 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer
+from PySide6.QtWidgets import QApplication
 
 from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.timer_bootstrap import build_console_timers
 
-_APP: QCoreApplication | None = None
+_APP: QApplication | None = None
 
 
-def _application() -> QCoreApplication:
+def _application() -> QApplication:
     global _APP
     if _APP is None:
         application = QCoreApplication.instance()
-        _APP = application if application is not None else QCoreApplication([])
+        if application is not None and not isinstance(application, QApplication):
+            raise RuntimeError("A QCoreApplication already exists without a QApplication")
+        _APP = application if isinstance(application, QApplication) else QApplication([])
     return _APP
 
 
