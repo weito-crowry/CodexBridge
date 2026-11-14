@@ -56,6 +56,12 @@ R3 runner evidence pathにはNOT_RUN gate記録を一度だけO_EXCLで作成し
 
 Workflow suiteは`tests/test_workflows_service.py::test_two_service_instances_enforce_capacity_two_atomically`でFAILした。2件がacceptedとなった一方、期待した`WorkflowConcurrencyConflict`数が1ではなく0だった。実際の3件目の例外種別はassertion outputに残らず、root causeはUNKNOWN。テストは再実行せず、service/製品sourceも変更していない。このFAILがR3実機をNOT_RUNにした。runner tests 14件、PoC OWS 155件、Ruff check/format、mypy 121 files、compileall、uv lock 66 packages、git diff checkはPASS。
 
+### 2026-11-14 follow-up diagnosis (starting HEAD `8ccdaed4b7ad300e1f6c81b8c3afeabd6bc26b70`)
+
+Focused testは初回1回と追加5回の計6回実行し、すべてPASSした。各回の結果は`WorkflowSnapshot` accepted 2件と`WorkflowConcurrencyConflict: workflow capacity is occupied` 1件で、順序だけが異なった。SQLite接続の`execute`を一時的に観測した6回ではSQLite例外は0件。診断用の一時テスト変更は戻し、製品sourceは変更していない。
+
+関連するWorkflow・workflow Console・Phase 5Fの20テストファイルも一度実行し、`631 passed, 6 skipped`。skipはWindows symlink privilege不足によるもの。以前のFAILは再現していないが、その3件目の例外型・発生箇所は元のassertion出力に保存されておらず、今回の成功実行から遡って確定できない。したがってroot causeは依然UNKNOWNで、SQLite競合と断定せず、修正も加えていない。R3 runner、Bridge、workflow API POST、実Codex jobは今回もNOT_RUN/0件。R3 evidenceを含む過去証跡は不変。
+
 ## Phase 5F-1〜5F-4の既知範囲と今回の未確認点
 
 - legacy issues loopの実Codex逐次3件成功は過去の受入結果であり、今回の証跡では再実行していない。
