@@ -179,3 +179,11 @@ workflow API POST合計は5回（A/B初回2、条件成立時のC capacity probe
 evidenceの補助`workflows.replay_A`/`replay_B`レコードは`post_outcome=MAYBE_SENT`の送信前markerを残したままになっている。一方、正式readback欄のA/B両方に`same_id_replay=REUSED_EXISTING_RUN`とHTTP 202があり、全体の`same_id_replay` checkもPASS、request/run/job/spawn/worker不変とrestart readbackもPASSである。この補助markerはreplay結果の最終状態を反映しない記録上の不整合として明示する。受入結果は保存済みの応答・readbackで確認できているが、次回runner evidenceの整合性改善候補として残す。
 
 R5の統合受入はPASS。R4の過去FAIL evidenceはそのまま保持する。今回の実機実行は隔離root内で完了し、本番反映・merge・PR作成は行っていない。production統合はこの差分のGitHubレビュー後に別途判断する。
+
+## R5レビュー後のreplay evidence recorder修正（offlineのみ）
+
+ChatGPTのGitHubレビューはR5受入13項目をすべてPASSとして確認した。R5 evidenceに保存された`workflows.replay_A`/`replay_B.post_outcome=MAYBE_SENT`は、その当時の送信前markerという歴史的記録として保持し、書き換えていない。新しいrunでは、replay HTTP応答を受信した後に、202・workflow/run ID一致・effective `succeeded`の全条件を確認してから、補助recordを`REUSED_EXISTING_RUN`、受信HTTP status、workflow/run IDで更新する。応答不一致は`HTTP_RESPONSE_UNEXPECTED`と受信statusを記録してUNKNOWN/read-only reconciliationで停止する。通信結果不明はUNKNOWNを維持し、再送しない。
+
+mock regressionは旧挙動で成功・予期せぬHTTP応答の2件が失敗し、通信結果不明の1件はUNKNOWN/non-retryを確認してPASSした。修正後の3経路はPASS。runner testsは33 PASS、Workflow serviceとConsole workflows dialogは69 PASS。Ruff check/format、mypy、compileall、`uv lock --check`、`git diff --check`もPASS。実Codex POST、Bridge起動、R5/R6 runner invocation、新evidence作成は0。
+
+GitHubのcombined statusはemptyで、PR-triggered CI runも確認されていないため、CI PASSとは判定しない。production merge/integrationは未実施。GitHub Issueノードの製品本体での実連携試験もまだなく、従来方針どおりproduction統合後の拡張段階へ延期する。

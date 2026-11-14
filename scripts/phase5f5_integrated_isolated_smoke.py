@@ -2012,6 +2012,8 @@ def _replay_same_ids(
                 "list_readable": reconciliation["list_readable"],
             }
             raise SmokeAbort("UNKNOWN", "same_id_replay_outcome_unknown_no_retry") from None
+        replay_record = evidence["workflows"].setdefault(replay_label, {})
+        replay_record["http_status"] = status
         if (
             status != 202
             or not isinstance(payload, dict)
@@ -2019,6 +2021,7 @@ def _replay_same_ids(
             or payload.get("run_id") != run_id
             or payload.get("status") != "succeeded"
         ):
+            replay_record["post_outcome"] = "HTTP_RESPONSE_UNEXPECTED"
             evidence["workflows"][label]["same_id_replay"] = "UNKNOWN"
             evidence["workflows"][label]["same_id_replay_http_status"] = status
             reconciliation = _reconcile_request(
@@ -2032,6 +2035,13 @@ def _replay_same_ids(
                 "list_readable": reconciliation["list_readable"],
             }
             raise SmokeAbort("UNKNOWN", "same_id_replay_outcome_unknown_no_retry")
+        replay_record.update(
+            {
+                "post_outcome": "REUSED_EXISTING_RUN",
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+            }
+        )
         evidence["workflows"][label]["same_id_replay"] = "REUSED_EXISTING_RUN"
         evidence["workflows"][label]["same_id_replay_http_status"] = status
     current = _read_replay_baseline(state_root=state_root, ids=ids)

@@ -134,7 +134,6 @@ def test_running_request_row_can_project_to_confirmed_success() -> None:
         definition_sha256=definition_sha256,
         input_sha256=input_sha256,
     )
-
     with pytest.raises(runner.SmokeAbort):
         runner._validate_confirmed_durable_success(
             request_state="running",
@@ -148,6 +147,169 @@ def test_running_request_row_can_project_to_confirmed_success() -> None:
             definition_sha256=definition_sha256,
             input_sha256=input_sha256,
         )
+
+
+def _replay_test_state(
+    monkeypatch: pytest.MonkeyPatch, runner: ModuleType, tmp_path: Path
+) -> tuple[dict[str, tuple[str, str, str]], dict[str, Any]]:
+    ids = {
+        "A": ("request-A", "workflow-A", "run-A"),
+        "B": ("request-B", "workflow-B", "run-B"),
+    }
+    evidence: dict[str, Any] = {
+        "checks": {},
+        "workflows": {
+            "A": {"client_request_id": "request-A", "status": "PASS"},
+            "B": {"client_request_id": "request-B", "status": "PASS"},
+        },
+    }
+    baseline = {
+        "request_rows": ["request-A", "request-B"],
+        "run_dirs": ["run-A", "run-B"],
+        "job_counts": {"run-A": 2, "run-B": 1},
+        "spawn_counts": {"run-A": 1, "run-B": 1},
+    }
+    monkeypatch.setattr(runner, "_read_replay_baseline", lambda **_kwargs: baseline)
+    monkeypatch.setattr(runner.support, "_worker_process_count", lambda _pid: 0)
+    monkeypatch.setattr(
+        runner,
+        "_reconcile_request",
+        lambda **_kwargs: {"matching_request_rows": 1, "list_readable": True},
+    )
+    return ids, evidence
+
+
+def _invoke_replay(
+    runner: ModuleType,
+    tmp_path: Path,
+    ids: dict[str, tuple[str, str, str]],
+    evidence: dict[str, Any],
+) -> None:
+    runner._replay_same_ids(
+        ui_port=19001,
+        token="test-token",
+        state_root=tmp_path / "state",
+        process=SimpleNamespace(pid=7123),
+        bodies={"A": b"request-A-body", "B": b"request-B-body"},
+        ids=ids,
+        evidence=evidence,
+        writer=SimpleNamespace(),
+        temp_root=tmp_path / "isolated-temp",
+    )
+
+
+def test_replay_success_records_confirmed_outcome_in_auxiliary_post_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _load_runner()
+    ids, evidence = _replay_test_state(monkeypatch, runner, tmp_path)
+    post_labels: list[str] = []
+
+    def fake_start_post(**kwargs: Any) -> tuple[int, dict[str, str]]:
+        label = kwargs["label"]
+        post_labels.append(label)
+        evidence["workflows"][label] = {"post_attempts": 1, "post_outcome": "MAYBE_SENT"}
+        workflow_label = label[-1]
+        return 202, {
+            "workflow_id": f"workflow-{workflow_label}",
+            "run_id": f"run-{workflow_label}",
+            "status": "succeeded",
+        }
+
+    monkeypatch.setattr(runner, "_start_post", fake_start_post)
+
+    _invoke_replay(runner, tmp_path, ids, evidence)
+
+    assert post_labels == ["replay_A", "replay_B"]
+    for workflow_label in ("A", "B"):
+        replay_record = evidence["workflows"][f"replay_{workflow_label}"]
+        assert replay_record == {
+            "post_attempts": 1,
+            "post_outcome": "REUSED_EXISTING_RUN",
+            "http_status": 202,
+            "workflow_id": f"workflow-{workflow_label}",
+            "run_id": f"run-{workflow_label}",
+        }
+        assert evidence["workflows"][workflow_label]["same_id_replay"] == ("REUSED_EXISTING_RUN")
+    assert evidence["checks"]["same_id_replay"] == "PASS"
+
+
+def test_replay_unexpected_http_response_is_recorded_and_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _load_runner()
+    ids, evidence = _replay_test_state(monkeypatch, runner, tmp_path)
+    post_labels: list[str] = []
+    reconciled_ids: list[str] = []
+
+    def fake_start_post(**kwargs: Any) -> tuple[int, dict[str, str]]:
+        label = kwargs["label"]
+        post_labels.append(label)
+        evidence["workflows"][label] = {"post_attempts": 1, "post_outcome": "MAYBE_SENT"}
+        return 409, {"error": "workflow_conflict"}
+
+    monkeypatch.setattr(runner, "_start_post", fake_start_post)
+    monkeypatch.setattr(
+        runner,
+        "_reconcile_request",
+        lambda **kwargs: (
+            reconciled_ids.append(kwargs["client_request_id"])
+            or {"matching_request_rows": 1, "list_readable": True}
+        ),
+    )
+
+    with pytest.raises(runner.SmokeAbort) as error:
+        _invoke_replay(runner, tmp_path, ids, evidence)
+
+    assert error.value.status == "UNKNOWN"
+    assert error.value.code == "same_id_replay_outcome_unknown_no_retry"
+    assert post_labels == ["replay_A"]
+    assert reconciled_ids == ["request-A"]
+    assert evidence["workflows"]["replay_A"] == {
+        "post_attempts": 1,
+        "post_outcome": "HTTP_RESPONSE_UNEXPECTED",
+        "http_status": 409,
+    }
+    assert evidence["workflows"]["A"]["same_id_replay"] == "UNKNOWN"
+
+
+def test_replay_unknown_transport_outcome_stays_unknown_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _load_runner()
+    ids, evidence = _replay_test_state(monkeypatch, runner, tmp_path)
+    post_labels: list[str] = []
+    reconciled_ids: list[str] = []
+
+    def fake_start_post(**kwargs: Any) -> tuple[int, dict[str, str]]:
+        label = kwargs["label"]
+        post_labels.append(label)
+        evidence["workflows"][label] = {"post_attempts": 1, "post_outcome": "UNKNOWN"}
+        raise runner.SmokeAbort("UNKNOWN", "transport_result_unknown")
+
+    monkeypatch.setattr(runner, "_start_post", fake_start_post)
+    monkeypatch.setattr(
+        runner,
+        "_reconcile_request",
+        lambda **kwargs: (
+            reconciled_ids.append(kwargs["client_request_id"])
+            or {"matching_request_rows": 1, "list_readable": True}
+        ),
+    )
+
+    with pytest.raises(runner.SmokeAbort) as error:
+        _invoke_replay(runner, tmp_path, ids, evidence)
+
+    assert error.value.status == "UNKNOWN"
+    assert error.value.code == "same_id_replay_outcome_unknown_no_retry"
+    assert post_labels == ["replay_A"]
+    assert reconciled_ids == ["request-A"]
+    assert evidence["workflows"]["replay_A"] == {
+        "post_attempts": 1,
+        "post_outcome": "UNKNOWN",
+    }
+    assert "same_id_replay_http_status" not in evidence["workflows"]["A"]
+    assert evidence["workflows"]["A"]["same_id_replay"] == "UNKNOWN"
 
 
 def test_attempt_selector_uses_fixed_paths_and_preserves_prior_evidence(
