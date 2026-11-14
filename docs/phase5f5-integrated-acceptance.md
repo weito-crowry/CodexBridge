@@ -100,6 +100,35 @@ R4固定証跡 [phase5f5-integrated-acceptance-r4-evidence.json](phase5f5-integr
 | graceful shutdown / process | 今回所有するBridgeへshutdown HTTP 202、process reaped、forced terminationなし。証跡`orphan_processes=0`。終了後のPID/creation-time/owner照合でもBridge、appserver、workerの一致プロセス0 |
 | lifecycle/redaction | formal runner checkは`NOT_RUN`。read-only scanでA/B各bridge logは`request_reserved=1`, `worker_launch_requested=1`, `worker_spawn_succeeded=1`, `worker_exited=1`, `workflow_state_changed=2`。各worker logは`worker_bootstrap=1`, `dbos_ready=1`, `workflow_started=1`, `result_persisted=1`。既知prompt本文、`final_text`、Authorization/Bearer markerは検出しなかった。tokenは停止後の比較値が保存されていないため、token値との照合は未確認 |
 
-失敗箇所は`_verify_saved_workflow()`のworker identity確認である。worker identity JSONのPID/parent PIDはR4 process snapshotsの記録と一致したが、`image_path.resolve(strict=True)`はrunnerの`sys.executable.resolve(strict=True)`と一致せず、AでFAILとなった。read-only照合ではA/B双方のworker image pathはrunnerの`sys._base_executable`へ解決し、venvの`sys.executable`とは異なっていた。workerがbase interpreterで起動した理由や、この差を許容すべきかは今回の証拠だけでは確定していない。runnerの検査を緩める変更や製品コード変更は加えていない。
+失敗箇所は`_verify_saved_workflow()`のworker identity確認である。worker identity JSONのPID/parent PIDはR4 process snapshotsの記録と一致したが、`image_path.resolve(strict=True)`はrunnerの`sys.executable.resolve(strict=True)`と一致せず、AでFAILとなった。read-only照合ではA/B双方のworker image pathはrunnerの`sys._base_executable`へ解決し、venvの`sys.executable`とは異なっていた。R4実行時点ではこの二段起動モデルの意味を確定できず、runner変更や製品コード変更は加えなかった。後続の読み取り専用postmortem結果を次節に記録する。
 
 追加の読み取りでAのjob2件、Bのjob1件が成功状態でresult/receiptを保存したことは確認したが、runner全体の結果は**FAIL**のまま扱う。A/Bとも初回POST以外のworkflow POSTはなく、C、replay、restartの追加送信は0回。R4 rootは調査用に保持し、R3のNOT_RUNと以前のoffline capacity failureのUNKNOWNはR4実機結果と混同しない。Phase 5F-5のproduction統合は未承認であり、ChatGPTレビュー後に次の判断を行う。
+
+### R4 postmortem: Windows venv launcher と実workerの識別
+
+R4の保存済みprocess snapshot、`start-worker-identity.json`、両lifecycle JSONL、manifestを読み取り専用で突き合わせた。run/workflow/launch IDは各A/B内で一致し、identity recordのPID・parent PID・`creation_time_100ns`は該当process snapshotに対応していた。Bridge Popen PID `51852` の子に実Bridge PID `43504` があり、appserver PID `51372` とA/Bのworker launcherは実Bridge PIDの子だった。各実workerは自分のlauncherの子だった。
+
+| Workflow | spawn/exitのlauncher PID | launcher parent | bootstrap/identityの実worker PID | 実worker parent | OS image |
+|---|---:|---:|---:|---:|---|
+| A | 41932 | 43504 | 42868 | 41932 | runner venvのbase Python |
+| B | 49004 | 43504 | 27744 | 49004 | runner venvのbase Python |
+
+この結果はvenv起動時の二段構造と整合する。Bridgeのspawn記録はvenv `sys.executable`で起動したlauncher PIDを記録し、worker identityはWindowsが報告した実OS worker PIDとそのbase interpreter image pathを記録する。R4のimage pathはrunnerの`sys._base_executable`と一致し、`sys.executable`とは異なっていた。したがってR4の`workflow_A_worker_identity_mismatch`はrunnerが二つの有効な実行ファイルとPIDを同一であることまで要求した誤判定であり、保存された結果から製品workerの不具合は示されていない。
+
+R4 snapshot上のworker-entry processは4個で、A/Bそれぞれのlauncher+実workerの組だった。旧capacity判定は生process数が2であることとspawn PIDがworker PIDと同じであることを要求していたため、R4のC=409は`NOT_OBSERVED`となった。このpostmortem修正では、完全一致する許可済みvenv/base executable、PID・parent・creation time・run directory、owned Bridgeの子孫関係を各launcher/実workerで照合する。直接起動ではlauncherと実worker PIDが一致し、venv child起動では実workerのparent PIDがlauncher PIDになる。capacity probeはA/B各1組の完全な照合ができた場合だけCを送信し、4 process/2組の形を認識する。重複、未知process、別run identity、実行ファイル不一致は照合失敗とし、Cは送信しない。保存証跡には実行ファイルの絶対pathを含めず、照合結果とprocess ID情報だけを記録する。
+
+今回のpostmortem修正はrunnerとrunner回帰テストに限定した。直接起動とvenv child起動、PID/parent/creation timeの不一致、第三者Python実行ファイル、owned Bridge外のlauncher、2 run/4 process、未知extra processをfake snapshotで検査する。R4 evidenceは変更しておらずstatusは引き続き`FAIL`。R4で未実施の最終API readback、same-ID replay、Console readback、restart readbackは未確認のままであり、今回もR5 runner、Bridge、実Codex POSTは実行していない。
+
+| 今回のoffline検証 | 結果 |
+|---|---|
+| Phase 5F-5 runner tests | 29 passed in the latest combined run |
+| Capacity concurrency focused + runner tests | 29 passed, 1 failed |
+| Workflow/Console/Phase 5F関連suite | 557 passed, 5 skipped |
+| PoC OWS suite | 155 passed |
+| Ruff check / format --check | PASS |
+| mypy src | PASS、121 source files |
+| compileall src/scripts/tests | PASS |
+| uv lock --check | PASS、66 packages resolved |
+| git diff --check | PASS |
+
+5件のskipはWindows symlink作成権限がない環境によるもの。直近の容量競合focused実行では、acceptedが2件だった一方で`WorkflowConcurrencyConflict`型の例外が0件としてassertionがFAILした。3件目のoutcome型・メッセージはこのtestのassertionに出力されず、原因は`UNKNOWN`。その直前の関連suiteでは同じtestを含めて557件PASSだったため、容量競合判定は実行間で不安定なままである。これはrunnerのプロセス識別修正とは独立した未解決事項であり、製品sourceは変更していない。静的検査とrunner testsはPASSだが、容量focused failureを含むためoffline検証全体は完全PASSではない。実機R5はChatGPTの差分レビュー後に別途判断し、今回実行していない。

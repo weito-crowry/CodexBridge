@@ -531,6 +531,217 @@ def _capture_owned_process(
     }
 
 
+def _resolved_executable(path: str | Path | None) -> tuple[Path, str] | None:
+    if not isinstance(path, (str, Path)) or not str(path):
+        return None
+    try:
+        resolved = Path(path).resolve(strict=True)
+        if not resolved.is_file():
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved, os.path.normcase(str(resolved)).casefold()
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        normalized_path = os.path.normcase(str(path)).casefold()
+        normalized_root = os.path.normcase(str(root)).casefold()
+        return os.path.commonpath((normalized_path, normalized_root)) == normalized_root
+    except (OSError, ValueError):
+        return False
+
+
+def _allowed_worker_executable_paths(
+    *,
+    executable: str | Path,
+    base_executable: str | Path | None,
+    prefix: str | Path,
+    base_prefix: str | Path,
+) -> frozenset[str]:
+    """Return exact executable paths for this interpreter and its venv base."""
+    current = _resolved_executable(executable)
+    if current is None:
+        return frozenset()
+    allowed = {current[1]}
+    try:
+        resolved_prefix = Path(prefix).resolve(strict=True)
+        resolved_base_prefix = Path(base_prefix).resolve(strict=True)
+        venv_active = (
+            os.path.normcase(str(resolved_prefix)).casefold()
+            != os.path.normcase(str(resolved_base_prefix)).casefold()
+        )
+    except (OSError, RuntimeError, ValueError):
+        return frozenset(allowed)
+    base = _resolved_executable(base_executable)
+    if (
+        venv_active
+        and _path_is_within(current[0], resolved_prefix)
+        and base is not None
+        and _path_is_within(base[0], resolved_base_prefix)
+    ):
+        allowed.add(base[1])
+    return frozenset(allowed)
+
+
+def _match_worker_process_pair(
+    *,
+    launcher_pid: int,
+    worker_identity_record: Mapping[str, Any],
+    process_snapshots: Sequence[Mapping[str, Any]],
+    run_dir: Path,
+    owned_bridge_pid: int,
+    allowed_worker_executables: frozenset[str] | set[str],
+) -> dict[str, Any] | None:
+    """Match one spawn PID to its direct worker or verified venv child."""
+    if type(launcher_pid) is not int or type(owned_bridge_pid) is not int:
+        return None
+    worker_pid = worker_identity_record.get("pid")
+    parent_pid = worker_identity_record.get("parent_pid")
+    creation_time = worker_identity_record.get("creation_time_100ns")
+    if (
+        type(worker_pid) is not int
+        or type(parent_pid) is not int
+        or type(creation_time) is not int
+        or creation_time <= 0
+        or not isinstance(worker_identity_record.get("run_dir"), str)
+        or not isinstance(worker_identity_record.get("image_path"), str)
+        or worker_identity_record.get("mode") != "start"
+        or not allowed_worker_executables
+    ):
+        return None
+    try:
+        expected_run_dir = str(run_dir.resolve(strict=True))
+        identity_run_dir = str(Path(str(worker_identity_record["run_dir"])).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if os.path.normcase(identity_run_dir) != os.path.normcase(expected_run_dir):
+        return None
+
+    snapshots_by_pid: dict[int, Mapping[str, Any]] = {}
+    for snapshot in process_snapshots:
+        pid = snapshot.get("pid")
+        if type(pid) is not int or pid in snapshots_by_pid:
+            return None
+        snapshots_by_pid[pid] = snapshot
+    launcher = snapshots_by_pid.get(launcher_pid)
+    worker = snapshots_by_pid.get(worker_pid)
+    if launcher is None or worker is None:
+        return None
+
+    def verified_owned(snapshot: Mapping[str, Any]) -> bool:
+        image = _resolved_executable(snapshot.get("image_path"))
+        ancestor_pids = snapshot.get("owned_bridge_ancestor_pids")
+        return (
+            snapshot.get("role") == "worker"
+            and snapshot.get("identity_verified") is True
+            and snapshot.get("owner_matches_current_user") is True
+            and snapshot.get("descendant_of_owned_bridge") is True
+            and snapshot.get("owned_bridge_pid") == owned_bridge_pid
+            and type(snapshot.get("parent_pid")) is int
+            and isinstance(ancestor_pids, list)
+            and bool(ancestor_pids)
+            and all(type(pid) is int for pid in ancestor_pids)
+            and len(ancestor_pids) == len(set(ancestor_pids))
+            and ancestor_pids[0] == snapshot.get("parent_pid")
+            and ancestor_pids[-1] == owned_bridge_pid
+            and isinstance(snapshot.get("created_at_epoch"), (int, float))
+            and image is not None
+            and image[1] in allowed_worker_executables
+        )
+
+    if not verified_owned(launcher) or not verified_owned(worker):
+        return None
+    record_image = _resolved_executable(worker_identity_record.get("image_path"))
+    worker_image = _resolved_executable(worker.get("image_path"))
+    if (
+        record_image is None
+        or worker_image is None
+        or record_image[1] not in allowed_worker_executables
+        or record_image[1] != worker_image[1]
+    ):
+        return None
+    try:
+        recorded_epoch = creation_time / 10_000_000 - 11_644_473_600
+        observed_epoch = float(worker["created_at_epoch"])
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if abs(recorded_epoch - observed_epoch) >= 0.01:
+        return None
+
+    if worker_pid == launcher_pid:
+        if parent_pid != launcher.get("parent_pid") or worker is not launcher:
+            return None
+        model = "direct"
+    else:
+        if (
+            worker.get("parent_pid") != launcher_pid
+            or parent_pid != launcher_pid
+            or launcher.get("pid") != launcher_pid
+        ):
+            return None
+        model = "venv_child"
+    return {
+        "launcher": dict(launcher),
+        "worker": dict(worker),
+        "model": model,
+    }
+
+
+def _match_worker_process_pairs(
+    *,
+    expected_pairs: Sequence[Mapping[str, Any]],
+    process_snapshots: Sequence[Mapping[str, Any]],
+    owned_bridge_pid: int,
+    allowed_worker_executables: frozenset[str] | set[str],
+) -> dict[str, dict[str, Any]] | None:
+    if not expected_pairs or not allowed_worker_executables:
+        return None
+    labels: set[str] = set()
+    expected_pids: set[int] = set()
+    matches: dict[str, dict[str, Any]] = {}
+    for expected in expected_pairs:
+        label = expected.get("label")
+        launcher_pid = expected.get("launcher_pid")
+        run_dir = expected.get("run_dir")
+        identity = expected.get("worker_identity_record")
+        if (
+            not isinstance(label, str)
+            or not label
+            or label in labels
+            or type(launcher_pid) is not int
+            or not isinstance(run_dir, Path)
+            or not isinstance(identity, Mapping)
+        ):
+            return None
+        labels.add(label)
+        worker_pid = identity.get("pid")
+        if type(worker_pid) is not int:
+            return None
+        if launcher_pid in expected_pids or worker_pid in expected_pids:
+            return None
+        expected_pids.update((launcher_pid, worker_pid))
+        pair = _match_worker_process_pair(
+            launcher_pid=launcher_pid,
+            worker_identity_record=identity,
+            process_snapshots=process_snapshots,
+            run_dir=run_dir,
+            owned_bridge_pid=owned_bridge_pid,
+            allowed_worker_executables=allowed_worker_executables,
+        )
+        if pair is None:
+            return None
+        matches[label] = pair
+    snapshot_pids = [row.get("pid") for row in process_snapshots]
+    if (
+        any(type(pid) is not int for pid in snapshot_pids)
+        or len(snapshot_pids) != len(set(snapshot_pids))
+        or set(snapshot_pids) != expected_pids
+    ):
+        return None
+    return matches
+
+
 def _capture_bridge_identity(process: subprocess.Popen[bytes]) -> dict[str, Any]:
     if process.poll() is not None:
         raise SmokeAbort("BLOCKED", "isolated_bridge_exited_during_startup")
@@ -562,13 +773,60 @@ def _assert_bridge_identity(process: subprocess.Popen[bytes], identity: Mapping[
         raise SmokeAbort("BLOCKED", "owned_bridge_identity_changed_before_shutdown")
 
 
-def _worker_process_snapshot(bridge_pid: int) -> list[dict[str, Any]]:
+def _worker_process_snapshot(
+    bridge_pid: int, bridge_identity: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     try:
-        descendants = psutil.Process(bridge_pid).children(recursive=True)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        bridge = psutil.Process(bridge_pid)
+        current_user = psutil.Process().username()
+        if (
+            not bridge.is_running()
+            or bridge.username() != current_user
+            or bridge_identity.get("pid") != bridge_pid
+            or bridge_identity.get("owner_matches_current_user") is not True
+            or bridge_identity.get("identity_verified") is not True
+            or abs(bridge.create_time() - float(bridge_identity["created_at_epoch"])) >= 0.01
+            or bridge.ppid() != bridge_identity.get("parent_pid")
+            or "codex_bridge" not in " ".join(bridge.cmdline())
+        ):
+            raise SmokeAbort("BLOCKED", "owned_bridge_process_identity_changed")
+        descendants = bridge.children(recursive=True)
+        descendant_pids = {process.pid for process in descendants}
+    except SmokeAbort:
+        raise
+    except (KeyError, TypeError, ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
         raise SmokeAbort("BLOCKED", "bridge_child_process_tree_unavailable") from None
+    descendant_identity: dict[int, tuple[int, str]] = {}
+    for descendant in descendants:
+        try:
+            descendant_identity[descendant.pid] = (
+                descendant.ppid(),
+                descendant.username(),
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    def owned_ancestor_chain(process_pid: int) -> list[int] | None:
+        current_pid = process_pid
+        visited = {process_pid}
+        ancestors: list[int] = []
+        while current_pid != bridge_pid:
+            identity = descendant_identity.get(current_pid)
+            if identity is None or identity[1] != current_user:
+                return None
+            parent_pid = identity[0]
+            if parent_pid <= 0 or parent_pid in visited:
+                return None
+            ancestors.append(parent_pid)
+            if parent_pid == bridge_pid:
+                return ancestors
+            if parent_pid not in descendant_pids:
+                return None
+            visited.add(parent_pid)
+            current_pid = parent_pid
+        return ancestors
+
     result: list[dict[str, Any]] = []
-    current_user = psutil.Process().username()
     for child in descendants:
         try:
             if "codex_bridge.workflows.worker_entry" not in child.cmdline():
@@ -576,15 +834,48 @@ def _worker_process_snapshot(bridge_pid: int) -> list[dict[str, Any]]:
             record = _capture_owned_process(child, role="worker")
             if record["owner_matches_current_user"] is not True:
                 raise SmokeAbort("BLOCKED", "worker_owner_mismatch")
-            record["descendant_of_owned_bridge"] = child.pid in {
-                process.pid for process in descendants
-            }
+            record["image_path"] = str(Path(child.exe()).resolve(strict=True))
+            ancestors = owned_ancestor_chain(child.pid)
+            record["descendant_of_owned_bridge"] = ancestors is not None
+            record["owned_bridge_ancestor_pids"] = ancestors or []
+            record["owned_bridge_pid"] = bridge_pid
             if not record["descendant_of_owned_bridge"] or child.username() != current_user:
                 raise SmokeAbort("BLOCKED", "worker_process_parent_or_owner_mismatch")
             result.append(record)
+        except SmokeAbort:
+            raise
         except psutil.NoSuchProcess:
             continue
+        except (OSError, psutil.AccessDenied):
+            raise SmokeAbort("BLOCKED", "worker_process_identity_unavailable") from None
     return result
+
+
+def _worker_snapshot_evidence(
+    snapshots: Sequence[Mapping[str, Any]],
+    allowed_worker_executables: frozenset[str] | set[str],
+) -> list[dict[str, Any]]:
+    allowed_fields = (
+        "role",
+        "pid",
+        "created_at_epoch",
+        "created_at_utc",
+        "owner_matches_current_user",
+        "parent_pid",
+        "identity_verified",
+        "descendant_of_owned_bridge",
+        "owned_bridge_ancestor_pids",
+        "owned_bridge_pid",
+    )
+    projected: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        image = _resolved_executable(snapshot.get("image_path"))
+        row = {key: snapshot[key] for key in allowed_fields if key in snapshot}
+        row["image_matches_configured_interpreter"] = (
+            image is not None and image[1] in allowed_worker_executables
+        )
+        projected.append(row)
+    return projected
 
 
 def _write_runtime_config(
@@ -875,6 +1166,8 @@ def _verify_lifecycle(
     worker_status: Mapping[str, Any],
     worker_identity_record: Mapping[str, Any],
     bridge_pid: int,
+    worker_process_snapshots: Sequence[Mapping[str, Any]],
+    allowed_worker_executables: frozenset[str] | set[str],
     token: str,
     temp_root: Path,
     prompts: Sequence[str],
@@ -908,31 +1201,51 @@ def _verify_lifecycle(
     ):
         raise SmokeAbort("UNKNOWN", "lifecycle_event_sequence_incomplete")
     reserved = next(row for row in bridge_rows if row["event"] == "request_reserved")
+    launch_requested = next(row for row in bridge_rows if row["event"] == "worker_launch_requested")
     spawned = next(row for row in bridge_rows if row["event"] == "worker_spawn_succeeded")
     exited = next(row for row in bridge_rows if row["event"] == "worker_exited")
     worker_identity = next(row for row in worker_rows if row["event"] == "worker_bootstrap")
     if (
         reserved.get("request_digest") != request_digest
+        or reserved.get("workflow_id") != workflow_id
+        or launch_requested.get("workflow_id") != workflow_id
+        or spawned.get("workflow_id") != workflow_id
+        or exited.get("workflow_id") != workflow_id
         or not isinstance(spawned.get("launch_id"), str)
+        or not spawned.get("launch_id")
+        or spawned.get("mode") != "start"
+        or launch_requested.get("launch_id") != spawned.get("launch_id")
+        or launch_requested.get("mode") != "start"
         or spawned.get("launch_id") != worker_identity.get("launch_id")
         or spawned.get("launch_id") != exited.get("launch_id")
-        or spawned.get("pid") != worker_identity.get("pid")
+        or type(spawned.get("pid")) is not int
+        or worker_identity_record.get("pid") != worker_identity.get("pid")
         or spawned.get("pid") != exited.get("pid")
         or exited.get("returncode") != 0
+        or exited.get("mode") != "start"
         or exited.get("state") != "completed"
         or exited.get("shutdown_requested") is not False
-        or worker_identity_record.get("pid") != spawned.get("pid")
-        or worker_identity_record.get("parent_pid") != bridge_pid
-        or worker_identity_record.get("run_dir") != str(run_dir.resolve(strict=True))
+        or worker_identity_record.get("mode") != "start"
     ):
         raise SmokeAbort("UNKNOWN", "lifecycle_worker_identity_or_exit_mismatch")
+    pair = _match_worker_process_pair(
+        launcher_pid=int(spawned["pid"]),
+        worker_identity_record=worker_identity_record,
+        process_snapshots=worker_process_snapshots,
+        run_dir=run_dir,
+        owned_bridge_pid=bridge_pid,
+        allowed_worker_executables=allowed_worker_executables,
+    )
+    if pair is None:
+        raise SmokeAbort("UNKNOWN", "lifecycle_worker_process_pair_unverified")
     required_worker_rows = [
         next(row for row in worker_rows if row["event"] == event) for event in worker_expected
     ]
     if any(
         row.get("launch_id") != spawned.get("launch_id")
-        or row.get("pid") != spawned.get("pid")
+        or row.get("pid") != worker_identity_record.get("pid")
         or row.get("workflow_id") != workflow_id
+        or row.get("mode") != "start"
         for row in required_worker_rows
     ):
         raise SmokeAbort("UNKNOWN", "worker_lifecycle_identity_mismatch")
@@ -950,11 +1263,17 @@ def _verify_lifecycle(
     def event_time(row: Mapping[str, Any]) -> datetime:
         return datetime.fromisoformat(str(row["timestamp_utc"]).replace("Z", "+00:00"))
 
-    reserved_time = event_time(reserved)
-    bootstrap_time = event_time(required_worker_rows[0])
-    result_time = event_time(required_worker_rows[-1])
-    exit_time = event_time(exited)
-    if reserved_time > bootstrap_time or result_time > exit_time:
+    ordered_events = [
+        reserved,
+        launch_requested,
+        spawned,
+        *required_worker_rows,
+        exited,
+    ]
+    event_times = [event_time(row) for row in ordered_events]
+    if any(
+        current < previous for previous, current in zip(event_times, event_times[1:], strict=False)
+    ):
         raise SmokeAbort("UNKNOWN", "lifecycle_cross_file_timestamp_order_invalid")
     return {
         "status": "PASS",
@@ -963,7 +1282,9 @@ def _verify_lifecycle(
         "bridge_events": _lifecycle_projection(bridge_rows),
         "worker_events": _lifecycle_projection(worker_rows),
         "launch_id": spawned["launch_id"],
-        "worker_pid": spawned["pid"],
+        "worker_launcher_pid": spawned["pid"],
+        "worker_pid": worker_identity_record["pid"],
+        "worker_process_model": pair["model"],
     }
 
 
@@ -1017,6 +1338,9 @@ def _verify_saved_workflow(
     max_live_codex_jobs: int,
     expected_definition: Mapping[str, Any],
     expected_input: Mapping[str, Any],
+    worker_process_observations: Sequence[Sequence[Mapping[str, Any]]],
+    owned_bridge_pid: int,
+    allowed_worker_executables: frozenset[str] | set[str],
 ) -> dict[str, Any]:
     request_rows = support._read_request_ledger(state_root)
     matches = [row for row in request_rows if row.get("client_request_id") == client_request_id]
@@ -1163,13 +1487,49 @@ def _verify_saved_workflow(
         not isinstance(worker_identity_record, dict)
         or not isinstance(worker_identity_record.get("pid"), int)
         or not isinstance(worker_identity_record.get("parent_pid"), int)
+        or worker_identity_record.get("mode") != "start"
         or not isinstance(worker_identity_record.get("image_path"), str)
-        or os.path.normcase(
-            str(Path(str(worker_identity_record["image_path"])).resolve(strict=True))
-        )
-        != os.path.normcase(str(Path(sys.executable).resolve(strict=True)))
     ):
         raise SmokeAbort("FAIL", f"workflow_{label}_worker_identity_mismatch")
+    bridge_rows = _read_lifecycle(
+        run_dir / "bridge-lifecycle.jsonl", run_id=run_id, workflow_id=workflow_id
+    )
+    worker_rows = _read_lifecycle(
+        run_dir / "worker-lifecycle.jsonl", run_id=run_id, workflow_id=workflow_id
+    )
+    launches = [row for row in bridge_rows if row.get("event") == "worker_spawn_succeeded"]
+    bootstraps = [row for row in worker_rows if row.get("event") == "worker_bootstrap"]
+    if (
+        len(launches) != 1
+        or len(bootstraps) != 1
+        or launches[0].get("workflow_id") != workflow_id
+        or bootstraps[0].get("workflow_id") != workflow_id
+        or launches[0].get("mode") != "start"
+        or not isinstance(launches[0].get("launch_id"), str)
+        or launches[0].get("launch_id") != bootstraps[0].get("launch_id")
+        or bootstraps[0].get("pid") != worker_identity_record.get("pid")
+        or bootstraps[0].get("mode") != "start"
+    ):
+        raise SmokeAbort("UNKNOWN", f"workflow_{label}_lifecycle_process_identity_mismatch")
+    worker_launcher_pid = launches[0].get("pid")
+    if type(worker_launcher_pid) is not int:
+        raise SmokeAbort("UNKNOWN", f"workflow_{label}_lifecycle_launcher_pid_invalid")
+    worker_process_pair = None
+    worker_process_observation: Sequence[Mapping[str, Any]] | None = None
+    for process_snapshot in worker_process_observations:
+        worker_process_pair = _match_worker_process_pair(
+            launcher_pid=worker_launcher_pid,
+            worker_identity_record=worker_identity_record,
+            process_snapshots=process_snapshot,
+            run_dir=run_dir,
+            owned_bridge_pid=owned_bridge_pid,
+            allowed_worker_executables=allowed_worker_executables,
+        )
+        if worker_process_pair is not None:
+            worker_process_observation = process_snapshot
+            break
+    if worker_process_pair is None or worker_process_observation is None:
+        raise SmokeAbort("UNKNOWN", f"workflow_{label}_worker_process_pair_unobserved")
     _validate_confirmed_durable_success(
         request_state=request.get("state"),
         dbos_status=dbos_status,
@@ -1208,6 +1568,9 @@ def _verify_saved_workflow(
         "dbos_status": dbos_status,
         "worker_status": worker_status,
         "worker_identity": worker_identity_record,
+        "worker_launcher_pid": worker_launcher_pid,
+        "worker_process_pair": worker_process_pair,
+        "worker_process_observation": worker_process_observation,
         "stored_result": stored_result,
     }
 
@@ -1276,6 +1639,8 @@ def _workflow_evidence(
         "dbos_status": saved["dbos_status"],
         "worker_exit_code": saved["worker_status"]["exit_code"],
         "worker_pid": saved["worker_identity"]["pid"],
+        "worker_launcher_pid": saved["worker_launcher_pid"],
+        "worker_process_model": saved["worker_process_pair"]["model"],
         "job_count": len(saved["jobs"]),
         "jobs": [
             {
@@ -1372,6 +1737,7 @@ def _verify_logical_run_ids(
 def _capacity_probe(
     *,
     process: subprocess.Popen[bytes],
+    bridge_identity: Mapping[str, Any],
     state_root: Path,
     ui_port: int,
     token: str,
@@ -1382,6 +1748,8 @@ def _capacity_probe(
     evidence: dict[str, Any],
     writer: _EvidenceWriter,
     temp_root: Path,
+    allowed_worker_executables: frozenset[str] | set[str],
+    worker_process_observations: list[list[dict[str, Any]]],
 ) -> None:
     workflows = _read_workflow_list(ui_port, token)
     by_id = {str(row.get("workflow_id")): row for row in workflows}
@@ -1389,35 +1757,85 @@ def _capacity_probe(
         workflow_id in by_id and by_id[workflow_id].get("status") in ACTIVE_STATUSES
         for _request, workflow_id, _run in accepted.values()
     )
-    workers = _worker_process_snapshot(process.pid)
-    spawn_pids: set[int] = set()
+    workers = _worker_process_snapshot(process.pid, bridge_identity)
+    worker_process_observations.append(workers)
+    expected_pairs: list[dict[str, Any]] = []
     spawn_counts: dict[str, int] = {}
-    if active and len(workflows) == 2 and len(workers) == 2:
+    if active and len(workflows) == 2 and set(accepted) == {"A", "B"}:
         for label, (_request_id, workflow_id, run_id) in accepted.items():
             try:
+                run_dir = support._run_directory(state_root, run_id)
                 bridge_rows = _read_lifecycle(
-                    support._run_directory(state_root, run_id) / "bridge-lifecycle.jsonl",
+                    run_dir / "bridge-lifecycle.jsonl",
                     run_id=run_id,
                     workflow_id=workflow_id,
                 )
-            except SmokeAbort:
-                bridge_rows = []
-            launched = [
-                row
-                for row in bridge_rows
-                if row.get("event") == "worker_spawn_succeeded" and isinstance(row.get("pid"), int)
-            ]
-            spawn_counts[label] = len(launched)
-            spawn_pids.update(int(row["pid"]) for row in launched)
-    observed_worker_pids = {int(row["pid"]) for row in workers}
-    observed_worker_creation = {int(row["pid"]): float(row["created_at_epoch"]) for row in workers}
+                worker_rows = _read_lifecycle(
+                    run_dir / "worker-lifecycle.jsonl",
+                    run_id=run_id,
+                    workflow_id=workflow_id,
+                )
+                launch_requests = [
+                    row for row in bridge_rows if row.get("event") == "worker_launch_requested"
+                ]
+                launched = [
+                    row for row in bridge_rows if row.get("event") == "worker_spawn_succeeded"
+                ]
+                exited = [row for row in bridge_rows if row.get("event") == "worker_exited"]
+                bootstraps = [row for row in worker_rows if row.get("event") == "worker_bootstrap"]
+                spawn_counts[label] = len(launched)
+                identity = support._bounded_json_file(
+                    run_dir / "start-worker-identity.json", maximum=8192
+                )
+                if (
+                    len(launch_requests) != 1
+                    or len(launched) != 1
+                    or exited
+                    or len(bootstraps) != 1
+                    or launch_requests[0].get("workflow_id") != workflow_id
+                    or launched[0].get("workflow_id") != workflow_id
+                    or bootstraps[0].get("workflow_id") != workflow_id
+                    or not isinstance(identity, dict)
+                    or launch_requests[0].get("mode") != "start"
+                    or launched[0].get("mode") != "start"
+                    or launch_requests[0].get("launch_id") != launched[0].get("launch_id")
+                    or bootstraps[0].get("launch_id") != launched[0].get("launch_id")
+                    or bootstraps[0].get("pid") != identity.get("pid")
+                    or bootstraps[0].get("mode") != "start"
+                    or identity.get("mode") != "start"
+                ):
+                    expected_pairs = []
+                    break
+                expected_pairs.append(
+                    {
+                        "label": label,
+                        "run_dir": run_dir,
+                        "launcher_pid": launched[0].get("pid"),
+                        "worker_identity_record": identity,
+                    }
+                )
+            except (SmokeAbort, OSError, ValueError):
+                expected_pairs = []
+                break
+    matched_pairs = (
+        _match_worker_process_pairs(
+            expected_pairs=expected_pairs,
+            process_snapshots=workers,
+            owned_bridge_pid=process.pid,
+            allowed_worker_executables=allowed_worker_executables,
+        )
+        if len(expected_pairs) == 2 and spawn_counts == {"A": 1, "B": 1}
+        else None
+    )
+    observed_worker_creation = {
+        int(row["pid"]): float(row["created_at_epoch"])
+        for row in workers
+        if type(row.get("pid")) is int and isinstance(row.get("created_at_epoch"), (int, float))
+    }
     if (
         not active
         or len(workflows) != 2
-        or len(workers) != 2
-        or not all(row.get("identity_verified") for row in workers)
-        or spawn_counts != {"A": 1, "B": 1}
-        or spawn_pids != observed_worker_pids
+        or matched_pairs is None
         or workspace_c.is_symlink()
         or not workspace_c.is_dir()
         or any(workspace_c.iterdir())
@@ -1430,7 +1848,10 @@ def _capacity_probe(
         }
         return
     evidence["processes"]["worker_snapshots"].append(
-        {"stage": "both_workflows_active", "workers": workers}
+        {
+            "stage": "both_workflows_active",
+            "workers": _worker_snapshot_evidence(workers, allowed_worker_executables),
+        }
     )
     before_rows = support._read_request_ledger(state_root)
     if len(before_rows) != 2:
@@ -1488,7 +1909,8 @@ def _capacity_probe(
         }
         raise SmokeAbort("UNKNOWN", "capacity_probe_did_not_return_expected_409")
     after_rows = support._read_request_ledger(state_root)
-    after_workers = _worker_process_snapshot(process.pid)
+    after_workers = _worker_process_snapshot(process.pid, bridge_identity)
+    worker_process_observations.append(after_workers)
     after_workflows = _read_workflow_list(ui_port, token)
     after_workers_same_identities = all(
         int(row["pid"]) in observed_worker_creation
@@ -1739,6 +2161,8 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
     state_root: Path | None = None
     safe_to_shutdown = False
     replies: list[str] = []
+    allowed_worker_executables: frozenset[str] = frozenset()
+    worker_process_observations: list[list[dict[str, Any]]] = []
     prompts = (
         "Reply with exactly ALPHA",
         "Reply with exactly SKIP",
@@ -1748,6 +2172,14 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
     )
     try:
         _preflight_runtime(evidence)
+        allowed_worker_executables = _allowed_worker_executable_paths(
+            executable=sys.executable,
+            base_executable=getattr(sys, "_base_executable", None),
+            prefix=sys.prefix,
+            base_prefix=sys.base_prefix,
+        )
+        if not allowed_worker_executables:
+            raise SmokeAbort("BLOCKED", "worker_executable_allowlist_unavailable")
         base_environment = dict(os.environ)
         head_commit = _verified_base_ancestor_head()
         evidence["source_commit"] = head_commit
@@ -1988,9 +2420,13 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
                     "run_id": run_id,
                 }
             )
-            snapshots = _worker_process_snapshot(process.pid)
+            snapshots = _worker_process_snapshot(process.pid, process_identity)
+            worker_process_observations.append(snapshots)
             evidence["processes"]["worker_snapshots"].append(
-                {"stage": f"after_workflow_{label}_accepted", "workers": snapshots}
+                {
+                    "stage": f"after_workflow_{label}_accepted",
+                    "workers": _worker_snapshot_evidence(snapshots, allowed_worker_executables),
+                }
             )
             _save_evidence(writer, evidence, token=token, temp_root=temp_root)
         _verify_logical_run_ids(state_root=state_root, ids=accepted, expected_count=2)
@@ -2003,10 +2439,12 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
                 for label, (_request, workflow_id, _run) in accepted.items()
             },
         }
+        snapshots = _worker_process_snapshot(process.pid, process_identity)
+        worker_process_observations.append(snapshots)
         evidence["processes"]["worker_snapshots"].append(
             {
                 "stage": "after_both_workflows_accepted",
-                "workers": _worker_process_snapshot(process.pid),
+                "workers": _worker_snapshot_evidence(snapshots, allowed_worker_executables),
             }
         )
         c_body = _request_body(
@@ -2018,6 +2456,7 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
         )
         _capacity_probe(
             process=process,
+            bridge_identity=process_identity,
             state_root=state_root,
             ui_port=ports[1],
             token=token,
@@ -2028,6 +2467,8 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
             evidence=evidence,
             writer=writer,
             temp_root=temp_root,
+            allowed_worker_executables=allowed_worker_executables,
+            worker_process_observations=worker_process_observations,
         )
         _save_evidence(writer, evidence, token=token, temp_root=temp_root)
 
@@ -2066,6 +2507,9 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
                 max_live_codex_jobs=max_live,
                 expected_definition=definition,
                 expected_input=input_data,
+                worker_process_observations=worker_process_observations,
+                owned_bridge_pid=process.pid,
+                allowed_worker_executables=allowed_worker_executables,
             )
             _verify_api_readback(
                 ui_port=ports[1],
@@ -2106,7 +2550,8 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
             _save_evidence(writer, evidence, token=token, temp_root=temp_root)
         _verify_logical_run_ids(state_root=state_root, ids=accepted, expected_count=2)
         support._wait_for_no_workers(process.pid, timeout_seconds=10.0)
-        worker_ids = {int(evidence["workflows"][label]["worker_pid"]) for label in ("A", "B")}
+        worker_ids = {int(saved_states[label]["worker_identity"]["pid"]) for label in ("A", "B")}
+        launcher_ids = {int(saved_states[label]["worker_launcher_pid"]) for label in ("A", "B")}
         spawned_ids = {
             int(row["pid"])
             for label in ("A", "B")
@@ -2117,13 +2562,31 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
             )
             if row.get("event") == "worker_spawn_succeeded" and isinstance(row.get("pid"), int)
         }
+        bootstrap_ids = {
+            int(row["pid"])
+            for label in ("A", "B")
+            for row in _read_lifecycle(
+                saved_states[label]["run_dir"] / "worker-lifecycle.jsonl",
+                run_id=accepted[label][2],
+                workflow_id=accepted[label][1],
+            )
+            if row.get("event") == "worker_bootstrap" and isinstance(row.get("pid"), int)
+        }
         observed_worker_ids = {
             int(row["pid"])
-            for snapshot in evidence["processes"]["worker_snapshots"]
-            for row in snapshot.get("workers", [])
-            if isinstance(row, dict) and isinstance(row.get("pid"), int)
+            for observation in worker_process_observations
+            for row in observation
+            if type(row.get("pid")) is int
         }
-        if worker_ids != spawned_ids or not worker_ids.issubset(observed_worker_ids):
+        if (
+            len(worker_ids) != 2
+            or len(launcher_ids) != 2
+            or len(spawned_ids) != 2
+            or len(bootstrap_ids) != 2
+            or launcher_ids != spawned_ids
+            or worker_ids != bootstrap_ids
+            or not (worker_ids | launcher_ids).issubset(observed_worker_ids)
+        ):
             raise SmokeAbort("UNKNOWN", "workflow_worker_spawn_identity_not_correlated")
         for label in ("A", "B"):
             lifecycle = _verify_lifecycle(
@@ -2134,6 +2597,8 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
                 worker_status=saved_states[label]["worker_status"],
                 worker_identity_record=saved_states[label]["worker_identity"],
                 bridge_pid=process.pid,
+                worker_process_snapshots=saved_states[label]["worker_process_observation"],
+                allowed_worker_executables=allowed_worker_executables,
                 token=token,
                 temp_root=temp_root,
                 prompts=prompts,
