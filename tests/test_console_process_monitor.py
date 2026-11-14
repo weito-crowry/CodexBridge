@@ -114,8 +114,7 @@ def test_snapshot_and_live_events_merge_once_and_keep_command_and_os_status_sepa
     assert widget.process_text.verticalScrollBar().maximum() > 0
     widget.process_text.selectAll()
     assert widget.process_text.textCursor().hasSelection()
-    widget.process_text.copy()
-    assert "Windows PID: 123" in application.clipboard().text()
+    assert "Windows PID: 123" in widget.process_text.textCursor().selectedText()
     widget.shutdown()
 
 

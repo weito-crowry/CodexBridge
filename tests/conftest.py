@@ -6,8 +6,30 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+
+
+class FakeClipboard:
+    def __init__(self) -> None:
+        self._text = ""
+
+    def setText(self, text: str) -> None:
+        self._text = text
+
+    def text(self) -> str:
+        return self._text
+
+    def clear(self) -> None:
+        self._text = ""
+
+
+@pytest.fixture
+def fake_clipboard(monkeypatch: pytest.MonkeyPatch) -> FakeClipboard:
+    clipboard = FakeClipboard()
+    monkeypatch.setattr(QApplication, "clipboard", staticmethod(lambda: clipboard))
+    return clipboard
 
 
 @pytest.fixture(autouse=True)

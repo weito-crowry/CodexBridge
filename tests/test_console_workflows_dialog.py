@@ -20,7 +20,9 @@ def _app() -> QApplication:
     return app if app is not None else QApplication([])
 
 
-def test_workflow_management_dialog_lists_short_ids_and_emits_selected_full_id() -> None:
+def test_workflow_management_dialog_lists_short_ids_and_emits_selected_full_id(
+    fake_clipboard,
+) -> None:
     _app()
     dialog = WorkflowManagementDialog()
     selected: list[str] = []
@@ -54,7 +56,7 @@ def test_workflow_management_dialog_lists_short_ids_and_emits_selected_full_id()
     assert dialog.selected_workflow_id == first_id
     assert selected == [first_id]
     dialog.copy_button.click()
-    assert QApplication.clipboard().text() == first_id
+    assert fake_clipboard.text() == first_id
     dialog.workflow_list.setCurrentRow(1)
     assert dialog.selected_workflow_id == second_id
     assert selected[-1] == second_id

@@ -97,7 +97,7 @@ def test_messages_execution_toggle_preserves_order_and_individual_disclosures() 
 
 
 @pytest.mark.parametrize("scheme", ["light", "dark"])
-def test_execution_details_live_prepend_copy_and_thread_switch(scheme: str) -> None:
+def test_execution_details_live_prepend_copy_and_thread_switch(scheme: str, fake_clipboard) -> None:
     application = QApplication.instance() or QApplication([])
     pane = HistoryPane()
     pane.setStyleSheet(stylesheet_for_theme(theme_for_scheme(scheme)))
@@ -124,7 +124,7 @@ def test_execution_details_live_prepend_copy_and_thread_switch(scheme: str) -> N
     copy_button = original_answer.findChild(QPushButton, "conversationCopyMessageButton")
     assert copy_button is not None
     copy_button.click()
-    assert application.clipboard().text() == "original\n**answer**"
+    assert fake_clipboard.text() == "original\n**answer**"
     older = TimelineEntry("old-turn", "old-tool", "MCP", "MCP", "old tool", "completed", ())
     pane.set_timeline((older, failed, answer), prepend=True)
     _process_layout(application)

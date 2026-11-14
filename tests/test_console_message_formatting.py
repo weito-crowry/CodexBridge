@@ -78,7 +78,9 @@ def test_history_projection_keeps_complete_message_source(
 
 
 @pytest.mark.parametrize("mode", ["Conversation", "Messages", "Details"])
-def test_history_modes_copy_complete_source_and_update_without_scroll_jump(mode: str) -> None:
+def test_history_modes_copy_complete_source_and_update_without_scroll_jump(
+    mode: str, fake_clipboard
+) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     original = "# 指示\r\n\r\n" + "日本語 ABC **強調** " * 1100 + "\r\n次の行\r\n\r\n末尾"
@@ -118,7 +120,7 @@ def test_history_modes_copy_complete_source_and_update_without_scroll_jump(mode:
     else:
         assert "次の行" in body.toPlainText() and "**強調**" not in body.toPlainText()
     button.click()
-    assert application.clipboard().text() == original + "\r\n追記"
+    assert fake_clipboard.text() == original + "\r\n追記"
     assert abs(scrollbar.value() - before) <= 3
     assert pane._scroll.horizontalScrollBar().maximum() == 0
     assert body.horizontalScrollBar().maximum() == 0

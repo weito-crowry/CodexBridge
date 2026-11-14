@@ -19,7 +19,9 @@ def _copy_button(pane: HistoryPane) -> QPushButton:
 
 
 @pytest.mark.parametrize("mode", ["Conversation", "Messages", "Details"])
-def test_copy_success_preserves_source_and_button_geometry_then_resets(mode: str) -> None:
+def test_copy_success_preserves_source_and_button_geometry_then_resets(
+    mode: str, fake_clipboard
+) -> None:
     application = QApplication.instance() or QApplication([])
     assert isinstance(application, QApplication)
     original = "# 日本語 **原文**\r\n\r\n" + "長文 😀\r\n" * 3000 + "末尾"
@@ -38,7 +40,7 @@ def test_copy_success_preserves_source_and_button_geometry_then_resets(mode: str
     QTest.keyClick(button, Qt.Key.Key_Space)
     _process_layout(application)
 
-    assert application.clipboard().text() == original
+    assert fake_clipboard.text() == original
     assert button.text() == "✓"
     assert "Copied" in button.accessibleName()
     assert "Copied" in button.toolTip()
@@ -52,7 +54,7 @@ def test_copy_success_preserves_source_and_button_geometry_then_resets(mode: str
     pane.close()
 
 
-def test_repeated_copy_restarts_feedback_time() -> None:
+def test_repeated_copy_restarts_feedback_time(fake_clipboard) -> None:
     application = QApplication.instance() or QApplication([])
     assert isinstance(application, QApplication)
     pane = HistoryPane()
@@ -60,9 +62,9 @@ def test_repeated_copy_restarts_feedback_time() -> None:
     button = _copy_button(pane)
     button.click()
     QTest.qWait(1100)
-    application.clipboard().setText("changed elsewhere")
+    fake_clipboard.setText("changed elsewhere")
     button.click()
-    assert application.clipboard().text() == "source"
+    assert fake_clipboard.text() == "source"
     QTest.qWait(1100)
     assert button.text() == "✓"
     QTest.qWait(1000)
@@ -111,7 +113,7 @@ def test_failed_recopy_clears_previous_success(monkeypatch: pytest.MonkeyPatch) 
 
 @pytest.mark.parametrize("change", ["redraw", "switch", "clear", "close"])
 def test_pending_feedback_is_disposed_with_card(
-    change: str, capsys: pytest.CaptureFixture[str]
+    change: str, fake_clipboard, capsys: pytest.CaptureFixture[str]
 ) -> None:
     application = QApplication.instance() or QApplication([])
     assert isinstance(application, QApplication)
@@ -120,6 +122,7 @@ def test_pending_feedback_is_disposed_with_card(
     pane.set_timeline((entry,))
     button = _copy_button(pane)
     button.click()
+    assert fake_clipboard.text() == "source"
     assert button.text() == "✓"
     if change == "redraw":
         pane.set_timeline((TimelineEntry("turn", "message", "User", "User", "updated", None, ()),))
@@ -162,8 +165,8 @@ def test_clipboard_helper_requires_successful_readback(
     assert widget_helpers.copy_to_clipboard("source") is False
 
 
-def test_clipboard_helper_reports_verified_success() -> None:
+def test_clipboard_helper_reports_verified_success(fake_clipboard) -> None:
     application = QApplication.instance() or QApplication([])
     assert isinstance(application, QApplication)
     assert widget_helpers.copy_to_clipboard("原文\r\n\n**Markdown**") is True
-    assert application.clipboard().text() == "原文\r\n\n**Markdown**"
+    assert fake_clipboard.text() == "原文\r\n\n**Markdown**"

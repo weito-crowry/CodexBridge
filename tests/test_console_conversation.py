@@ -271,7 +271,7 @@ def test_activity_pane_reports_approval_and_input_requests_without_changing_cont
     pane.close()
 
 
-def test_conversation_markdown_is_safe_and_copy_keeps_original_text() -> None:
+def test_conversation_markdown_is_safe_and_copy_keeps_original_text(fake_clipboard) -> None:
     application = QApplication.instance() or QApplication([])
     assert application is not None
     original = (
@@ -315,7 +315,7 @@ def test_conversation_markdown_is_safe_and_copy_keeps_original_text() -> None:
     )
     assert copy_button is not None
     copy_button.click()
-    assert application.clipboard().text() == original
+    assert fake_clipboard.text() == original
     pane.close()
 
 
