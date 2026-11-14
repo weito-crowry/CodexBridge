@@ -149,19 +149,111 @@ def test_running_request_row_can_project_to_confirmed_success() -> None:
         )
 
 
-def test_attempt_selector_uses_only_canonical_and_r2_evidence_paths(tmp_path: Path) -> None:
+def test_attempt_selector_uses_only_canonical_r2_and_r3_evidence_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runner = _load_runner()
+    r3_path = tmp_path / "phase5f5-integrated-acceptance-r3-evidence.json"
+    monkeypatch.setattr(runner, "R3_EVIDENCE_PATH", r3_path, raising=False)
 
     assert runner._evidence_path_for_attempt(None) == runner.EVIDENCE_PATH
     assert runner._evidence_path_for_attempt("r2") == runner.R2_EVIDENCE_PATH
+    assert runner._evidence_path_for_attempt("r3") == r3_path
     with pytest.raises(ValueError):
-        runner._evidence_path_for_attempt("r3")
+        runner._evidence_path_for_attempt("r4")
 
     occupied = tmp_path / "occupied-evidence.json"
     occupied.write_text("preserve", encoding="utf-8")
     with pytest.raises(runner.SmokeAbort):
         runner._EvidenceWriter(occupied, {})
     assert occupied.read_text(encoding="utf-8") == "preserve"
+
+    r3_path.write_text("preserve-r3", encoding="utf-8")
+    with pytest.raises(runner.SmokeAbort):
+        runner._EvidenceWriter(runner._evidence_path_for_attempt("r3"), {})
+    assert r3_path.read_text(encoding="utf-8") == "preserve-r3"
+
+
+def test_runtime_state_root_uses_localappdata_and_ignores_config_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _load_runner()
+    temp_root = tmp_path / "isolated"
+    local_app_data = temp_root / "localappdata"
+    local_app_data.mkdir(parents=True)
+    config_path = temp_root / "bridge.toml"
+    config_path.write_text("isolated config", encoding="utf-8")
+    environment = {"LOCALAPPDATA": str(local_app_data)}
+
+    def fake_write_runtime_config(**_kwargs: Any) -> tuple[dict[str, str], Path]:
+        return environment, config_path
+
+    monkeypatch.setattr(runner, "_write_runtime_config", fake_write_runtime_config)
+    runtime_result = runner._write_runtime_config(
+        temp_root=temp_root,
+        base_environment={},
+        token="test-only-token",
+        ports=(12345, 12346),
+        workspaces=(),
+        codex_executable=tmp_path / "codex.exe",
+        config_name="bridge.toml",
+    )
+
+    prepared_environment, prepared_config, state_root = runner._runtime_paths_from_config_result(
+        runtime_result,
+        temp_root=temp_root,
+    )
+
+    assert prepared_environment == environment
+    assert prepared_config == config_path
+    assert state_root == (local_app_data / "CodexBridge" / "workflows").resolve()
+    assert state_root != config_path
+    runner.support._ensure_empty_isolated_state(state_root)
+
+
+def test_runtime_state_root_rejects_localappdata_outside_temp_root(tmp_path: Path) -> None:
+    runner = _load_runner()
+    temp_root = tmp_path / "isolated"
+    temp_root.mkdir()
+    (temp_root / "localappdata").mkdir()
+    outside_local_app_data = tmp_path / "outside" / "localappdata"
+    outside_local_app_data.mkdir(parents=True)
+    config_path = temp_root / "bridge.toml"
+    config_path.write_text("isolated config", encoding="utf-8")
+
+    with pytest.raises(runner.SmokeAbort) as error:
+        runner._runtime_paths_from_config_result(
+            ({"LOCALAPPDATA": str(outside_local_app_data)}, config_path),
+            temp_root=temp_root,
+        )
+
+    assert error.value.code == "isolated_localappdata_outside_temp_root"
+
+
+def test_runtime_state_root_may_not_overlap_a_workspace(tmp_path: Path) -> None:
+    runner = _load_runner()
+    temp_root = tmp_path / "isolated"
+    local_app_data = temp_root / "localappdata"
+    local_app_data.mkdir(parents=True)
+    config_path = temp_root / "bridge.toml"
+    config_path.write_text("isolated config", encoding="utf-8")
+    _environment, _config_path, state_root = runner._runtime_paths_from_config_result(
+        ({"LOCALAPPDATA": str(local_app_data)}, config_path),
+        temp_root=temp_root,
+    )
+    state_root.mkdir(parents=True)
+    workspaces = (state_root, temp_root / "workspace-B", temp_root / "workspace-C")
+    for workspace in workspaces[1:]:
+        workspace.mkdir()
+
+    with pytest.raises(runner.SmokeAbort) as error:
+        runner._ensure_workspace_preflight(
+            temp_root=temp_root,
+            state_root=state_root,
+            workspaces=workspaces,
+        )
+
+    assert error.value.code == "isolated_state_overlaps_workspace"
 
 
 def test_isolation_preflight_allows_state_under_its_dedicated_temp_root(tmp_path: Path) -> None:

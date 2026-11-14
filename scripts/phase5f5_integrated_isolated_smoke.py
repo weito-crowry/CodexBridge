@@ -43,6 +43,7 @@ ITEM_FIXTURE_PATH = (
 SINGLE_JOB_FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "codex_job_workflow.yaml"
 EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-evidence.json"
 R2_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-r2-evidence.json"
+R3_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-r3-evidence.json"
 BASE_COMMIT = "9cdb00d2332a781e33387fffc1d237804a6ee4a4"
 BRIDGE_HOST = "127.0.0.1"
 ITEM_MAX_LIVE_CODEX_JOBS = 3
@@ -114,6 +115,8 @@ def _evidence_path_for_attempt(attempt: str | None) -> Path:
         return EVIDENCE_PATH
     if attempt == "r2":
         return R2_EVIDENCE_PATH
+    if attempt == "r3":
+        return R3_EVIDENCE_PATH
     raise ValueError("unsupported acceptance attempt")
 
 
@@ -634,6 +637,51 @@ def _write_runtime_config(
     ):
         raise SmokeAbort("BLOCKED", "isolated_bridge_config_does_not_match_scope")
     return child_environment, config_path
+
+
+def _runtime_paths_from_config_result(
+    runtime_config: tuple[dict[str, str], Path], *, temp_root: Path
+) -> tuple[dict[str, str], Path, Path]:
+    environment, config_path = runtime_config
+    local_app_data_value = environment.get("LOCALAPPDATA")
+    if not isinstance(local_app_data_value, str) or not local_app_data_value:
+        raise SmokeAbort("BLOCKED", "isolated_localappdata_unavailable")
+    if temp_root.is_symlink() or Path(local_app_data_value).is_symlink():
+        raise SmokeAbort("BLOCKED", "isolated_temp_or_localappdata_is_a_symlink")
+    try:
+        canonical_temp_root = temp_root.resolve(strict=True)
+        canonical_local_app_data = Path(local_app_data_value).resolve(strict=True)
+        expected_local_app_data = (canonical_temp_root / "localappdata").resolve(strict=True)
+        canonical_config_path = config_path.resolve(strict=True)
+    except OSError:
+        raise SmokeAbort("BLOCKED", "isolated_runtime_path_unavailable") from None
+    if (
+        not canonical_local_app_data.is_dir()
+        or canonical_local_app_data != expected_local_app_data
+        or not canonical_local_app_data.is_relative_to(canonical_temp_root)
+    ):
+        raise SmokeAbort("BLOCKED", "isolated_localappdata_outside_temp_root")
+    if (
+        config_path.is_symlink()
+        or not canonical_config_path.is_file()
+        or not canonical_config_path.is_relative_to(canonical_temp_root)
+    ):
+        raise SmokeAbort("BLOCKED", "isolated_config_path_outside_temp_root")
+
+    state_root_candidate = canonical_local_app_data / "CodexBridge" / "workflows"
+    if state_root_candidate.parent.is_symlink() or state_root_candidate.is_symlink():
+        raise SmokeAbort("BLOCKED", "isolated_state_root_is_a_symlink")
+    try:
+        state_root = state_root_candidate.resolve(strict=False)
+    except OSError:
+        raise SmokeAbort("BLOCKED", "isolated_state_root_unavailable") from None
+    if (
+        state_root == canonical_local_app_data
+        or not state_root.is_relative_to(canonical_local_app_data)
+        or state_root == canonical_config_path
+    ):
+        raise SmokeAbort("BLOCKED", "isolated_state_root_outside_localappdata")
+    return environment, canonical_config_path, state_root
 
 
 def _ensure_workspace_preflight(
@@ -1745,15 +1793,18 @@ def _run_acceptance(*, evidence: dict[str, Any], writer: _EvidenceWriter) -> int
         if len(set(client_ids.values())) != 3:
             raise SmokeAbort("BLOCKED", "client_request_id_uniqueness_failed")
         ports, reservations = support._reserve_loopback_ports()
-        config_path = temp_root / "bridge.toml"
-        environment, state_root = _write_runtime_config(
+        runtime_config = _write_runtime_config(
             temp_root=temp_root,
             base_environment=base_environment,
             token=token,
             ports=ports,
             workspaces=workspaces,
             codex_executable=codex_executable,
-            config_name=config_path.name,
+            config_name="bridge.toml",
+        )
+        environment, _config_path, state_root = _runtime_paths_from_config_result(
+            runtime_config,
+            temp_root=temp_root,
         )
         _ensure_workspace_preflight(
             temp_root=temp_root, state_root=state_root, workspaces=workspaces
@@ -2256,7 +2307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run the one-shot Phase 5F-5 integrated isolated acceptance"
     )
-    parser.add_argument("--attempt", choices=("r2",))
+    parser.add_argument("--attempt", choices=("r2", "r3"))
     args = parser.parse_args(argv)
     evidence_path = _evidence_path_for_attempt(args.attempt)
     evidence = _new_evidence()
