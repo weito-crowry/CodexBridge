@@ -155,3 +155,27 @@ run 7の3 outcomesは、`WorkflowSnapshot(status=running)`が2件、`WorkflowSer
 | uv lock --check / git diff --check | PASS |
 
 5件のSKIPはWindows symlink作成権限による。実Codex POST、Phase 5F-5 runner実行、隔離Bridge起動はすべて`NOT_RUN`。新規R5 evidenceは作成していない。canonical/R2/R3/R4 evidenceと未追跡の2件は保全した。
+
+## R5 隔離Windows native統合受入（2026-11-14、1回限定）
+
+R5 fixed evidence [phase5f5-integrated-acceptance-r5-evidence.json](phase5f5-integrated-acceptance-r5-evidence.json) はrunnerがO_EXCLで新規作成した。正式moduleの`--attempt r5` invocationは1回のみで、runner結果は`PASS`。証跡に記録されたsource HEADは`74a6ed2b0beb9d3b86f36a7292c135db76144a22`、実行runner SHA-256は`31ce77c1e7b5643602917c0de5b2d1088870cbe8cd1e9e161323322e50f67d94`。旧canonical/R2/R3/R4証跡は変更していない。
+
+offline gateはすべてPASS（既知のWindows symlink権限skipを除く）。R5 runner tests 30 PASS、capacity focused 1 PASS、Workflow/Console/Phase 5F関連suite 558 PASS/5 SKIP、PoC OWS 155 PASS。Ruff check・format、mypy、compileall、`uv lock --check`、`git diff --check`もPASS。承認済みbase commitは実行時HEADの祖先だった。
+
+| 受入項目 | R5結果 |
+|---|---|
+| isolated runtime/auth/state/workspaces/loopback/ownership preflight | PASS。新規temp root、隔離auth copy、空のworkspace A/B/Cとstate、動的loopback port、GitHub MCP/LAN無効。本番port 18000/18001回避 |
+| 初回Workflow POST | A/B各1回、合計2回。どちらもHTTP 202 accepted |
+| Workflow A | DBOS SUCCESS、worker exit 0、durable request row `running`。effective API detail/result成功。alpha/gammaの2 jobがSUCCEEDED、skipはskipped。result順序はSUCCEEDED/skipped/SUCCEEDED、summary total=3/succeeded=2/skipped=1、digest `2f3cb6f28b7e3a20d201edec1f6549e47479a0c9429daff761cbeae1b23ad499` |
+| Workflow B | DBOS SUCCESS、worker exit 0、durable request row `running`。effective API detail/result成功。BRAVOの1 jobがSUCCEEDED、digest `4ff998dab62078928e46a51ab6c57b319d377cfb6789fcaf20a16a0c36911d4c` |
+| identity/lifecycle | A/Bは別workflow/run。合計3 job、3 distinct thread/turn。各workerは`venv_child`でlauncher→実workerのPID/parent/executable/creation/run/launch identity照合PASS。両lifecycle logとredaction検査PASS |
+| simultaneous capacity | A/Bがrunningでowned launcher/worker pair各1組を同時観測。C POSTは1回、HTTP 409 `workflow_capacity_reached`。C worker/jobは0 |
+| same-ID replay | A/Bとも同一bodyで各1回HTTP 202、既存run再利用。request row/run/job/spawn/worker count増加なし。readback PASS |
+| Console/restart | Qt offscreen readback PASS。graceful shutdown後、同じstateの別portでread-only restart GETとConsole readback PASS。detail/result一致、request rows不変、restart worker 0 |
+| process cleanup | 初回・restart Bridgeの通常shutdownはHTTP 202、両方reaped、forced terminationなし。initial exit 0、orphan 0、既存process操作0 |
+
+workflow API POST合計は5回（A/B初回2、条件成立時のC capacity probe 1、成功確定後のsame-ID replay 2）。Codex jobsは3件（A=2、B=1、C=0）。R5証跡にtoken、auth body、prompt/final text、個人の絶対pathは含まれない。
+
+evidenceの補助`workflows.replay_A`/`replay_B`レコードは`post_outcome=MAYBE_SENT`の送信前markerを残したままになっている。一方、正式readback欄のA/B両方に`same_id_replay=REUSED_EXISTING_RUN`とHTTP 202があり、全体の`same_id_replay` checkもPASS、request/run/job/spawn/worker不変とrestart readbackもPASSである。この補助markerはreplay結果の最終状態を反映しない記録上の不整合として明示する。受入結果は保存済みの応答・readbackで確認できているが、次回runner evidenceの整合性改善候補として残す。
+
+R5の統合受入はPASS。R4の過去FAIL evidenceはそのまま保持する。今回の実機実行は隔離root内で完了し、本番反映・merge・PR作成は行っていない。production統合はこの差分のGitHubレビュー後に別途判断する。
