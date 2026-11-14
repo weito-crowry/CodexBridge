@@ -149,18 +149,21 @@ def test_running_request_row_can_project_to_confirmed_success() -> None:
         )
 
 
-def test_attempt_selector_uses_only_canonical_r2_and_r3_evidence_paths(
+def test_attempt_selector_uses_only_canonical_r2_r3_and_r4_evidence_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = _load_runner()
     r3_path = tmp_path / "phase5f5-integrated-acceptance-r3-evidence.json"
+    r4_path = tmp_path / "phase5f5-integrated-acceptance-r4-evidence.json"
     monkeypatch.setattr(runner, "R3_EVIDENCE_PATH", r3_path, raising=False)
+    monkeypatch.setattr(runner, "R4_EVIDENCE_PATH", r4_path, raising=False)
 
     assert runner._evidence_path_for_attempt(None) == runner.EVIDENCE_PATH
     assert runner._evidence_path_for_attempt("r2") == runner.R2_EVIDENCE_PATH
     assert runner._evidence_path_for_attempt("r3") == r3_path
+    assert runner._evidence_path_for_attempt("r4") == r4_path
     with pytest.raises(ValueError):
-        runner._evidence_path_for_attempt("r4")
+        runner._evidence_path_for_attempt("r5")
 
     occupied = tmp_path / "occupied-evidence.json"
     occupied.write_text("preserve", encoding="utf-8")
@@ -172,6 +175,36 @@ def test_attempt_selector_uses_only_canonical_r2_and_r3_evidence_paths(
     with pytest.raises(runner.SmokeAbort):
         runner._EvidenceWriter(runner._evidence_path_for_attempt("r3"), {})
     assert r3_path.read_text(encoding="utf-8") == "preserve-r3"
+
+    r4_path.write_text("preserve-r4", encoding="utf-8")
+    with pytest.raises(runner.SmokeAbort):
+        runner._EvidenceWriter(runner._evidence_path_for_attempt("r4"), {})
+    assert r4_path.read_text(encoding="utf-8") == "preserve-r4"
+
+
+def test_cli_accepts_r4_and_selects_the_fixed_evidence_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _load_runner()
+    evidence_path = tmp_path / "docs" / "phase5f5-integrated-acceptance-r4-evidence.json"
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(runner, "R4_EVIDENCE_PATH", evidence_path, raising=False)
+    captured: dict[str, Any] = {}
+
+    class FakeEvidenceWriter:
+        def __init__(self, path: Path, _evidence: Any) -> None:
+            self.path = path
+
+    def fake_run_acceptance(*, evidence: dict[str, Any], writer: Any) -> int:
+        captured["path"] = writer.path
+        evidence["status"] = "NOT_RUN"
+        return 1
+
+    monkeypatch.setattr(runner, "_EvidenceWriter", FakeEvidenceWriter)
+    monkeypatch.setattr(runner, "_run_acceptance", fake_run_acceptance)
+
+    assert runner.main(["--attempt", "r4"]) == 1
+    assert captured["path"] == evidence_path
 
 
 def test_runtime_state_root_uses_localappdata_and_ignores_config_path(

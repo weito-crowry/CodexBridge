@@ -65,8 +65,8 @@ Focused testは初回1回と追加5回の計6回実行し、すべてPASSした�
 ## Phase 5F-1〜5F-4の既知範囲と今回の未確認点
 
 - legacy issues loopの実Codex逐次3件成功は過去の受入結果であり、今回の証跡では再実行していない。
-- Phase 5F-3 items条件分岐・結果集約とPhase 5F-4の独立2 workflowはこれまでofflineで確認済み。**今回の実Codex統合では確認できていない。**
-- 実機のA/B真の並走、3件目409、実result、DBOS/worker/lifecycle関連、同一ID replay、永続state restart readbackはすべて未確認。
+- Phase 5F-3 items条件分岐・結果集約とPhase 5F-4の独立2 workflowはofflineで確認済み。R4ではA/Bの2初回POSTと3実Codex jobの結果を隔離rootで確認したが、runner全体はworker identity照合でFAILしており、統合受入PASSとはしていない。
+- R4でA/Bのjob ledger/result/DBOS/worker完了はread-only照合できた。A/Bが同時activeである条件下のC=409はNOT_OBSERVED、same-ID replay、effective API statusの最終照合、Qt readback、restart GETは実施していない。
 - R3は`NOT_RUN`。offline容量競合テストのFAIL原因を確定できておらず、R3のPOST/worker/processは0件。
 - 実クラッシュ復旧、あらゆるrace、無制限のfault injectionは今回の範囲外であり実施していない。
 - Phase 5F-4 GitHub review PASSと基準commit `9cdb00d2332a781e33387fffc1d237804a6ee4a4` は今回の開始条件として扱った。今回のbranch/commit自体のレビュー結果を意味しない。
@@ -79,3 +79,27 @@ Focused testは初回1回と追加5回の計6回実行し、すべてPASSした�
 - [ ] 実機受入を行う場合、A/B実行数、optional C=409の観測可否、結果digest、workflow/worker identity、lifecycle event counts、shutdown/restartを別々のPASS/NOT_OBSERVED/NOT_RUNとして確認する。
 - [ ] 実機結果がPASSになるまでは、Phase 5F-5のitemsと独立workflow統合をproduction-readyと扱わない。
 - [ ] 本番統合時は承認済みの通常review/CI/merge手順を使う。本作業ではPR作成、merge、rebase、tag、release、production反映を行わない。
+
+## R4 隔離実機受入（2026-11-14、1回限定）
+
+R4固定証跡 [phase5f5-integrated-acceptance-r4-evidence.json](phase5f5-integrated-acceptance-r4-evidence.json) はrunnerがO_EXCLで新規作成した。runner invocationは1回、終了コード1、`status=FAIL`、reason=`workflow_A_worker_identity_mismatch`。source/headは`fedbb995fc75f0c51dff41e70ea9de8164f991c0`、実行runner SHA-256は`053e67b83888e3d53dcb7d3e3835577e7e1863959429e1fba76274446d07f3c2`。stdout/stderr/raw exit codeはOS temp capture label `codexbridge-phase5f5-r4-capture-790cba0bbf664f5ebfbb7752813272cf` に保持した。R1/R2/R3/canonical evidenceは変更していない。
+
+隔離preflightはPASSし、専用temp root labelは`codexbridge-phase5f5-lu1dbn2m`。新規workspace A/B/C、isolated auth copy、空state、GitHub MCP disabled、LAN disabledを確認した。専用loopback portはMCP 53870 / UI 53871で、18000/18001は使っていない。
+
+| 項目 | R4結果 |
+|---|---|
+| Workflow A初回POST | 1回、HTTP 202 accepted。request rowは`running`。run/workflow identityとrequest digestはR4 evidenceに記録 |
+| Workflow B初回POST | 1回、HTTP 202 accepted。request rowは`running`。Aとは独立したrun/workflow identityとdigest |
+| Workflow C capacity probe | POST 0回、`NOT_OBSERVED`。同時active owned worker条件をrunnerのreadback window内で確認できなかった |
+| 実Codex jobs | 合計3件。Aは2、Bは1。全件job ledger `SUCCEEDED`、receiptあり、distinct thread/turn identityは各workflow内で2/2と1/1 |
+| DBOS / worker | A/BともDBOS `SUCCESS`、worker `completed`, exit 0。durable request rowは`running`のまま保存 |
+| A items result | read-only result.json照合で`alpha=SUCCEEDED`, `skip=skipped`, `gamma=SUCCEEDED`、順序・期待値一致。SHA-256 `44053897ad72512a290199a98513cf70a5332893517d5361e70a555fc1d598d7` |
+| B single-job result | read-only result.json照合でBRAVO結果一致。SHA-256 `5b7dd8ed14d73bcfdba4f023c2574c845ea6b65aa1f42b9ebd034136ecf009ae` |
+| effective API status / final API result assertion | `NOT_RUN`扱い。runnerはworker identity照合で停止し、最終成功判定を完了していない。row=`running`を成功へ人工更新していない |
+| same-ID replay / Console offscreen / restart GET | すべて`NOT_RUN`。再POSTや再起動はしていない |
+| graceful shutdown / process | 今回所有するBridgeへshutdown HTTP 202、process reaped、forced terminationなし。証跡`orphan_processes=0`。終了後のPID/creation-time/owner照合でもBridge、appserver、workerの一致プロセス0 |
+| lifecycle/redaction | formal runner checkは`NOT_RUN`。read-only scanでA/B各bridge logは`request_reserved=1`, `worker_launch_requested=1`, `worker_spawn_succeeded=1`, `worker_exited=1`, `workflow_state_changed=2`。各worker logは`worker_bootstrap=1`, `dbos_ready=1`, `workflow_started=1`, `result_persisted=1`。既知prompt本文、`final_text`、Authorization/Bearer markerは検出しなかった。tokenは停止後の比較値が保存されていないため、token値との照合は未確認 |
+
+失敗箇所は`_verify_saved_workflow()`のworker identity確認である。worker identity JSONのPID/parent PIDはR4 process snapshotsの記録と一致したが、`image_path.resolve(strict=True)`はrunnerの`sys.executable.resolve(strict=True)`と一致せず、AでFAILとなった。read-only照合ではA/B双方のworker image pathはrunnerの`sys._base_executable`へ解決し、venvの`sys.executable`とは異なっていた。workerがbase interpreterで起動した理由や、この差を許容すべきかは今回の証拠だけでは確定していない。runnerの検査を緩める変更や製品コード変更は加えていない。
+
+追加の読み取りでAのjob2件、Bのjob1件が成功状態でresult/receiptを保存したことは確認したが、runner全体の結果は**FAIL**のまま扱う。A/Bとも初回POST以外のworkflow POSTはなく、C、replay、restartの追加送信は0回。R4 rootは調査用に保持し、R3のNOT_RUNと以前のoffline capacity failureのUNKNOWNはR4実機結果と混同しない。Phase 5F-5のproduction統合は未承認であり、ChatGPTレビュー後に次の判断を行う。

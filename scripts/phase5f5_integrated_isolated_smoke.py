@@ -44,6 +44,7 @@ SINGLE_JOB_FIXTURE_PATH = REPOSITORY_ROOT / "poc" / "ows" / "fixtures" / "codex_
 EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-evidence.json"
 R2_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-r2-evidence.json"
 R3_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-r3-evidence.json"
+R4_EVIDENCE_PATH = REPOSITORY_ROOT / "docs" / "phase5f5-integrated-acceptance-r4-evidence.json"
 BASE_COMMIT = "9cdb00d2332a781e33387fffc1d237804a6ee4a4"
 BRIDGE_HOST = "127.0.0.1"
 ITEM_MAX_LIVE_CODEX_JOBS = 3
@@ -117,6 +118,8 @@ def _evidence_path_for_attempt(attempt: str | None) -> Path:
         return R2_EVIDENCE_PATH
     if attempt == "r3":
         return R3_EVIDENCE_PATH
+    if attempt == "r4":
+        return R4_EVIDENCE_PATH
     raise ValueError("unsupported acceptance attempt")
 
 
@@ -2307,7 +2310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run the one-shot Phase 5F-5 integrated isolated acceptance"
     )
-    parser.add_argument("--attempt", choices=("r2", "r3"))
+    parser.add_argument("--attempt", choices=("r2", "r3", "r4"))
     args = parser.parse_args(argv)
     evidence_path = _evidence_path_for_attempt(args.attempt)
     evidence = _new_evidence()
