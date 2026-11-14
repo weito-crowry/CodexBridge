@@ -47,6 +47,10 @@ _MAX_RESULT_BYTES = 64 * 1024
 _MAX_RUN_FILE_BYTES = 2 * 1024 * 1024
 _MAX_ACTIVE_CHECKS = 100
 _WORKER_START_TIMEOUT_SECONDS = 10.0
+_SQLITE_INITIALIZATION_TIMEOUT_SECONDS = 5.0
+_SQLITE_INITIALIZATION_RETRY_INTERVAL_SECONDS = 0.025
+_SQLITE_INITIALIZATION_BUSY_TIMEOUT_MS = 100
+_SQLITE_REQUEST_BUSY_TIMEOUT_MS = 5000
 
 
 class WorkflowWorkerStarter(Protocol):
@@ -789,11 +793,24 @@ def _request_database(state_root: Path) -> Path:
     return database
 
 
-def _connect_write(database: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(database, timeout=5.0, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.execute("PRAGMA journal_mode = WAL")
+def _is_sqlite_busy_or_locked(error: sqlite3.Error) -> bool:
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if type(error_code) is int:
+        primary_code = error_code & 0xFF
+        return primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    message = str(error).casefold()
+    return message in {"database is locked", "database is busy"} or message.startswith(
+        ("database table is locked", "database schema is locked")
+    )
+
+
+def _initialize_write_connection(connection: sqlite3.Connection) -> None:
+    connection.execute(f"PRAGMA busy_timeout = {_SQLITE_INITIALIZATION_BUSY_TIMEOUT_MS}")
+    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+    if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
+        changed_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        if changed_mode is None or str(changed_mode[0]).casefold() != "wal":
+            raise sqlite3.DatabaseError("workflow request ledger could not enter WAL mode")
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute(
         """
@@ -820,7 +837,34 @@ def _connect_write(database: Path) -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS workflow_requests_state_idx ON workflow_requests(state)"
     )
-    return connection
+    connection.execute(f"PRAGMA busy_timeout = {_SQLITE_REQUEST_BUSY_TIMEOUT_MS}")
+
+
+def _connect_write(database: Path) -> sqlite3.Connection:
+    deadline = time.monotonic() + _SQLITE_INITIALIZATION_TIMEOUT_SECONDS
+    while True:
+        try:
+            connection = sqlite3.connect(database, timeout=0.1, isolation_level=None)
+        except sqlite3.Error as error:
+            remaining = deadline - time.monotonic()
+            if not _is_sqlite_busy_or_locked(error) or remaining <= 0:
+                raise
+            time.sleep(min(_SQLITE_INITIALIZATION_RETRY_INTERVAL_SECONDS, remaining))
+            continue
+        connection.row_factory = sqlite3.Row
+        try:
+            _initialize_write_connection(connection)
+        except sqlite3.Error as error:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+            remaining = deadline - time.monotonic()
+            if not _is_sqlite_busy_or_locked(error) or remaining <= 0:
+                raise
+            time.sleep(min(_SQLITE_INITIALIZATION_RETRY_INTERVAL_SECONDS, remaining))
+            continue
+        return connection
 
 
 def _connect_read(database: Path) -> sqlite3.Connection:

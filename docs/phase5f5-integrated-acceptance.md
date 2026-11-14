@@ -132,3 +132,26 @@ R4 snapshot上のworker-entry processは4個で、A/Bそれぞれのlauncher+実
 | git diff --check | PASS |
 
 5件のskipはWindows symlink作成権限がない環境によるもの。直近の容量競合focused実行では、acceptedが2件だった一方で`WorkflowConcurrencyConflict`型の例外が0件としてassertionがFAILした。3件目のoutcome型・メッセージはこのtestのassertionに出力されず、原因は`UNKNOWN`。その直前の関連suiteでは同じtestを含めて557件PASSだったため、容量競合判定は実行間で不安定なままである。これはrunnerのプロセス識別修正とは独立した未解決事項であり、製品sourceは変更していない。静的検査とrunner testsはPASSだが、容量focused failureを含むためoffline検証全体は完全PASSではない。実機R5はChatGPTの差分レビュー後に別途判断し、今回実行していない。
+
+## SQLite並行受付FAILの診断と限定修正（2026-11-14）
+
+容量focused testに、assertion失敗時の3 outcomesそれぞれの型・状態・短い例外メッセージ・例外chain・stack frameと、SQL値を含めないSQLite stage traceを加えた。focused testは修正前に最大80回の順次実行を開始し、run 7で初回FAILを観測したため停止した。結果は最初の6回PASS、run 7 FAILである。
+
+run 7の3 outcomesは、`WorkflowSnapshot(status=running)`が2件、`WorkflowServiceUnavailable`が1件だった。例外メッセージは`workflow request could not be persisted`、例外contextは`sqlite3.OperationalError: database is locked`。tracebackは`WorkflowService.start_workflow → _reserve_request → _connect_write`を示し、失敗frameは`_connect_write`内だった。SQLite traceでは該当接続の最後の実行stageが`PRAGMA_JOURNAL_MODE`（直前は`PRAGMA_BUSY_TIMEOUT`）だった。他接続ではDDL、`BEGIN_IMMEDIATE`、SELECT/UPDATE/INSERT、COMMITまで進んでいた。connect自体の失敗は0件。
+
+**root causeは、各write connectionで毎回`PRAGMA journal_mode = WAL`を書き込み実行し、同じledgerへの並行初期化・write transactionと競合して`database is locked`になったことと確定した。** 失敗stageとSQLite exceptionは観測済み。どの特定connectionがlockを保持していたかまではtraceから特定していない。
+
+修正は`service.py::_connect_write`のtransaction開始前に限定した。現在のjournal modeを読み、既にWALならmode変更PRAGMAを実行しない。未初期化時またはidempotent schema/connection初期化中にBUSY/LOCKEDが発生した場合だけ、初期化を最大5秒の有限deadlineで再試行する。初期化中のbusy timeoutは100ms、正常な接続を返す前に従来相当の5000msへ戻す。retry対象はSQLite BUSY/LOCKEDのみで、他のSQLite異常は即時にfail-closedする。`BEGIN IMMEDIATE`後、request rowのINSERT後、COMMIT後のretryはない。容量2、workspace検証、同ID replay順序、schema、API、worker、diagnostic logは変更していない。
+
+| 検証 | 結果 |
+|---|---|
+| 修正後capacity focused | 30/30 PASS、run 31は実施せず |
+| Workflow/Console/Phase 5F関連suite | 528 PASS, 5 SKIP |
+| PoC OWS suite | 155 PASS |
+| Phase 5F-5 runner tests | 29 PASS |
+| Ruff check / format --check | PASS |
+| mypy src | PASS |
+| compileall src/scripts/tests | PASS |
+| uv lock --check / git diff --check | PASS |
+
+5件のSKIPはWindows symlink作成権限による。実Codex POST、Phase 5F-5 runner実行、隔離Bridge起動はすべて`NOT_RUN`。新規R5 evidenceは作成していない。canonical/R2/R3/R4 evidenceと未追跡の2件は保全した。

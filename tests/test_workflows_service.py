@@ -568,6 +568,7 @@ async def test_active_workspace_path_that_cannot_be_safely_isolated_fails_closed
 @pytest.mark.asyncio
 async def test_two_service_instances_enforce_capacity_two_atomically(
     service_fixture: tuple[WorkflowService, FakeWorkerManager, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _service, manager, workspace_a = service_fixture
     workspace_b = workspace_a.parent / "workspace-b"
@@ -582,6 +583,44 @@ async def test_two_service_instances_enforce_capacity_two_atomically(
     )
     service_one = WorkflowService(manager, codex_bridge_port=18001)
     service_two = WorkflowService(manager_two, codex_bridge_port=18001)
+
+    original_connect = sqlite3.connect
+    connection_labels: dict[int, str] = {}
+    sqlite_stages: dict[str, list[str]] = {}
+    connect_failures: list[str] = []
+
+    def stage_for_statement(statement: str) -> str:
+        normalized = " ".join(statement.strip().split()).upper()
+        if normalized.startswith("PRAGMA "):
+            pragma_name = normalized.split(maxsplit=1)[1].split("=", maxsplit=1)[0].strip()
+            return f"PRAGMA_{pragma_name}"
+        if normalized.startswith("CREATE TABLE"):
+            return "DDL_CREATE_TABLE"
+        if normalized.startswith("CREATE INDEX"):
+            return "DDL_CREATE_INDEX"
+        if normalized.startswith("BEGIN IMMEDIATE"):
+            return "BEGIN_IMMEDIATE"
+        if normalized.startswith("COMMIT"):
+            return "COMMIT"
+        if normalized.startswith("ROLLBACK"):
+            return "ROLLBACK"
+        return f"SQL_{normalized.split(maxsplit=1)[0]}" if normalized else "SQL_EMPTY"
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        try:
+            connection = original_connect(*args, **kwargs)
+        except sqlite3.Error as error:
+            connect_failures.append(type(error).__name__)
+            raise
+        label = f"connection-{len(connection_labels) + 1}"
+        connection_labels[id(connection)] = label
+        sqlite_stages[label] = []
+        connection.set_trace_callback(
+            lambda statement: sqlite_stages[label].append(stage_for_statement(statement))
+        )
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
 
     async def start(service: WorkflowService, request_id: str, path: Path):
         return await service.start_workflow(
@@ -599,8 +638,63 @@ async def test_two_service_instances_enforce_capacity_two_atomically(
     )
     accepted = [value for value in outcomes if not isinstance(value, BaseException)]
 
-    assert len(accepted) == 2
-    assert sum(isinstance(value, WorkflowConcurrencyConflict) for value in outcomes) == 1
+    def safe_message(error: BaseException) -> str:
+        message = " ".join(str(error).split())
+        for path in (manager.state_root, workspace_a.parent, workspace_a):
+            message = message.replace(str(path), "<isolated-path>")
+        return message[:180]
+
+    def outcome_diagnostics(value: object) -> dict[str, object]:
+        if not isinstance(value, BaseException):
+            return {
+                "kind": "accepted",
+                "type": type(value).__name__,
+                "status": getattr(value, "status", None),
+            }
+        exception_chain: list[BaseException] = []
+        current: BaseException | None = value
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            exception_chain.append(current)
+            current = current.__cause__ or current.__context__
+        frames: list[str] = []
+        stages: list[str] = []
+        for error in exception_chain:
+            traceback = error.__traceback__
+            while traceback is not None:
+                frame = traceback.tb_frame
+                frames.append(
+                    f"{Path(frame.f_code.co_filename).name}:{traceback.tb_lineno}:"
+                    f"{frame.f_code.co_name}"
+                )
+                connection = frame.f_locals.get("connection")
+                label = connection_labels.get(id(connection)) if connection is not None else None
+                if label is not None:
+                    stages.append(f"{label}:{sqlite_stages[label][-1:]}")
+                traceback = traceback.tb_next
+        return {
+            "kind": "exception",
+            "type": type(value).__name__,
+            "message": safe_message(value),
+            "exception_chain": [
+                {"type": type(error).__name__, "message": safe_message(error)}
+                for error in exception_chain
+            ],
+            "sqlite_stage": stages[-1:] or ["unmatched"],
+            "frames": frames[-8:],
+        }
+
+    diagnostics = {
+        "outcomes": [outcome_diagnostics(value) for value in outcomes],
+        "sqlite_trace_stages": sqlite_stages,
+        "sqlite_connect_failures": connect_failures,
+    }
+
+    assert len(accepted) == 2, f"capacity outcomes: {diagnostics}"
+    assert sum(isinstance(value, WorkflowConcurrencyConflict) for value in outcomes) == 1, (
+        f"capacity outcomes: {diagnostics}"
+    )
     assert len(manager.start_calls) + len(manager_two.start_calls) == 2
     assert len({snapshot.run_id for snapshot in accepted}) == 2
 
