@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QSettings, Qt
@@ -9,6 +10,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QLabel, QLineEdit, QMenu, QWidget
 
+from codex_bridge.console import control_token_dialog
 from codex_bridge.console.main_window import MainWindow
 from tests.console_main_window_test_support import (
     FakeClient,
@@ -24,17 +26,28 @@ _ROTATED_DUMMY_TOKEN = "rotated-dummy-control-token-for-tests"
 
 
 @pytest.fixture
-def clipboard():
-    app = _application()
-    target = app.clipboard()
-    original = target.text()
-    try:
-        yield target
-    finally:
-        if original:
-            target.setText(original)
-        else:
-            target.clear()
+def clipboard(monkeypatch: pytest.MonkeyPatch) -> _FakeClipboard:
+    target = _FakeClipboard()
+    monkeypatch.setattr(
+        control_token_dialog,
+        "QApplication",
+        SimpleNamespace(clipboard=lambda: target),
+    )
+    return target
+
+
+class _FakeClipboard:
+    def __init__(self) -> None:
+        self._text = ""
+
+    def setText(self, text: str) -> None:
+        self._text = text
+
+    def text(self) -> str:
+        return self._text
+
+    def clear(self) -> None:
+        self._text = ""
 
 
 def _window(tmp_path: Path, language: str = "en") -> MainWindow:
