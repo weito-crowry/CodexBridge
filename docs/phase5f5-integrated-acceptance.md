@@ -2,7 +2,7 @@
 
 ## 結論
 
-**隔離実機でのPhase 5F-5受入はR5でPASS（13項目）**。2026-11-14にWindows nativeの隔離環境で実施し、証跡は[phase5f5-integrated-acceptance-r5-evidence.json](phase5f5-integrated-acceptance-r5-evidence.json)。R5実行時のsource HEADは`74a6ed2b0beb9d3b86f36a7292c135db76144a22`であり、現在の文書更新対象HEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`で全実機試験をやり直したという意味ではない。R5ではWorkflow A/Bの実Codex job計3件、Cのcapacity `409`、同一ID replay、Qt offscreen readback、read-only restart、graceful shutdownを確認した。R5後のコード修正はreplay evidence recorderに限定され、その後の実Codex POSTは0件。
+**隔離実機でのPhase 5F-5受入はR5でPASS（13項目）**。2026-11-14にWindows nativeの隔離環境で実施し、証跡は[phase5f5-integrated-acceptance-r5-evidence.json](phase5f5-integrated-acceptance-r5-evidence.json)。R5実行時のsource HEADは`74a6ed2b0beb9d3b86f36a7292c135db76144a22`であり、文書更新直前のコードHEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`とは異なる。したがって、後続HEADで全実機試験をやり直したという意味ではない。R5ではWorkflow A/Bの実Codex job計3件、Cのcapacity `409`、同一ID replay、Qt offscreen readback、read-only restart、graceful shutdownを確認した。R5後のコード修正はreplay evidence recorderに限定され、その後の実Codex POSTは0件。
 
 以下のR1〜R4の詳細と結果表は当時の履歴であり、最終の隔離実機受入判定は「R5 隔離Windows native統合受入」節を参照する。R1〜R4に記録されたBLOCKED/FAIL/NOT_RUNは履歴として維持する。
 
@@ -76,7 +76,7 @@ Focused testは初回1回と追加5回の計6回実行し、すべてPASSした�
 ## 現在の統合前に残る確認事項
 
 - GitHub Actions workflowは0件、対象commitのchecksも0件のため、CI PASSは未確認。
-- 全pytestは142 files / 2616 nodeidsを複数コミット・複数pytest processで分割実施し、集計は2604 PASS / 12 SKIP。過去バッチ1〜27の報告にあった1 PASSの加算漏れを訂正した値である。12 SKIPはWindows symlink作成権限による。現行HEAD上で全件を単一pytest processで実行した結果ではない。現行HEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`での最新関連検証は152 PASSとstatic checks PASS。
+- 全pytestは142 files / 2616 nodeidsを複数コミット・複数pytest processで分割実施し、集計は2604 PASS / 12 SKIP。過去バッチ1〜27の報告にあった1 PASSの加算漏れを訂正した値である。12 SKIPはWindows symlink作成権限による。現行HEAD上で全件を単一pytest processで実行した結果ではない。文書更新直前のコードHEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`での最新関連検証は152 PASSとstatic checks PASS。
 - Windows native clipboardを使うGUI dogfoodは`NOT_RUN`。R5のQt offscreen readbackとは別の未確認事項。
 - 専用TEMPで配布物と2つの非GUI EXE smoke結果は得たが、PyInstallerのexit codeを取得できず、正式な配布ビルドgateは未完了。追加ビルド検証は後続指示まで行わない。
 - devへのmerge/PR作成/production反映は未実施。製品本体でのGitHub Issueノード実連携も本Phaseの範囲外で、production統合後の特殊ノード拡充段階へ延期。
