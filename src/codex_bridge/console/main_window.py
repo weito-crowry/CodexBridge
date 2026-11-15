@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from secrets import token_urlsafe
 from time import monotonic, time
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from PySide6.QtCore import QTimer
@@ -38,7 +38,6 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QMessageBox as QMessageBox
 
-from ..models import ApprovalDecision
 from ..tunnel_profile import generate_tunnel_profile
 from .api_client import ApiClient
 from .api_result_dispatcher import ApiResultDispatcher
@@ -76,6 +75,13 @@ from .history_stream import (
 )
 from .history_timeline import ACTIVE_TURN_STATES, HistoryTimelineState
 from .i18n import initialize_language, tr
+from .main_window_control_events import (
+    apply_control_failure,
+    apply_control_success,
+    connect_client,
+    connect_runtime,
+    resolve_approval,
+)
 from .main_window_layout import build_main_window_ui
 from .notification_controller import NotificationController, NotificationSettingsDialog
 from .project_folder_actions import ProjectFolderActionsController
@@ -610,55 +616,10 @@ class MainWindow(QMainWindow):
             application.quit()
 
     def _connect_client(self) -> None:
-        self._client.json_succeeded.connect(self.apply_json_result)
-        self._client.json_failed.connect(self._apply_json_error)
-        self._client.activity_received.connect(self._apply_activity)
-        self._client.stream_state_changed.connect(self._apply_stream_state)
-        global_activity_signal = getattr(self._client, "global_activity_received", None)
-        if global_activity_signal is not None:
-            global_activity_signal.connect(self._apply_global_activity)
-        global_state_signal = getattr(self._client, "global_stream_state_changed", None)
-        if global_state_signal is not None:
-            global_state_signal.connect(self._apply_global_stream_state)
-        self._client.control_succeeded.connect(self._apply_control_success)
-        self._client.control_failed.connect(self._apply_control_failure)
-        self.activity_pane.approval_decision_requested.connect(self._resolve_approval)
-        self.thread_pane.refresh_requested.connect(self.refresh)
-        self.thread_pane.thread_selected.connect(self.select_thread)
-        self.thread_pane.thread_rename_requested.connect(self._rename_thread)
-        self.thread_pane.thread_open_requested.connect(self._open_thread_in_codex)
-        self.thread_pane.thread_copy_requested.connect(self._copy_thread_content)
-        self.thread_pane.new_thread_for_folder_requested.connect(self._new_thread_for_folder)
-        self.thread_pane.folder_explorer_requested.connect(self._open_project_folder)
-        self.thread_pane.folder_terminal_requested.connect(self._open_project_terminal)
-        self.history_pane.older_requested.connect(self.load_older)
+        connect_client(self)
 
     def _connect_runtime(self) -> None:
-        self._codex_probe_controller.attach(self._codex_probe)
-        self._codex_update_probe.check_succeeded.connect(self._apply_codex_update_check)
-        self._codex_update_probe.check_failed.connect(self._apply_codex_update_check_error)
-        self._codex_update_probe.update_succeeded.connect(self._apply_codex_update_success)
-        self._codex_update_probe.update_failed.connect(self._apply_codex_update_failure)
-        self._codex_update_probe.busy_changed.connect(self._apply_codex_update_busy)
-        self.start_bridge_button.clicked.connect(self._start_bridge)
-        self.stop_bridge_button.clicked.connect(self._stop_bridge)
-        self.restart_bridge_button.clicked.connect(self._restart_bridge)
-        self._tunnel.state_changed.connect(self._apply_tunnel_state)
-        self._tunnel.message_changed.connect(self._apply_tunnel_message)
-        self._tunnel.controls_changed.connect(self._apply_tunnel_controls)
-        self.start_tunnel_button.clicked.connect(self._start_tunnel)
-        self.stop_tunnel_button.clicked.connect(self._stop_tunnel)
-        self.restart_tunnel_button.clicked.connect(self._restart_tunnel)
-        self.status_button.clicked.connect(self._show_status)
-        self.usage_status_label.activated.connect(self._create_or_show_usage_history_window)
-        self.usage_history_button.clicked.connect(self._create_or_show_usage_history_window)
-        self.status_refresh_button.clicked.connect(self._refresh_status)
-        self.status_close_button.clicked.connect(self.status_dialog.close)
-        self.codex_update_check_button.clicked.connect(self._check_codex_updates)
-        self.codex_update_button.clicked.connect(self._update_codex)
-        self.retry_now_button.clicked.connect(self._retry_now)
-        self.restart_codexbridge_button.clicked.connect(self._restart_codexbridge)
-        self.advanced_toggle_button.toggled.connect(self.advanced_controls.setVisible)
+        connect_runtime(self)
 
     def _show_status(self) -> None:
         self.status_dialog.show()
@@ -1173,43 +1134,10 @@ class MainWindow(QMainWindow):
         self._bridge_transition_coordinator.request_shutdown(allow_closing=allow_closing)
 
     def _apply_control_success(self, key: str) -> None:
-        if key == "control:approval" and self._approval_control_pending:
-            self._approval_control_pending = False
-            self.activity_pane.set_approval_busy(False)
-            self.activity_pane.set_approval_feedback(tr("Approval sent. Refreshing status…"))
-            self._request_selected_status()
-            return
-        if key != "control:shutdown" or not (
-            self._bridge_transition_coordinator.acknowledge_shutdown_success()
-        ):
-            return
-        self._bridge_stop_confirmation.begin()
-        self.bottom_status_label.setText(tr("Bridge shutdown requested"))
-        self._request_health()
+        apply_control_success(self, key)
 
     def _apply_control_failure(self, key: str, message: str) -> None:
-        if key == "control:approval" and self._approval_control_pending:
-            self._approval_control_pending = False
-            self.activity_pane.set_approval_busy(False)
-            if "already resolved" in message.casefold():
-                self.activity_pane.mark_approval_resolved()
-                self.activity_pane.set_approval_feedback(
-                    tr("Approval already resolved. Refreshing status…")
-                )
-                self._request_selected_status()
-            else:
-                self.activity_pane.set_approval_feedback(tr("Approval request failed"))
-            return
-        if key != "control:shutdown":
-            return
-        self._bridge_transition_coordinator.mark_shutdown_failed()
-        self._bridge_stop_confirmation.cancel()
-        if self._exit_shutdown_pending:
-            self._finish_exit()
-            return
-        self._bridge_transition = False
-        self._set_runtime_state("control_failed")
-        self.bottom_status_label.setText(tr("Bridge control request failed"))
+        apply_control_failure(self, key, message)
 
     def _maybe_finish_stop_confirmation(self) -> None:
         self._bridge_stop_confirmation.maybe_finish()
@@ -1448,27 +1376,7 @@ class MainWindow(QMainWindow):
         )
 
     def _resolve_approval(self, request_id: object, decision: str) -> None:
-        if (
-            self._closing
-            or self._approval_control_pending
-            or self._runtime_state != "console_started"
-            or self._control_token is None
-            or request_id != self.activity_pane.approval_request_id
-            or isinstance(request_id, bool)
-            or not isinstance(request_id, (int, str))
-            or decision not in {"accept", "acceptForSession", "decline", "cancel"}
-        ):
-            return
-        self._approval_control_pending = True
-        self.activity_pane.set_approval_busy(True)
-        accepted = self._client.post_control_approval(
-            self._control_token,
-            request_id=request_id,
-            decision=cast(ApprovalDecision, decision),
-            key="control:approval",
-        )
-        if not accepted and self._approval_control_pending:
-            self._apply_control_failure("control:approval", tr("Bridge control request failed"))
+        resolve_approval(self, request_id, decision)
 
     def _apply_stream_state(self, generation: int, state: str) -> None:
         self._history_stream.apply_stream_state(generation, state)
