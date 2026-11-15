@@ -10,6 +10,7 @@ from threading import Event, get_ident
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from codex_bridge import external_sessions
 from codex_bridge.console import external_running_threads
 
 
@@ -129,7 +130,7 @@ def test_initial_scan_parses_only_metadata_and_relevant_event_rows(
     path.write_bytes(
         _record(_metadata(project)) + filler * 2_000 + _record(_event("task_started", "turn-a"))
     )
-    real_loads = external_running_threads.json.loads
+    real_loads = external_sessions.json.loads
     parsed_lines = 0
 
     def count_json_loads(value: object, *args: object, **kwargs: object):
@@ -137,7 +138,7 @@ def test_initial_scan_parses_only_metadata_and_relevant_event_rows(
         parsed_lines += 1
         return real_loads(value, *args, **kwargs)
 
-    monkeypatch.setattr(external_running_threads.json, "loads", count_json_loads)
+    monkeypatch.setattr(external_sessions.json, "loads", count_json_loads)
 
     assert set(scanner.scan()) == {THREAD_A}
     assert parsed_lines < 10
@@ -160,6 +161,23 @@ def test_matching_terminal_and_interruption_events_clear_running(
     )
 
     assert scanner.scan() == {}
+
+
+@pytest.mark.parametrize("terminal_event", ("task_complete", "turn_aborted", "turn_interrupted"))
+def test_restart_scan_matches_live_scan_when_terminal_has_no_turn_id(
+    tmp_path: Path, terminal_event: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    scanner = _scanner(tmp_path, project)
+    path = _session_file(tmp_path / "codex-home", THREAD_A)
+    _write_session(path, project, _event("task_started", "turn-a"))
+    assert set(scanner.scan()) == {THREAD_A}
+    with path.open("ab") as session:
+        session.write(_record(_event(terminal_event)))
+
+    assert scanner.scan() == {}
+    assert _scanner(tmp_path, project).scan() == {}
 
 
 def test_latest_turn_controls_state_and_old_terminal_does_not_clear_it(tmp_path: Path) -> None:

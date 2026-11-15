@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
+import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..observability import get_observer
 from ..tunnel_profile import TunnelProfileError
+from .i18n import tr
+from .tunnel_profile_job import TunnelProfileJob
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -36,22 +42,45 @@ _SAFE_TUNNEL_PROFILE_ERRORS = frozenset(
 def _safe_tunnel_profile_error(error: TunnelProfileError) -> str:
     message = str(error)
     if message in _SAFE_TUNNEL_PROFILE_ERRORS:
-        return message
+        return tr(message)
     prefix = "Tunnel client rejected the staged profile (exit code "
     if message.startswith(prefix) and message.endswith(")"):
         exit_code = message[len(prefix) : -1]
         if exit_code.isdecimal():
-            return message
-    return "Managed Tunnel profile generation or doctor validation failed"
+            return tr("Tunnel client rejected the staged profile (exit code {p0})", p0=exit_code)
+    return tr("Managed Tunnel profile generation or doctor validation failed")
+
+
+class TunnelProfileInstallGate:
+    def __init__(self, generation: int) -> None:
+        self._generation = generation
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def advance_generation(self) -> int:
+        with self._lock:
+            self._generation += 1
+            return self._generation
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def install_if_current(self, generation: int, staged_path: Path, target_path: Path) -> bool:
+        with self._lock:
+            if self._closed or generation != self._generation:
+                return False
+            os.replace(staged_path, target_path)
+            return True
 
 
 def advance_bridge_generation(window: MainWindow) -> None:
-    window._bridge_generation += 1
+    window._bridge_generation = window._bridge_runtime_observer.advance_generation()
     if window._managed_tunnel_profile is None:
         return
     window._managed_tunnel_profile_attempted_generation = None
     window._tunnel_profile_status = "not_run"
-    window._tunnel_profile_skip_reason = "Waiting for Bridge and App Server readiness"
+    window._tunnel_profile_skip_reason = tr("Waiting for Bridge and App Server readiness")
     if window._tunnel_resolution_status == "passed":
         window._tunnel_resolution_error = None
     window._update_tunnel_client_status()
@@ -75,23 +104,39 @@ def set_tunnel_bridge_ready(window: MainWindow, ready: bool) -> None:
             window._tunnel_resolution_error = None
         window._update_tunnel_client_status()
         profile_settings, profile_dir, profile_name, executable, generate_profile = profile_request
-        try:
-            generate_profile(
+        generation = window._bridge_generation
+        install_gate = window._bridge_runtime_observer
+
+        def install_if_current(staged: Path, target: Path) -> bool:
+            return install_gate.install_profile_if_current(generation, staged, target)
+
+        def generate() -> object:
+            return generate_profile(
                 profile_settings,
                 profile_dir=profile_dir,
                 profile_name=profile_name,
                 client_executable=executable,
+                install_if_current=install_if_current,
             )
-        except TunnelProfileError as exc:
-            window._tunnel_profile_status = "failed"
+
+        def completed(error: TunnelProfileError | None) -> None:
+            if window._closing or generation != window._bridge_generation:
+                return
+            window._tunnel_profile_status = "failed" if error is not None else "passed"
             window._tunnel_profile_skip_reason = ""
-            window._tunnel_resolution_error = _safe_tunnel_profile_error(exc)
+            if error is not None:
+                window._tunnel_resolution_error = _safe_tunnel_profile_error(error)
             window._update_tunnel_client_status()
-            window._tunnel.set_bridge_ready(False)
-            return
-        window._tunnel_profile_status = "passed"
-        window._tunnel_profile_skip_reason = ""
-        window._update_tunnel_client_status()
+            ready = (
+                window._health_ok
+                and window._bridge_ready
+                and window._app_server_ready
+                and not window._bridge_transition
+                and not window._bridge_stop_confirmation.active
+            )
+            window._tunnel.set_bridge_ready(ready and error is None)
+
+        TunnelProfileJob(generate, completed, parent=window).start()
 
     window._tunnel.set_bridge_ready(window._tunnel_profile_status == "passed")
 
@@ -100,6 +145,19 @@ class BridgeRuntimeObserver:
     def __init__(self, window: MainWindow) -> None:
         self._window = window
         self._bridge_loss_count = 0
+        self._bridge_loss_reason = "bridge_unavailable"
+        self._profile_install_gate = TunnelProfileInstallGate(window._bridge_generation)
+
+    def advance_generation(self) -> int:
+        return self._profile_install_gate.advance_generation()
+
+    def close(self) -> None:
+        self._profile_install_gate.close()
+
+    def install_profile_if_current(
+        self, generation: int, staged_path: Path, target_path: Path
+    ) -> bool:
+        return self._profile_install_gate.install_if_current(generation, staged_path, target_path)
 
     @property
     def loss_count(self) -> int:
@@ -107,6 +165,27 @@ class BridgeRuntimeObserver:
 
     def reset_loss_count(self) -> None:
         self._bridge_loss_count = 0
+
+    def _log_status_event(
+        self,
+        event: str,
+        *,
+        reason: str,
+        consecutive_failures: int,
+    ) -> None:
+        window = self._window
+        get_observer().bridge_status_observation(
+            event,
+            reason=reason,
+            consecutive_failures=consecutive_failures,
+            health_ok=bool(window._health_ok),
+            bridge_ready=bool(window._bridge_ready),
+            app_server_ready=bool(window._app_server_ready),
+            managed=bool(window._detached_launch_started),
+            bridge_pid=(
+                getattr(window, "_detached_pid", None) if window._detached_launch_started else None
+            ),
+        )
 
     def apply_runtime_observation(self) -> None:
         window = self._window
@@ -134,7 +213,9 @@ class BridgeRuntimeObserver:
             if window._detached_launch_started:
                 window._launch_in_progress = False
                 window.readiness_timer.stop()
-                window._set_runtime_state("console_started", label="Runtime: started by Console")
+                window._set_runtime_state(
+                    "console_started", label=tr("Runtime: started by Console")
+                )
                 window._restore_restarted_tunnel()
             else:
                 window._set_runtime_state("external")
@@ -143,22 +224,47 @@ class BridgeRuntimeObserver:
             if not window._launch_in_progress and window._runtime_state != "launch_timed_out":
                 window._set_runtime_state(
                     "console_started_unreachable",
-                    label="Runtime: started by Console (not reachable)",
+                    label=tr("Runtime: started by Console (not reachable)"),
                 )
         elif window._bridge_seen_ready:
             window._set_runtime_state(
                 "external_unreachable",
-                label="Runtime: external (not reachable)",
+                label=tr("Runtime: external (not reachable)"),
             )
         else:
             window._set_runtime_state("unavailable")
         window._maybe_auto_start_bridge()
 
-    def record_bridge_status_observation(self, available: bool) -> None:
+    def record_bridge_status_observation(
+        self,
+        available: bool,
+        *,
+        reason: str = "bridge_unavailable",
+    ) -> None:
         if available:
+            if self._bridge_loss_count:
+                self._log_status_event(
+                    "bridge.status.recovered",
+                    reason="status_recovered",
+                    consecutive_failures=self._bridge_loss_count,
+                )
             self.reset_loss_count()
+            self._bridge_loss_reason = "bridge_unavailable"
             return
         self._bridge_loss_count += 1
+        self._bridge_loss_reason = reason
+        if self._bridge_loss_count == 1:
+            self._log_status_event(
+                "bridge.status.unavailable",
+                reason=reason,
+                consecutive_failures=self._bridge_loss_count,
+            )
+        elif self._bridge_loss_count == _BRIDGE_LOSS_THRESHOLD:
+            self._log_status_event(
+                "bridge.status.threshold_reached",
+                reason=reason,
+                consecutive_failures=self._bridge_loss_count,
+            )
         window = self._window
         if (
             self._bridge_loss_count < _BRIDGE_LOSS_THRESHOLD
@@ -174,6 +280,11 @@ class BridgeRuntimeObserver:
         self._bridge_loss_count = _BRIDGE_LOSS_THRESHOLD
         if window._detached_launch_started and window._control_token is not None:
             window._bridge_managed_retry_coordinator.activate()
+            self._log_status_event(
+                "bridge.restart.requested",
+                reason=self._bridge_loss_reason,
+                consecutive_failures=self._bridge_loss_count,
+            )
             window._begin_bridge_transition(
                 "restart", tunnel_running=window._tunnel_owned_running()
             )

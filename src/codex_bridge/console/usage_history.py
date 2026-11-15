@@ -222,6 +222,32 @@ def get_usage_samples(
     ]
 
 
+def get_latest_usage_sample(
+    end_epoch: float,
+    *,
+    database_path: Path | None = None,
+) -> UsageHistorySample | None:
+    with _open_database(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT minute_epoch, captured_at_epoch, five_hour_remaining, weekly_remaining
+            FROM usage_samples
+            WHERE captured_at_epoch <= ?
+            ORDER BY minute_epoch DESC
+            LIMIT 1
+            """,
+            (end_epoch,),
+        ).fetchone()
+    if row is None:
+        return None
+    return UsageHistorySample(
+        row["minute_epoch"],
+        row["captured_at_epoch"],
+        row["five_hour_remaining"],
+        row["weekly_remaining"],
+    )
+
+
 def get_usage_samples_for_display(
     start_epoch: float,
     end_epoch: float,

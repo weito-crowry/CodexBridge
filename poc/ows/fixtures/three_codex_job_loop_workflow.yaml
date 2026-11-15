@@ -1,0 +1,41 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: three-codex-job-loop
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+input:
+  from: '${ {issues: (.issues | sort_by(.number))} }'
+do:
+  - processIssues:
+      for:
+        in: '${ .issues }'
+        each: issue
+        at: index
+      do:
+        - choose:
+            switch:
+              - enabled:
+                  when: '${ $issue.enabled == true }'
+                  then: processIssue
+              - disabled:
+                  then: skipIssue
+        - processIssue:
+            input:
+              from: '${ {number: $issue.number} }'
+            call: codex-job
+            with:
+              prompt: 'Reply with only the synthetic issue number: '
+              prompt_from: '${ .number | tostring }'
+            output:
+              as: '${ {number: $input.number, status: .status, job_id: .job_id, request_key: .request_key, final_text: .result.final_text} }'
+            then: exit
+        - skipIssue:
+            set:
+              number: '${ $issue.number }'
+              status: skipped
+              job_id: null
+              request_key: null
+              final_text: null

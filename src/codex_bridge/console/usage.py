@@ -6,6 +6,8 @@ from datetime import datetime
 from math import isfinite
 from typing import TypeGuard
 
+from .i18n import tr
+
 
 @dataclass(frozen=True, slots=True)
 class UsageWindow:
@@ -104,36 +106,49 @@ def _window_text(window: UsageWindow | None) -> str:
 
 def format_codex_usage(usage: CodexUsage) -> str:
     if usage.five_hour is None and usage.weekly is None:
-        return "Codex Usage  unavailable"
-    return f"Codex Usage  5h {_window_text(usage.five_hour)} · Week {_window_text(usage.weekly)}"
+        return tr("Codex Usage  unavailable")
+    return tr(
+        "Codex Usage  5h {p0} · Week {p1}",
+        p0=_window_text(usage.five_hour),
+        p1=_window_text(usage.weekly),
+    )
 
 
 def format_codex_usage_tooltip(usage: CodexUsage) -> str:
     if usage.five_hour is None and usage.weekly is None:
-        return "Codex Usage unavailable"
+        return tr("Codex Usage unavailable")
     details: list[str] = []
-    for label, window in (("5h", usage.five_hour), ("Week", usage.weekly)):
+    for label, window in ((tr("5h"), usage.five_hour), (tr("Week"), usage.weekly)):
         if window is None:
-            details.append(f"{label}: unavailable")
+            details.append(tr("{p0}: unavailable", p0=label))
         else:
             details.append(
-                f"{label}: {window.remaining_percent}% left · reset {window.reset_label}"
+                tr(
+                    "{p0}: {p1}% left · reset {p2}",
+                    p0=label,
+                    p1=window.remaining_percent,
+                    p2=tr("unavailable")
+                    if window.reset_label == "unavailable"
+                    else window.reset_label,
+                )
             )
     return "\n".join(details)
 
 
 def format_codex_usage_detail(usage: CodexUsage) -> str:
     if usage.five_hour is None and usage.weekly is None:
-        return "Unavailable"
+        return tr("Unavailable")
     return format_codex_usage_tooltip(usage)
 
 
 def format_codex_usage_snapshot(snapshot: CodexUsageSnapshot) -> str:
     usage = snapshot.usage
     captured_at = snapshot.captured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        f"Usage snapshot: 5h {_window_text(usage.five_hour)} · "
-        f"Week {_window_text(usage.weekly)} · captured {captured_at}"
+    return tr(
+        "Usage snapshot: 5h {p0} · Week {p1} · captured {p2}",
+        p0=_window_text(usage.five_hour),
+        p1=_window_text(usage.weekly),
+        p2=captured_at,
     )
 
 

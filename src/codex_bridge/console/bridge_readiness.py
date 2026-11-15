@@ -4,6 +4,8 @@ from collections.abc import Callable, Mapping
 from time import monotonic
 from typing import Protocol
 
+from .i18n import tr
+
 _READINESS_TIMEOUT_SECONDS = 10.0
 
 
@@ -97,10 +99,10 @@ class BridgeReadinessCoordinator:
         self._bridge_ready = bridge in {"ready", "connected"}
         self._app_server_ready = app_server in {"ready", "connected"}
         self._bridge_status_label.setText(
-            "Bridge: connected" if self._bridge_ready else "Bridge: disconnected"
+            tr("Bridge: connected") if self._bridge_ready else tr("Bridge: disconnected")
         )
         self._app_server_status_label.setText(
-            "App Server: ready" if self._app_server_ready else "App Server: failed"
+            tr("App Server: ready") if self._app_server_ready else tr("App Server: failed")
         )
         self._notify_if_ready()
 

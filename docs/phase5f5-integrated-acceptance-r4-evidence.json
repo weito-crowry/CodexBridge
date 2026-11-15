@@ -1,0 +1,276 @@
+{
+  "base_commit": "9cdb00d2332a781e33387fffc1d237804a6ee4a4",
+  "checks": {
+    "bridge_owner_ports_and_control_auth": "PASS",
+    "bridge_readiness": "PASS",
+    "console_offscreen_readback": "NOT_RUN",
+    "graceful_shutdown": "NOT_RUN",
+    "isolated_auth_config_roots_and_empty_state": "PASS",
+    "lifecycle_logs": "NOT_RUN",
+    "native_runtime_and_dependencies": "PASS",
+    "restart_read_only_get": "NOT_RUN",
+    "same_id_replay": "NOT_RUN",
+    "simultaneous_capacity_409": "NOT_OBSERVED",
+    "workflow_A_items_result": "NOT_RUN",
+    "workflow_B_single_result": "NOT_RUN"
+  },
+  "finished_at_utc": "2026-11-14T09:23:43.008+00:00",
+  "head_commit": "fedbb995fc75f0c51dff41e70ea9de8164f991c0",
+  "isolation": {
+    "allowed_root_count": 3,
+    "allowed_root_labels": [
+      "A",
+      "B",
+      "C"
+    ],
+    "github_mcp_disabled": true,
+    "isolated_auth_copy_verified": true,
+    "isolated_codex_home": true,
+    "isolated_state_empty": true,
+    "lan_disabled": true,
+    "production_checkouts_touched": 0,
+    "state_and_workspaces_separate": true,
+    "status": "PASS",
+    "temp_root_label": "codexbridge-phase5f5-lu1dbn2m",
+    "temp_root_retained": true,
+    "workspace_labels": [
+      "A",
+      "B",
+      "C"
+    ],
+    "workspace_roots_distinct_and_empty": true
+  },
+  "offline_regression_preceded_live_posts": true,
+  "phase": "5F-5",
+  "ports": {
+    "initial": {
+      "default_ports_18000_18001_avoided": true,
+      "loopback_only": true,
+      "mcp": 53870,
+      "ui": 53871
+    }
+  },
+  "posts": {
+    "accepted_initial_workflows": 2,
+    "capacity_probe_attempts": 0,
+    "same_id_replay_attempts": 0,
+    "unique_initial_attempts": 2,
+    "workflow_post_total_attempts": 2
+  },
+  "processes": {
+    "appserver": {
+      "created_at_epoch": 1794648200.5949721,
+      "created_at_utc": "2026-11-14T09:23:20.594+00:00",
+      "identity_verified": true,
+      "owner_matches_current_user": true,
+      "parent_pid": 43504,
+      "pid": 51372,
+      "role": "codex_appserver"
+    },
+    "appserver_pid": 51372,
+    "bridge_initial": {
+      "created_at_epoch": 1794648197.2625048,
+      "created_at_utc": "2026-11-14T09:23:17.262+00:00",
+      "identity_verified": true,
+      "owner_matches_current_user": true,
+      "parent_pid": 41856,
+      "pid": 51852,
+      "role": "bridge"
+    },
+    "bridge_restart": null,
+    "existing_processes_touched": 0,
+    "orphan_processes": 0,
+    "shutdowns": [
+      {
+        "descendant_count": 18,
+        "forced_termination": false,
+        "pid": 51852,
+        "reaped": true,
+        "role": "finalized_after_error",
+        "shutdown_http_status": 202
+      }
+    ],
+    "worker_snapshots": [
+      {
+        "stage": "after_workflow_A_accepted",
+        "workers": [
+          {
+            "created_at_epoch": 1794648202.797111,
+            "created_at_utc": "2026-11-14T09:23:22.797+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 43504,
+            "pid": 41932,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648202.813493,
+            "created_at_utc": "2026-11-14T09:23:22.813+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 41932,
+            "pid": 42868,
+            "role": "worker"
+          }
+        ]
+      },
+      {
+        "stage": "after_workflow_B_accepted",
+        "workers": [
+          {
+            "created_at_epoch": 1794648202.797111,
+            "created_at_utc": "2026-11-14T09:23:22.797+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 43504,
+            "pid": 41932,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648206.6530735,
+            "created_at_utc": "2026-11-14T09:23:26.653+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 43504,
+            "pid": 49004,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648206.668648,
+            "created_at_utc": "2026-11-14T09:23:26.668+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 49004,
+            "pid": 27744,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648202.813493,
+            "created_at_utc": "2026-11-14T09:23:22.813+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 41932,
+            "pid": 42868,
+            "role": "worker"
+          }
+        ]
+      },
+      {
+        "stage": "after_both_workflows_accepted",
+        "workers": [
+          {
+            "created_at_epoch": 1794648202.797111,
+            "created_at_utc": "2026-11-14T09:23:22.797+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 43504,
+            "pid": 41932,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648206.6530735,
+            "created_at_utc": "2026-11-14T09:23:26.653+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 43504,
+            "pid": 49004,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648206.668648,
+            "created_at_utc": "2026-11-14T09:23:26.668+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 49004,
+            "pid": 27744,
+            "role": "worker"
+          },
+          {
+            "created_at_epoch": 1794648202.813493,
+            "created_at_utc": "2026-11-14T09:23:22.813+00:00",
+            "descendant_of_owned_bridge": true,
+            "identity_verified": true,
+            "owner_matches_current_user": true,
+            "parent_pid": 41932,
+            "pid": 42868,
+            "role": "worker"
+          }
+        ]
+      }
+    ]
+  },
+  "reason": "workflow_A_worker_identity_mismatch",
+  "runner_sha256": "053e67b83888e3d53dcb7d3e3835577e7e1863959429e1fba76274446d07f3c2",
+  "runtime": {
+    "platform": "windows_native",
+    "python_version": "3.14.10",
+    "repository_venv": true,
+    "workflow_and_console_dependencies": {
+      "PySide6": "6.11.2",
+      "PyYAML": "6.0.3",
+      "dbos": "3.4.0",
+      "jq": "1.13.0",
+      "jsonschema": "4.25.1",
+      "psutil": "7.2.2"
+    }
+  },
+  "schema_version": 1,
+  "source_commit": "fedbb995fc75f0c51dff41e70ea9de8164f991c0",
+  "started_at_utc": "2026-11-14T09:23:15.581+00:00",
+  "status": "FAIL",
+  "workflows": {
+    "A": {
+      "client_request_id": "phase5f5-e82dfde3804d4bf6925e035f3aa10c5f",
+      "max_live_codex_jobs": 3,
+      "post_attempts": 1,
+      "post_http_status": 202,
+      "post_outcome": "ACCEPTED_202",
+      "reconciliation": {
+        "list_readable": true,
+        "matching_request_rows": 1
+      },
+      "request_body_sha256": "1cbf435ee86641d69761389dff138b6a9fe0c4ae2e9a60d7d839621fb9afd11c",
+      "run_id": "run-26053b19d7304085bf9810172766bf47",
+      "workflow_id": "3f339797-310f-428a-8ca6-bfc077303184",
+      "workflow_yaml_sha256": "dbfb1e4b96601acea01924b90472175d5f904571b8018dc0c028d5bacdd44a96",
+      "workspace_label": "A"
+    },
+    "B": {
+      "client_request_id": "phase5f5-054b0950e66f4bb6aeced83f53e0505d",
+      "max_live_codex_jobs": 1,
+      "post_attempts": 1,
+      "post_http_status": 202,
+      "post_outcome": "ACCEPTED_202",
+      "reconciliation": {
+        "list_readable": true,
+        "matching_request_rows": 1
+      },
+      "request_body_sha256": "69088e38ee496f728a83050702e8aaf55ed582d0a0440fbe4917e44408b0b4fd",
+      "run_id": "run-811b5980bb6548b7a3c505d4203d1b06",
+      "workflow_id": "19534ede-0de1-4473-904e-f89d65d895c2",
+      "workflow_yaml_sha256": "098ef39d063d9cd865da7559d7f8d382cef5d4d53a7972b9c111d5af3ce4f8c9",
+      "workspace_label": "B"
+    },
+    "C": {
+      "post_attempts": 0,
+      "reason": "two_active_owned_workers_not_observed_in_one_readback_window",
+      "status": "NOT_OBSERVED"
+    },
+    "active_observation": {
+      "statuses": {
+        "A": "running",
+        "B": "running"
+      },
+      "workflow_count": 2
+    }
+  }
+}

@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Protocol
 
 from PySide6.QtGui import QFont, QPalette
 
+from .api_error_presentation import format_api_error
+from .i18n import tr
 from .usage import (
     CodexUsage,
     format_codex_usage,
@@ -43,7 +45,9 @@ class UsagePresentationController:
 
     def apply_usage_failure(self, message: str) -> None:
         bounded_message = " ".join(message.split())[:256]
-        self.refresh_error = bounded_message or "request failed"
+        self.refresh_error = (
+            format_api_error(bounded_message) if bounded_message else tr("request failed")
+        )
         self.render_usage_status()
 
     def render_usage_status(self) -> None:
@@ -52,8 +56,8 @@ class UsagePresentationController:
         tooltip = format_codex_usage_tooltip(self.usage)
         detail = format_codex_usage_detail(self.usage)
         if self.refresh_error is not None:
-            failure_detail = f"Refresh failed: {self.refresh_error}"
-            status_text += " · refresh failed"
+            failure_detail = tr("Refresh failed: {p0}", p0=self.refresh_error)
+            status_text += tr(" · refresh failed")
             tooltip += f"\n{failure_detail}"
             detail += f"\n{failure_detail}"
         window.usage_status_label.setText(status_text)

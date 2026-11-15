@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
+import logging
 from collections.abc import Sequence
 
 from .config import BridgeConfig
+from .logging_utils import configure_logging
 from .server import run_server
 
 
@@ -19,6 +20,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    configure_logging()
     try:
         config = BridgeConfig.from_sources(
             explicit_allowed_roots=None if args.allowed_root is None else tuple(args.allowed_root),
@@ -27,8 +29,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         asyncio.run(run_server(config))
     except (ValueError, OSError) as exc:
-        print(str(exc), file=sys.stderr)
+        logging.getLogger("codex_bridge").error("%s", exc)
         return 2
+    except KeyboardInterrupt:
+        logging.getLogger("codex_bridge").info("bridge.shutdown.interrupted")
+        return 0
     return 0
 
 

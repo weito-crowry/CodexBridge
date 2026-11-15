@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import uvicorn
 from starlette.applications import Starlette
@@ -43,8 +43,18 @@ class _SignalFreeUvicornServer(uvicorn.Server):
         yield
 
 
-def _create_server(app: Starlette, host: str, port: int) -> UvicornServerLike:
-    return _SignalFreeUvicornServer(uvicorn.Config(app, host=host, port=port))
+def _create_server(
+    app: Starlette, host: str, port: int, graceful_timeout: float = 3.0
+) -> UvicornServerLike:
+    return _SignalFreeUvicornServer(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            timeout_graceful_shutdown=cast(Any, graceful_timeout),
+            log_config=None,
+        )
+    )
 
 
 class LocalUiServer:
@@ -55,11 +65,13 @@ class LocalUiServer:
         app: Starlette,
         port: int,
         *,
-        server_factory: ServerFactory = _create_server,
+        server_factory: ServerFactory | None = None,
+        graceful_shutdown_timeout: float = 3.0,
     ) -> None:
         self._app = app
         self._port = port
         self._server_factory = server_factory
+        self._graceful_shutdown_timeout = graceful_shutdown_timeout
         self._server: UvicornServerLike | None = None
         self._task: asyncio.Task[Any] | None = None
 
@@ -83,7 +95,12 @@ class LocalUiServer:
     async def start(self) -> None:
         if self.running:
             return
-        self._server = self._server_factory(self._app, "127.0.0.1", self._port)
+        if self._server_factory is None:
+            self._server = _create_server(
+                self._app, "127.0.0.1", self._port, self._graceful_shutdown_timeout
+            )
+        else:
+            self._server = self._server_factory(self._app, "127.0.0.1", self._port)
         self._task = asyncio.create_task(self._server.serve())
         try:
             await asyncio.wait_for(self._wait_until_started(), timeout=5.0)
@@ -98,12 +115,20 @@ class LocalUiServer:
         server.should_exit = True
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=max(0.0, timeout))
-        except TimeoutError:
-            if not task.done():
+        except TimeoutError as exc:
+            if task.done():
+                task.result()
+            else:
                 task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        except BaseException:
-            await asyncio.gather(task, return_exceptions=True)
+                done, _ = await asyncio.wait({task}, timeout=0.1)
+                if not done:
+                    raise TimeoutError("UI server remained running after cancellation") from exc
+                if not task.cancelled():
+                    task.result()
+            raise TimeoutError(
+                f"UI server did not shut down within {max(0.0, timeout):g} seconds"
+            ) from exc
         finally:
-            self._server = None
-            self._task = None
+            if task.done():
+                self._server = None
+                self._task = None

@@ -1,0 +1,164 @@
+{
+  "artifact_id": "6406a8408206480681dd95009c8bdb81",
+  "checks": {
+    "bridge_api_preflight": {
+      "status": "PASS"
+    },
+    "console_rendering": {
+      "status": "UNKNOWN"
+    },
+    "durable_state": {
+      "status": "PASS"
+    },
+    "environment_isolation": {
+      "status": "PASS"
+    },
+    "fixed_fixture": {
+      "status": "PASS"
+    },
+    "fixed_result": {
+      "final_text": "4",
+      "status": "PASS"
+    },
+    "port_preflight": {
+      "status": "PASS"
+    },
+    "restart_readback": {
+      "status": "PASS"
+    },
+    "same_id_replay": {
+      "status": "PASS"
+    },
+    "single_live_post": {
+      "http_status": 202,
+      "status": "PASS"
+    },
+    "state_workspace_separation": {
+      "status": "PASS"
+    },
+    "thread_count_after_replay": {
+      "status": "PASS"
+    },
+    "workflow_api_identity": {
+      "status": "PASS"
+    }
+  },
+  "diagnostics": {
+    "diagnostic_bytes_saved": 0,
+    "raw_logs_saved": false
+  },
+  "ended_at_utc": "2026-11-11T08:04:37+00:00",
+  "initial_poll_outcome": "runner_stopped_on_unknown_or_needs_reconciliation",
+  "isolated_auth_copy_removed": true,
+  "isolated_codex_home_directory_removed": false,
+  "live_post_attempted": true,
+  "phase": "5E-0",
+  "ports": {
+    "host": "127.0.0.1",
+    "mcp": 62767,
+    "readback_restart": {
+      "mcp": 61072,
+      "ui": 61073
+    },
+    "ui": 62768
+  },
+  "preflight": {
+    "appserver_pid": 34716,
+    "bridge_pid": 11312,
+    "capabilities_authenticated": true,
+    "codex_home_mcp_config_present": false,
+    "github_mount_enabled": false,
+    "incorrect_token_rejected": true,
+    "missing_token_rejected": true,
+    "ports_owned_by_bridge": true
+  },
+  "process_cleanup": {
+    "bridge_processes": 3,
+    "descendant_processes_observed": 8,
+    "forced_termination": false,
+    "reaped": true
+  },
+  "production_side_effects": "no_existing_checkout_service_port_or_state_used",
+  "readback_auth_copy_removed": true,
+  "readback_restart": {
+    "appserver_pid": 33328,
+    "bridge_pid": 7524,
+    "post_attempted": false,
+    "replay_post_attempted": true,
+    "status": "PASS",
+    "worker_artifacts_unchanged": true,
+    "workflow_workers_after_replay": 0,
+    "workflow_workers_before_replay": 0
+  },
+  "readback_restart_history": [
+    {
+      "block_reason": "readback_restart_thread_is_not_completed",
+      "ports": {
+        "mcp": 50072,
+        "ui": 50073
+      },
+      "same_id_replay_post_attempted": false,
+      "status": "BLOCKED",
+      "workflow_api_readback": "PASS_before_additional_thread_status_check"
+    }
+  ],
+  "reconciliation": {
+    "dbos_status": "SUCCESS",
+    "job_count": 1,
+    "job_state": "SUCCEEDED",
+    "post_restart_api_status": "succeeded",
+    "read_only_state": "inspected",
+    "request_count": 1,
+    "request_state": "running",
+    "thread_read_only_status": {
+      "http_status": 200,
+      "status": "inspected",
+      "turn_state": "completed"
+    },
+    "worker_exit_status": "completed_exit_0"
+  },
+  "replay": {
+    "additional_codex_job_posts": 0,
+    "codex_post_claims_after": 1,
+    "codex_post_claims_before": 1,
+    "http_status": 202,
+    "job_events_after": 5,
+    "job_events_before": 5,
+    "job_rows_after": 1,
+    "job_rows_before": 1,
+    "post_attempted": true,
+    "same_workflow_and_run": true,
+    "status": "PASS",
+    "visible_thread_count_after": 1,
+    "visible_thread_count_before": 1,
+    "visible_thread_ids_unchanged": true,
+    "workflow_workers_after_replay": 0
+  },
+  "replay_attempted": true,
+  "restart": {
+    "appserver_pid": 33328,
+    "bridge_pid": 7524,
+    "dbos_status_after_restart": "SUCCESS",
+    "job_rows_after_restart": 1,
+    "read_only_list_detail_result": "PASS",
+    "status": "PASS",
+    "worker_artifacts_unchanged": true,
+    "workflow_workers_started": 0
+  },
+  "resumed_at_utc": "2026-11-11T08:04:32+00:00",
+  "started_at_utc": "2026-11-11T07:46:31+00:00",
+  "status": "PASS",
+  "workflow": {
+    "client_request_id": "phase5e0-5b4bf65d67544bdba428363d8fe6988d",
+    "dbos_status": "SUCCESS",
+    "final_text": "4",
+    "fixture_sha256": "dfa53ef7b1d59f9c96ee1fd2eb2f55df1394115fc78de2e8826a8cd905f1e34a",
+    "initial_status": "running",
+    "job_id": "9ec76042-15e1-407e-8092-ff2cee6afda5",
+    "job_state": "SUCCEEDED",
+    "run_id": "run-904bda7df9944ac5ad432fa944b28892",
+    "status": "succeeded",
+    "thread_id": "01a1c992-bd38-70d1-81b9-2ebb54e43f79",
+    "workflow_id": "3f056c95-c0e4-4e93-ac4d-e024ef73762d"
+  }
+}

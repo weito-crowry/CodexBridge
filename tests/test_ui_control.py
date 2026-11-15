@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -275,6 +276,35 @@ async def test_control_routes_require_token_and_allow_absent_origin(tmp_path) ->
     assert denied.status_code == bad_origin.status_code == 403
     assert accepted.status_code == 200
     assert len([call for call in bridge.calls if call[0] == "start"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_control_shutdown_logs_authorized_fixed_request_event(tmp_path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="codex_bridge")
+    app = create_ui_app(
+        FakeBridge(),
+        ActivityStore(),
+        config(tmp_path),
+        shutdown_callback=lambda: None,
+    )
+    endpoint = route(app, "/ui-api/control/shutdown").endpoint
+
+    denied = await endpoint(request("/ui-api/control/shutdown"))
+    accepted = await endpoint(
+        request(
+            "/ui-api/control/shutdown",
+            authorization="Bearer local-control-token",
+        )
+    )
+
+    assert denied.status_code == 403
+    assert accepted.status_code == 202
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "bridge.control.shutdown.requested" in record.getMessage()
+    ] == ["bridge.control.shutdown.requested reason=control_api"]
+    assert "local-control-token" not in caplog.text
 
 
 @pytest.mark.asyncio

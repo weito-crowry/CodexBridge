@@ -577,14 +577,15 @@ class ExecutionTargetRouter:
                 row["native_thread_id"] = native
                 row["id"] = _public_thread_id(target, native)
                 row["target_id"] = target.id
-        rows = result.get("threads")
-        if isinstance(rows, list):
-            for row in rows:
-                if isinstance(row, dict) and isinstance(row.get("id"), str):
-                    native = row["id"]
-                    row["native_thread_id"] = native
-                    row["id"] = _public_thread_id(target, native)
-                    row["target_id"] = target.id
+        for key in ("threads", "external_threads"):
+            rows = result.get(key)
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and isinstance(row.get("id"), str):
+                        native = row["id"]
+                        row["native_thread_id"] = native
+                        row["id"] = _public_thread_id(target, native)
+                        row["target_id"] = target.id
         return result
 
     async def codex_start(

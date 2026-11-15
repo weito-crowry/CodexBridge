@@ -21,6 +21,7 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "allowed_roots": list,
         "allowed_hosts": list,
         "allowed_origins": list,
+        "lan_enabled": bool,
         "codex_executable": str,
         "wait_default_seconds": float,
         "wait_max_seconds": float,

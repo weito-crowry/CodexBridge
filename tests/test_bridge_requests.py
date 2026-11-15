@@ -403,6 +403,22 @@ async def test_interrupt_active_turns_bounds_hung_interrupt_request(allowed_dir)
 
 
 @pytest.mark.asyncio
+async def test_interrupt_active_turns_excludes_only_exact_ledger_owned_turn(allowed_dir) -> None:
+    bridge, app, store = make_bridge(allowed_dir)
+    store.ensure_turn("workflow-thread", "shared-turn-id")
+    store.ensure_turn("ui-thread", "shared-turn-id")
+
+    await bridge.interrupt_active_turns(
+        wait_seconds=0.05,
+        exclude_turns=frozenset({("workflow-thread", "shared-turn-id")}),
+    )
+
+    assert [params for method, params in app.calls if method == "turn/interrupt"] == [
+        {"threadId": "ui-thread", "turnId": "shared-turn-id"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unsupported_server_request_is_rejected_without_raising(allowed_dir) -> None:
     bridge, app, store = make_bridge(allowed_dir)
     store.ensure_turn("thread", "turn")

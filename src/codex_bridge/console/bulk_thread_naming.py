@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..thread_titles import derive_thread_title, normalize_explicit_title
+from .i18n import tr
 from .project_names import normalize_cwd
 
 if TYPE_CHECKING:
@@ -42,9 +43,9 @@ def build_thread_list_header(
     header = QHBoxLayout()
     header.addWidget(title)
     header.addStretch(1)
-    button = QPushButton("Name untitled threads…")
+    button = QPushButton(tr("Name untitled threads…"))
     button.setObjectName("nameUntitledThreadsButton")
-    button.setToolTip("Preview names for untitled threads in the currently loaded list")
+    button.setToolTip(tr("Preview names for untitled threads in the currently loaded list"))
     button.clicked.connect(on_clicked)
     header.addWidget(button)
     header.addWidget(refresh_button)
@@ -138,7 +139,7 @@ def build_untitled_thread_proposals(
         if project_text and cwd_text:
             cwd_label = f"{project_text} — {cwd_text}"
         else:
-            cwd_label = project_text or cwd_text or "Other"
+            cwd_label = project_text or cwd_text or tr("Other")
         proposals.append(UntitledThreadProposal(thread_id, cwd_label, title))
     return proposals
 
@@ -165,18 +166,21 @@ class BulkThreadNamingDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Name untitled threads")
+        self.setWindowTitle(tr("Name untitled threads"))
         self.setMinimumSize(760, 420)
         self._busy = False
         self._completed = False
         self.scope_label = QLabel(
-            f"Preview of {len(proposals)} currently loaded untitled threads. "
-            "Only loaded rows are included; this does not scan all history."
+            tr(
+                "Preview of {p0} currently loaded untitled threads. Only loaded rows are "
+                "included; this does not scan all history.",
+                p0=len(proposals),
+            )
         )
         self.scope_label.setWordWrap(True)
         self.table = QTableWidget(len(proposals), 5)
         self.table.setHorizontalHeaderLabels(
-            ["Select", "Thread ID", "CWD / project", "Proposed title", "Result"]
+            [tr("Select"), tr("Thread ID"), tr("CWD / project"), tr("Proposed title"), tr("Result")]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setColumnWidth(_COLUMN_CHECK, 58)
@@ -215,9 +219,9 @@ class BulkThreadNamingDialog(QDialog):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, max(1, len(proposals)))
         self.progress_bar.setValue(0)
-        self.progress_label = QLabel("No changes are made until you confirm selected rows.")
-        self.confirm_button = QPushButton("Confirm selected")
-        self.cancel_button = QPushButton("Cancel")
+        self.progress_label = QLabel(tr("No changes are made until you confirm selected rows."))
+        self.confirm_button = QPushButton(tr("Confirm selected"))
+        self.cancel_button = QPushButton(tr("Cancel"))
         self.confirm_button.clicked.connect(self._confirm_clicked)
         self.cancel_button.clicked.connect(self.reject)
         buttons = QHBoxLayout()
@@ -262,14 +266,14 @@ class BulkThreadNamingDialog(QDialog):
 
     def show_validation_error(self, rows: Sequence[int]) -> None:
         for row in rows:
-            self.set_row_status(row, "Invalid title")
-        self.progress_label.setText("Correct blank or unsupported titles before confirming.")
+            self.set_row_status(row, tr("Invalid title"))
+        self.progress_label.setText(tr("Correct blank or unsupported titles before confirming."))
 
     def set_busy(self, total: int) -> None:
         self._busy = True
         self.table.setEnabled(False)
         self.confirm_button.setEnabled(False)
-        self.cancel_button.setText("Cancel after current item")
+        self.cancel_button.setText(tr("Cancel after current item"))
         self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(0)
 
@@ -281,7 +285,14 @@ class BulkThreadNamingDialog(QDialog):
     def set_progress(self, done: int, total: int, renamed: int, skipped: int, failed: int) -> None:
         self.progress_bar.setValue(done)
         self.progress_label.setText(
-            f"Processed {done}/{total} · Renamed {renamed} · Skipped {skipped} · Failed {failed}"
+            tr(
+                "Processed {p0}/{p1} · Renamed {p2} · Skipped {p3} · Failed {p4}",
+                p0=done,
+                p1=total,
+                p2=renamed,
+                p3=skipped,
+                p4=failed,
+            )
         )
 
     def set_completed(self) -> None:
@@ -289,8 +300,8 @@ class BulkThreadNamingDialog(QDialog):
         self._completed = True
         self.table.setEnabled(False)
         self.confirm_button.setEnabled(True)
-        self.confirm_button.setText("Done")
-        self.cancel_button.setText("Close")
+        self.confirm_button.setText(tr("Done"))
+        self.cancel_button.setText(tr("Close"))
 
     def reject(self) -> None:
         if self._busy:
@@ -404,16 +415,16 @@ class BulkThreadNamingController:
             status = payload.get("status")
             if status == "renamed":
                 self._renamed += 1
-                self._dialog_row_status(current, "Renamed")
+                self._dialog_row_status(current, tr("Renamed"))
             elif status == "skipped":
                 self._skipped += 1
-                self._dialog_row_status(current, "Skipped")
+                self._dialog_row_status(current, tr("Skipped"))
             else:
                 self._failed += 1
-                self._dialog_row_status(current, "Failed")
+                self._dialog_row_status(current, tr("Failed"))
         else:
             self._failed += 1
-            self._dialog_row_status(current, "Failed")
+            self._dialog_row_status(current, tr("Failed"))
         self._advance()
         return True
 
@@ -422,7 +433,7 @@ class BulkThreadNamingController:
             return False
         current = self._requests[self._next_request]
         self._failed += 1
-        self._dialog_row_status(current, "Failed")
+        self._dialog_row_status(current, tr("Failed"))
         self._advance()
         return True
 
@@ -449,7 +460,9 @@ class BulkThreadNamingController:
             return
         self._cancel_requested = True
         if self._dialog is not None:
-            self._dialog.progress_label.setText("Cancellation requested; current item will finish.")
+            self._dialog.progress_label.setText(
+                tr("Cancellation requested; current item will finish.")
+            )
         if self._active_key is None:
             self._finish()
 
@@ -460,7 +473,7 @@ class BulkThreadNamingController:
         self._active_key = None
         if self._cancel_requested:
             for request in self._requests[self._next_request :]:
-                self._dialog_row_status(request, "Not processed")
+                self._dialog_row_status(request, tr("Not processed"))
         if self._attempted:
             self._window._request_threads()
         if self._dialog is not None:

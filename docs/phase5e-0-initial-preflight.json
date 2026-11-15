@@ -1,0 +1,72 @@
+{
+  "artifact_id": "0f6f575c8e7b436c938f5c60d2b7fdfc",
+  "block_reason": "bridge_ports_are_not_owned_only_by_test_process",
+  "checks": {
+    "bridge_api_preflight": {
+      "status": "UNKNOWN"
+    },
+    "console_rendering": {
+      "status": "UNKNOWN"
+    },
+    "durable_state": {
+      "status": "UNKNOWN"
+    },
+    "environment_isolation": {
+      "status": "PASS"
+    },
+    "fixed_fixture": {
+      "status": "PASS"
+    },
+    "fixed_result": {
+      "status": "UNKNOWN"
+    },
+    "port_preflight": {
+      "status": "PASS"
+    },
+    "restart_readback": {
+      "status": "UNKNOWN"
+    },
+    "same_id_replay": {
+      "status": "UNKNOWN"
+    },
+    "single_live_post": {
+      "status": "UNKNOWN"
+    },
+    "state_workspace_separation": {
+      "status": "PASS"
+    },
+    "workflow_api_identity": {
+      "status": "UNKNOWN"
+    }
+  },
+  "diagnostics": {
+    "diagnostic_bytes_saved": 0,
+    "raw_logs_saved": false
+  },
+  "ended_at_utc": "2026-11-11T07:37:52+00:00",
+  "isolated_auth_copy_removed": true,
+  "isolated_codex_home_directory_removed": false,
+  "live_post_attempted": false,
+  "phase": "5E-0",
+  "ports": {
+    "host": "127.0.0.1",
+    "mcp": 53277,
+    "ui": 53278
+  },
+  "process_cleanup": {
+    "bridge_processes": 1,
+    "descendant_processes_observed": 2,
+    "forced_termination": false,
+    "reaped": true
+  },
+  "production_side_effects": "none_expected",
+  "replay": {
+    "status": "NOT_RUN"
+  },
+  "restart": {
+    "status": "NOT_RUN"
+  },
+  "started_at_utc": "2026-11-11T07:37:47+00:00",
+  "status": "BLOCKED",
+  "workflow": {}
+}

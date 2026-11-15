@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QLabel
 
+from .api_error_presentation import format_api_error
+from .i18n import tr
 from .widgets import ActivityPane
 
 _RECONNECT_MS = 1_500
@@ -83,7 +85,7 @@ class HistoryStreamCoordinator:
             self._update_thread_activity(thread_id, state)
         self._activity_pane.set_snapshot(payload)
         self._sync_approval_controls()
-        self._bottom_status_label.setText("Thread snapshot updated")
+        self._bottom_status_label.setText(tr("Thread snapshot updated"))
         if self._stream_sync_pending and context.thread_id is not None:
             self._stream_sync_pending = False
             self._start_stream(context.thread_id, context.generation)
@@ -134,7 +136,7 @@ class HistoryStreamCoordinator:
             self._schedule_selected_history_refresh()
 
     def status_request_failed(self, message: str) -> None:
-        self._activity_pane.set_error(message)
+        self._activity_pane.set_error(format_api_error(message))
         if self._stream_sync_pending:
             self.schedule_reconnect(self._context_provider().generation)
 
@@ -143,9 +145,9 @@ class HistoryStreamCoordinator:
         if context.closing or generation != context.generation:
             return
         if state == "disconnected" and context.thread_id is None:
-            self._stream_status_label.setText("Stream: idle")
+            self._stream_status_label.setText(tr("Stream: idle"))
         else:
-            self._stream_status_label.setText(f"Stream: {state}")
+            self._stream_status_label.setText(tr("Stream: {p0}", p0=tr(state)))
         if state == "connected":
             is_reconnected = self._stream_ever_connected and not self._stream_connected
             self._stream_connected = True
@@ -161,7 +163,7 @@ class HistoryStreamCoordinator:
         if self._reconnect_scheduled or self._context_provider().closing:
             return
         self._reconnect_scheduled = True
-        self._stream_status_label.setText("Stream: reconnecting")
+        self._stream_status_label.setText(tr("Stream: reconnecting"))
         QTimer.singleShot(_RECONNECT_MS, lambda: self.reconnect(generation))
 
     def reconnect(self, generation: int) -> None:

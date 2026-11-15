@@ -4,6 +4,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QLabel, QWidget
 
+from .i18n import tr
+
 
 class UsageShortcutLabel(QLabel):
     activated = Signal()
@@ -13,8 +15,8 @@ class UsageShortcutLabel(QLabel):
         self._left_press_active = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName("Codex Usage")
-        self.setAccessibleDescription("Open Usage History")
+        self.setAccessibleName(tr("Codex Usage"))
+        self.setAccessibleDescription(tr("Open Usage History"))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:

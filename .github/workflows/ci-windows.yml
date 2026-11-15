@@ -1,0 +1,75 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-checks:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: '0.13.7'
+          enable-cache: false
+
+      - name: Show tool versions
+        run: |
+          python --version
+          uv --version
+
+      - name: Sync locked dependencies
+        run: uv sync --locked --no-default-groups --extra dev --extra console --extra workflows
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Ruff check
+        run: uv run --no-sync ruff check .
+
+      - name: Ruff format check
+        run: uv run --no-sync ruff format --check .
+
+      - name: Mypy
+        run: uv run --no-sync mypy src
+
+      - name: Compile Python sources
+        run: uv run --no-sync python -m compileall -q src scripts tests
+
+      - name: Pytest - module size
+        run: uv run --no-sync pytest -x -q -ra -o faulthandler_timeout=100 tests/test_python_module_size.py
+
+      - name: Pytest - Workflow package, service, and API
+        run: uv run --no-sync pytest -x -q -ra -o faulthandler_timeout=100 tests/test_workflows_package.py tests/test_workflows_service.py tests/test_workflows_api.py
+
+      - name: Pytest - Workflow manager and multi-job
+        run: uv run --no-sync pytest -x -q -ra -o faulthandler_timeout=100 tests/test_workflows_manager.py tests/test_workflows_multi_api.py tests/test_workflows_multijob.py
+
+      - name: Pytest - Qt timer and tray
+        run: uv run --no-sync pytest -x -q -ra -o faulthandler_timeout=100 tests/test_console_timer_bootstrap.py tests/test_console_tray.py
+
+      - name: Pytest - Workflow client and controller
+        run: uv run --no-sync pytest -x -q -ra -o faulthandler_timeout=100 tests/test_console_workflow_client.py tests/test_console_workflow_controller.py

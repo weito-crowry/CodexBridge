@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from codex_bridge.console import main_window as main_window_module
 from codex_bridge.console.codex_resolver import CodexResolution
 from codex_bridge.console.config import ConsoleConfig
@@ -48,6 +50,15 @@ def _report_bridge_ready(client: FakeClient, *, key_prefix: str = "") -> None:
         f"{key_prefix}status" if key_prefix else "bridge-status",
         {"bridge": "ready", "app_server": "ready"},
     )
+
+
+def _wait_for_profile(window: MainWindow) -> None:
+    app = _application()
+    deadline = time.monotonic() + 3
+    while window._tunnel_profile_status == "running" and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    assert window._tunnel_profile_status != "running"
 
 
 def test_close_stops_timers_and_aborts_only_client_replies() -> None:
@@ -111,6 +122,33 @@ def test_valid_detected_codex_enables_start_when_bridge_is_unavailable() -> None
     assert window.runtime_state == "launching"
     assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
     assert not window.start_bridge_button.isEnabled()
+    window.close()
+
+
+def test_retry_now_while_reprobe_runs_keeps_exactly_one_managed_launch(monkeypatch) -> None:
+    _application()
+    initial = FakeCodexProbe()
+    retry = FakeCodexProbe()
+    client = FakeClient()
+    launcher = FakeLauncher()
+    window = MainWindow(
+        _config(),
+        api_client=client,
+        codex_probe=initial,
+        runtime_launcher=launcher,
+        tray_available=False,
+    )
+    monkeypatch.setattr(window, "_new_codex_probe", lambda: retry)
+    initial.failure()
+    client.failure("health", "Bridge unavailable")
+    client.failure("bridge-status", "Bridge unavailable")
+
+    window._retry_now()
+    window._retry_now()
+    retry.result(CodexResolution("C:/Codex/codex.exe", "1.2.3", "path"))
+
+    assert retry.starts == 1
+    assert launcher.calls == [("C:/Codex/codex.exe", 8001)]
     window.close()
 
 
@@ -188,17 +226,19 @@ def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch)
     )
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
 
-    assert generator_calls == [
-        (
-            profile_settings,
-            {
-                "profile_dir": profile_path.parent,
-                "profile_name": "tunnel-profile",
-                "client_executable": "C:/tools/tunnel-client.exe",
-            },
-        )
-    ]
+    assert len(generator_calls) == 1
+    generated_profile, generate_kwargs = generator_calls[0]
+    assert generated_profile is profile_settings
+    assert {
+        key: value for key, value in generate_kwargs.items() if key != "install_if_current"
+    } == {
+        "profile_dir": profile_path.parent,
+        "profile_name": "tunnel-profile",
+        "client_executable": "C:/tools/tunnel-client.exe",
+    }
+    assert callable(generate_kwargs["install_if_current"])
     assert events.index(("generate",)) < events.index(("supervisor_ready", True))
     assert supervisor_options[0]["profile_file"] == str(profile_path)
     assert supervisor_options[0]["executable"] == "C:/tools/tunnel-client.exe"
@@ -211,6 +251,7 @@ def test_generated_tunnel_profile_is_passed_to_supervisor(tmp_path, monkeypatch)
     )
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     assert len(generator_calls) == 1
     window.close()
 
@@ -285,7 +326,9 @@ def test_failed_tunnel_profile_generation_disables_tunnel_without_fallback(
     assert window._tunnel_profile_status == "not_run"
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     _report_bridge_ready(client)
+    _wait_for_profile(window)
 
     assert generator_calls == [True]
     assert not any(supervisor_readiness)
@@ -344,9 +387,10 @@ def test_retry_now_retries_failed_managed_tunnel_profile_generation_once(
         runtime_launcher=FakeLauncher(),
         tray_available=False,
     )
-
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     _report_bridge_ready(client)
+    _wait_for_profile(window)
 
     assert len(generator_calls) == 1
     assert supervisor_readiness and not any(supervisor_readiness)
@@ -354,6 +398,7 @@ def test_retry_now_retries_failed_managed_tunnel_profile_generation_once(
     assert window.retry_now_button.isEnabled()
 
     window.retry_now_button.click()
+    _wait_for_profile(window)
 
     assert len(generator_calls) == 2
     assert supervisor_readiness[-1] is True
@@ -367,6 +412,7 @@ def test_retry_now_retries_failed_managed_tunnel_profile_generation_once(
     assert "private-secret" not in window.tunnel_init_diagnostics_label.text()
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     assert len(generator_calls) == 2
     window.close()
 
@@ -405,7 +451,9 @@ def test_retry_now_keeps_managed_tunnel_stopped_when_profile_retry_fails(
     )
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     window._retry_now()
+    _wait_for_profile(window)
 
     assert generator_calls == [True, True]
     assert supervisor_readiness and not any(supervisor_readiness)
@@ -450,14 +498,17 @@ def test_retry_now_does_not_retry_failed_managed_profile_when_bridge_unready_or_
     )
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     assert generator_calls == [True]
     window._health_ok = False
     window._retry_now()
+    _wait_for_profile(window)
     assert generator_calls == [True]
 
     window._health_ok = True
     window._bridge_transition = True
     window._retry_now()
+    _wait_for_profile(window)
 
     assert generator_calls == [True]
     window.close()
@@ -491,10 +542,12 @@ def test_retry_now_uses_supervisor_for_valid_managed_profile(tmp_path, monkeypat
     )
 
     _report_bridge_ready(client)
+    _wait_for_profile(window)
     assert window._tunnel_profile_status == "passed"
     tunnel.emit_state("failed")
 
     window._retry_now()
+    _wait_for_profile(window)
 
     assert generator_calls == [True]
     assert tunnel.retry_calls == 1
@@ -536,6 +589,7 @@ def test_managed_tunnel_profile_is_rechecked_after_bridge_restart(tmp_path, monk
     client.failure("bridge-status", "Bridge unavailable")
     window.start_bridge_button.click()
     _report_bridge_ready(client, key_prefix="launch:")
+    _wait_for_profile(window)
     assert len(generator_calls) == 1
 
     window.restart_bridge_button.click()
@@ -548,6 +602,7 @@ def test_managed_tunnel_profile_is_rechecked_after_bridge_restart(tmp_path, monk
         window.tunnel_init_diagnostics_label.text()
     )
     _report_bridge_ready(client, key_prefix="launch:")
+    _wait_for_profile(window)
 
     assert len(generator_calls) == 2
     assert window._tunnel_profile_status == "passed"
@@ -949,9 +1004,11 @@ def test_retry_now_routes_to_bridge_when_bridge_unavailable() -> None:
 def test_retry_now_routes_to_tunnel_when_bridge_ready_but_tunnel_unavailable() -> None:
     _application()
     tunnel = LifecycleTunnel("failed")
+    probe = FakeCodexProbe()
     window = MainWindow(
         _config(),
         api_client=FakeClient(),
+        codex_probe=probe,
         tunnel_supervisor=tunnel,
         tray_available=False,
     )

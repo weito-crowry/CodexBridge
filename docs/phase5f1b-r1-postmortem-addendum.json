@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-11-12T17:06:31+00:00",
+  "phase": "5F-1B-R1 postmortem addendum",
+  "status": "PASS_READ_ONLY_DIAGNOSIS",
+  "scope": "R1 saved-state postmortem only; the original R1 E2E remains BLOCKED",
+  "checkout": {
+    "branch": "codex/phase5f1b-three-job-e2e",
+    "base_commit": "d61b5cc442bf0be806d85eaa212d99818b723f64"
+  },
+  "source_r1": {
+    "status": "BLOCKED",
+    "reason": "three_job_request_ledger_identity_or_state_mismatch",
+    "workflow_id": "bca46292-4ea0-4ab1-b80b-e45b924f5ecf",
+    "client_request_id": "phase5f1b-cfa1c2cd73334624bbf14f03fce1dece",
+    "run_id": "run-14e085cffd6443a484533a985dcbe135",
+    "evidence_path": "docs/phase5f1b-three-job-e2e-r1-evidence.json",
+    "evidence_sha256": "a9572b879933808c813b1f96eaad0852ca55722dfd3f01c899944e74b4b17176"
+  },
+  "root_cause": {
+    "confidence": "CONFIRMED_FOR_RECORDED_R1_BLOCK",
+    "finding": "The request ledger contains one row with state=running and all three identities plus request_digest match. The original runner required state=succeeded and emitted the recorded identity_or_state_mismatch. With only that predicate changed to allow running or succeeded, the same saved-state verifier passes every downstream durable check on this preserved run.",
+    "state_projection_difference": {
+      "request_ledger_raw_state": "running",
+      "final_workflow_api_projection": "succeeded",
+      "final_worker_projection": "completed",
+      "final_job_projection": [
+        "SUCCEEDED",
+        "SUCCEEDED",
+        "SUCCEEDED"
+      ]
+    }
+  },
+  "request_ledger_read_only_check": {
+    "row_count": 1,
+    "raw_state": "running",
+    "client_request_id_matches": true,
+    "workflow_id_matches": true,
+    "run_id_matches": true,
+    "request_digest_matches_manifest": true
+  },
+  "durable_saved_state_verification": {
+    "status": "PASS",
+    "verifier": "scripts.phase5f1b_three_job_isolated_smoke._read_three_job_saved_state",
+    "manifest_workflow_id_matches": true,
+    "manifest_run_id_matches": true,
+    "manifest_request_digest_matches": true,
+    "manifest_workspace_root_matches": true,
+    "manifest_definition_sha256": "e34b3bd2c2e1cf573cf751c73ccb5b107ab3e5579275905268d0be857eee5cb1",
+    "stored_definition_sha256": "e34b3bd2c2e1cf573cf751c73ccb5b107ab3e5579275905268d0be857eee5cb1",
+    "input_file_sha256": "49c56c5cd2dab0ab4b3685befb2e8486b84b1c55136f7be49dc6cea565b961c3",
+    "manifest_input_sha256": "882bbc49818597ba4de691c461983aff711e51d560173dd9aea8a6f2b4c095a8",
+    "v2_job_ledger_schema_check": "PASS",
+    "job_count": 3,
+    "jobs": [
+      {
+        "task_identity": "do[0].processIssues.iteration[1].do[1].processIssue",
+        "state": "SUCCEEDED",
+        "remote_state": "completed",
+        "thread_id_present": true,
+        "turn_id_present": true,
+        "thread_and_turn_ids_unique": true,
+        "request_key_matches_workflow_and_task": true,
+        "request_digest_and_scope_check": "PASS",
+        "receipt_final_text": "9"
+      },
+      {
+        "task_identity": "do[0].processIssues.iteration[2].do[1].processIssue",
+        "state": "SUCCEEDED",
+        "remote_state": "completed",
+        "thread_id_present": true,
+        "turn_id_present": true,
+        "thread_and_turn_ids_unique": true,
+        "request_key_matches_workflow_and_task": true,
+        "request_digest_and_scope_check": "PASS",
+        "receipt_final_text": "17"
+      },
+      {
+        "task_identity": "do[0].processIssues.iteration[3].do[1].processIssue",
+        "state": "SUCCEEDED",
+        "remote_state": "completed",
+        "thread_id_present": true,
+        "turn_id_present": true,
+        "thread_and_turn_ids_unique": true,
+        "request_key_matches_workflow_and_task": true,
+        "request_digest_and_scope_check": "PASS",
+        "receipt_final_text": "21"
+      }
+    ],
+    "job_events": {
+      "count": 15,
+      "sequences_by_job": [
+        [
+          "PREPARED",
+          "MAYBE_SENT",
+          "ACCEPTED",
+          "RUNNING",
+          "SUCCEEDED"
+        ],
+        [
+          "PREPARED",
+          "MAYBE_SENT",
+          "ACCEPTED",
+          "RUNNING",
+          "SUCCEEDED"
+        ],
+        [
+          "PREPARED",
+          "MAYBE_SENT",
+          "ACCEPTED",
+          "RUNNING",
+          "SUCCEEDED"
+        ]
+      ],
+      "one_sequential_dispatch_per_job": true,
+      "maximum_active_jobs": 1
+    },
+    "dbos_status": "SUCCESS",
+    "worker_entry": {
+      "state": "completed",
+      "exit_code": 0
+    },
+    "result": {
+      "saved_projection_check": "PASS",
+      "api_result_http_status_from_original_r1_evidence": 200,
+      "final_texts": [
+        "9",
+        "17",
+        "21"
+      ],
+      "result_file_sha256": "250478c20131a857d671dab93408b757a919eb7c23b7dd7ac45de8df93d1011d"
+    }
+  },
+  "original_r1_api_observations": {
+    "http_get_count": 25,
+    "workflow_http_get_count": 19,
+    "other_http_get_count": 6,
+    "qt_get_count": 0,
+    "workflow_post_count": 1,
+    "same_id_replay_post_attempted": false,
+    "same_id_replay_post_count": 0,
+    "final_detail_http_status": 200,
+    "final_detail_workflow_status": "succeeded",
+    "final_detail_worker_state": "completed",
+    "final_detail_job_states": [
+      "SUCCEEDED",
+      "SUCCEEDED",
+      "SUCCEEDED"
+    ],
+    "final_result_http_status": 200
+  },
+  "this_postmortem_activity": {
+    "api_get_count": 0,
+    "qt_get_count": 0,
+    "workflow_post_count": 0,
+    "same_id_replay_post_count": 0,
+    "new_codex_job_count": 0,
+    "shutdown_or_restart_request_count": 0,
+    "process_signal_count": 0,
+    "canonical_list_detail_result_gets": "NOT_RUN",
+    "canonical_get_reason": "Listener port 62807 was owned by PID 10308, not recorded Bridge PID 14208; the user-specified listener identity condition was not met."
+  },
+  "process_preservation": {
+    "old_initial_bridge": {
+      "pid": 3584,
+      "process_present": true,
+      "owner": "WEITO-PC\\weito",
+      "owner_matches_current_user": true,
+      "creation_epoch": 1794482814.016682,
+      "listener_ports": [
+        50247,
+        50248
+      ],
+      "listener_owner_pid": 18460
+    },
+    "r1_bridge": {
+      "pid": 14208,
+      "process_present": true,
+      "owner": "WEITO-PC\\weito",
+      "owner_matches_current_user": true,
+      "creation_epoch": 1794500465.809399,
+      "listener_ports": [
+        62806,
+        62807
+      ],
+      "listener_owner_pid": 10308
+    },
+    "stop_restart_shutdown_or_resume_performed": false,
+    "cleanup": false
+  },
+  "sqlite_read_only_protection": {
+    "isolated_root_label": "codexbridge-phase5f1b-_xwln6v5",
+    "scope": "localappdata/CodexBridge/workflows and the named target run only",
+    "read_only_connections": true,
+    "request_and_job_wal_shm_sidecars_present_before_read": true,
+    "new_sidecar_created": false,
+    "target_run_and_request_database_hashes_unchanged": true,
+    "writes_performed": false,
+    "cleanup": false,
+    "key_file_sha256": {
+      "requests.sqlite": "40c0f4c0973655ac459ca91655fb102194c1d8dc18a4f8c7f548feee2cb61788",
+      "codex_jobs.sqlite": "b28dbafb55108646c8b20883175a3b6417c6805ccc0d107659df640667446741",
+      "dbos.sqlite": "db7624ef2c86991f563f0edc0267419f942301c15f6f48a5d8c129380b86afc3",
+      "manifest.json": "2659023533936831c8eb363d3b78af45aae609be81609970220a62ea5d4590c2",
+      "workflow.yaml": "e34b3bd2c2e1cf573cf751c73ccb5b107ab3e5579275905268d0be857eee5cb1",
+      "input.json": "49c56c5cd2dab0ab4b3685befb2e8486b84b1c55136f7be49dc6cea565b961c3",
+      "result.json": "250478c20131a857d671dab93408b757a919eb7c23b7dd7ac45de8df93d1011d"
+    }
+  },
+  "unverified": {
+    "same_id_replay": true,
+    "bridge_restart": true,
+    "canonical_api_get": true,
+    "qt_get": true
+  },
+  "source_evidence_sha256": {
+    "initial_5f1b_blocked_evidence": "1af75fcb89ad314be79f35f5e06b2eca777a1c877e150d6e683c0f88a435bdc5",
+    "r1_blocked_evidence": "a9572b879933808c813b1f96eaad0852ca55722dfd3f01c899944e74b4b17176",
+    "prior_postmortem_addendum": "8298326e05c6779bd41de01c74c93b1eafe06adb7e295510ab3f01f458f81c3d"
+  },
+  "preserved_untracked_evidence_sha256": {
+    "docs/phase5e-2c2-diagnostic-retest-evidence.json": "ede76c2334f362765ff136619f9a393fd592bb514ab9b707374598a5bd4152b5",
+    "docs/phase5e-2c2-r4-evidence.json": "9fc47e74ea21854af1a8e1157da72496f5a5cf30480880a713ca4497fd311742"
+  },
+  "offline_verification": {
+    "focused_four_files": {
+      "passed": 158,
+      "skipped": 2,
+      "failed": 0
+    },
+    "workflow_suite_10_files": {
+      "passed": 342,
+      "skipped": 4,
+      "failed": 0
+    },
+    "r4_runner": {
+      "passed": 71,
+      "skipped": 1,
+      "failed": 0
+    },
+    "r1_runner_test_file": {
+      "passed": 23,
+      "skipped": 0,
+      "failed": 0
+    },
+    "ows_multijob": {
+      "passed": 95,
+      "skipped": 0,
+      "failed": 0
+    },
+    "ruff_check": "PASS",
+    "ruff_format_check": {
+      "status": "PASS",
+      "files": 326
+    },
+    "mypy": {
+      "status": "PASS",
+      "source_files": 120
+    },
+    "compileall": "PASS",
+    "uv_lock_check": "PASS",
+    "git_diff_check": "PASS"
+  },
+  "secrets_prompts_and_auth_contents_included": false
+}

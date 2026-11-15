@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
+from .i18n import tr
+
 if TYPE_CHECKING:
     from .main_window import MainWindow
 
@@ -34,7 +36,7 @@ class TrayController:
             ("Show Console", window._show_console),
             ("Hide Console", window._hide_console),
         ):
-            action = QAction(text, window)
+            action = QAction(tr(text), window)
             action.triggered.connect(callback)
             menu.addAction(action)
             window._tray_actions[text] = action
@@ -44,7 +46,7 @@ class TrayController:
             ("Stop Bridge", window._stop_bridge),
             ("Restart Bridge", window._restart_bridge),
         ):
-            action = QAction(text, window)
+            action = QAction(tr(text), window)
             action.triggered.connect(callback)
             menu.addAction(action)
             window._tray_actions[text] = action
@@ -54,12 +56,12 @@ class TrayController:
             ("Stop Tunnel", window._stop_tunnel),
             ("Restart Tunnel", window._restart_tunnel),
         ):
-            action = QAction(text, window)
+            action = QAction(tr(text), window)
             action.triggered.connect(callback)
             menu.addAction(action)
             window._tray_actions[text] = action
         menu.addSeparator()
-        exit_action = QAction("Exit", window)
+        exit_action = QAction(tr("Exit"), window)
         exit_action.triggered.connect(window._begin_exit)
         menu.addAction(exit_action)
         window._tray_actions["Exit"] = exit_action
@@ -102,7 +104,7 @@ class TrayController:
                     try:
                         show_message(
                             "CodexBridge Console",
-                            "Console is still running in the system tray.",
+                            tr("Console is still running in the system tray."),
                         )
                     except Exception:
                         pass

@@ -159,8 +159,8 @@ def test_rename_posts_encoded_thread_name_and_tracks_only_accepted_request(
     assert dialog_calls == [
         (
             window,
-            "名前を変更",
-            "名前:",
+            "Rename",
+            "Name:",
             thread_interactions.QLineEdit.EchoMode.Normal,
             "Current name",
         )

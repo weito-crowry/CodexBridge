@@ -1,0 +1,119 @@
+{
+  "checks": {
+    "active_job_concurrency": {
+      "status": "NOT_RUN"
+    },
+    "bridge_preflight_and_authentication": {
+      "appserver_ready": true,
+      "capabilities_authenticated": true,
+      "incorrect_token_rejected": true,
+      "missing_token_rejected": true,
+      "ports_owned_by_bridge": true,
+      "process_identity_matches": true,
+      "status": "PASS"
+    },
+    "bridge_restart_readback": {
+      "status": "NOT_RUN"
+    },
+    "console_qt_get_readback": {
+      "status": "NOT_RUN"
+    },
+    "dedicated_loopback_ports": {
+      "mcp": 57259,
+      "production_ports_avoided": true,
+      "status": "PASS",
+      "ui": 57260
+    },
+    "expected_final_texts": {
+      "status": "NOT_RUN"
+    },
+    "immutable_hashes_and_ledgers": {
+      "status": "NOT_RUN"
+    },
+    "isolated_environment_and_roots": {
+      "allowlist": true,
+      "state_and_workspace_separate": true,
+      "status": "PASS"
+    },
+    "native_windows": {
+      "platform": "windows_native",
+      "status": "PASS"
+    },
+    "production_side_effects": {
+      "basis": "production_process_and_state_not_used",
+      "count": 0,
+      "status": "PASS"
+    },
+    "same_id_replay": {
+      "status": "NOT_RUN"
+    },
+    "single_live_workflow_post": {
+      "accepted_http_status": 409,
+      "post_count": 1,
+      "status": "FAIL"
+    },
+    "workflow_api_identity_and_jobs": {
+      "status": "NOT_RUN"
+    },
+    "workspace_allowed_root_and_cwd": {
+      "status": "NOT_RUN"
+    }
+  },
+  "cleanup": {
+    "forced_termination": false,
+    "owned_children_reaped": false,
+    "status": "PRESERVED_ACTIVE_OR_UNKNOWN"
+  },
+  "exit_code": 1,
+  "finished_at_utc": "2026-11-11T14:39:33+00:00",
+  "jobs": [],
+  "live_workflow_post_attempted": true,
+  "live_workflow_post_count": 1,
+  "maximum_active_codex_jobs": null,
+  "new_codex_job_count": 0,
+  "phase": "5E-2C2-R",
+  "ports": {
+    "loopback_only": true,
+    "mcp": 57259,
+    "ui": 57260
+  },
+  "previous_evidence_path": "docs/phase5e-2c2-evidence.json",
+  "previous_evidence_sha256": "5eb3e3bb66471bd1e7d18e83ce09e1dab8774752fc3ba4936787eb9bdea82844",
+  "production_side_effect_count": 0,
+  "reason": "initial_workflow_post_was_not_accepted",
+  "retest_reason": "previous_runner_hash_validation_false_positive",
+  "retry_of": "5E-2C2",
+  "same_id_replay_post_attempted": false,
+  "same_id_replay_post_count": 0,
+  "started_at_utc": "2026-11-11T14:39:23+00:00",
+  "status": "FAIL",
+  "workflow": {
+    "initial_post_http_status": 409,
+    "read_only_reconciliation": {
+      "ledger_rows": 1,
+      "list_readable": true,
+      "matching_list_workflow_ids": [
+        "52492317-50cb-416e-95ad-d213dfd9f7d6"
+      ],
+      "matching_request_rows": 1,
+      "matching_run_ids": [
+        "run-f11a3b8e07454aeba9ba51958c3d71fa"
+      ],
+      "matching_states": [
+        "needs_reconciliation"
+      ],
+      "matching_workflow_ids": [
+        "52492317-50cb-416e-95ad-d213dfd9f7d6"
+      ]
+    },
+    "read_only_response_identity": {
+      "run_id": "run-f11a3b8e07454aeba9ba51958c3d71fa",
+      "status": "needs_reconciliation",
+      "workflow_id": "52492317-50cb-416e-95ad-d213dfd9f7d6"
+    },
+    "workspace_preflight": {
+      "allowed_root_isolated_workspace": true,
+      "workspace_exists": true
+    }
+  }
+}

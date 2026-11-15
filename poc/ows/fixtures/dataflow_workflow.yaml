@@ -1,0 +1,26 @@
+document:
+  dsl: '1.0.3'
+  namespace: codexbridge-poc
+  name: ows-dataflow-checkpoint-smoke
+  version: '1.0.0'
+evaluate:
+  language: jq
+  mode: strict
+input:
+  from: ${ .request }
+output:
+  as: '${ {result: .value, seen_context: .context_value, context: $context} }'
+do:
+  - first:
+      input:
+        from: '${ {value: .value} }'
+      set:
+        value: ${ .value + 1 }
+      output:
+        as: '${ {value: .value, input: $input.value} }'
+      export:
+        as: '${ $context + {published: $output.value, source: .input} }'
+  - second:
+      set:
+        value: ${ .value }
+        context_value: ${ $context.published }

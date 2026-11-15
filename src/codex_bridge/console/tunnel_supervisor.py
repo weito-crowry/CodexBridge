@@ -16,6 +16,7 @@ from PySide6.QtNetwork import (
 )
 
 from ..observability import get_observer
+from .i18n import tr
 
 _DOCTOR_TIMEOUT_MS = 10_000
 _MAX_DOCTOR_OUTPUT = 8 * 1024
@@ -61,13 +62,13 @@ HealthPortProvider = Callable[[], int]
 
 
 def tunnel_state_label(state: str) -> str:
-    return _STATE_LABELS.get(state, "Tunnel: unavailable")
+    return tr(_STATE_LABELS.get(state, "Tunnel: unavailable"))
 
 
 def _version_key(version: str) -> tuple[int, int, int, int]:
     match = _SEMVER_PATTERN.fullmatch(version)
     if match is None:
-        raise ValueError("Tunnel version is invalid")
+        raise ValueError(tr("Tunnel version is invalid"))
     return (
         int(match.group("major")),
         int(match.group("minor")),
@@ -78,28 +79,34 @@ def _version_key(version: str) -> tuple[int, int, int, int]:
 
 def parse_tunnel_version(output: bytes, *, minimum: str = MIN_SUPPORTED_TUNNEL_VERSION) -> str:
     if len(output) > _MAX_DOCTOR_OUTPUT:
-        raise ValueError("Tunnel version output is too large")
+        raise ValueError(tr("Tunnel version output is too large"))
     try:
         text = output.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError("Tunnel version output is invalid") from exc
+        raise ValueError(tr("Tunnel version output is invalid")) from exc
     match = _TUNNEL_VERSION_PATTERN.match(text)
     if match is None:
-        raise ValueError("Tunnel version output is invalid")
+        raise ValueError(tr("Tunnel version output is invalid"))
     version = match.group("version")
     if _version_key(version) < _version_key(minimum):
-        raise ValueError(f"Tunnel client {version} is too old; CodexBridge requires >= {minimum}")
+        raise ValueError(
+            tr(
+                "Tunnel client {p0} is too old; CodexBridge requires >= {p1}",
+                p0=version,
+                p1=minimum,
+            )
+        )
     return version
 
 
 def default_health_port_provider() -> int:
     server = QTcpServer()
     if not server.listen(QHostAddress(_HEALTH_HOST), 0):
-        raise RuntimeError("Tunnel health port unavailable")
+        raise RuntimeError(tr("Tunnel health port unavailable"))
     port = int(server.serverPort())
     server.close()
     if not 1 <= port <= 65_535:
-        raise RuntimeError("Tunnel health port unavailable")
+        raise RuntimeError(tr("Tunnel health port unavailable"))
     return port
 
 
@@ -158,11 +165,13 @@ class TunnelSupervisor(QObject):
         self._client_version: str | None = None
         self._validation_status = "not_run"
         self._validation_detail = (
-            "Waiting for Bridge readiness" if executable is not None else "Executable unavailable"
+            tr("Waiting for Bridge readiness")
+            if executable is not None
+            else tr("Executable unavailable")
         )
         self._profile = profile
         if profile_file is not None and not profile_file.strip():
-            raise ValueError("Tunnel profile file must not be empty")
+            raise ValueError(tr("Tunnel profile file must not be empty"))
         self._profile_file = profile_file
         self._process_factory = process_factory or (lambda owner: QProcess(owner))
         self._network_manager = network_manager or QNetworkAccessManager(self)
@@ -429,7 +438,7 @@ class TunnelSupervisor(QObject):
             return
         self._version_checked = True
         self._validation_status = "running"
-        self._validation_detail = "Version check in progress"
+        self._validation_detail = tr("Version check in progress")
         process: Any | None = None
         try:
             process = self._process_factory(self)
@@ -450,7 +459,7 @@ class TunnelSupervisor(QObject):
             process.setProgram(self._executable)
             process.setArguments(["--version"])
             process.start()
-            self._set_state("checking", message="Tunnel: checking version")
+            self._set_state("checking", message=tr("Tunnel: checking version"))
             self._doctor_timer.start()
         except Exception:
             self._fail_version(process)
@@ -513,8 +522,8 @@ class TunnelSupervisor(QObject):
             active_process.deleteLater()
         self._client_version = None
         self._validation_status = "failed"
-        self._validation_detail = "Tunnel version check failed"
-        self._set_state("failed", message=message or "Tunnel: version check failed")
+        self._validation_detail = tr("Tunnel version check failed")
+        self._set_state("failed", message=message or tr("Tunnel: version check failed"))
 
     def _set_state(self, state: str, *, message: str | None = None) -> None:
         self._state = state
@@ -530,7 +539,7 @@ class TunnelSupervisor(QObject):
             return
         self._doctor_started = True
         self._validation_status = "running"
-        self._validation_detail = "Supervisor doctor check in progress"
+        self._validation_detail = tr("Supervisor doctor check in progress")
         self._set_state("checking")
         process: Any | None = None
         try:
@@ -605,9 +614,9 @@ class TunnelSupervisor(QObject):
             self._doctor_passed = True
             self._validation_status = "passed"
             self._validation_detail = (
-                "Version and doctor checks passed"
+                tr("Version and doctor checks passed")
                 if self._validate_version
-                else "Doctor check passed"
+                else tr("Doctor check passed")
             )
             if self._bridge_ready:
                 self._maybe_start_process(reason="readiness")
@@ -635,8 +644,8 @@ class TunnelSupervisor(QObject):
             active_process.deleteLater()
         self._doctor_passed = False
         self._validation_status = "failed"
-        self._validation_detail = "Supervisor doctor check failed"
-        self._set_state("failed", message="Tunnel: configuration check failed")
+        self._validation_detail = tr("Supervisor doctor check failed")
+        self._set_state("failed", message=tr("Tunnel: configuration check failed"))
 
     def _start_process(self, *, reason: str) -> bool:
         executable = self._executable

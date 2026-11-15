@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtWidgets import QMessageBox
 
 from .codex_updates import CodexUpdateInfo, parse_codex_update_info
+from .i18n import tr
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -65,11 +66,11 @@ class CodexUpdateController:
         if window._closing or resolution is None or self._codex_update_busy:
             return
         self._codex_update_busy = True
-        window.codex_update_status_label.setText("Checking…")
+        window.codex_update_status_label.setText(tr("Checking…"))
         window.codex_update_message_label.setText("")
         self.sync_codex_update_controls()
         if not window._codex_update_probe.check_for_updates(resolution):
-            self.apply_codex_update_check_error("Codex update check failed")
+            self.apply_codex_update_check_error(tr("Codex update check failed"))
 
     def apply_codex_update_check(self, payload: object) -> None:
         window = self._window
@@ -83,13 +84,13 @@ class CodexUpdateController:
             )
         )
         self._codex_update_info = info
-        window.codex_latest_label.setText(info.latest_version or "Unavailable")
-        window.codex_update_status_label.setText(info.display_status)
+        window.codex_latest_label.setText(info.latest_version or tr("Unavailable"))
+        window.codex_update_status_label.setText(tr(info.display_status))
         window.codex_update_message_label.setText(
-            f"Last checked: {info.last_checked_at}" if info.last_checked_at else ""
+            tr("Last checked: {p0}", p0=info.last_checked_at) if info.last_checked_at else ""
         )
         window.codex_update_banner_label.setText(
-            "↑ Codex update available" if info.update_available else ""
+            tr("↑ Codex update available") if info.update_available else ""
         )
         window.codex_update_banner_label.setVisible(info.update_available)
         self.sync_codex_update_controls()
@@ -100,8 +101,8 @@ class CodexUpdateController:
             return
         self._codex_update_busy = False
         self._codex_update_info = None
-        window.codex_latest_label.setText("Unavailable")
-        window.codex_update_status_label.setText("Unavailable")
+        window.codex_latest_label.setText(tr("Unavailable"))
+        window.codex_update_status_label.setText(tr("Unavailable"))
         window.codex_update_message_label.setText(message)
         window.codex_update_banner_label.clear()
         window.codex_update_banner_label.setVisible(False)
@@ -115,19 +116,19 @@ class CodexUpdateController:
             return
         answer = QMessageBox.question(
             window,
-            "Update Codex",
-            "Install the available Codex update now?",
+            tr("Update Codex"),
+            tr("Install the available Codex update now?"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         self._codex_update_busy = True
-        window.codex_update_status_label.setText("Updating…")
+        window.codex_update_status_label.setText(tr("Updating…"))
         window.codex_update_message_label.setText("")
         self.sync_codex_update_controls()
         if not window._codex_update_probe.update(resolution):
-            self.apply_codex_update_failure("Codex update failed")
+            self.apply_codex_update_failure(tr("Codex update failed"))
 
     def apply_codex_update_success(self) -> None:
         window = self._window
@@ -135,7 +136,7 @@ class CodexUpdateController:
             return
         self._codex_update_busy = False
         self._codex_update_info = None
-        window.codex_update_status_label.setText("Update completed; restart required")
+        window.codex_update_status_label.setText(tr("Update completed; restart required"))
         window.codex_update_message_label.setText("")
         window.codex_update_banner_label.clear()
         window.codex_update_banner_label.setVisible(False)
@@ -146,6 +147,6 @@ class CodexUpdateController:
         if window._closing:
             return
         self._codex_update_busy = False
-        window.codex_update_status_label.setText("Update failed")
+        window.codex_update_status_label.setText(tr("Update failed"))
         window.codex_update_message_label.setText(message)
         self.sync_codex_update_controls()

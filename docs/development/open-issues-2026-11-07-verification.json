@@ -1,0 +1,44 @@
+{
+  "source_commit": "2ad8b68d7fd11e75f3d3984dfd566ac62607f150",
+  "branch": "codex/python314-migration",
+  "pytest": {
+    "collected": 1863,
+    "inherited_console": 1117,
+    "final_selected": 746,
+    "final_selected_counts": {
+      "PASS": 740,
+      "SKIP": 6
+    },
+    "unique_partitioned_counts": {
+      "PASS": 1857,
+      "SKIP": 6
+    },
+    "uncovered": 0,
+    "single_full_pytest": "NOT RUN"
+  },
+  "static": {
+    "ruff_check": "PASS",
+    "ruff_format": "PASS (227 files)",
+    "mypy": "PASS (102 source files)",
+    "compileall": "PASS",
+    "module_size": "FAIL: main_window.py 1534 LOC > 1500; baseline 1506 LOC"
+  },
+  "core_without_qt": "PASS",
+  "package": {
+    "build": "PASS",
+    "exe": "D:\\CodexBridge\\.runtime\\issue-sequence-20261107\\package-final\\dist\\CodexBridge\\CodexBridge.exe",
+    "exe_sha256": "d4a84a8756db0725d5f6d23b8decd2b64d22f97a1a48e255b6100e11942aac67",
+    "exe_bytes": 11329453,
+    "zip": "D:\\CodexBridge\\.runtime\\issue-sequence-20261107\\package-final\\CodexBridge-windows.zip",
+    "zip_sha256": "2d150db23929d792df28012a7c3c9a31a2b3600f4f80daa6fb20bb6681291b27",
+    "zip_bytes": 70570317,
+    "catalog_entries": 648,
+    "catalog_sha256": "4636b26a5c37c32accc2cc6d50f2e57a70e7f95605d7e839aaab17fd6b285edc",
+    "qt_qm_sha256": "2b9581c69b975f59be505b127cd3c19d403ef3d12e0e8386fb97238223e9c1df",
+    "exe_help_exit": 0,
+    "exe_invalid_argument_exit": 2,
+    "bundled_components": "PASS",
+    "japanese_translation": "PASS",
+    "ordinary_gui_acceptance": "NOT RUN"
+  }
+}

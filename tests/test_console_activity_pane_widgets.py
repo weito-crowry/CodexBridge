@@ -80,17 +80,17 @@ def test_activity_pane_displays_bounded_read_only_command_output_and_process_met
         }
     )
 
-    output = pane.command_output_text.toPlainText()
-    assert pane.command_output_text.isReadOnly()
-    assert (
-        "[Command command-1 · App Server process id: pty-42 · cwd: C:/workspace] python task.py"
-        in output
-    )
-    assert "日本語 output" in output
-    assert "tail" in output
-    assert "Output delta truncated" in output
-    assert "Final output recovered from the completed App Server item" in output
-    assert output.count("cached output") == 1
+    first, second = pane.command_output.panels.values()
+    first.toggle_button.click()
+    second.toggle_button.click()
+    assert first.output_text.isReadOnly()
+    assert "python task.py" in first.toggle_button.text()
+    assert "App Server process id: pty-42" in first.metadata_label.text()
+    assert "cwd: C:/workspace" in first.metadata_label.text()
+    assert first.output_text.toPlainText() == "日本語 outputtail"
+    assert "Output delta truncated" in first.note_label.text()
+    assert "completed App Server item" in second.note_label.text()
+    assert second.output_text.toPlainText() == "cached output"
     assert pane.activity_list.count() == 1
 
     pane.append_activity(
@@ -112,8 +112,9 @@ def test_activity_pane_displays_bounded_read_only_command_output_and_process_met
             "details": {"exit_code": 9},
         }
     )
-    assert "No command output was observed" in pane.command_output_text.toPlainText()
-    assert "[failed · exit 9]" in pane.command_output_text.toPlainText()
+    empty = list(pane.command_output.panels.values())[-1]
+    assert "Output not observed" in empty.note_label.text()
+    assert "Failed · exit 9" in empty.toggle_button.text()
 
     pane.append_activity(
         {
@@ -124,7 +125,7 @@ def test_activity_pane_displays_bounded_read_only_command_output_and_process_met
             "details": {},
         }
     )
-    assert len(pane.command_output_text.toPlainText()) <= 256_000
+    assert sum(len(p.output) for p in pane.command_output.panels.values()) <= 256_000
 
 
 def test_activity_rows_distinguish_commentary_from_final_agent_message() -> None:

@@ -1,0 +1,70 @@
+{
+  "schema_version": "codexbridge.phase5f1b.postmortem-addendum.v1",
+  "recorded_at_utc": "2026-11-12T13:36:09Z",
+  "phase": "5F-1B-B",
+  "scope": "offline_only",
+  "original_run": {
+    "result": "BLOCKED",
+    "reason": "workflow_api_requires_reconciliation",
+    "runner_blocked_at_utc": "2026-11-12T11:27:07Z",
+    "evidence_path": "docs/phase5f1b-three-job-e2e-evidence.json",
+    "evidence_sha256": "1af75fcb89ad314be79f35f5e06b2eca777a1c877e150d6e683c0f88a435bdc5",
+    "historical_evidence_status_preserved": true,
+    "saved_failure_get_response": false,
+    "runner_reported_live_workflow_posts": 1,
+    "runner_reported_new_codex_job_count": null
+  },
+  "postmortem_findings": {
+    "source": "user-provided Phase 5F-1B postmortem forensic report",
+    "second_maybe_sent_window_utc": [
+      "2026-11-12T11:27:06.902Z",
+      "2026-11-12T11:27:06.959Z"
+    ],
+    "same_run_codex_job_states": [
+      "SUCCEEDED",
+      "SUCCEEDED",
+      "SUCCEEDED"
+    ],
+    "dbos_status": "SUCCESS",
+    "maximum_active_codex_jobs": 1,
+    "reconciliation_marker_count": 0,
+    "worker_entry_status": "completed",
+    "after_the_fact_inspect_run_status": "succeeded",
+    "initial_failure_get_branch": "UNKNOWN",
+    "leading_hypothesis": "Three-job projection treated MAYBE_SENT as needs_reconciliation while the worker was still running.",
+    "retained_isolated_bridge": {
+      "pid": 3584,
+      "creation_epoch": 1794482814.016682,
+      "status_as_reported": "not_reaped_and_retained",
+      "state_rechecked_this_task": false,
+      "actions_this_task": []
+    },
+    "historical_cleanup_field": {
+      "initial_evidence_owned_children_reaped": true,
+      "forensic_assessment_owned_children_reaped": false,
+      "original_evidence_edited": false
+    },
+    "sqlite_sidecar_note": "The report notes that SQLite postmortem reads can create -wal or -shm files; no incident DBOS or raw SQLite readback was performed in this task."
+  },
+  "implementation_basis": {
+    "pre_change_commit": "f0122c4e50860ecf76d994d753dfa1faa41b619b",
+    "static_projection_observation": "The three-job projector unconditionally returned needs_reconciliation for any MAYBE_SENT row.",
+    "historical_root_cause_claimed": false
+  },
+  "this_task_activity": {
+    "live_workflow_posts": 0,
+    "live_codex_job_posts": 0,
+    "bridge_shutdown_requests": 0,
+    "existing_isolated_process_actions": 0,
+    "incident_dbos_or_raw_sqlite_readbacks": 0,
+    "r1_e2e_started": false
+  },
+  "evidence_sha256_at_recording": {
+    "docs/phase5e-0-evidence.json": "ef8606f3929b138cdc5d9618e53b275d4206f8c623b22ef1c9dc7c20fb80a4bf",
+    "docs/phase5e-2c2-evidence.json": "0644f26e79828a6da4644cd5fe49a34eb876fda9cc4ece8a9cd4f7aa85742662",
+    "docs/phase5e-2c2-retest-evidence.json": "06d804d8141b2a7cce8494170687c221c118575ac2a8058f2a16d73a6abaa459",
+    "docs/phase5e-2c2-diagnostic-retest-evidence.json": "ede76c2334f362765ff136619f9a393fd592bb514ab9b707374598a5bd4152b5",
+    "docs/phase5e-2c2-r4-evidence.json": "9fc47e74ea21854af1a8e1157da72496f5a5cf30480880a713ca4497fd311742",
+    "docs/phase5f1b-three-job-e2e-evidence.json": "1af75fcb89ad314be79f35f5e06b2eca777a1c877e150d6e683c0f88a435bdc5"
+  }
+}

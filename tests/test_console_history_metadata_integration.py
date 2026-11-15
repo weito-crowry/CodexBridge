@@ -45,7 +45,7 @@ def test_history_summary_tracks_older_pages_live_refresh_and_reload() -> None:
     widget = window.composer_widget
     assert widget.model_combo.itemText(0) == "Model: gpt-5"
     assert widget.access_combo.currentText() == "Access: Full Access"
-    assert "現在の実行権限を保証しません" in widget.access_combo.toolTip()
+    assert "does not guarantee current execution permissions" in widget.access_combo.toolTip()
 
     window.history_pane.older_requested.emit()
     older_key = next(key for key, _, _ in client.requests if ":older:" in key)
@@ -160,7 +160,7 @@ def test_loaded_thread_uses_current_sandbox_metadata_instead_of_history() -> Non
     )
     widget = window.composer_widget
     assert widget.access_combo.currentText() == "Access: Full Access"
-    assert "履歴から観測したsandbox設定" in widget.access_combo.toolTip()
+    assert "Sandbox observed in history" in widget.access_combo.toolTip()
 
     client.result(
         "selection:1:status",

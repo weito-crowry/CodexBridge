@@ -93,6 +93,11 @@ def test_production_line_limit_accepts_1500_and_rejects_1501(checker: ModuleType
     assert "production_physical_loc" in _codes(rejected.errors)
 
 
+def test_main_window_keeps_headroom_below_1491_physical_lines() -> None:
+    main_window = ROOT / "src" / "codex_bridge" / "console" / "main_window.py"
+    assert len(main_window.read_bytes().splitlines()) <= 1490
+
+
 def test_production_byte_limit_accepts_65536_and_rejects_65537(
     checker: ModuleType,
 ) -> None:

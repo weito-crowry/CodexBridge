@@ -1,0 +1,83 @@
+{
+  "base_commit": "9cdb00d2332a781e33387fffc1d237804a6ee4a4",
+  "checks": {
+    "bridge_owner_ports_and_control_auth": "NOT_RUN",
+    "console_offscreen_readback": "NOT_RUN",
+    "graceful_shutdown": "NOT_RUN",
+    "isolated_auth_config_roots_and_empty_state": "NOT_RUN",
+    "lifecycle_logs": "NOT_RUN",
+    "native_runtime_and_dependencies": "NOT_RUN",
+    "restart_read_only_get": "NOT_RUN",
+    "same_id_replay": "NOT_RUN",
+    "simultaneous_capacity_409": "NOT_RUN",
+    "workflow_A_items_result": "NOT_RUN",
+    "workflow_B_single_result": "NOT_RUN"
+  },
+  "finished_at_utc": "2026-11-14T08:50:24.188+00:00",
+  "head_commit": "ff2dab3538e290d1705552fbed251e3dc4777f87",
+  "isolation": {
+    "status": "NOT_RUN"
+  },
+  "offline_regression": {
+    "compileall": "PASS",
+    "git_diff_check": "PASS",
+    "mypy_src": "PASS_121_FILES",
+    "poc_ows": {
+      "failed": 0,
+      "passed": 155,
+      "skipped": 0,
+      "status": "PASS"
+    },
+    "r3_runner_invocations": 0,
+    "ruff_check": "PASS",
+    "ruff_format_check": "PASS",
+    "runner_tests": {
+      "failed": 0,
+      "passed": 14,
+      "status": "PASS"
+    },
+    "status": "BLOCKED",
+    "uv_lock_check": "PASS_66_PACKAGES",
+    "workflow_console_phase5": {
+      "failed": 1,
+      "failure_nodeid": "tests/test_workflows_service.py::test_two_service_instances_enforce_capacity_two_atomically",
+      "observed": "accepted_count=2; WorkflowConcurrencyConflict_count=0",
+      "passed": 527,
+      "root_cause": "UNKNOWN_NOT_RETRIED",
+      "skipped": 5,
+      "status": "FAIL"
+    }
+  },
+  "offline_regression_preceded_live_posts": true,
+  "phase": "5F-5",
+  "ports": {},
+  "posts": {
+    "accepted_initial_workflows": 0,
+    "capacity_probe_attempts": 0,
+    "same_id_replay_attempts": 0,
+    "unique_initial_attempts": 0,
+    "workflow_post_total_attempts": 0
+  },
+  "processes": {
+    "bridge_initial": null,
+    "bridge_restart": null,
+    "existing_processes_touched": 0,
+    "orphan_processes": null,
+    "shutdowns": [],
+    "worker_snapshots": []
+  },
+  "reason": "offline_workflow_suite_failed_before_r3",
+  "runner_sha256": "f22fe6dbe8848a27cf49273fb34ec5f21d32757afa43277e0a24b73984a8cfa9",
+  "runtime": {},
+  "schema_version": 1,
+  "source_commit": "ff2dab3538e290d1705552fbed251e3dc4777f87",
+  "started_at_utc": "2026-11-14T08:50:24.187+00:00",
+  "status": "NOT_RUN",
+  "workflows": {
+    "A": {},
+    "B": {},
+    "C": {
+      "status": "NOT_RUN"
+    }
+  }
+}

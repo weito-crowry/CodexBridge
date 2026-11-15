@@ -81,6 +81,7 @@ _MANAGED_ENV_KEYS: dict[str, tuple[str, str]] = {
     "CODEX_BRIDGE_ALLOWED_ROOTS": ("bridge", "allowed_roots"),
     "CODEX_BRIDGE_ALLOWED_HOSTS": ("bridge", "allowed_hosts"),
     "CODEX_BRIDGE_ALLOWED_ORIGINS": ("bridge", "allowed_origins"),
+    "CODEX_BRIDGE_LAN_ENABLED": ("bridge", "lan_enabled"),
     "CODEX_BRIDGE_CODEX_EXECUTABLE": ("bridge", "codex_executable"),
     "CODEX_BRIDGE_WAIT_DEFAULT_SECONDS": ("bridge", "wait_default_seconds"),
     "CODEX_BRIDGE_WAIT_MAX_SECONDS": ("bridge", "wait_max_seconds"),
@@ -433,6 +434,8 @@ class BridgeConfig:
     wait_max_seconds: float
     shutdown_grace_seconds: float
     control_token: str | None = None
+    lan_enabled: bool = False
+    mcp_token: str | None = field(default=None, repr=False)
     file_put_dir: str | None = None
     codex_executable_source: str = "default"
     github_mcp: GitHubMcpConfig = field(default_factory=GitHubMcpConfig)
@@ -442,6 +445,12 @@ class BridgeConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "targets", _validate_execution_targets(self.targets))
+        if self.mcp_token is not None and _CONTROL_TOKEN_PATTERN.fullmatch(self.mcp_token) is None:
+            raise ConfigurationError(
+                "CODEX_BRIDGE_MCP_TOKEN must be 32-256 ASCII URL-safe characters"
+            )
+        if self.lan_enabled and not self.mcp_token:
+            raise ConfigurationError("LAN access requires CODEX_BRIDGE_MCP_TOKEN")
         if self.file_put_dir is not None:
             if not isinstance(self.file_put_dir, str) or not self.file_put_dir:
                 raise ConfigurationError("file put inbox must be a configured absolute directory")
@@ -598,6 +607,11 @@ class BridgeConfig:
                 values,
             ),
             control_token=_control_token(values),
+            lan_enabled=_boolean(
+                values.get("CODEX_BRIDGE_LAN_ENABLED", bridge_config.get("lan_enabled", False)),
+                "bridge.lan_enabled",
+            ),
+            mcp_token=values.get("CODEX_BRIDGE_MCP_TOKEN") or None,
             file_put_dir=file_put_dir,
             codex_executable_source=executable_source,
             github_mcp=GitHubMcpConfig.from_sources(

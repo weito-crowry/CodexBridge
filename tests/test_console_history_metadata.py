@@ -29,7 +29,7 @@ def test_single_resolved_turn_is_shown_with_history_source() -> None:
 
     assert summary.model == "gpt-5"
     assert summary.effort == "high"
-    assert "読み込んだ履歴" in summary.model_tooltip
+    assert "loaded history" in summary.model_tooltip
     assert "turn-1" in summary.model_tooltip
 
 
@@ -114,7 +114,7 @@ def test_unavailable_turns_are_partial_and_metadata_without_a_loaded_turn_is_ign
 
     assert summary.model == "gpt-5"
     assert summary.effort == "high"
-    assert "一部" in summary.model_tooltip
+    assert "Some" in summary.model_tooltip
     assert "unavailable" in summary.model_tooltip
     assert "orphan" not in summary.model_tooltip
     assert "gpt-6" not in summary.model_tooltip
@@ -138,8 +138,8 @@ def test_tooltips_include_history_source_and_are_truncated() -> None:
 
     assert len(summary.model_tooltip) <= 1200
     assert len(summary.effort_tooltip) <= 1200
-    assert "読み込んだ履歴" in summary.model_tooltip
-    assert "省略" in summary.model_tooltip
+    assert "loaded history" in summary.model_tooltip
+    assert "omitted" in summary.model_tooltip
 
 
 def test_observed_access_is_summarized_only_for_displayed_turns() -> None:
@@ -165,7 +165,7 @@ def test_observed_access_is_summarized_only_for_displayed_turns() -> None:
     assert "turn-1" in summary.tooltip
     assert "turn-2" in summary.tooltip
     assert "orphan" not in summary.tooltip
-    assert "現在の実行権限を保証しません" in summary.tooltip
+    assert "does not guarantee current execution permissions" in summary.tooltip
 
 
 def test_access_conflicts_across_turns_or_within_a_turn_are_multiple() -> None:
@@ -205,7 +205,7 @@ def test_partial_access_history_shows_observed_value_and_missing_turns() -> None
     )
 
     assert summary.access == "workspace-write"
-    assert "一部のターンではAccessを取得できていません" in summary.tooltip
+    assert "Access metadata is unavailable for some turns" in summary.tooltip
     assert "missing [unavailable]" in summary.tooltip
 
 
@@ -223,11 +223,11 @@ def test_unknown_access_and_oversized_tooltip_remain_bounded() -> None:
 
     assert summary.access == "danger-full-access"
     assert len(summary.tooltip) <= 1200
-    assert "一部" in summary.tooltip
-    assert "省略" in summary.tooltip
+    assert "Access metadata is unavailable for some turns" in summary.tooltip
+    assert "omitted" in summary.tooltip
     unknown = _summarize_access(
         ["unknown"],
         {"unknown": {"access_candidates": [{"private": "value"}], "access_resolution_status": []}},
     )
     assert unknown.access is None
-    assert "履歴からAccessを取得できませんでした" in unknown.tooltip
+    assert "Access metadata is unavailable in history" in unknown.tooltip

@@ -278,6 +278,58 @@ async def test_mcp_request_records_status_duration_and_protocol_without_payloads
     assert "body" not in serialized
 
 
+def test_bridge_status_observations_validate_fixed_fields(tmp_path) -> None:
+    from codex_bridge.observability import ObservabilityLogger
+
+    log_path = tmp_path / "console-observability.jsonl"
+    observer = ObservabilityLogger(log_path)
+    observer.bridge_status_observation(
+        "bridge.status.unavailable",
+        reason="app_server_unavailable",
+        consecutive_failures=1,
+        health_ok=True,
+        bridge_ready=True,
+        app_server_ready=False,
+        managed=True,
+        bridge_pid=4321,
+    )
+    observer.bridge_status_observation(
+        "bridge.status.unavailable",
+        reason="private reason",
+        consecutive_failures=1,
+        health_ok=True,
+        bridge_ready=False,
+        app_server_ready=False,
+        managed=True,
+        bridge_pid=4321,
+    )
+    observer.bridge_status_observation(
+        "bridge.status.unavailable",
+        reason="app_server_unavailable",
+        consecutive_failures=True,
+        health_ok=False,
+        bridge_ready=False,
+        app_server_ready=False,
+        managed=True,
+        bridge_pid=True,
+    )
+
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["event"] == "bridge.status.unavailable"
+    assert records[0]["reason"] == "app_server_unavailable"
+    assert records[0]["consecutive_failures"] == 1
+    assert records[0]["health_ok"] is True
+    assert records[0]["bridge_ready"] is True
+    assert records[0]["app_server_ready"] is False
+    assert records[0]["managed"] is True
+    assert records[0]["bridge_pid"] == 4321
+    serialized = json.dumps(records)
+    assert "private reason" not in serialized
+    assert '"prompt"' not in serialized
+    assert '"token"' not in serialized
+
+
 @pytest.mark.asyncio
 async def test_mcp_exception_and_cancel_are_distinct_and_do_not_log_messages(tmp_path) -> None:
     from codex_bridge.observability import MCPObservabilityMiddleware, ObservabilityLogger

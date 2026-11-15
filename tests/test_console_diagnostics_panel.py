@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtGui import QColor, QPalette, QTextCursor, QTextDocument
 
 from codex_bridge.console.diagnostics_panel import DiagnosticsPanelController
 
@@ -27,18 +28,29 @@ class FakeText:
         self.events = events
         self.scrollbar = FakeScrollBar(maximum, value)
         self.next_maximum: int | None = None
-        self.lines: list[str] = []
+        self._document = QTextDocument()
+        self._palette = QPalette()
+        self._palette.setColor(QPalette.ColorRole.Text, QColor(25, 35, 45))
+        self._document.contentsChanged.connect(self._document_changed)
+
+    @property
+    def lines(self) -> list[str]:
+        return self._document.toPlainText().splitlines()
 
     def clear(self) -> None:
         self.events.append("clear")
-        self.lines.clear()
+        self._document.clear()
 
     def verticalScrollBar(self) -> FakeScrollBar:
         return self.scrollbar
 
-    def appendPlainText(self, text: str) -> None:
-        self.events.append(("append", text))
-        self.lines.append(text)
+    def document(self) -> QTextDocument:
+        return self._document
+
+    def palette(self) -> QPalette:
+        return self._palette
+
+    def _document_changed(self) -> None:
         if self.next_maximum is not None:
             self.scrollbar._maximum = self.next_maximum
 
@@ -95,12 +107,20 @@ class FakeTimer:
 class FakeWindow:
     def __init__(self) -> None:
         self.events: list[object] = []
+        self._palette = QPalette()
+        self._palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
         self.diagnostics_pane = FakePane(self.events)
         self.diagnostics_toggle_button = FakeButton(self.events)
         self.diagnostics_text = FakeText(self.events)
         self._diagnostics_reader = FakeReader(self.events)
         self.diagnostics_timer = FakeTimer(self.events)
         self.controller = DiagnosticsPanelController(self)  # type: ignore[arg-type]
+
+    def palette(self) -> QPalette:
+        return self._palette
+
+    def foregroundRole(self) -> QPalette.ColorRole:
+        return QPalette.ColorRole.WindowText
 
     def _on_diagnostics_timeout(self) -> None:
         self.controller._on_diagnostics_timeout()
@@ -121,9 +141,9 @@ def test_visible_toggle_resets_reader_polls_immediately_and_starts_timer() -> No
         "clear",
         "reset",
         "poll",
-        ("append", "first line\nsecond line"),
         "start",
     ]
+    assert window.diagnostics_text.lines == ["first line", "second line"]
     assert window.diagnostics_toggle_button.text == "Hide Diagnostics"
     assert window.events[-1] == "start"
 
@@ -172,3 +192,22 @@ def test_append_empty_lines_has_no_text_or_scrollbar_side_effects() -> None:
 
     assert window.events == []
     assert window.diagnostics_text.scrollbar.set_values == []
+
+
+def test_append_formats_only_stderr_prefix_in_document() -> None:
+    window = FakeWindow()
+    row = "[Bridge stderr] warning body"
+
+    window.controller._append_diagnostics_lines([row])
+
+    document = window.diagnostics_text.document()
+    assert document.toPlainText() == row
+    cursor = QTextCursor(document)
+    cursor.setPosition(2)
+    prefix_color = cursor.charFormat().foreground().color()
+    cursor.setPosition(len("[Bridge stderr]") + 2)
+    body_color = cursor.charFormat().foreground().color()
+    expected_prefix_color = QColor(230, 185, 105)
+    assert prefix_color == expected_prefix_color
+    assert body_color == window.diagnostics_text.palette().color(QPalette.ColorRole.Text)
+    assert prefix_color != body_color

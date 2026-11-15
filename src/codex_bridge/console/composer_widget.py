@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .composer_attachments import ComposerAttachmentBar
+from .i18n import tr
 
 
 class ComposerInput(QPlainTextEdit):
@@ -26,7 +27,7 @@ class ComposerInput(QPlainTextEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("composerInput")
-        self.setPlaceholderText("Codexと一緒に作業する")
+        self.setPlaceholderText(tr("Work with Codex"))
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         option = self.document().defaultTextOption()
         option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
@@ -95,12 +96,12 @@ class ComposerWidget(QWidget):
         self._rendering = False
         self._allowed_roots = tuple(allowed_roots)
 
-        self.target_label = QLabel("スレッドを選択するか、新しいスレッドを開始してください")
+        self.target_label = QLabel(tr("Select a thread or start a new thread"))
         self.target_label.setObjectName("composerTarget")
         self.target_label.setWordWrap(True)
         self.target_label.setMinimumWidth(0)
         self.target_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.new_thread_button = QPushButton("New thread")
+        self.new_thread_button = QPushButton(tr("New thread"))
         self.new_thread_button.setObjectName("composerNewThread")
         self.new_thread_button.clicked.connect(self.new_thread_requested.emit)
 
@@ -108,7 +109,7 @@ class ComposerWidget(QWidget):
         target_row.addWidget(self.target_label, 1)
         target_row.addWidget(self.new_thread_button)
 
-        self.cwd_label = QLabel("CWD")
+        self.cwd_label = QLabel(tr("CWD"))
         self.cwd_combo = QComboBox()
         self.cwd_combo.setObjectName("composerCwd")
         self.cwd_combo.setEditable(True)
@@ -120,7 +121,7 @@ class ComposerWidget(QWidget):
         self.cwd_combo.setMinimumWidth(0)
         cwd_line_edit = self.cwd_combo.lineEdit()
         if cwd_line_edit is not None:
-            cwd_line_edit.setPlaceholderText("作業フォルダを選択")
+            cwd_line_edit.setPlaceholderText(tr("Select a working folder"))
         self.cwd_combo.currentTextChanged.connect(self._emit_cwd_changed)
         self.cwd_container = QWidget(self)
         cwd_row = QHBoxLayout(self.cwd_container)
@@ -143,8 +144,8 @@ class ComposerWidget(QWidget):
 
         self.access_combo = QComboBox()
         self.access_combo.setObjectName("composerAccess")
-        self.access_combo.addItem("Access: Default", "inherit")
-        self.access_combo.addItem("Access: Full Access", "danger-full-access")
+        self.access_combo.addItem(tr("Access: Default"), "inherit")
+        self.access_combo.addItem(tr("Access: Full Access"), "danger-full-access")
         self.access_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
         )
@@ -152,13 +153,13 @@ class ComposerWidget(QWidget):
 
         self.model_combo = QComboBox()
         self.model_combo.setObjectName("composerModel")
-        self.model_combo.addItem("Model: Default", None)
+        self.model_combo.addItem(tr("Model: Default"), None)
         self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
         self.model_combo.currentIndexChanged.connect(self._emit_model_changed)
 
         self.effort_combo = QComboBox()
         self.effort_combo.setObjectName("composerEffort")
-        self.effort_combo.addItem("Effort: Default", None)
+        self.effort_combo.addItem(tr("Effort: Default"), None)
         self.effort_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow
         )
@@ -167,11 +168,11 @@ class ComposerWidget(QWidget):
             combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.effort_combo.currentIndexChanged.connect(self._emit_effort_changed)
 
-        self.send_button = QPushButton("Send")
+        self.send_button = QPushButton(tr("Send"))
         self.send_button.setObjectName("composerSend")
         self.send_button.setEnabled(False)
         self.send_button.clicked.connect(self.send_requested.emit)
-        self.stop_button = QPushButton("Stop")
+        self.stop_button = QPushButton(tr("Stop"))
         self.stop_button.setObjectName("composerStop")
         self.stop_button.setEnabled(False)
         self.stop_button.setVisible(False)
@@ -338,7 +339,7 @@ class ComposerWidget(QWidget):
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         self.model_combo.addItem(
-            "Model: Default" if available else "Model: Default (catalog unavailable)", None
+            tr("Model: Default") if available else tr("Model: Default (catalog unavailable)"), None
         )
         for label, model_id in models:
             self.model_combo.addItem(label, model_id)
@@ -355,7 +356,7 @@ class ComposerWidget(QWidget):
         self.effort_combo.setToolTip("")
         self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
-        self.effort_combo.addItem("Effort: Default", None)
+        self.effort_combo.addItem(tr("Effort: Default"), None)
         for label, effort_id in efforts:
             self.effort_combo.addItem(label, effort_id)
         index = self.effort_combo.findData(selected)
@@ -372,13 +373,13 @@ class ComposerWidget(QWidget):
         self.access_combo.setToolTip("")
         if mode not in {"inherit", "danger-full-access"}:
             self.access_combo.clear()
-            self.access_combo.addItem(f"Access: {mode or 'Unknown'}", None)
+            self.access_combo.addItem(tr("Access: {p0}", p0=mode or tr("Unknown")), None)
             self.access_combo.setEnabled(False)
         else:
-            self.access_combo.setItemText(0, "Access: Default")
+            self.access_combo.setItemText(0, tr("Access: Default"))
             self.access_combo.setItemData(0, "inherit")
             if self.access_combo.count() == 1:
-                self.access_combo.addItem("Access: Full Access", "danger-full-access")
+                self.access_combo.addItem(tr("Access: Full Access"), "danger-full-access")
             self.access_combo.setEnabled(self._new_draft)
             self.access_combo.setCurrentIndex(0 if mode == "inherit" else 1)
         self.access_combo.blockSignals(False)
@@ -398,18 +399,18 @@ class ComposerWidget(QWidget):
     ) -> None:
         self.set_draft_mode(False)
         self.set_model_options([], None, available=False)
-        self.model_combo.setItemText(0, f"Model: {model or 'Unknown'}")
+        self.model_combo.setItemText(0, tr("Model: {p0}", p0=model or tr("Unknown")))
         self.model_combo.setToolTip(model_tooltip or "")
         self._refresh_combo_size_hint(self.model_combo)
         self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
-        self.effort_combo.addItem(f"Effort: {effort or 'Unknown'}", None)
+        self.effort_combo.addItem(tr("Effort: {p0}", p0=effort or tr("Unknown")), None)
         self.effort_combo.setToolTip(effort_tooltip or "")
         self.effort_combo.setEnabled(False)
         self.effort_combo.blockSignals(False)
         self._refresh_combo_size_hint(self.effort_combo)
         self._update_controls_layout()
-        self.set_access(sandbox_mode or "Unknown")
+        self.set_access(sandbox_mode or tr("Unknown"))
         self.access_combo.setToolTip(access_tooltip or "")
 
     def set_status(self, text: str, *, error: bool = False) -> None:

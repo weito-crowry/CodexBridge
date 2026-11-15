@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .bridge_runtime_observer import advance_bridge_generation, set_tunnel_bridge_ready
+from .i18n import tr
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -102,7 +103,7 @@ class BridgeLifecycleController:
             window._control_token = None
             window._bridge_transition = False
             window._set_runtime_state("launch_failed")
-            window.bottom_status_label.setText("Bridge launch failed")
+            window.bottom_status_label.setText(tr("Bridge launch failed"))
             window._schedule_managed_bridge_retry()
             return
         if not result.started:
@@ -110,7 +111,7 @@ class BridgeLifecycleController:
             window._control_token = None
             window._bridge_transition = False
             window._set_runtime_state("launch_failed")
-            window.bottom_status_label.setText("Bridge launch failed")
+            window.bottom_status_label.setText(tr("Bridge launch failed"))
             window._schedule_managed_bridge_retry()
             return
         window._detached_launch_started = True
@@ -125,7 +126,7 @@ class BridgeLifecycleController:
             window._set_runtime_state("launch_failed")
         else:
             window._set_runtime_state("launch_timed_out")
-        window.bottom_status_label.setText("Bridge launch timed out; it may still be starting")
+        window.bottom_status_label.setText(tr("Bridge launch timed out; it may still be starting"))
         window._schedule_managed_bridge_retry()
 
     def finish_launch_if_ready(self) -> None:
@@ -141,8 +142,8 @@ class BridgeLifecycleController:
         window._bridge_runtime_observer.reset_loss_count()
         window._bridge_managed_retry_coordinator.reset_after_ready()
         window._bridge_transition = False
-        window._set_runtime_state("console_started", label="Runtime: started by Console")
-        window.bottom_status_label.setText("Bridge started by Console")
+        window._set_runtime_state("console_started", label=tr("Runtime: started by Console"))
+        window.bottom_status_label.setText(tr("Bridge started by Console"))
         set_tunnel_bridge_ready(window, True)
         window._begin_usage_sequence()
         window._restore_restarted_tunnel()
@@ -176,7 +177,7 @@ class BridgeLifecycleController:
         window._health_observed = False
         window._status_observed = False
         window._set_runtime_state("stop_timed_out")
-        window.bottom_status_label.setText("Bridge stop timed out")
+        window.bottom_status_label.setText(tr("Bridge stop timed out"))
 
     def confirm_bridge_stopped(self) -> None:
         window = self._window
@@ -201,14 +202,14 @@ class BridgeLifecycleController:
                 window._bridge_transition = False
                 window._bridge_transition_coordinator.clear_restart_flag()
                 window._set_runtime_state("launch_failed")
-                window.bottom_status_label.setText("Bridge relaunch failed")
+                window.bottom_status_label.setText(tr("Bridge relaunch failed"))
                 return
             window._launch_bridge(resolution.path)
             return
         window._bridge_transition_coordinator.clear_restart_flag()
         window._bridge_transition = False
         window._sync_tunnel_controls()
-        window.bridge_status_label.setText("Bridge: disconnected")
-        window.app_server_status_label.setText("App Server: failed")
+        window.bridge_status_label.setText(tr("Bridge: disconnected"))
+        window.app_server_status_label.setText(tr("App Server: failed"))
         window._set_runtime_state("stopped")
-        window.bottom_status_label.setText("Bridge stopped")
+        window.bottom_status_label.setText(tr("Bridge stopped"))
