@@ -18,9 +18,11 @@ from codex_bridge.workflows.service import (
     WorkflowJobSnapshot,
     WorkflowNotFoundError,
     WorkflowResultSnapshot,
+    WorkflowService,
     WorkflowServiceUnavailable,
     WorkflowSnapshot,
 )
+from tests.test_workflows_api import FakeWorkerManager, _workflow_yaml
 
 _WORKFLOW_TOOLS = {
     "workflow_runs_list",
@@ -268,6 +270,45 @@ async def test_native_workflow_calls_use_shared_service_and_existing_public_shap
     assert service.result_ids == [_WORKFLOW_ID]
     assert runtime.start_count == 1
     assert runtime.shutdown_count == 1
+
+
+@pytest.mark.asyncio
+async def test_native_workflow_tools_read_temp_service_without_http_or_extra_worker_start(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state" / "workflows"
+    manager = FakeWorkerManager(state_root, tmp_path)
+    service = WorkflowService(manager, codex_bridge_port=8001)
+    started = await service.start_workflow(
+        client_request_id="phaseb1-mcp-read-state",
+        workflow_yaml=_workflow_yaml(),
+        input_data={"value": "test-only"},
+        workspace_root=str(workspace),
+    )
+    assert len(manager.start_calls) == 1
+
+    app = create_app(
+        _config(tmp_path, ("read",)),
+        runtime_factory=lambda _: FakeRuntime(service),
+    )
+    async with _mcp_client(app) as client:
+        listing = await client.call_tool("workflow_runs_list", {})
+        detail = await client.call_tool("workflow_run_get", {"workflow_id": started.workflow_id})
+        result = await client.call_tool("workflow_run_result", {"workflow_id": started.workflow_id})
+
+    assert [item["workflow_id"] for item in listing.structured_content["workflows"]] == [
+        started.workflow_id
+    ]
+    assert detail.structured_content["status"] == "running"
+    assert result.structured_content == {
+        "error": "workflow_not_completed",
+        "workflow_id": started.workflow_id,
+        "status": "running",
+    }
+    assert (state_root / "requests.sqlite").is_file()
+    assert len(manager.start_calls) == 1
 
 
 @pytest.mark.asyncio
