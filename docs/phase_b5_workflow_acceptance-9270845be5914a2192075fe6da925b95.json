@@ -1,0 +1,189 @@
+{
+  "attempt_id": "9270845be5914a2192075fe6da925b95",
+  "finished_at_utc": "2026-11-15T21:28:25.895+00:00",
+  "isolation": {
+    "distinct_control_and_mcp_tokens": true,
+    "github_mcp_disabled": true,
+    "isolated_auth_copy_verified": true,
+    "isolated_state_empty": true,
+    "lan_disabled": true,
+    "production_defaults_18000_18001_avoided": true,
+    "state_and_workspace_separate": true,
+    "status": "PASS",
+    "temp_root_label": "codexbridge-phase-b5-9bt9089x",
+    "workspace_label": "workspace"
+  },
+  "mcp_control_gate": {
+    "checks": {
+      "control_bearer_origin_host": {
+        "bad_host": 400,
+        "bad_origin": 403,
+        "status": "PASS",
+        "wrong_bearer": 403
+      }
+    },
+    "reason": "ValueError",
+    "status": "BLOCKED"
+  },
+  "offline_gate": {
+    "preflight": {
+      "active_codex_cli": "PASS",
+      "authentication_source": "AVAILABLE",
+      "parent_head_matches": "PASS",
+      "production_default_ports": "DEFERRED_TO_ISOLATION_PORT_RESERVATION",
+      "windows_python_and_dependencies": "PASS"
+    },
+    "static": {
+      "compileall": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "git_diff_cached_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "git_diff_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "mypy": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "ruff_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "ruff_format": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "uv_lock_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      }
+    },
+    "status": "PASS",
+    "tests": {
+      "groups": {
+        "console_smoke_and_b5_runner": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 244,
+            "skipped": 1,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "ows_regression": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 155,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "service_api_multijob_manager": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 439,
+            "skipped": 5,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "workflow_api_mcp_saved_definitions": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 107,
+            "skipped": 2,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        }
+      },
+      "totals": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 945,
+        "skipped": 8,
+        "xfailed": 0,
+        "xpassed": 0
+      }
+    }
+  },
+  "parent_head": "6d8b6b941a84d81694de5126e07998e3399ebf3e",
+  "phase": "B5",
+  "ports": {
+    "initial_random_loopback_pair": [
+      58195,
+      58196
+    ],
+    "production_defaults_avoided": true
+  },
+  "processes": {
+    "initial_bridge": {
+      "descendant_count_before_shutdown": 3,
+      "forced_termination": false,
+      "identity_verified": true,
+      "orphan_processes": 0,
+      "reaped": true
+    },
+    "restart_bridge": "NOT_RUN"
+  },
+  "reason": "ValueError",
+  "restart_gate": {
+    "checks": {},
+    "status": "NOT_RUN"
+  },
+  "runner_sha256": "5d2c6ae99b076c90a3a55083786c8e7499538c6f6c7f344127a3ae90bc0c0227",
+  "runtime": {
+    "active_codex_cli": "PASS",
+    "codex_authentication_source": "AVAILABLE",
+    "ows_dsl_version": "1.0.3",
+    "platform": "windows_native",
+    "python_version": "3.14.10",
+    "repository_venv": true,
+    "workflow_and_console_dependencies": {
+      "PySide6": "6.11.2",
+      "PyYAML": "6.0.3",
+      "dbos": "3.4.0",
+      "httpx2": "2.12.0",
+      "jq": "1.13.0",
+      "jsonschema": "4.25.1",
+      "mcp": "2.1.1",
+      "psutil": "7.2.2"
+    }
+  },
+  "saved_execution_gate": {
+    "posts": {
+      "actual_codex_job_observation": "NOT_OBSERVED",
+      "actual_codex_jobs": 0,
+      "initial_http_workflow_posts": 0,
+      "initial_post_outcome": "NOT_RUN",
+      "new_client_request_ids_after_initial": 0,
+      "same_id_conflict_http_posts": 0,
+      "same_id_mcp_replay_calls": 0,
+      "same_id_mcp_replay_outcome": "NOT_RUN",
+      "unique_initial_client_request_ids": 0
+    },
+    "status": "NOT_RUN"
+  },
+  "schema_version": 1,
+  "source_head": "6d8b6b941a84d81694de5126e07998e3399ebf3e",
+  "started_at_utc": "2026-11-15T21:16:22.469+00:00",
+  "status": "BLOCKED"
+}

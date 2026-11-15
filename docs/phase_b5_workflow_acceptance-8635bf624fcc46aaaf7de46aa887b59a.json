@@ -1,0 +1,136 @@
+{
+  "attempt_id": "8635bf624fcc46aaaf7de46aa887b59a",
+  "finished_at_utc": "2026-11-15T20:47:50.353+00:00",
+  "mcp_control_gate": {
+    "checks": {},
+    "status": "NOT_RUN"
+  },
+  "offline_gate": {
+    "preflight": {
+      "preflight_error": "production_default_port_in_use"
+    },
+    "reason": "runtime_preflight_unavailable",
+    "static": {
+      "compileall": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "git_diff_cached_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "git_diff_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "mypy": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "ruff_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "ruff_format": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "uv_lock_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      }
+    },
+    "status": "BLOCKED",
+    "tests": {
+      "groups": {
+        "console_smoke_and_b5_runner": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 242,
+            "skipped": 1,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "ows_regression": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 155,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "service_api_multijob_manager": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 439,
+            "skipped": 5,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "workflow_api_mcp_saved_definitions": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 107,
+            "skipped": 2,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        }
+      },
+      "totals": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 943,
+        "skipped": 8,
+        "xfailed": 0,
+        "xpassed": 0
+      }
+    }
+  },
+  "parent_head": "6d8b6b941a84d81694de5126e07998e3399ebf3e",
+  "phase": "B5",
+  "processes": {
+    "initial_bridge": "NOT_RUN",
+    "restart_bridge": "NOT_RUN"
+  },
+  "reason": "runtime_preflight_unavailable",
+  "restart_gate": {
+    "checks": {},
+    "status": "NOT_RUN"
+  },
+  "runner_sha256": "98de9c3d9e84884234d23486e7ceef5333c29402c71fdb7e59e784152a7c5e40",
+  "runtime": {},
+  "saved_execution_gate": {
+    "posts": {
+      "actual_codex_job_observation": "NOT_OBSERVED",
+      "actual_codex_jobs": 0,
+      "initial_http_workflow_posts": 0,
+      "initial_post_outcome": "NOT_RUN",
+      "new_client_request_ids_after_initial": 0,
+      "same_id_conflict_http_posts": 0,
+      "same_id_mcp_replay_calls": 0,
+      "same_id_mcp_replay_outcome": "NOT_RUN",
+      "unique_initial_client_request_ids": 0
+    },
+    "status": "NOT_RUN"
+  },
+  "schema_version": 1,
+  "source_head": "6d8b6b941a84d81694de5126e07998e3399ebf3e",
+  "started_at_utc": "2026-11-15T20:34:26.643+00:00",
+  "status": "BLOCKED"
+}
