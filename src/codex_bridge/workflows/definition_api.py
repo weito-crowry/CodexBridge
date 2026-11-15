@@ -172,9 +172,12 @@ def create_workflow_definition_routes(
             return forbidden
         if repository is None:
             return _definition_error(DefinitionRepositoryUnavailable("repository unavailable"))
-        if "if-match" not in request.headers:
+        if_match_values = request.headers.getlist("if-match")
+        if not if_match_values:
             return JSONResponse({"error": "precondition_required"}, status_code=428)
-        etag = request.headers["if-match"]
+        if len(if_match_values) != 1:
+            return _invalid_error()
+        etag = if_match_values[0]
         if not _STRONG_ETAG.fullmatch(etag):
             return _invalid_error()
         try:

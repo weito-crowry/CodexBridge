@@ -397,7 +397,13 @@ class WorkflowDefinitionRepository:
 
         with self._read_connection() as connection:
             if connection is None:
-                return None
+                raise DefinitionNotFound("workflow definition was not found")
+            definition_row = connection.execute(
+                "SELECT 1 FROM workflow_definitions WHERE definition_id = ?",
+                (canonical_id,),
+            ).fetchone()
+            if definition_row is None:
+                raise DefinitionNotFound("workflow definition was not found")
             rows = connection.execute(
                 """
                 SELECT result_revision, result_etag

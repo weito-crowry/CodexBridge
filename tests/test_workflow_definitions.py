@@ -305,6 +305,35 @@ def test_missing_database_reads_are_empty_or_not_found_without_creating_state(
     assert not state_root.exists()
 
 
+def test_revision_for_etag_distinguishes_unknown_id_from_mismatched_etag(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "etag-state"
+    repository = WorkflowDefinitionRepository(state_root)
+    unknown_id = "00000000-0000-4000-8000-000000000001"
+    valid_etag = '"workflow-definition-v1-' + "0" * 64 + '"'
+
+    with pytest.raises(DefinitionNotFound):
+        repository.revision_for_etag(unknown_id, valid_etag)
+    assert not state_root.exists()
+
+    first = repository.create(
+        mutation_request_id="etag-first-create",
+        source_yaml=VALID_YAML,
+        max_live_codex_jobs=1,
+    )
+    second = repository.create(
+        mutation_request_id="etag-second-create",
+        source_yaml=VALID_YAML.replace("definition-test", "definition-test-second"),
+        max_live_codex_jobs=1,
+    )
+
+    assert repository.revision_for_etag(first.definition_id, first.etag) == 1
+    assert repository.revision_for_etag(first.definition_id, second.etag) is None
+    with pytest.raises(DefinitionNotFound):
+        repository.revision_for_etag(unknown_id, first.etag)
+
+
 def test_read_only_missing_database_does_not_create_sqlite_file(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     state_root.mkdir()

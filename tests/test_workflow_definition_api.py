@@ -196,7 +196,15 @@ async def test_http_update_etag_errors_stale_cas_and_original_replay(tmp_path) -
                 headers=_auth(**{"if-match": value}),
                 json=_payload(f"bad-etag-{index}", source_three),
             )
-            for index, value in enumerate(("W/" + etag_one, "*", etag_one + ", " + etag_one))
+            for index, value in enumerate(
+                (
+                    "W/" + etag_one,
+                    "*",
+                    etag_one + ", " + etag_one,
+                    " " + etag_one,
+                    etag_one + " ",
+                )
+            )
         ]
 
     assert first_update.status_code == second_update.status_code == 200
@@ -209,6 +217,96 @@ async def test_http_update_etag_errors_stale_cas_and_original_replay(tmp_path) -
     assert stale.json() == {"error": "precondition_failed"}
     assert missing.status_code == 428
     assert all(response.status_code == 400 for response in malformed)
+
+
+@pytest.mark.asyncio
+async def test_http_update_rejects_duplicate_if_match_header_fields(tmp_path) -> None:
+    repository = WorkflowDefinitionRepository(tmp_path / "state")
+    app = _app(tmp_path, repository=repository)
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        created = await client.post(
+            _BASE, headers=_auth(), json=_payload("duplicate-header-create", _source("one"))
+        )
+        definition_id = created.json()["definition_id"]
+        response = await client.put(
+            f"{_BASE}/{definition_id}",
+            headers=[
+                ("authorization", f"Bearer {_TOKEN}"),
+                ("if-match", created.headers["etag"]),
+                ("if-match", created.headers["etag"]),
+            ],
+            json=_payload("duplicate-header-update", _source("two")),
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid"}
+    assert repository.get(definition_id).revision == 1
+
+
+@pytest.mark.asyncio
+async def test_http_put_unknown_definition_returns_404_with_or_without_database(tmp_path) -> None:
+    valid_etag = '"workflow-definition-v1-' + "0" * 64 + '"'
+    payload = _payload("unknown-definition-update", _source("unknown"))
+    unknown_id = "00000000-0000-4000-8000-000000000001"
+
+    empty_root = tmp_path / "empty-state"
+    empty_repository = WorkflowDefinitionRepository(empty_root)
+    empty_app = _app(tmp_path, repository=empty_repository)
+    async with httpx.AsyncClient(
+        transport=_transport(empty_app), base_url="http://localhost"
+    ) as client:
+        without_database = await client.put(
+            f"{_BASE}/{unknown_id}",
+            headers=_auth(**{"if-match": valid_etag}),
+            json=payload,
+        )
+    assert without_database.status_code == 404
+    assert without_database.json() == {"error": "not_found"}
+    assert not empty_root.exists()
+
+    repository = WorkflowDefinitionRepository(tmp_path / "initialized-state")
+    created = repository.create(
+        mutation_request_id="known-definition-create",
+        source_yaml=_source("known"),
+        max_live_codex_jobs=1,
+    )
+    app = _app(tmp_path, repository=repository)
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        with_database = await client.put(
+            f"{_BASE}/{unknown_id}",
+            headers=_auth(**{"if-match": created.etag}),
+            json=payload,
+        )
+        malformed_id = await client.put(
+            f"{_BASE}/not-a-uuid",
+            headers=_auth(**{"if-match": created.etag}),
+            json=payload,
+        )
+
+    assert with_database.status_code == 404
+    assert with_database.json() == {"error": "not_found"}
+    assert malformed_id.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_http_put_corrupt_definition_database_returns_503(tmp_path) -> None:
+    state_root = tmp_path / "corrupt-put-state"
+    state_root.mkdir()
+    database = state_root / "definitions.sqlite"
+    database.write_bytes(b"not sqlite")
+    repository = WorkflowDefinitionRepository(state_root)
+    app = _app(tmp_path, repository=repository)
+
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.put(
+            f"{_BASE}/{_DEFINITION_ID}",
+            headers=_auth(**{"if-match": '"workflow-definition-v1-' + "0" * 64 + '"'}),
+            json=_payload("corrupt-definition-update", _source("corrupt")),
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "repository_unavailable"}
+    assert database.read_bytes() == b"not sqlite"
 
 
 @pytest.mark.asyncio
