@@ -2,7 +2,7 @@
 
 ## 結論
 
-**隔離実機でのPhase 5F-5受入はR5でPASS（13項目）**。2026-11-14にWindows nativeの隔離環境で実施し、証跡は[phase5f5-integrated-acceptance-r5-evidence.json](phase5f5-integrated-acceptance-r5-evidence.json)。R5実行時のsource HEADは`74a6ed2b0beb9d3b86f36a7292c135db76144a22`であり、文書更新直前のコードHEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`とは異なる。したがって、後続HEADで全実機試験をやり直したという意味ではない。R5ではWorkflow A/Bの実Codex job計3件、Cのcapacity `409`、同一ID replay、Qt offscreen readback、read-only restart、graceful shutdownを確認した。R5後のコード修正はreplay evidence recorderに限定され、その後の実Codex POSTは0件。
+**隔離実機でのPhase 5F-5受入はR5でPASS（13項目）**。2026-11-14にWindows nativeの隔離環境で実施し、証跡は[phase5f5-integrated-acceptance-r5-evidence.json](phase5f5-integrated-acceptance-r5-evidence.json)。R5実行時のsource HEADは`74a6ed2b0beb9d3b86f36a7292c135db76144a22`であり、文書更新直前のコードHEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`とは異なる。したがって、後続HEADで全実機試験をやり直したという意味ではない。R5ではWorkflow A/Bの実Codex job計3件、Cのcapacity `409`、同一ID replay、Qt offscreen readback、read-only restart、graceful shutdownを確認した。R5後にはreplay証跡記録の修正、テストダブル・Qt後処理の改善、main_windowの責務分離などが行われたが、それらの後続コミットでR5実機受入を再実行しておらず、実Codex POSTの追加は0件である。
 
 以下のR1〜R4の詳細と結果表は当時の履歴であり、最終の隔離実機受入判定は「R5 隔離Windows native統合受入」節を参照する。R1〜R4に記録されたBLOCKED/FAIL/NOT_RUNは履歴として維持する。
 
