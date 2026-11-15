@@ -14,6 +14,7 @@ from .api import (
     WorkflowPayloadTooLarge,
     _authorization_error,
     _json_payload,
+    _snapshot_json,
 )
 from .definitions import (
     DefinitionError,
@@ -27,7 +28,15 @@ from .definitions import (
     WorkflowDefinitionRepository,
 )
 from .graph import project_workflow_graph
-from .service import WorkflowRequestError
+from .service import (
+    WorkflowConcurrencyConflict,
+    WorkflowReconciliationRequired,
+    WorkflowRequestConflict,
+    WorkflowRequestError,
+    WorkflowService,
+    WorkflowServiceUnavailable,
+    WorkflowStartFailed,
+)
 
 _MAX_SOURCE_YAML_BYTES = 64 * 1024
 _MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
@@ -37,9 +46,11 @@ _STRONG_ETAG = re.compile(r'"workflow-definition-v1-[0-9a-f]{64}"\Z', re.ASCII)
 def create_workflow_definition_routes(
     repository: WorkflowDefinitionRepository | None,
     *,
+    service: WorkflowService | None = None,
     token: str,
     ui_port: int,
     authorize: Callable[[Request, str | None], bool],
+    ready: Callable[[], bool] | None = None,
 ) -> list[Route]:
     """Create authenticated, read-only/definition-mutation Control routes."""
 
@@ -126,6 +137,80 @@ def create_workflow_definition_routes(
             return _invalid_error()
         except _PayloadTooLarge:
             return _payload_too_large()
+        except DefinitionError as error:
+            return _definition_error(error)
+        except Exception:
+            return _internal_error()
+
+    async def start_saved_run(request: Request) -> Response:
+        forbidden = authorize_request(request)
+        if forbidden is not None:
+            return forbidden
+        if service is None or repository is None:
+            return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
+        try:
+            payload = await _request_json(request)
+            if set(payload) - {"client_request_id", "revision", "workspace_root", "input"}:
+                raise WorkflowRequestError("request contains unsupported fields")
+            if not {"client_request_id", "revision", "workspace_root"} <= set(payload):
+                raise WorkflowRequestError("request is missing required fields")
+            client_request_id = payload["client_request_id"]
+            revision = payload["revision"]
+            workspace_root = payload["workspace_root"]
+            if not isinstance(client_request_id, str):
+                raise WorkflowRequestError("client_request_id must be a string")
+            if type(revision) is not int or revision < 1:
+                raise WorkflowRequestError("revision must be a positive integer")
+            if not isinstance(workspace_root, str):
+                raise WorkflowRequestError("workspace_root must be a string")
+            if ready is None or not ready():
+                return JSONResponse({"error": "bridge_not_ready"}, status_code=503)
+            snapshot = await service.start_saved_workflow(
+                repository=repository,
+                definition_id=request.path_params["definition_id"],
+                revision=revision,
+                client_request_id=client_request_id,
+                input_data=payload.get("input", {}),
+                workspace_root=workspace_root,
+            )
+            return JSONResponse(
+                {
+                    **_snapshot_json(snapshot),
+                    "definition_id": request.path_params["definition_id"],
+                    "revision": revision,
+                },
+                status_code=202,
+            )
+        except WorkflowPayloadTooLarge:
+            return _payload_too_large()
+        except WorkflowRequestError:
+            return _invalid_error()
+        except WorkflowRequestConflict:
+            return JSONResponse({"error": "request_id_conflict"}, status_code=409)
+        except WorkflowConcurrencyConflict:
+            return JSONResponse({"error": "workflow_capacity_reached"}, status_code=409)
+        except WorkflowStartFailed as error:
+            return JSONResponse(
+                {
+                    "error": "workflow_worker_not_ready",
+                    **_snapshot_json(error.snapshot),
+                    "definition_id": request.path_params["definition_id"],
+                    "revision": revision,
+                },
+                status_code=503,
+            )
+        except WorkflowReconciliationRequired as error:
+            return JSONResponse(
+                {
+                    "error": "workflow_needs_reconciliation",
+                    **_snapshot_json(error.snapshot),
+                    "definition_id": request.path_params["definition_id"],
+                    "revision": revision,
+                },
+                status_code=409,
+            )
+        except WorkflowServiceUnavailable:
+            return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
         except DefinitionError as error:
             return _definition_error(error)
         except Exception:
@@ -262,6 +347,11 @@ def create_workflow_definition_routes(
         Route(
             "/ui-api/control/workflow-definitions/validate",
             validate_definition,
+            methods=["POST"],
+        ),
+        Route(
+            "/ui-api/control/workflow-definitions/{definition_id}/runs",
+            start_saved_run,
             methods=["POST"],
         ),
         Route(

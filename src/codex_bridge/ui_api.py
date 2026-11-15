@@ -468,9 +468,11 @@ def create_ui_app(
         routes.extend(
             create_workflow_definition_routes(
                 workflow_definitions,
+                service=workflow_service,
                 token=config.control_token,
                 ui_port=config.ui_port,
                 authorize=_authorized_control_request,
+                ready=lambda: _app_server_ready(bridge),
             )
         )
     app = Starlette(routes=routes)

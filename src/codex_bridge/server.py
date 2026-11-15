@@ -45,6 +45,7 @@ from .workflows.definition_mcp import register_workflow_definition_tools
 from .workflows.definitions import WorkflowDefinitionRepository
 from .workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
 from .workflows.mcp import register_workflow_tools
+from .workflows.run_mcp import register_workflow_run_start_tool
 from .workflows.service import WorkflowService
 
 
@@ -421,6 +422,8 @@ def create_app(
         register_workflow_tools(mcp, config, lambda: runtime_holder["runtime"])
     if {"read", "write"} & set(config.workflow_mcp_permissions):
         register_workflow_definition_tools(mcp, config, lambda: runtime_holder["runtime"])
+    if "execute" in config.workflow_mcp_permissions:
+        register_workflow_run_start_tool(mcp, config, lambda: runtime_holder["runtime"])
     files = FileTools(config.allowed_roots)
 
     @mcp.tool()

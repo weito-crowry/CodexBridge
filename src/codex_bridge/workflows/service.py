@@ -8,12 +8,13 @@ import re
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..paths import AllowedPathPolicy, PathPolicyError
+from .definitions import WorkflowDefinitionRepository
 from .diagnostic_log import append_lifecycle_event
 from .manager import WorkflowManagerError, missing_workflow_dependencies
 from .startup_diagnostics import (
@@ -130,6 +131,18 @@ class WorkflowSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class _SavedWorkflowReference:
+    definition_id: str
+    revision: int
+    source_sha256: str
+    canonical_sha256: str
+
+    @property
+    def identity(self) -> tuple[str, int, str]:
+        return (self.definition_id, self.revision, self.source_sha256)
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowResultSnapshot:
     workflow: WorkflowSnapshot
     result: dict[str, Any] | None
@@ -146,6 +159,7 @@ class _PreparedRequest:
     workspace_root: str
     request_digest: str
     max_live_codex_jobs: int
+    saved_reference: _SavedWorkflowReference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +171,7 @@ class _RequestRow:
     state: str
     created_at: str
     updated_at: str
+    saved_reference: _SavedWorkflowReference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +211,7 @@ class WorkflowService:
         input_data: Any,
         workspace_root: str,
         max_live_codex_jobs: int = 1,
+        saved_reference: _SavedWorkflowReference | None = None,
     ) -> WorkflowSnapshot:
         missing = await asyncio.to_thread(missing_workflow_dependencies)
         if missing:
@@ -209,11 +225,17 @@ class WorkflowService:
                 workspace_root,
                 max_live_codex_jobs,
                 False,
+                saved_reference,
             )
         except WorkflowRequestError:
             raise
         except (ImportError, ModuleNotFoundError):
             raise WorkflowServiceUnavailable("workflow dependencies are unavailable") from None
+        if (
+            saved_reference is not None
+            and prepared.definition_sha256 != saved_reference.canonical_sha256
+        ):
+            raise WorkflowServiceUnavailable("saved workflow definition is inconsistent")
         async with self._start_lock:
             try:
                 existing = await asyncio.to_thread(
@@ -222,7 +244,9 @@ class WorkflowService:
             except (OSError, sqlite3.Error, ValueError):
                 raise WorkflowServiceUnavailable("workflow request ledger is unavailable") from None
             if existing is not None:
-                if existing.request_digest != prepared.request_digest:
+                if existing.request_digest != prepared.request_digest or _saved_reference_identity(
+                    existing.saved_reference
+                ) != _saved_reference_identity(prepared.saved_reference):
                     append_lifecycle_event(
                         self._state_root / existing.run_id,
                         source="bridge",
@@ -231,7 +255,11 @@ class WorkflowService:
                         workflow_id=existing.workflow_id,
                         request_digest=prepared.request_digest,
                         state=existing.state,
-                        reason_code="request_digest_mismatch",
+                        reason_code=(
+                            "request_digest_mismatch"
+                            if existing.request_digest != prepared.request_digest
+                            else "source_identity_mismatch"
+                        ),
                     )
                     raise WorkflowRequestConflict(
                         "request ID is already bound to different workflow content"
@@ -293,6 +321,41 @@ class WorkflowService:
                 diagnostic.begin(WorkflowStartupStage.REQUEST_RESERVED)
                 diagnostic.complete_if_active(WorkflowStartupStage.REQUEST_RESERVED)
                 return await self._start_reserved_workflow(row, prepared, diagnostic)
+
+    async def start_saved_workflow(
+        self,
+        *,
+        repository: WorkflowDefinitionRepository,
+        definition_id: str,
+        revision: int,
+        client_request_id: str,
+        input_data: Any,
+        workspace_root: str,
+    ) -> WorkflowSnapshot:
+        """Start one explicitly selected immutable definition revision."""
+        saved = await asyncio.to_thread(repository.get, definition_id, revision)
+        try:
+            source_sha256 = hashlib.sha256(
+                saved.source_yaml.encode("utf-8", errors="strict")
+            ).hexdigest()
+        except (AttributeError, UnicodeEncodeError):
+            raise WorkflowServiceUnavailable("saved workflow definition is inconsistent") from None
+        if source_sha256 != saved.source_sha256:
+            raise WorkflowServiceUnavailable("saved workflow definition is inconsistent")
+        reference = _SavedWorkflowReference(
+            definition_id=saved.definition_id,
+            revision=saved.revision,
+            source_sha256=saved.source_sha256,
+            canonical_sha256=saved.canonical_sha256,
+        )
+        return await self.start_workflow(
+            client_request_id=client_request_id,
+            workflow_yaml=saved.source_yaml,
+            input_data=input_data,
+            workspace_root=workspace_root,
+            max_live_codex_jobs=saved.max_live_codex_jobs,
+            saved_reference=reference,
+        )
 
     async def _start_reserved_workflow(
         self,
@@ -645,6 +708,7 @@ class WorkflowService:
         workspace_root: str,
         max_live_codex_jobs: int = 1,
         validate_definition: bool = True,
+        saved_reference: _SavedWorkflowReference | None = None,
     ) -> _PreparedRequest:
         if (
             not isinstance(client_request_id, str)
@@ -727,6 +791,7 @@ class WorkflowService:
             workspace_root=canonical_workspace,
             request_digest=digest,
             max_live_codex_jobs=max_live_codex_jobs,
+            saved_reference=saved_reference,
         )
 
     @staticmethod
@@ -837,6 +902,16 @@ def _initialize_write_connection(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS workflow_requests_state_idx ON workflow_requests(state)"
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_request_sources (
+            run_id TEXT PRIMARY KEY,
+            definition_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            source_sha256 TEXT NOT NULL
+        )
+        """
+    )
     connection.execute(f"PRAGMA busy_timeout = {_SQLITE_REQUEST_BUSY_TIMEOUT_MS}")
 
 
@@ -899,6 +974,51 @@ def _row_from_sql(row: sqlite3.Row) -> _RequestRow:
     return result
 
 
+def _saved_reference_identity(
+    reference: _SavedWorkflowReference | None,
+) -> tuple[str, int, str] | None:
+    return None if reference is None else reference.identity
+
+
+def _source_reference_for_run(
+    connection: sqlite3.Connection, run_id: str
+) -> _SavedWorkflowReference | None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("workflow_request_sources",),
+    ).fetchone()
+    if table is None:
+        return None
+    row = connection.execute(
+        "SELECT definition_id, revision, source_sha256 FROM workflow_request_sources "
+        "WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    definition_id = row["definition_id"]
+    revision = row["revision"]
+    source_sha256 = row["source_sha256"]
+    try:
+        canonical_id = str(uuid.UUID(str(definition_id)))
+    except (ValueError, AttributeError):
+        raise WorkflowServiceUnavailable("workflow source reference is invalid") from None
+    if (
+        canonical_id != definition_id
+        or type(revision) is not int
+        or revision < 1
+        or not isinstance(source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha256, re.ASCII) is None
+    ):
+        raise WorkflowServiceUnavailable("workflow source reference is invalid")
+    return _SavedWorkflowReference(
+        definition_id=canonical_id,
+        revision=revision,
+        source_sha256=source_sha256,
+        canonical_sha256="",
+    )
+
+
 def _find_request(state_root: Path, client_request_id: str) -> _RequestRow | None:
     root = _ensure_state_root(state_root, create=False)
     if root is None:
@@ -915,9 +1035,15 @@ def _find_request(state_root: Path, client_request_id: str) -> _RequestRow | Non
             "created_at, updated_at FROM workflow_requests WHERE client_request_id = ?",
             (client_request_id,),
         ).fetchone()
+        if row is None:
+            return None
+        request = _row_from_sql(row)
+        return replace(
+            request,
+            saved_reference=_source_reference_for_run(connection, request.run_id),
+        )
     finally:
         connection.close()
-    return None if row is None else _row_from_sql(row)
 
 
 def _find_workflow(state_root: Path, workflow_id: str) -> _RequestRow | None:
@@ -983,8 +1109,14 @@ def _reserve_request(
             (prepared.client_request_id,),
         ).fetchone()
         if existing_sql is not None:
-            existing = _row_from_sql(existing_sql)
-            if existing.request_digest != prepared.request_digest:
+            existing_row = _row_from_sql(existing_sql)
+            existing = replace(
+                existing_row,
+                saved_reference=_source_reference_for_run(connection, existing_row.run_id),
+            )
+            if existing.request_digest != prepared.request_digest or _saved_reference_identity(
+                existing.saved_reference
+            ) != _saved_reference_identity(prepared.saved_reference):
                 raise WorkflowRequestConflict(
                     "request ID is already bound to different workflow content"
                 )
@@ -1073,6 +1205,17 @@ def _reserve_request(
                 now,
             ),
         )
+        if prepared.saved_reference is not None:
+            connection.execute(
+                "INSERT INTO workflow_request_sources "
+                "(run_id, definition_id, revision, source_sha256) VALUES (?, ?, ?, ?)",
+                (
+                    run_id,
+                    prepared.saved_reference.definition_id,
+                    prepared.saved_reference.revision,
+                    prepared.saved_reference.source_sha256,
+                ),
+            )
         connection.execute("COMMIT")
         return (
             _RequestRow(
@@ -1083,6 +1226,7 @@ def _reserve_request(
                 "queued",
                 now,
                 now,
+                prepared.saved_reference,
             ),
             True,
         )
