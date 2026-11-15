@@ -665,6 +665,81 @@ def test_repository_managed_settings_reject_legacy_environment_conflicts(
     assert "8123" not in str(exc_info.value)
 
 
+def test_workflow_mcp_permissions_default_to_empty_and_parse_as_tuple() -> None:
+    default = BridgeConfig.from_sources(environ={}, config_data={})
+    configured = BridgeConfig.from_sources(
+        environ={},
+        config_data={"workflow": {"mcp_permissions": ["read", "write", "execute"]}},
+    )
+
+    assert default.workflow_mcp_permissions == ()
+    assert configured.workflow_mcp_permissions == ("read", "write", "execute")
+
+
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        ["admin"],
+        ["read", "read"],
+        [1],
+        "read",
+        [" read"],
+    ],
+)
+def test_workflow_mcp_permissions_reject_unknown_duplicate_and_invalid_values(
+    permissions: object,
+) -> None:
+    with pytest.raises(ConfigurationError, match="workflow.mcp_permissions"):
+        BridgeConfig.from_sources(
+            environ={}, config_data={"workflow": {"mcp_permissions": permissions}}
+        )
+
+
+def test_workflow_mcp_permissions_accept_environment_override_and_managed_conflict(
+    tmp_path, monkeypatch
+) -> None:
+    from codex_bridge import config_file
+
+    configured = BridgeConfig.from_sources(
+        environ={"CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS": "read,execute"},
+        config_data={"workflow": {"mcp_permissions": ["write"]}},
+    )
+    assert configured.workflow_mcp_permissions == ("read", "execute")
+
+    package = tmp_path / "src" / "codex_bridge"
+    package.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    monkeypatch.setattr(config_file, "__file__", str(package / "config_file.py"))
+    (tmp_path / "config.toml").write_text(
+        '[workflow]\nmcp_permissions = ["read"]\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigurationError, match="conflicts"):
+        BridgeConfig.from_sources(environ={"CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS": "write"})
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        'mcp_permissions = "read"',
+        "mcp_permissions = [1]",
+        'mcp_permissions = ["admin"]',
+        'mcp_permissions = ["read", "read"]',
+        'unknown = ["read"]',
+    ],
+)
+def test_workflow_mcp_permissions_strict_toml_schema_rejects_invalid_values(
+    tmp_path, setting: str
+) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "workflow-config.toml"
+    config_path.write_text(f"[workflow]\n{setting}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigFileError):
+        load_user_config(path=config_path)
+
+
 def test_tunnel_profile_schema_accepts_references_and_rejects_literal_secrets(tmp_path) -> None:
     from codex_bridge.config_file import ConfigFileError, load_user_config
 

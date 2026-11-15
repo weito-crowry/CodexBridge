@@ -192,6 +192,13 @@ Outside managed mode, precedence remains:
 explicit CLI option > environment variable > config file > built-in default
 ```
 
+Workflow MCP tools are disabled by default. Set `[workflow] mcp_permissions = ["read"]` in
+TOML (or `CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS=read` in the environment) to publish the three
+read-only tools for existing runs. `write` and `execute` are accepted permission values for future
+phases; they do not publish additional tools in Phase B1. This setting applies only to Workflow MCP
+tools. These permissions are not RBAC for existing Codex MCP tools and do not change their access.
+`mcp_token` remains transport authentication and is separate from Workflow permissions.
+
 `allowed_roots` is required at Bridge startup and every supplied or persisted working directory is
 validated as an absolute, existing, canonicalized directory inside one of those roots.
 
@@ -229,6 +236,7 @@ not supported. CodexBridge does not synchronize project files between machines.
 | `CODEX_BRIDGE_GITHUB_MCP_TOOLSETS` | empty | Optional `X-MCP-Toolsets` value. |
 | `CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS` | `0` | Maximum exposed upstream tools; `0` means unlimited. |
 | `CODEX_BRIDGE_GITHUB_PAT` | unset | Dedicated GitHub bearer token; environment-only. |
+| `CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS` | empty | Comma-separated Workflow MCP permissions: `read`, `write`, or `execute`. |
 
 The config file intentionally does not accept API keys, runtime control tokens, or the GitHub MCP
 PAT.

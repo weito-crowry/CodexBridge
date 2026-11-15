@@ -1342,6 +1342,7 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     runtime = build_runtime(config(tmp_path), shutdown_callback=callback)
 
     assert captured[0]["shutdown_callback"] is callback
+    assert captured[0]["workflow_service"] is runtime.workflow_service
     assert captured[0]["workflow_service"]._worker_manager is runtime.workflow_manager
 
 

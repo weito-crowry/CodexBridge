@@ -44,7 +44,9 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "toolsets": list,
         "max_tools": int,
     },
+    "workflow": {"mcp_permissions": list},
 }
+WORKFLOW_MCP_PERMISSIONS = frozenset({"read", "write", "execute"})
 _SECRET_TERMS = ("key", "token", "secret", "password", "credential", "pat")
 _TUNNEL_SECTIONS: dict[str, dict[str, type[object]]] = {
     "control_plane": {
@@ -283,6 +285,15 @@ def load_user_config(
             if expected is list:
                 if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                     raise ConfigFileError(f"{section}.{key} must be an array of strings")
+                if section == "workflow" and key == "mcp_permissions":
+                    if len(set(value)) != len(value):
+                        raise ConfigFileError(
+                            "workflow.mcp_permissions must not contain duplicates"
+                        )
+                    if any(item not in WORKFLOW_MCP_PERMISSIONS for item in value):
+                        raise ConfigFileError(
+                            "workflow.mcp_permissions contains an unsupported value"
+                        )
             elif expected is str and not isinstance(value, str):
                 raise ConfigFileError(f"{section}.{key} must be a string")
             normalized[key] = value

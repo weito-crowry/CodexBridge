@@ -42,6 +42,7 @@ from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
 from .workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
+from .workflows.mcp import register_workflow_tools
 from .workflows.service import WorkflowService
 
 
@@ -62,6 +63,7 @@ class BridgeRuntime:
     ui_server: LocalUiServer
     external_monitor: ExternalExecutionMonitor | None = None
     workflow_manager: WorkflowWorkerManager | None = None
+    workflow_service: WorkflowService | None = None
 
     async def start(self) -> None:
         await self.app_server.start()
@@ -196,6 +198,7 @@ def build_runtime(
         ui_server=ui_server,
         external_monitor=bridge.observations.external,
         workflow_manager=workflow_manager,
+        workflow_service=workflow_service,
     )
 
 
@@ -408,6 +411,8 @@ def create_app(
         instructions=MCP_SERVER_INSTRUCTIONS,
         extensions=[apps],
     )
+    if "read" in config.workflow_mcp_permissions:
+        register_workflow_tools(mcp, config, lambda: runtime_holder["runtime"])
     files = FileTools(config.allowed_roots)
 
     @mcp.tool()

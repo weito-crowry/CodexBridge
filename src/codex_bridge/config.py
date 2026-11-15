@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
-from .config_file import ConfigFileError, active_config_source, load_user_config
+from .config_file import (
+    WORKFLOW_MCP_PERMISSIONS,
+    ConfigFileError,
+    active_config_source,
+    load_user_config,
+)
 from .file_put import validate_file_put_inbox
 
 
@@ -99,6 +104,7 @@ _MANAGED_ENV_KEYS: dict[str, tuple[str, str]] = {
     "CODEX_BRIDGE_GITHUB_MCP_EXCLUDE": ("github_mcp", "exclude"),
     "CODEX_BRIDGE_GITHUB_MCP_TOOLSETS": ("github_mcp", "toolsets"),
     "CODEX_BRIDGE_GITHUB_MCP_MAX_TOOLS": ("github_mcp", "max_tools"),
+    "CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS": ("workflow", "mcp_permissions"),
 }
 MANAGED_CONFIG_ENVIRONMENT_KEYS = tuple(_MANAGED_ENV_KEYS)
 
@@ -220,6 +226,16 @@ def _github_prefix(value: object, source: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None:
         raise ConfigurationError(f"{source} contains unsupported tool-name characters")
     return value
+
+
+def _workflow_mcp_permissions(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list)) or any(type(item) is not str for item in value):
+        raise ConfigurationError("workflow.mcp_permissions must be an array of strings")
+    if len(set(value)) != len(value):
+        raise ConfigurationError("workflow.mcp_permissions must not contain duplicates")
+    if any(item not in WORKFLOW_MCP_PERMISSIONS for item in value):
+        raise ConfigurationError("workflow.mcp_permissions contains an unsupported value")
+    return tuple(value)
 
 
 def _target_url(value: object) -> str:
@@ -442,9 +458,15 @@ class BridgeConfig:
     targets: tuple[ExecutionTargetConfig, ...] = field(
         default_factory=lambda: (ExecutionTargetConfig("local", "Local PC", "local"),)
     )
+    workflow_mcp_permissions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "targets", _validate_execution_targets(self.targets))
+        object.__setattr__(
+            self,
+            "workflow_mcp_permissions",
+            _workflow_mcp_permissions(self.workflow_mcp_permissions),
+        )
         if self.mcp_token is not None and _CONTROL_TOKEN_PATTERN.fullmatch(self.mcp_token) is None:
             raise ConfigurationError(
                 "CODEX_BRIDGE_MCP_TOKEN must be 32-256 ASCII URL-safe characters"
@@ -489,14 +511,22 @@ class BridgeConfig:
         bridge_config = file_config.get("bridge", {})
         console_config = file_config.get("console", {})
         github_mcp_config = file_config.get("github_mcp", {})
+        workflow_config = file_config.get("workflow", {})
         configured_file_put_dir = bridge_config.get("file_put_dir")
         target_config = file_config.get("targets")
         if (
             not isinstance(bridge_config, Mapping)
             or not isinstance(console_config, Mapping)
             or not isinstance(github_mcp_config, Mapping)
+            or not isinstance(workflow_config, Mapping)
         ):
             raise ConfigurationError("CodexBridge configuration sections are malformed")
+
+        workflow_permissions = _workflow_mcp_permissions(
+            _split(values["CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS"], ",")
+            if "CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS" in values
+            else workflow_config.get("mcp_permissions", ())
+        )
 
         wait_max = _positive_float(
             "CODEX_BRIDGE_WAIT_MAX_SECONDS",
@@ -618,5 +648,6 @@ class BridgeConfig:
                 environ=values,
                 config_data=github_mcp_config,
             ),
+            workflow_mcp_permissions=workflow_permissions,
             targets=_execution_targets(target_config),
         )

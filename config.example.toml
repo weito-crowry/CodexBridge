@@ -65,6 +65,11 @@ exclude = []
 toolsets = []
 max_tools = 0
 
+# Existing Workflow run access is opt-in. B1 exposes only read-only MCP tools.
+# Allowed values are "read", "write", and "execute"; only "read" enables B1 tools.
+[workflow]
+mcp_permissions = []
+
 # An explicit target table must include exactly one local target.
 # [targets.local]
 # name = "Local PC"
