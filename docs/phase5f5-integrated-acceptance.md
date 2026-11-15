@@ -2,13 +2,15 @@
 
 ## 結論
 
-**Phase 5F-5の実機統合受入はBLOCKED。R2はBridge起動前にBLOCKED、R3はoffline regression failureのためNOT_RUN。A/B workflowは未送信で、製品動作をPASS判定していない。**
+**隔離実機でのPhase 5F-5受入はR5でPASS（13項目）**。2026-11-14にWindows nativeの隔離環境で実施し、証跡は[phase5f5-integrated-acceptance-r5-evidence.json](phase5f5-integrated-acceptance-r5-evidence.json)。R5実行時のsource HEADは`74a6ed2b0beb9d3b86f36a7292c135db76144a22`であり、現在の文書更新対象HEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`で全実機試験をやり直したという意味ではない。R5ではWorkflow A/Bの実Codex job計3件、Cのcapacity `409`、同一ID replay、Qt offscreen readback、read-only restart、graceful shutdownを確認した。R5後のコード修正はreplay evidence recorderに限定され、その後の実Codex POSTは0件。
+
+以下のR1〜R4の詳細と結果表は当時の履歴であり、最終の隔離実機受入判定は「R5 隔離Windows native統合受入」節を参照する。R1〜R4に記録されたBLOCKED/FAIL/NOT_RUNは履歴として維持する。
 
 初回のcanonical証跡はstate rootの包含判定誤りでBridge起動前にBLOCKEDとなった。R2は専用証跡pathと新しい隔離rootで実行し、runnerのstate root変数結線誤りでBridge起動前にBLOCKEDとなった。R2原因を修正後、offline Workflow suiteで1件FAILしたためR3 runnerは起動していない。canonical/R2のworkflow POSTと、今回のR3 workflow POST・Codex job・capacity probe・replayは0回である。production checkout、既存Bridge、D:\CodexBridge-PoC、既定ポート18000/18001には接続・書込・停止をしていない。
 
 初回証跡 [phase5f5-integrated-acceptance-evidence.json](phase5f5-integrated-acceptance-evidence.json) とR2証跡 [phase5f5-integrated-acceptance-r2-evidence.json](phase5f5-integrated-acceptance-r2-evidence.json) は変更していない。R2のrunner hashは `b88135f25e470517ca926946340dcf28ba0593e288aa109b576cafc64ca9d044`、source/headは`8e90588d1cf09d0a8a832fdd9cf70f7ef5e7ccf7`。今回の[phase5f5-integrated-acceptance-r3-evidence.json](phase5f5-integrated-acceptance-r3-evidence.json)は`status=NOT_RUN`、理由`offline_workflow_suite_failed_before_r3`。R3 runner hashは`f22fe6dbe8848a27cf49273fb34ec5f21d32757afa43277e0a24b73984a8cfa9`、gate記録のHEADは`ff2dab3538e290d1705552fbed251e3dc4777f87`。R2 rootは調査用に保持している。
 
-## 受入項目と結果
+## R2/R3時点の受入項目と結果（履歴）
 
 | 項目 | 状態 | 実施結果 |
 |---|---|---|
@@ -71,7 +73,17 @@ Focused testは初回1回と追加5回の計6回実行し、すべてPASSした�
 - 実クラッシュ復旧、あらゆるrace、無制限のfault injectionは今回の範囲外であり実施していない。
 - Phase 5F-4 GitHub review PASSと基準commit `9cdb00d2332a781e33387fffc1d237804a6ee4a4` は今回の開始条件として扱った。今回のbranch/commit自体のレビュー結果を意味しない。
 
-## 本番統合前 checklist
+## 現在の統合前に残る確認事項
+
+- GitHub Actions workflowは0件、対象commitのchecksも0件のため、CI PASSは未確認。
+- 全pytestは142 files / 2616 nodeidsを複数コミット・複数pytest processで分割実施し、集計は2604 PASS / 12 SKIP。過去バッチ1〜27の報告にあった1 PASSの加算漏れを訂正した値である。12 SKIPはWindows symlink作成権限による。現行HEAD上で全件を単一pytest processで実行した結果ではない。現行HEAD `5309bdc8ce7c6ee3485eb47b4847a061cdb2fd5d`での最新関連検証は152 PASSとstatic checks PASS。
+- Windows native clipboardを使うGUI dogfoodは`NOT_RUN`。R5のQt offscreen readbackとは別の未確認事項。
+- 専用TEMPで配布物と2つの非GUI EXE smoke結果は得たが、PyInstallerのexit codeを取得できず、正式な配布ビルドgateは未完了。追加ビルド検証は後続指示まで行わない。
+- devへのmerge/PR作成/production反映は未実施。製品本体でのGitHub Issueノード実連携も本Phaseの範囲外で、production統合後の特殊ノード拡充段階へ延期。
+
+これらはCI、単一processでの全件pytest、GUI/配布確認、production統合準備に残る項目であり、R5証跡に基づく隔離実機受入PASSを取り消すものではない。
+
+## R5以前の本番統合前チェックリスト（履歴）
 
 - [ ] Phase 5F-5差分をGitHubでレビューし、最終commitのCIを確認する。
 - [ ] Workflow容量競合テストのFAIL原因を、追加実Codex POSTなしで特定する。
