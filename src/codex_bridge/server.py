@@ -41,6 +41,8 @@ from .server_instructions import MCP_SERVER_INSTRUCTIONS
 from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
+from .workflows.definition_mcp import register_workflow_definition_tools
+from .workflows.definitions import WorkflowDefinitionRepository
 from .workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
 from .workflows.mcp import register_workflow_tools
 from .workflows.service import WorkflowService
@@ -64,6 +66,7 @@ class BridgeRuntime:
     external_monitor: ExternalExecutionMonitor | None = None
     workflow_manager: WorkflowWorkerManager | None = None
     workflow_service: WorkflowService | None = None
+    workflow_definitions: WorkflowDefinitionRepository | None = None
 
     async def start(self) -> None:
         await self.app_server.start()
@@ -178,6 +181,7 @@ def build_runtime(
         allowed_roots=config.allowed_roots,
         control_token=config.control_token,
     )
+    workflow_definitions = WorkflowDefinitionRepository(workflow_manager.state_root)
     workflow_service = WorkflowService(workflow_manager, codex_bridge_port=config.ui_port)
     ui_server = LocalUiServer(
         create_ui_app(
@@ -186,6 +190,7 @@ def build_runtime(
             config,
             shutdown_callback=shutdown_callback,
             workflow_service=workflow_service,
+            workflow_definitions=workflow_definitions,
         ),
         config.ui_port,
         graceful_shutdown_timeout=config.shutdown_grace_seconds,
@@ -199,6 +204,7 @@ def build_runtime(
         external_monitor=bridge.observations.external,
         workflow_manager=workflow_manager,
         workflow_service=workflow_service,
+        workflow_definitions=workflow_definitions,
     )
 
 
@@ -413,6 +419,8 @@ def create_app(
     )
     if "read" in config.workflow_mcp_permissions:
         register_workflow_tools(mcp, config, lambda: runtime_holder["runtime"])
+    if {"read", "write"} & set(config.workflow_mcp_permissions):
+        register_workflow_definition_tools(mcp, config, lambda: runtime_holder["runtime"])
     files = FileTools(config.allowed_roots)
 
     @mcp.tool()

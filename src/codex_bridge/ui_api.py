@@ -26,6 +26,8 @@ from .paths import PathPolicyError
 from .thread_titles import normalize_explicit_title
 from .ui_control import ControlConflictError, create_control_routes
 from .workflows.api import create_workflow_routes
+from .workflows.definition_api import create_workflow_definition_routes
+from .workflows.definitions import WorkflowDefinitionRepository
 from .workflows.service import WorkflowService
 
 
@@ -247,6 +249,7 @@ def create_ui_app(
     *,
     shutdown_callback: ShutdownCallback | None = None,
     workflow_service: WorkflowService | None = None,
+    workflow_definitions: WorkflowDefinitionRepository | None = None,
 ) -> Starlette:
     async def healthz(request: Request) -> Response:
         return JSONResponse({"status": "ok"})
@@ -462,6 +465,14 @@ def create_ui_app(
                     ready=lambda: _app_server_ready(bridge),
                 )
             )
+        routes.extend(
+            create_workflow_definition_routes(
+                workflow_definitions,
+                token=config.control_token,
+                ui_port=config.ui_port,
+                authorize=_authorized_control_request,
+            )
+        )
     app = Starlette(routes=routes)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     app.state.bridge = bridge

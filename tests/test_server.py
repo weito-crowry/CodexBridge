@@ -1330,6 +1330,7 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
             {
                 "shutdown_callback": kwargs.get("shutdown_callback"),
                 "workflow_service": kwargs.get("workflow_service"),
+                "workflow_definitions": kwargs.get("workflow_definitions"),
             }
         )
         return object()
@@ -1344,6 +1345,9 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     assert captured[0]["shutdown_callback"] is callback
     assert captured[0]["workflow_service"] is runtime.workflow_service
     assert captured[0]["workflow_service"]._worker_manager is runtime.workflow_manager
+    assert captured[0]["workflow_definitions"] is runtime.workflow_definitions
+    assert runtime.workflow_definitions is not None
+    assert runtime.workflow_definitions._state_root == runtime.workflow_manager.state_root
 
 
 def test_build_runtime_attaches_inert_workflow_manager(tmp_path) -> None:

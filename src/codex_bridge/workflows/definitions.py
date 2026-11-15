@@ -22,6 +22,7 @@ _BUSY_TIMEOUT_MS = 10_000
 _SOURCE_YAML_MAX_BYTES = 64 * 1024
 _MUTATION_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_STRONG_ETAG = re.compile(r'"workflow-definition-v1-[0-9a-f]{64}"\Z', re.ASCII)
 _CURSOR_COMPONENT = re.compile(r"[A-Za-z0-9_-]+\Z", re.ASCII)
 _CURSOR_MAX_LENGTH = 512
 _SCHEMA_UNAVAILABLE_PREFIX = "could not load official OWS v1.0.3 schema"
@@ -387,6 +388,43 @@ class WorkflowDefinitionRepository:
             if type(latest_revision) is not int or latest_revision < revision:
                 raise DefinitionRepositoryUnavailable("workflow definition storage is unavailable")
             return self._revision_from_row(revision_row)
+
+    def revision_for_etag(self, definition_id: str, etag: str) -> int | None:
+        """Resolve a recorded strong ETag to its immutable revision without writing state."""
+        canonical_id = _validate_definition_id(definition_id)
+        if not isinstance(etag, str) or not _STRONG_ETAG.fullmatch(etag):
+            raise DefinitionInvalid("workflow definition ETag is invalid")
+
+        with self._read_connection() as connection:
+            if connection is None:
+                return None
+            rows = connection.execute(
+                """
+                SELECT result_revision, result_etag
+                FROM workflow_definition_mutations
+                WHERE definition_id = ? AND result_etag = ?
+                """,
+                (canonical_id, etag),
+            ).fetchall()
+            if not rows:
+                return None
+
+            revisions: set[int] = set()
+            for row in rows:
+                revision = row["result_revision"]
+                if type(revision) is not int or revision < 1 or row["result_etag"] != etag:
+                    raise DefinitionRepositoryUnavailable(
+                        "workflow definition storage is unavailable"
+                    )
+                resolved = self._get_revision(connection, canonical_id, revision)
+                if resolved.etag != etag:
+                    raise DefinitionRepositoryUnavailable(
+                        "workflow definition storage is unavailable"
+                    )
+                revisions.add(revision)
+            if len(revisions) != 1:
+                raise DefinitionRepositoryUnavailable("workflow definition storage is unavailable")
+            return next(iter(revisions))
 
     def list(self, limit: int = 50, cursor: str | None = None) -> DefinitionPage:
         if type(limit) is not int or not 1 <= limit <= 100:

@@ -25,6 +25,10 @@ _MAX_BODY_BYTES = 128 * 1024
 _MAX_WORKFLOW_YAML_BYTES = 64 * 1024
 
 
+class WorkflowPayloadTooLarge(WorkflowRequestError):
+    """A request body exceeded the shared Workflow JSON parser limit."""
+
+
 def create_workflow_routes(
     service: WorkflowService,
     *,
@@ -200,13 +204,15 @@ async def _json_payload(request: Request) -> dict[str, Any]:
             declared_length = int(content_length)
         except ValueError:
             raise WorkflowRequestError("content length is invalid") from None
-        if declared_length < 0 or declared_length > _MAX_BODY_BYTES:
-            raise WorkflowRequestError("request body exceeds 128 KiB")
+        if declared_length < 0:
+            raise WorkflowRequestError("content length is invalid")
+        if declared_length > _MAX_BODY_BYTES:
+            raise WorkflowPayloadTooLarge("request body exceeds 128 KiB")
     body = bytearray()
     async for chunk in request.stream():
         body.extend(chunk)
         if len(body) > _MAX_BODY_BYTES:
-            raise WorkflowRequestError("request body exceeds 128 KiB")
+            raise WorkflowPayloadTooLarge("request body exceeds 128 KiB")
     try:
         value = json.loads(
             body,
