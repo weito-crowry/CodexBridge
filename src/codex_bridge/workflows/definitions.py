@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -9,7 +10,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ _BUSY_TIMEOUT_MS = 10_000
 _SOURCE_YAML_MAX_BYTES = 64 * 1024
 _MUTATION_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_CURSOR_COMPONENT = re.compile(r"[A-Za-z0-9_-]+\Z", re.ASCII)
+_CURSOR_MAX_LENGTH = 512
 _SCHEMA_UNAVAILABLE_PREFIX = "could not load official OWS v1.0.3 schema"
 
 
@@ -388,7 +391,7 @@ class WorkflowDefinitionRepository:
     def list(self, limit: int = 50, cursor: str | None = None) -> DefinitionPage:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise DefinitionInvalid("workflow definition list limit is invalid")
-        after_id = _decode_cursor(cursor)
+        after = _decode_cursor(cursor)
 
         with self._read_connection() as connection:
             if connection is None:
@@ -405,15 +408,27 @@ class WorkflowDefinitionRepository:
                   ON r.definition_id = d.definition_id
                  AND r.revision = d.latest_revision
             """
-            if after_id is None:
+            if after is None:
                 rows = connection.execute(
-                    query + " ORDER BY d.definition_id ASC LIMIT ?",
+                    query + " ORDER BY d.created_at DESC, d.definition_id DESC LIMIT ?",
                     (limit + 1,),
                 ).fetchall()
             else:
+                last_created_at, last_definition_id = after
                 rows = connection.execute(
-                    query + " WHERE d.definition_id > ? ORDER BY d.definition_id ASC LIMIT ?",
-                    (after_id, limit + 1),
+                    query
+                    + """
+                    WHERE d.created_at < ?
+                       OR (d.created_at = ? AND d.definition_id < ?)
+                    ORDER BY d.created_at DESC, d.definition_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        last_created_at,
+                        last_created_at,
+                        last_definition_id,
+                        limit + 1,
+                    ),
                 ).fetchall()
 
             has_more = len(rows) > limit
@@ -438,8 +453,10 @@ class WorkflowDefinitionRepository:
                     )
                 definition_created_at = row["definition_created_at"]
                 definition_updated_at = row["definition_updated_at"]
-                if not isinstance(definition_created_at, str) or not isinstance(
-                    definition_updated_at, str
+                if (
+                    not isinstance(definition_created_at, str)
+                    or not _is_canonical_utc_timestamp(definition_created_at)
+                    or not isinstance(definition_updated_at, str)
                 ):
                     raise DefinitionRepositoryUnavailable(
                         "workflow definition storage is unavailable"
@@ -457,7 +474,11 @@ class WorkflowDefinitionRepository:
                         etag=revision.etag,
                     )
                 )
-            next_cursor = _encode_cursor(items[-1].definition_id) if has_more and items else None
+            next_cursor = (
+                _encode_cursor(items[-1].created_at, items[-1].definition_id)
+                if has_more and items
+                else None
+            )
             return DefinitionPage(items=tuple(items), next_cursor=next_cursor)
 
     def _read_mutation_replay(
@@ -760,19 +781,56 @@ def _strong_etag(
     return f'"workflow-definition-v1-{digest}"'
 
 
-def _encode_cursor(definition_id: str) -> str:
-    return f"v1:{definition_id}"
+def _encode_cursor(created_at: str, definition_id: str) -> str:
+    payload = _canonical_json(
+        {
+            "created_at": created_at,
+            "definition_id": definition_id,
+        }
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return f"v1:{encoded}"
 
 
-def _decode_cursor(cursor: str | None) -> str | None:
+def _decode_cursor(cursor: str | None) -> tuple[str, str] | None:
     if cursor is None:
         return None
-    if not isinstance(cursor, str) or not cursor.startswith("v1:"):
+    if (
+        not isinstance(cursor, str)
+        or len(cursor) > _CURSOR_MAX_LENGTH
+        or not cursor.startswith("v1:")
+    ):
         raise DefinitionInvalid("workflow definition cursor is invalid")
-    definition_id = cursor[3:]
-    if not _is_canonical_uuid(definition_id):
+    encoded = cursor[3:]
+    if not _CURSOR_COMPONENT.fullmatch(encoded):
         raise DefinitionInvalid("workflow definition cursor is invalid")
-    return definition_id
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeError, TypeError):
+        raise DefinitionInvalid("workflow definition cursor is invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"created_at", "definition_id"}
+        or not isinstance(payload["created_at"], str)
+        or not _is_canonical_utc_timestamp(payload["created_at"])
+        or not _is_canonical_uuid(payload["definition_id"])
+        or _encode_cursor(payload["created_at"], payload["definition_id"]) != cursor
+    ):
+        raise DefinitionInvalid("workflow definition cursor is invalid")
+    return payload["created_at"], payload["definition_id"]
+
+
+def _is_canonical_utc_timestamp(value: str) -> bool:
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return timestamp.utcoffset() == timedelta(0) and value in {
+        timestamp.isoformat(),
+        timestamp.isoformat(timespec="microseconds"),
+    }
 
 
 def _utc_now() -> str:

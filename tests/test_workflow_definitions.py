@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -347,34 +349,108 @@ def test_unexpected_database_error_is_classified_without_exposing_path(
     assert str(database) not in str(raised.value)
 
 
-def test_list_uses_stable_keyset_cursor_and_enforces_limit_bounds(tmp_path: Path) -> None:
+def test_list_orders_newer_created_definitions_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = _repo(tmp_path)
-    first = repo.create(
-        mutation_request_id="list-create-a",
+    identifiers = iter(
+        [
+            uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            uuid.UUID("00000000-0000-4000-8000-000000000002"),
+        ]
+    )
+    timestamps = iter(
+        [
+            "2026-11-15T10:00:00.000000+00:00",
+            "2026-11-16T10:00:00.000000+00:00",
+        ]
+    )
+    monkeypatch.setattr(definitions_module.uuid, "uuid4", lambda: next(identifiers))
+    monkeypatch.setattr(definitions_module, "_utc_now", lambda: next(timestamps))
+
+    older = repo.create(
+        mutation_request_id="list-create-older",
         source_yaml=VALID_YAML,
         max_live_codex_jobs=1,
     )
-    second = repo.create(
-        mutation_request_id="list-create-b",
-        source_yaml=VALID_YAML.replace("definition-test", "definition-test-b"),
+    newer = repo.create(
+        mutation_request_id="list-create-newer",
+        source_yaml=VALID_YAML.replace("definition-test", "definition-test-newer"),
         max_live_codex_jobs=1,
     )
 
+    page = repo.list()
+
+    assert [item.definition_id for item in page.items] == [
+        newer.definition_id,
+        older.definition_id,
+    ]
+    assert [item.created_at for item in page.items] == [
+        "2026-11-16T10:00:00.000000+00:00",
+        "2026-11-15T10:00:00.000000+00:00",
+    ]
+
+
+def test_list_keyset_pages_tied_creation_times_by_descending_id_without_gaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    identifiers = iter(
+        [
+            uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            uuid.UUID("00000000-0000-4000-8000-000000000002"),
+            uuid.UUID("00000000-0000-4000-8000-000000000003"),
+        ]
+    )
+    timestamp = "2026-11-16T10:00:00.000000+00:00"
+    monkeypatch.setattr(definitions_module.uuid, "uuid4", lambda: next(identifiers))
+    monkeypatch.setattr(definitions_module, "_utc_now", lambda: timestamp)
+
+    saved = [
+        repo.create(
+            mutation_request_id=f"list-tied-{index}",
+            source_yaml=VALID_YAML.replace("definition-test", f"definition-test-{index}"),
+            max_live_codex_jobs=1,
+        )
+        for index in range(1, 4)
+    ]
+
     page_one = repo.list(limit=1)
     page_two = repo.list(limit=1, cursor=page_one.next_cursor)
+    page_three = repo.list(limit=1, cursor=page_two.next_cursor)
 
-    expected_ids = sorted([first.definition_id, second.definition_id])
-    assert [page_one.items[0].definition_id, page_two.items[0].definition_id] == expected_ids
-    assert page_one.next_cursor == f"v1:{expected_ids[0]}"
-    assert page_two.next_cursor is None
+    expected_ids = sorted((item.definition_id for item in saved), reverse=True)
+    assert [len(page.items) for page in (page_one, page_two, page_three)] == [1, 1, 1]
+    assert [
+        page_one.items[0].definition_id,
+        page_two.items[0].definition_id,
+        page_three.items[0].definition_id,
+    ] == expected_ids
+    assert page_one.next_cursor is not None
+    assert page_two.next_cursor is not None
+    assert page_three.next_cursor is None
+    cursor_payload = json.loads(
+        base64.urlsafe_b64decode(page_one.next_cursor.removeprefix("v1:") + "===")
+    )
+    assert cursor_payload == {
+        "created_at": timestamp,
+        "definition_id": expected_ids[0],
+    }
+
     with pytest.raises(DefinitionInvalid):
         repo.list(limit=0)
     with pytest.raises(DefinitionInvalid):
         repo.list(limit=101)
     with pytest.raises(DefinitionInvalid):
         repo.list(limit=True)
-    with pytest.raises(DefinitionInvalid):
-        repo.list(cursor="not-a-cursor")
+    for cursor in (
+        "not-a-cursor",
+        "v1:" + "A" * 600,
+        "v1:!!!!",
+        "v1:eyJjcmVhdGVkX2F0IjoiYmFkIn0",
+    ):
+        with pytest.raises(DefinitionInvalid):
+            repo.list(cursor=cursor)
 
 
 def test_independent_repository_instances_allow_only_one_stale_cas_update(
