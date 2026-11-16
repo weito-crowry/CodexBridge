@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from codex_bridge.console.workflow_controller import WorkflowManagementController
@@ -161,6 +161,302 @@ def test_workflow_controller_loads_list_detail_and_result_in_order(
     controller.shutdown()
 
 
+def test_workflow_controller_repeated_identical_polls_preserve_display_and_avoid_extra_gets(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    dialog = controller.dialog
+    dialog.workflow_list.setMaximumHeight(120)
+    rows = [
+        {
+            "workflow_id": f"workflow-{index}",
+            "status": "succeeded" if index == 0 else "running",
+            "created_at": "created",
+            "updated_at": "updated",
+        }
+        for index in range(50)
+    ]
+    payload = {"workflows": rows, "truncated": False}
+    selected: list[str] = []
+    dialog.workflow_selected.connect(selected.append)
+
+    client.succeed(client.calls[-1], 200, payload)
+    detail = _detail("workflow-0", "succeeded")
+    detail["max_live_codex_jobs"] = 2
+    detail["jobs"] = [
+        {
+            "job_id": "job-1",
+            "task_identity": "do[0].first",
+            "state": "SUCCEEDED",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        }
+    ]
+    client.succeed(client.calls[-1], 200, detail)
+    client.succeed(
+        client.calls[-1],
+        200,
+        {"result": {"result": {"final_text": "workflow complete"}}, "value": "stable"},
+    )
+    QApplication.instance().processEvents()
+    dialog.workflow_list.scrollToItem(dialog.workflow_list.item(49))
+    scrollbar = dialog.workflow_list.verticalScrollBar()
+    scroll_value = scrollbar.value()
+    assert scrollbar.maximum() > 0
+    assert scroll_value > 0
+
+    original_items = [dialog.workflow_list.item(index) for index in range(50)]
+    detail_labels = {key: label.text() for key, label in dialog.detail_labels.items()}
+    job_item = dialog.job_list.item(0)
+    job_text = job_item.text()
+    final_text = dialog.final_text_view.toPlainText()
+    result_json = dialog.result_json.toPlainText()
+    request_counts = {
+        kind: sum(call[0] == kind for call in client.calls) for kind in ("detail", "result")
+    }
+
+    for _ in range(2):
+        controller._refresh_if_ready()
+        list_call = client.calls[-1]
+        assert list_call[0] == "list"
+        client.succeed(list_call, 200, payload)
+
+        assert dialog.selected_workflow_id == "workflow-0"
+        assert all(dialog.workflow_list.item(index) is original_items[index] for index in range(50))
+        assert scrollbar.value() == scroll_value
+        assert {key: label.text() for key, label in dialog.detail_labels.items()} == detail_labels
+        assert dialog.job_list.item(0) is job_item
+        assert dialog.job_list.item(0).text() == job_text
+        assert dialog.final_text_view.toPlainText() == final_text
+        assert dialog.result_json.toPlainText() == result_json
+        assert dialog.copy_button.isEnabled()
+        assert dialog.result_button.isEnabled()
+        assert selected == ["workflow-0"]
+        assert sum(call[0] == "detail" for call in client.calls) == request_counts["detail"]
+        assert sum(call[0] == "result" for call in client.calls) == request_counts["result"]
+    controller.shutdown()
+
+
+def test_workflow_controller_refreshes_only_changed_selected_row_and_keeps_visible_result(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    rows = [
+        {
+            "workflow_id": "workflow-one",
+            "status": "running",
+            "created_at": "created",
+            "updated_at": "updated",
+        },
+        {
+            "workflow_id": "workflow-two",
+            "status": "queued",
+            "created_at": "created",
+            "updated_at": "updated",
+        },
+    ]
+    payload = {"workflows": rows, "truncated": False}
+    selected: list[str] = []
+    controller.dialog.workflow_selected.connect(selected.append)
+    client.succeed(client.calls[-1], 200, payload)
+    initial_detail = _detail("workflow-one")
+    initial_detail["max_live_codex_jobs"] = 2
+    initial_detail["jobs"] = [
+        {"job_id": "job-one", "task_identity": "do[0].first", "state": "RUNNING"}
+    ]
+    client.succeed(client.calls[-1], 200, initial_detail)
+    controller.dialog.set_result({"result": {"final_text": "previous visible result"}})
+    items = [controller.dialog.workflow_list.item(index) for index in range(2)]
+    unchanged_row_text = items[1].text()
+
+    changed_rows = [dict(row) for row in rows]
+    changed_rows[0]["status"] = "succeeded"
+    changed_rows[0]["updated_at"] = "updated later"
+    changed_payload = {"workflows": changed_rows, "truncated": False}
+    controller._refresh_if_ready()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, changed_payload)
+
+    assert client.calls[-1][0] == "detail"
+    changed_detail_call = client.calls[-1]
+    assert changed_detail_call[3] == "workflow-one"
+    assert controller.dialog.workflow_list.item(0) is items[0]
+    assert controller.dialog.workflow_list.item(1) is items[1]
+    assert "succeeded" in items[0].text()
+    assert items[1].text() == unchanged_row_text
+    assert controller.dialog.selected_workflow_id == "workflow-one"
+    assert selected == ["workflow-one"]
+    assert controller.dialog.detail_labels["status"].text() == "Workflow status: running"
+    assert controller.dialog.job_list.count() == 1
+    assert controller.dialog.final_text_view.toPlainText() == "previous visible result"
+
+    client.succeed(changed_detail_call, 200, _detail("workflow-one", "succeeded"))
+    assert client.calls[-1][0] == "result"
+    result_call = client.calls[-1]
+    assert result_call[3] == "workflow-one"
+    assert controller.dialog.final_text_view.toPlainText() == "previous visible result"
+    client.succeed(result_call, 200, {"result": {"final_text": "new result"}})
+    assert controller.dialog.final_text_view.toPlainText() == "new result"
+
+    nonselected_rows = [dict(row) for row in changed_rows]
+    nonselected_rows[1]["updated_at"] = "non-selected update"
+    controller._refresh_if_ready()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, {"workflows": nonselected_rows, "truncated": False})
+
+    assert controller.dialog.workflow_list.item(0) is items[0]
+    assert controller.dialog.workflow_list.item(1) is items[1]
+    assert controller.dialog.selected_workflow_id == "workflow-one"
+    assert selected == ["workflow-one"]
+    assert sum(call[0] == "detail" for call in client.calls) == 2
+    assert sum(call[0] == "result" for call in client.calls) == 1
+    controller.shutdown()
+
+
+def test_workflow_controller_reuses_items_and_clears_state_when_selection_disappears(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    dialog = controller.dialog
+    dialog.workflow_list.setMaximumHeight(120)
+    rows = [
+        {
+            "workflow_id": f"workflow-{index}",
+            "status": "running",
+            "created_at": "created",
+            "updated_at": "updated",
+        }
+        for index in range(50)
+    ]
+    payload = {"workflows": rows, "truncated": False}
+    selected: list[str] = []
+    cleared: list[bool] = []
+    dialog.workflow_selected.connect(selected.append)
+    dialog.selection_cleared.connect(lambda: cleared.append(True))
+    client.succeed(client.calls[-1], 200, payload)
+    client.succeed(client.calls[-1], 200, _detail("workflow-0"))
+    dialog.workflow_list.setCurrentRow(1)
+    selected_detail = _detail("workflow-1", "succeeded")
+    selected_detail["max_live_codex_jobs"] = 2
+    selected_detail["jobs"] = [
+        {
+            "job_id": "job-selected",
+            "task_identity": "do[0].selected",
+            "state": "SUCCEEDED",
+        }
+    ]
+    client.succeed(client.calls[-1], 200, selected_detail)
+    client.succeed(client.calls[-1], 200, {"result": {"final_text": "selected result"}})
+    job_item = dialog.job_list.item(0)
+    QApplication.instance().processEvents()
+    dialog.workflow_list.scrollToItem(dialog.workflow_list.item(35))
+    scrollbar = dialog.workflow_list.verticalScrollBar()
+    scroll_value = scrollbar.value()
+    assert scroll_value > 0
+    original_items = {
+        dialog.workflow_list.item(index).data(Qt.ItemDataRole.UserRole): dialog.workflow_list.item(
+            index
+        )
+        for index in range(dialog.workflow_list.count())
+    }
+
+    reordered_rows = [
+        dict(rows[0]),
+        {
+            "workflow_id": "workflow-new",
+            "status": "queued",
+            "created_at": "created",
+            "updated_at": "updated",
+        },
+        dict(rows[1]),
+        *[dict(row) for row in rows[3:]],
+    ]
+    controller._refresh_if_ready()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, {"workflows": reordered_rows, "truncated": False})
+
+    item_by_id = {
+        dialog.workflow_list.item(index).data(Qt.ItemDataRole.UserRole): dialog.workflow_list.item(
+            index
+        )
+        for index in range(dialog.workflow_list.count())
+    }
+    assert dialog.selected_workflow_id == "workflow-1"
+    assert selected == ["workflow-0", "workflow-1"]
+    assert item_by_id["workflow-0"] is original_items["workflow-0"]
+    assert item_by_id["workflow-1"] is original_items["workflow-1"]
+    assert "workflow-new" not in original_items
+    assert scrollbar.value() == scroll_value
+    assert dialog.detail_labels["workflow_id"].text() == "workflow-1"
+    assert dialog.job_list.item(0) is job_item
+    assert dialog.final_text_view.toPlainText() == "selected result"
+
+    removed_rows = [dict(row) for row in reordered_rows if row["workflow_id"] != "workflow-1"]
+    controller._refresh_if_ready()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, {"workflows": removed_rows, "truncated": False})
+
+    assert dialog.selected_workflow_id == "workflow-0"
+    assert controller._selected_workflow_id == "workflow-0"
+    assert controller._result_loaded_for is None
+    assert selected == ["workflow-0", "workflow-1", "workflow-0"]
+    assert dialog.detail_labels["workflow_id"].text() == "Not available"
+    assert dialog.job_list.count() == 0
+    assert dialog.final_text_view.toPlainText() == ""
+    fallback_detail = client.calls[-1]
+    assert fallback_detail[0] == "detail" and fallback_detail[3] == "workflow-0"
+    client.succeed(fallback_detail, 200, _detail("workflow-0"))
+
+    controller._pending_selected_workflow_id = "workflow-stale"
+    controller._refresh_if_ready()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, {"workflows": [], "truncated": False})
+
+    assert dialog.workflow_list.count() == 0
+    assert dialog.selected_workflow_id is None
+    assert controller._selected_workflow_id is None
+    assert controller._result_loaded_for is None
+    assert controller._pending_selected_workflow_id is None
+    assert dialog.detail_labels["workflow_id"].text() == "Not available"
+    assert dialog.final_text_view.toPlainText() == ""
+    assert selected == ["workflow-0", "workflow-1", "workflow-0"]
+    assert cleared == [True]
+    controller.shutdown()
+
+
+def test_workflow_controller_manual_refresh_reloads_detail_without_clearing_result(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    payload = _list_payload("workflow-one")
+    client.succeed(client.calls[-1], 200, payload)
+    client.succeed(client.calls[-1], 200, _detail("workflow-one", "succeeded"))
+    client.succeed(client.calls[-1], 200, {"result": {"final_text": "persisted result"}})
+    old_result = controller.dialog.final_text_view.toPlainText()
+    detail_count = sum(call[0] == "detail" for call in client.calls)
+    result_count = sum(call[0] == "result" for call in client.calls)
+
+    controller.refresh()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, payload)
+
+    assert client.calls[-1][0] == "detail"
+    detail_call = client.calls[-1]
+    assert controller.dialog.final_text_view.toPlainText() == old_result
+    assert sum(call[0] == "detail" for call in client.calls) == detail_count + 1
+    client.succeed(detail_call, 200, _detail("workflow-one", "succeeded"))
+
+    assert controller.dialog.final_text_view.toPlainText() == old_result
+    assert sum(call[0] == "result" for call in client.calls) == result_count
+    controller.shutdown()
+
+
 def test_workflow_controller_ignores_old_detail_after_selection_changes(
     managed_controller: ControllerFactory,
 ) -> None:
@@ -178,6 +474,28 @@ def test_workflow_controller_ignores_old_detail_after_selection_changes(
 
     client.succeed(new_detail, 200, _detail("workflow-two"))
     assert controller.dialog.detail_labels["workflow_id"].text() == "workflow-two"
+    controller.shutdown()
+
+
+def test_workflow_controller_ignores_old_result_after_selection_changes(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one", "workflow-two"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one", "succeeded"))
+    stale_result = client.calls[-1]
+    assert stale_result[0] == "result"
+
+    controller.dialog.workflow_list.setCurrentRow(1)
+    new_detail = client.calls[-1]
+    assert new_detail[0] == "detail" and new_detail[3] == "workflow-two"
+    assert stale_result[1] in client.aborted
+    client.succeed(stale_result, 200, {"result": {"final_text": "stale result"}})
+
+    assert controller.dialog.final_text_view.toPlainText() == ""
+    assert controller.dialog.result_json.toPlainText() == ""
+    client.succeed(new_detail, 200, _detail("workflow-two"))
+    assert controller.dialog.final_text_view.toPlainText() == ""
     controller.shutdown()
 
 

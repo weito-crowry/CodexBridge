@@ -91,6 +91,26 @@ def _display_identifier(value: object) -> str:
     return value
 
 
+def _format_workflow_row(row: Mapping[str, object]) -> tuple[str, str] | None:
+    workflow_id = row.get("workflow_id")
+    if not isinstance(workflow_id, str):
+        return None
+    displayed_id = _display_identifier(workflow_id)
+    if displayed_id == tr("Not available"):
+        return None
+    short_id = (
+        displayed_id if len(displayed_id) <= 20 else f"{displayed_id[:10]}…{displayed_id[-8:]}"
+    )
+    text = tr(
+        "{p0} · {p1} · started {p2} · updated {p3}",
+        p0=short_id,
+        p1=workflow_status_label(row.get("status")),
+        p2=_display_identifier(row.get("created_at")),
+        p3=_display_identifier(row.get("updated_at")),
+    )
+    return workflow_id, text
+
+
 def _safe_state(value: object) -> str:
     if isinstance(value, bool):
         return tr("Yes") if value else tr("No")
@@ -164,6 +184,7 @@ class WorkflowManagementDialog(QDialog):
     """A nonmodal, read-only view over the existing workflow control API."""
 
     workflow_selected = Signal(str)
+    selection_cleared = Signal()
     refresh_requested = Signal()
     start_requested = Signal()
     result_requested = Signal()
@@ -293,113 +314,216 @@ class WorkflowManagementDialog(QDialog):
         rows: Sequence[Mapping[str, object]],
         *,
         selected_workflow_id: str | None = None,
-    ) -> None:
-        selected = selected_workflow_id or self._current_workflow_id
-        self.workflow_list.blockSignals(True)
-        self.workflow_list.clear()
-        selected_item: QListWidgetItem | None = None
+    ) -> bool:
+        target_rows: list[tuple[str, str]] = []
+        seen_ids: set[str] = set()
         for row in rows[:50]:
-            workflow_id = row.get("workflow_id")
-            if not isinstance(workflow_id, str) or not workflow_id:
+            if not isinstance(row, Mapping):
                 continue
-            displayed_id = _display_identifier(workflow_id)
-            if displayed_id == tr("Not available"):
+            formatted = _format_workflow_row(row)
+            if formatted is None:
                 continue
-            short_id = (
-                displayed_id
-                if len(displayed_id) <= 20
-                else f"{displayed_id[:10]}…{displayed_id[-8:]}"
-            )
-            created = _display_identifier(row.get("created_at"))
-            updated = _display_identifier(row.get("updated_at"))
-            status = workflow_status_label(row.get("status"))
-            item = QListWidgetItem(
-                tr(
-                    "{p0} · {p1} · started {p2} · updated {p3}",
-                    p0=short_id,
-                    p1=status,
-                    p2=created,
-                    p3=updated,
-                )
-            )
-            item.setData(Qt.ItemDataRole.UserRole, workflow_id)
-            self.workflow_list.addItem(item)
-            if workflow_id == selected:
-                selected_item = item
-        self.workflow_list.blockSignals(False)
-        if self.workflow_list.count():
-            self.workflow_list.setCurrentItem(selected_item or self.workflow_list.item(0))
+            workflow_id, text = formatted
+            if workflow_id in seen_ids:
+                continue
+            seen_ids.add(workflow_id)
+            target_rows.append((workflow_id, text))
+
+        current = self._current_workflow_id
+        target_ids = [workflow_id for workflow_id, _text in target_rows]
+        target_id_set = set(target_ids)
+        selected: str | None
+        if selected_workflow_id in target_id_set:
+            selected = selected_workflow_id
+        elif current in target_id_set:
+            selected = current
         else:
-            self._current_workflow_id = None
-            self.clear_selection()
+            selected = target_ids[0] if target_ids else None
+
+        old_items = [self.workflow_list.item(index) for index in range(self.workflow_list.count())]
+        old_ids = [
+            item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(item.data(Qt.ItemDataRole.UserRole), str)
+            else None
+            for item in old_items
+        ]
+        old_text_by_id = {
+            item_id: item.text()
+            for item_id, item in zip(old_ids, old_items, strict=True)
+            if isinstance(item_id, str)
+        }
+        target_text_by_id = dict(target_rows)
+        scrollbar = self.workflow_list.verticalScrollBar()
+        scroll_value = scrollbar.value()
+        selected_row_changed = (
+            selected == current
+            and isinstance(selected, str)
+            and old_text_by_id.get(selected) != target_text_by_id.get(selected)
+        )
+
+        if old_ids == target_ids:
+            items_by_id = {
+                item_id: item
+                for item_id, item in zip(old_ids, old_items, strict=True)
+                if isinstance(item_id, str)
+            }
+            text_changed = False
+            for workflow_id, text in target_rows:
+                item = items_by_id[workflow_id]
+                if item.text() != text:
+                    item.setText(text)
+                    text_changed = True
+            if selected != self._current_workflow_id:
+                previous_blocked = self.workflow_list.blockSignals(True)
+                try:
+                    if selected is None:
+                        self.workflow_list.setCurrentRow(-1)
+                    else:
+                        self.workflow_list.setCurrentItem(items_by_id[selected])
+                finally:
+                    self.workflow_list.blockSignals(previous_blocked)
+                self._apply_selection(selected)
+            elif not text_changed:
+                return False
+            if scrollbar.value() != scroll_value:
+                scrollbar.setValue(scroll_value)
+            return selected_row_changed
+
+        existing_items_by_id: dict[str, QListWidgetItem] = {}
+        for item_id, item in zip(old_ids, old_items, strict=True):
+            if isinstance(item_id, str) and item_id not in existing_items_by_id:
+                existing_items_by_id[item_id] = item
+
+        previous_blocked = self.workflow_list.blockSignals(True)
+        try:
+            while self.workflow_list.count():
+                self.workflow_list.takeItem(0)
+            target_items: dict[str, QListWidgetItem] = {}
+            for index, (workflow_id, text) in enumerate(target_rows):
+                target_item = existing_items_by_id.get(workflow_id)
+                if target_item is None:
+                    target_item = QListWidgetItem(text)
+                elif target_item.text() != text:
+                    target_item.setText(text)
+                target_item.setData(Qt.ItemDataRole.UserRole, workflow_id)
+                self.workflow_list.insertItem(index, target_item)
+                target_items[workflow_id] = target_item
+            if selected is None:
+                self.workflow_list.setCurrentRow(-1)
+            else:
+                self.workflow_list.setCurrentItem(target_items[selected])
+        finally:
+            self.workflow_list.blockSignals(previous_blocked)
+        scrollbar.setValue(scroll_value)
+        self._apply_selection(selected)
+        return selected_row_changed
 
     def _selection_changed(
         self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
     ) -> None:
         workflow_id = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
-        self._current_workflow_id = workflow_id if isinstance(workflow_id, str) else None
-        self.copy_button.setEnabled(self._current_workflow_id is not None)
-        self.result_button.setEnabled(False)
+        self._apply_selection(workflow_id if isinstance(workflow_id, str) else None)
+
+    def _apply_selection(self, workflow_id: str | None) -> None:
+        if workflow_id == self._current_workflow_id:
+            return
+        self._current_workflow_id = workflow_id
+        copy_enabled = workflow_id is not None
+        if self.copy_button.isEnabled() != copy_enabled:
+            self.copy_button.setEnabled(copy_enabled)
+        if self.result_button.isEnabled():
+            self.result_button.setEnabled(False)
         self.clear_detail()
         self.clear_result()
-        if self._current_workflow_id is not None:
-            self.workflow_selected.emit(self._current_workflow_id)
+        if workflow_id is not None:
+            self.workflow_selected.emit(workflow_id)
+        else:
+            self.selection_cleared.emit()
 
     def clear_selection(self) -> None:
-        self.workflow_list.clearSelection()
-        self.workflow_list.setCurrentRow(-1)
-        self._current_workflow_id = None
-        self.copy_button.setEnabled(False)
-        self.result_button.setEnabled(False)
-        self.clear_detail()
-        self.clear_result()
+        previous_blocked = self.workflow_list.blockSignals(True)
+        try:
+            self.workflow_list.clearSelection()
+            self.workflow_list.setCurrentRow(-1)
+        finally:
+            self.workflow_list.blockSignals(previous_blocked)
+        self._apply_selection(None)
 
     def clear_detail(self) -> None:
         for label in self.detail_labels.values():
-            label.setText(tr("Not available"))
-        self.job_list.clear()
-        self.jobs_group.setVisible(False)
+            placeholder = tr("Not available")
+            if label.text() != placeholder:
+                label.setText(placeholder)
+        self._sync_job_items([])
+        if not self.jobs_group.isHidden():
+            self.jobs_group.setVisible(False)
 
     def clear_result(self) -> None:
-        self.final_text_view.clear()
-        self.result_json.clear()
+        if self.final_text_view.toPlainText():
+            self.final_text_view.clear()
+        if self.result_json.toPlainText():
+            self.result_json.clear()
 
     def set_detail(self, detail: Mapping[str, object], *, error_code: str | None = None) -> None:
         status = detail.get("status")
-        self.detail_labels["workflow_id"].setText(_display_identifier(detail.get("workflow_id")))
-        self.detail_labels["status"].setText(workflow_status_label(status))
-        self.detail_labels["created_at"].setText(_display_identifier(detail.get("created_at")))
-        self.detail_labels["updated_at"].setText(_display_identifier(detail.get("updated_at")))
-        self.detail_labels["job_id"].setText(_display_identifier(detail.get("job_id")))
-        self.detail_labels["thread_id"].setText(_display_identifier(detail.get("thread_id")))
-        self.detail_labels["worker_state"].setText(_safe_state(detail.get("worker_state")))
-        self.detail_labels["terminal"].setText(_safe_state(detail.get("terminal")))
+        values = {
+            "workflow_id": _display_identifier(detail.get("workflow_id")),
+            "status": workflow_status_label(status),
+            "created_at": _display_identifier(detail.get("created_at")),
+            "updated_at": _display_identifier(detail.get("updated_at")),
+            "job_id": _display_identifier(detail.get("job_id")),
+            "thread_id": _display_identifier(detail.get("thread_id")),
+            "worker_state": _safe_state(detail.get("worker_state")),
+            "terminal": _safe_state(detail.get("terminal")),
+        }
+        for key, value in values.items():
+            label = self.detail_labels[key]
+            if label.text() != value:
+                label.setText(value)
         failure_state = status in {"failed", "failed_to_start", "needs_reconciliation", "unknown"}
         classification = error_code or (str(status) if failure_state else "")
-        self.detail_labels["error"].setText(
-            workflow_error_message(classification) if classification else tr("None")
-        )
-        self.job_list.clear()
+        error_text = workflow_error_message(classification) if classification else tr("None")
+        if self.detail_labels["error"].text() != error_text:
+            self.detail_labels["error"].setText(error_text)
         max_jobs = detail.get("max_live_codex_jobs")
         two_job_workflow = type(max_jobs) is int and max_jobs == 2
-        self.jobs_group.setVisible(two_job_workflow)
+        jobs_visible = not self.jobs_group.isHidden()
+        if jobs_visible != two_job_workflow:
+            self.jobs_group.setVisible(two_job_workflow)
         jobs = detail.get("jobs")
+        job_texts: list[str] = []
         if two_job_workflow and isinstance(jobs, list):
             for index, job in enumerate(jobs[:2], start=1):
                 if isinstance(job, Mapping):
-                    self.job_list.addItem(_codex_job_list_item(index, job))
-        self.result_button.setEnabled(status == "succeeded")
+                    job_texts.append(_codex_job_list_item(index, job))
+        self._sync_job_items(job_texts)
+        result_enabled = status == "succeeded"
+        if self.result_button.isEnabled() != result_enabled:
+            self.result_button.setEnabled(result_enabled)
+
+    def _sync_job_items(self, texts: Sequence[str]) -> None:
+        for index, text in enumerate(texts):
+            if index < self.job_list.count():
+                item = self.job_list.item(index)
+                if item.text() != text:
+                    item.setText(text)
+            else:
+                self.job_list.addItem(text)
+        while self.job_list.count() > len(texts):
+            self.job_list.takeItem(self.job_list.count() - 1)
 
     def set_error_classification(self, code: str) -> None:
         self.detail_labels["error"].setText(workflow_error_message(code))
 
     def set_result(self, payload: object) -> None:
         safe_payload = _redact_result(payload)
-        self.result_json.setPlainText(json.dumps(safe_payload, ensure_ascii=False, indent=2))
+        json_text = json.dumps(safe_payload, ensure_ascii=False, indent=2)
         final_text = _extract_final_text(payload)
-        self.final_text_view.setPlainText(
-            str(_redact_result(final_text)) if final_text is not None else ""
-        )
+        final_text_display = str(_redact_result(final_text)) if final_text is not None else ""
+        if self.result_json.toPlainText() != json_text:
+            self.result_json.setPlainText(json_text)
+        if self.final_text_view.toPlainText() != final_text_display:
+            self.final_text_view.setPlainText(final_text_display)
 
     def copy_selected_id(self) -> None:
         application = QApplication.instance()

@@ -45,6 +45,7 @@ class WorkflowManagementController(QObject):
         self._dialog.start_requested.connect(self._start_new_workflow)
         self._dialog.result_requested.connect(self._request_selected_result)
         self._dialog.workflow_selected.connect(self._select_workflow)
+        self._dialog.selection_cleared.connect(self._clear_workflow_selection)
         self._dialog.finished.connect(self._on_dialog_closed)
         self._signal_connections: list[tuple[Any, Any]] = []
         self._timer = QTimer(self)
@@ -57,6 +58,8 @@ class WorkflowManagementController(QObject):
         self._inflight: _WorkflowRequest | None = None
         self._selected_workflow_id: str | None = None
         self._pending_selected_workflow_id: str | None = None
+        self._pending_detail_workflow_id: str | None = None
+        self._manual_detail_refresh_id: str | None = None
         self._result_loaded_for: str | None = None
         self._active_start_dialog: StartWorkflowDialog | None = None
         self._auth_blocked_token: str | None = None
@@ -161,6 +164,7 @@ class WorkflowManagementController(QObject):
         if not self._availability[0]:
             self._dialog.set_message(tr("Bridge unavailable"))
             return
+        self._manual_detail_refresh_id = self._selected_workflow_id
         # This is an explicit user request. Authentication failures suppress polling,
         # while a manual refresh remains available after reviewing the message.
         self._auth_blocked_token = None
@@ -184,13 +188,39 @@ class WorkflowManagementController(QObject):
         )
 
     def _select_workflow(self, workflow_id: str) -> None:
+        if workflow_id == self._selected_workflow_id:
+            return
         self._selection_generation += 1
         self._selected_workflow_id = workflow_id
         self._result_loaded_for = None
+        if self._manual_detail_refresh_id != workflow_id:
+            self._manual_detail_refresh_id = None
         if self._inflight is not None and self._inflight.kind in {"detail", "result"}:
             self._cancel_inflight()
         if self._inflight is None:
+            self._pending_detail_workflow_id = None
             self._request_detail(workflow_id)
+        else:
+            self._pending_detail_workflow_id = workflow_id
+
+    def _clear_workflow_selection(self) -> None:
+        if (
+            self._selected_workflow_id is None
+            and self._pending_selected_workflow_id is None
+            and self._pending_detail_workflow_id is None
+            and self._manual_detail_refresh_id is None
+            and self._result_loaded_for is None
+        ):
+            return
+        self._selection_generation += 1
+        self._selected_workflow_id = None
+        self._pending_selected_workflow_id = None
+        self._pending_detail_workflow_id = None
+        self._manual_detail_refresh_id = None
+        self._result_loaded_for = None
+        if self._inflight is not None and self._inflight.kind in {"detail", "result"}:
+            self._cancel_inflight()
+        self._update_buttons()
 
     def _request_detail(self, workflow_id: str) -> None:
         if not self._can_request() or self._inflight is not None:
@@ -202,6 +232,10 @@ class WorkflowManagementController(QObject):
                 workflow_id, token, key=key
             ),
         )
+
+    def _request_detail_if_idle(self, workflow_id: str) -> None:
+        if self._inflight is None:
+            self._request_detail(workflow_id)
 
     def _request_selected_result(self) -> None:
         workflow_id = self._selected_workflow_id
@@ -298,9 +332,24 @@ class WorkflowManagementController(QObject):
             for row in rows_value[:50]
             if isinstance(row, Mapping) and isinstance(row.get("workflow_id"), str)
         ]
+        pending_detail_id = self._pending_detail_workflow_id
+        self._pending_detail_workflow_id = None
+        manual_detail_id = self._manual_detail_refresh_id
+        self._manual_detail_refresh_id = None
         selected = self._pending_selected_workflow_id or self._selected_workflow_id
         self._pending_selected_workflow_id = None
-        self._dialog.set_workflows(rows, selected_workflow_id=selected)
+        selected_row_changed = self._dialog.set_workflows(rows, selected_workflow_id=selected)
+        selected_after_update = self._dialog.selected_workflow_id
+        if selected_after_update is None:
+            self._clear_workflow_selection()
+        elif selected_after_update != self._selected_workflow_id:
+            self._select_workflow(selected_after_update)
+        if selected_after_update is not None and (
+            selected_row_changed
+            or selected_after_update == pending_detail_id
+            or selected_after_update == manual_detail_id
+        ):
+            self._request_detail_if_idle(selected_after_update)
         truncated = isinstance(payload, Mapping) and payload.get("truncated") is True
         self._dialog.set_message(
             tr("Showing the newest 50 workflows") if truncated else tr("Workflow list updated")
@@ -483,6 +532,8 @@ class WorkflowManagementController(QObject):
         self._epoch += 1
         self._cancel_inflight()
         self._selected_workflow_id = None
+        self._pending_detail_workflow_id = None
+        self._manual_detail_refresh_id = None
         self._result_loaded_for = None
         active = self._active_start_dialog
         if active is not None:
@@ -496,6 +547,8 @@ class WorkflowManagementController(QObject):
         self._timer.stop()
         self._epoch += 1
         self._cancel_inflight()
+        self._pending_detail_workflow_id = None
+        self._manual_detail_refresh_id = None
         active = self._active_start_dialog
         if active is not None:
             active.force_close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from codex_bridge.console.i18n import initialize_language
@@ -60,6 +60,64 @@ def test_workflow_management_dialog_lists_short_ids_and_emits_selected_full_id(
     dialog.workflow_list.setCurrentRow(1)
     assert dialog.selected_workflow_id == second_id
     assert selected[-1] == second_id
+
+
+def test_workflow_management_dialog_updates_rows_by_id_without_clearing_selection_or_result() -> (
+    None
+):
+    _app()
+    dialog = WorkflowManagementDialog()
+    first_id = "workflow-first"
+    rows = [
+        {
+            "workflow_id": first_id,
+            "status": "running",
+            "created_at": "created",
+            "updated_at": "updated",
+        },
+        {
+            "workflow_id": "workflow-second",
+            "status": "queued",
+            "created_at": "created",
+            "updated_at": "updated",
+        },
+    ]
+    selected: list[str] = []
+    dialog.workflow_selected.connect(selected.append)
+
+    dialog.set_workflows(rows)
+    dialog.set_detail(
+        {
+            "workflow_id": first_id,
+            "status": "running",
+            "max_live_codex_jobs": 2,
+            "jobs": [{"job_id": "job-first", "task_identity": "do[0]", "state": "RUNNING"}],
+        }
+    )
+    dialog.set_result({"result": {"final_text": "previous result"}, "value": "visible"})
+    items = [dialog.workflow_list.item(index) for index in range(dialog.workflow_list.count())]
+    second_text = items[1].text()
+    detail_status = dialog.detail_labels["status"].text()
+    job_item = dialog.job_list.item(0)
+    final_text = dialog.final_text_view.toPlainText()
+    result_json = dialog.result_json.toPlainText()
+
+    changed_rows = [dict(row) for row in rows]
+    changed_rows[0]["status"] = "succeeded"
+    changed_rows[0]["updated_at"] = "updated later"
+    dialog.set_workflows(changed_rows)
+
+    assert dialog.workflow_list.item(0) is items[0]
+    assert dialog.workflow_list.item(1) is items[1]
+    assert "succeeded" in items[0].text()
+    assert items[1].text() == second_text
+    assert dialog.selected_workflow_id == first_id
+    assert selected == [first_id]
+    assert dialog.detail_labels["status"].text() == detail_status
+    assert dialog.job_list.item(0) is job_item
+    assert dialog.final_text_view.toPlainText() == final_text
+    assert dialog.result_json.toPlainText() == result_json
+    dialog.close()
 
 
 def test_workflow_management_dialog_displays_details_and_redacts_result_secrets() -> None:
@@ -278,6 +336,25 @@ def test_workflow_management_dialog_caps_list_at_fifty_rows() -> None:
     dialog.set_workflows(rows)
 
     assert dialog.workflow_list.count() == 50
+
+
+def test_workflow_management_dialog_deduplicates_and_hides_unsafe_workflow_ids() -> None:
+    _app()
+    dialog = WorkflowManagementDialog()
+    dialog.set_workflows(
+        [
+            {"workflow_id": "workflow-safe", "status": "queued"},
+            {"workflow_id": "workflow-safe", "status": "succeeded"},
+            {"workflow_id": r"C:\private\workflow-secret", "status": "running"},
+            {"workflow_id": "Bearer private-token", "status": "running"},
+            {"workflow_id": "workflow-bad\nidentifier", "status": "running"},
+        ]
+    )
+
+    assert dialog.workflow_list.count() == 1
+    assert dialog.workflow_list.item(0).data(Qt.ItemDataRole.UserRole) == "workflow-safe"
+    assert "private" not in dialog.workflow_list.item(0).text()
+    dialog.close()
 
 
 def test_start_workflow_dialog_validates_yaml_and_workspace_and_reuses_request_on_retry(
