@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import stat
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,11 +38,15 @@ _MAX_EDGES = 1_024
 _MAX_TASK_RESPONSE_BYTES = 256 * 1024
 _MAX_EVENT_RESPONSE_BYTES = 128 * 1024
 _SQLITE_TIMEOUT_SECONDS = 0.1
-_IDENTITY_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:/~@-[]"
+_IDENTITY_PUNCTUATION = frozenset("_.:/~@-[]")
+_GRAPH_ID_PUNCTUATION = frozenset("_/@:.~/-[]")
+_TASK_NAME_PUNCTUATION = frozenset("_.~/-")
+_SECRET_LIKE_RE = re.compile(
+    r"(?:sk-(?:proj|live|test)-[A-Za-z0-9_-]{16,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})",
+    re.IGNORECASE | re.ASCII,
 )
-_GRAPH_ID_RE = re.compile(r"[A-Za-z0-9_/@:.~/-]{1,2048}\Z", re.ASCII)
-_TASK_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.~/-]{0,127}\Z", re.ASCII)
 _HEX_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _EVENT_TYPES = frozenset(
     {
@@ -128,6 +133,7 @@ class _Job:
     thread_id: str | None
     turn_id: str | None
     reconciliation: bool
+    receipt_verified: bool
 
 
 def project_workflow_tasks(
@@ -143,7 +149,6 @@ def project_workflow_tasks(
         "workflow_status": snapshot.status,
         "coverage": "unavailable",
         "latest_event_id": 0,
-        "snapshot_version": "sha256:" + _snapshot_version(snapshot, None, ()),
         "truncated": False,
         "nodes": [],
         "edges": [],
@@ -153,7 +158,7 @@ def project_workflow_tasks(
         run_dir, definition, max_jobs = _verified_run_source(state_root, row)
     except _ProjectionIssue as issue:
         base["coverage_reason"] = issue.reason
-        return base
+        return _attach_snapshot_version(base, snapshot, None, ())
 
     try:
         graph = project_workflow_graph(
@@ -167,7 +172,7 @@ def project_workflow_tasks(
     except Exception:
         base["coverage"] = "partial"
         base["coverage_reason"] = "graph_invalid"
-        return base
+        return _attach_snapshot_version(base, snapshot, None, ())
 
     node_ids = {node["node_id"] for node in static_nodes}
     journal_reason: str | None = None
@@ -196,12 +201,21 @@ def project_workflow_tasks(
     by_identity: dict[str, list[_Job]] = defaultdict(list)
     for ledger_job in jobs:
         by_identity[ledger_job.task_identity].append(ledger_job)
-    journal_task_identities = {
+    call_node_ids = {
+        node["node_id"]
+        for node in static_nodes
+        if node.get("operation") == "call"
+        and isinstance(node.get("attributes"), dict)
+        and node["attributes"].get("call") == "codex-job"
+    }
+    journal_call_task_identities = {
         event.task_identity
         for event in events
-        if event.event_type == "task_started" and event.task_identity is not None
+        if event.event_type == "task_started"
+        and event.node_id in call_node_ids
+        and event.task_identity is not None
     }
-    if any(job.task_identity not in journal_task_identities for job in jobs):
+    if any(job.task_identity not in journal_call_task_identities for job in jobs):
         ledger_reason = ledger_reason or "evidence_conflict"
     event_groups: dict[tuple[str, str, str], list[_Event]] = defaultdict(list)
     groups_by_node: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
@@ -214,18 +228,7 @@ def project_workflow_tasks(
                 groups_by_node[event.node_id].append(group_key)
             event_groups[group_key].append(event)
 
-    conflicts, scope_pairs, _iteration_pairs = _validate_event_relationships(events)
-    operation_by_node = {node["node_id"]: node["operation"] for node in static_nodes}
-    for event in events:
-        event_operation = event.metadata.get("operation")
-        if (
-            event.node_id is not None
-            and event_operation is not None
-            and event_operation != operation_by_node.get(event.node_id)
-            and event.execution_id is not None
-            and event.task_identity is not None
-        ):
-            conflicts.add((event.node_id, event.execution_id, event.task_identity))
+    conflicts = _event_projection_conflicts(events, static_nodes)
     task_exec_refs: list[tuple[dict[str, Any], str, str, list[_Event]]] = []
     for node in static_nodes:
         for key in groups_by_node.get(node["node_id"], ()):
@@ -241,16 +244,29 @@ def project_workflow_tasks(
             item[2],
         )
     )
-    execution_counts_by_node = Counter(node["node_id"] for node, *_ in task_exec_refs)
+    observation_by_key: dict[tuple[str, str, str], bool] = {}
+    for node, execution_id, task_identity, rows in task_exec_refs:
+        key = (node["node_id"], execution_id, task_identity)
+        observation_complete = _execution_observation_complete(
+            node["operation"], node["node_id"], task_identity, rows, events
+        )
+        observation_by_key[key] = observation_complete
+        starts = [event for event in rows if event.event_type == "task_started"]
+        terminals = [
+            event for event in rows if event.event_type in {"task_completed", "task_failed"}
+        ]
+        if len(starts) == 1 and len(terminals) == 1 and starts[0].event_id >= terminals[0].event_id:
+            conflicts.add(key)
+        if terminals and not observation_complete:
+            conflicts.add(key)
     total_executions = len(task_exec_refs)
     exposed_execution_keys = {
         (node["node_id"], execution_id, identity)
         for node, execution_id, identity, _ in task_exec_refs[:_MAX_EXECUTIONS]
     }
-    global_success = (
-        snapshot.status in _WORKFLOW_SUCCESS_STATES
-        and snapshot.worker_state == "completed"
-        and dbos_status in _SUCCESS_DBOS_STATES
+    global_success = _workflow_status_success(snapshot, events, dbos_status)
+    coverage_complete = _complete_workflow_evidence(
+        snapshot, events, static_nodes, jobs, dbos_status, conflicts
     )
     executions_by_node: dict[str, list[dict[str, Any]]] = defaultdict(list)
     all_states_by_node: dict[str, list[str]] = defaultdict(list)
@@ -282,28 +298,7 @@ def project_workflow_tasks(
             conflict = True
         if global_success and failures:
             conflict = True
-        if operation == "do":
-            scope_entered, scope_exited = scope_pairs.get(node["node_id"], (0, 0))
-            observation_complete = (
-                len(starts) == 1
-                and len(completes) + len(failures) == 1
-                and scope_entered == scope_exited
-                and scope_entered == execution_counts_by_node[node["node_id"]]
-            )
-        elif operation == "for":
-            iteration_start_count, iteration_complete_count = iteration_counts(
-                events, node["node_id"]
-            )
-            scope_start_count, scope_exit_count = scope_counts(events, node["node_id"])
-            observation_complete = (
-                len(starts) == 1
-                and len(completes) + len(failures) == 1
-                and iteration_start_count == iteration_complete_count
-                and scope_start_count == scope_exit_count
-                and iteration_start_count == scope_start_count
-            )
-        else:
-            observation_complete = len(starts) == 1 and len(completes) + len(failures) == 1
+        observation_complete = observation_by_key.get(key, False)
 
         completion_observed = bool(completes or failures)
         evidence_sources = ["node_events"]
@@ -323,12 +318,21 @@ def project_workflow_tasks(
         elif completes:
             if global_success:
                 if operation == "call" and node.get("attributes", {}).get("call") == "codex-job":
-                    if matched_job is None or matched_job.state != "SUCCEEDED":
+                    if (
+                        matched_job is None
+                        or matched_job.state != "SUCCEEDED"
+                        or not matched_job.receipt_verified
+                        or not observation_complete
+                    ):
                         state = "unknown"
                     else:
                         state = "succeeded"
                         evidence_sources.append("codex_job_ledger")
-                elif matched_job is not None and matched_job.state != "SUCCEEDED":
+                elif matched_job is not None and (
+                    matched_job.state != "SUCCEEDED" or not matched_job.receipt_verified
+                ):
+                    state = "unknown"
+                elif not observation_complete:
                     state = "unknown"
                 else:
                     state = "succeeded"
@@ -451,15 +455,17 @@ def project_workflow_tasks(
         coverage, coverage_reason = "partial", ledger_reason
     elif conflicts:
         coverage, coverage_reason = "partial", "evidence_conflict"
+    elif _workflow_marker_reason(events) == "evidence_conflict":
+        coverage, coverage_reason = "partial", "evidence_conflict"
     elif truncated:
         coverage, coverage_reason = "partial", "truncated"
+    elif not coverage_complete:
+        coverage, coverage_reason = "partial", "workflow_not_confirmed"
 
     result = {
         **base,
         "coverage": coverage,
         "latest_event_id": latest_event_id,
-        "snapshot_version": "sha256:"
-        + _snapshot_version(snapshot, dbos_status, jobs, latest_event_id),
         "truncated": truncated,
         "nodes": nodes,
         "edges": safe_edges,
@@ -467,7 +473,7 @@ def project_workflow_tasks(
     }
     if coverage_reason is not None:
         result["coverage_reason"] = coverage_reason
-    return _fit_task_response(result)
+    return _attach_snapshot_version(_fit_task_response(result), snapshot, dbos_status, jobs)
 
 
 def project_workflow_task_events(
@@ -512,6 +518,58 @@ def project_workflow_task_events(
         base["coverage_reason"] = "graph_invalid"
         return base
 
+    snapshot = _snapshot_from_inspection(row, inspection)
+    jobs: list[_Job] = []
+    ledger_reason: str | None = None
+    try:
+        jobs = _read_jobs(run_dir, row.workflow_id)
+    except _ProjectionIssue as issue:
+        ledger_reason = issue.reason
+    dbos_status: str | None = None
+    dbos_path = run_dir / "dbos.sqlite"
+    if dbos_path.exists() or dbos_path.is_symlink():
+        try:
+            if _is_reparse_point(dbos_path):
+                raise _ProjectionIssue("ledger_unavailable")
+            dbos_status = _read_dbos_status(dbos_path, row.workflow_id)
+        except Exception:
+            ledger_reason = ledger_reason or "ledger_unavailable"
+
+    conflicts = _event_projection_conflicts(events, nodes)
+    call_node_ids = {
+        node["node_id"]
+        for node in nodes
+        if node.get("operation") == "call"
+        and isinstance(node.get("attributes"), dict)
+        and node["attributes"].get("call") == "codex-job"
+    }
+    identities = {
+        event.task_identity
+        for event in events
+        if event.event_type == "task_started"
+        and event.node_id in call_node_ids
+        and event.task_identity is not None
+    }
+    if any(job.task_identity not in identities for job in jobs):
+        ledger_reason = ledger_reason or "evidence_conflict"
+    workflow_confirmed = _complete_workflow_evidence(
+        snapshot, events, nodes, jobs, dbos_status, conflicts
+    )
+    if ledger_reason is not None:
+        base["coverage"] = "partial"
+        base["coverage_reason"] = ledger_reason
+    elif conflicts:
+        base["coverage"] = "partial"
+        base["coverage_reason"] = "evidence_conflict"
+    elif _workflow_marker_reason(events) == "evidence_conflict":
+        base["coverage"] = "partial"
+        base["coverage_reason"] = "evidence_conflict"
+    elif not workflow_confirmed:
+        base["coverage"] = "partial"
+        base["coverage_reason"] = "workflow_not_confirmed"
+    else:
+        base["coverage"] = "complete"
+
     page = [event for event in events if event.event_id > after_id][:limit]
     public_events = [_public_event(event) for event in page]
     result = {
@@ -520,7 +578,6 @@ def project_workflow_task_events(
         "latest_event_id": latest,
         "next_after_id": page[-1].event_id if page else after_id,
         "has_more": (page[-1].event_id if page else after_id) < latest,
-        "coverage": "complete",
     }
     while len(_json_bytes(result)) > _MAX_EVENT_RESPONSE_BYTES and result["events"]:
         result["events"].pop()
@@ -648,13 +705,19 @@ def _validate_static_graph(nodes: Any, edges: Any) -> None:
         task_name = node.get("task_name")
         if (
             not isinstance(node_id, str)
-            or not _GRAPH_ID_RE.fullmatch(node_id)
+            or not _valid_unicode_identifier(
+                node_id, max_length=2_048, punctuation=_GRAPH_ID_PUNCTUATION
+            )
+            or _has_graph_traversal_segment(node_id)
             or not isinstance(task_name, str)
-            or not _TASK_NAME_RE.fullmatch(task_name)
+            or not _valid_task_name(task_name)
             or node_id in seen
             or node.get("operation") not in _OPERATIONS
             or not isinstance(node.get("parent_scope"), str)
-            or not _GRAPH_ID_RE.fullmatch(node["parent_scope"])
+            or not _valid_unicode_identifier(
+                node["parent_scope"], max_length=2_048, punctuation=_GRAPH_ID_PUNCTUATION
+            )
+            or _has_graph_traversal_segment(node["parent_scope"])
             or type(node.get("order")) is not int
             or node["order"] < 0
         ):
@@ -666,8 +729,14 @@ def _validate_static_graph(nodes: Any, edges: Any) -> None:
             or not isinstance(edge.get("source"), str)
             or not isinstance(edge.get("target"), str)
             or not isinstance(edge.get("kind"), str)
-            or not _GRAPH_ID_RE.fullmatch(edge["source"])
-            or not _GRAPH_ID_RE.fullmatch(edge["target"])
+            or not _valid_unicode_identifier(
+                edge["source"], max_length=2_048, punctuation=_GRAPH_ID_PUNCTUATION
+            )
+            or not _valid_unicode_identifier(
+                edge["target"], max_length=2_048, punctuation=_GRAPH_ID_PUNCTUATION
+            )
+            or _has_graph_traversal_segment(edge["source"])
+            or _has_graph_traversal_segment(edge["target"])
             or not re.fullmatch(r"[a-z_]{1,32}", edge["kind"], re.ASCII)
         ):
             raise ValueError("workflow graph edge identity is invalid")
@@ -921,7 +990,8 @@ def _read_jobs(run_dir: Path, workflow_id: str) -> list[_Job]:
         if version not in {1, 2}:
             raise _ProjectionIssue("ledger_unavailable")
         rows = connection.execute(
-            "SELECT job_id, workflow_id, task_identity, state, thread_id, turn_id "
+            "SELECT job_id, workflow_id, task_identity, state, thread_id, turn_id, "
+            "remote_state, receipt_json "
             "FROM jobs WHERE workflow_id = ? ORDER BY created_at ASC, job_id ASC LIMIT 4",
             (workflow_id,),
         ).fetchall()
@@ -942,6 +1012,11 @@ def _read_jobs(run_dir: Path, workflow_id: str) -> list[_Job]:
             state = item["state"]
             thread_id = item["thread_id"]
             turn_id = item["turn_id"]
+            receipt_verified = _job_receipt_verified(
+                state,
+                item["remote_state"],
+                item["receipt_json"],
+            )
             if (
                 item["workflow_id"] != workflow_id
                 or not CodexJobAdapter._valid_persisted_id(job_id)
@@ -969,6 +1044,7 @@ def _read_jobs(run_dir: Path, workflow_id: str) -> list[_Job]:
                     thread_id=thread_id,
                     turn_id=turn_id,
                     reconciliation=job_id in markers,
+                    receipt_verified=receipt_verified,
                 )
             )
         if not markers <= job_ids:
@@ -1096,6 +1172,334 @@ def _validate_event_relationships(
     return conflicts, scope_pair_map, iteration_pair_map
 
 
+def _event_projection_conflicts(
+    events: list[_Event], static_nodes: list[dict[str, Any]]
+) -> set[tuple[str, str, str]]:
+    conflicts, _scope_pairs, _iteration_pairs = _validate_event_relationships(events)
+    operation_by_node = {node["node_id"]: node["operation"] for node in static_nodes}
+    grouped: dict[tuple[str, str, str], list[_Event]] = defaultdict(list)
+    task_operations: dict[tuple[str, str], str] = {}
+    for event in events:
+        if event.event_type not in {
+            "task_started",
+            "task_completed",
+            "task_failed",
+            "branch_selected",
+        }:
+            continue
+        assert event.node_id is not None
+        assert event.execution_id is not None
+        assert event.task_identity is not None
+        key = (event.node_id, event.execution_id, event.task_identity)
+        grouped[key].append(event)
+        operation = operation_by_node.get(event.node_id)
+        event_operation = event.metadata.get("operation")
+        if event_operation is not None and event_operation != operation:
+            conflicts.add(key)
+        if event.event_type == "task_started" and isinstance(event_operation, str):
+            task_operations[(event.node_id, event.task_identity)] = event_operation
+
+    for (node_id, execution_id, task_identity), rows in grouped.items():
+        key = (node_id, execution_id, task_identity)
+        operation = operation_by_node.get(node_id)
+        starts = [event for event in rows if event.event_type == "task_started"]
+        terminals = [
+            event for event in rows if event.event_type in {"task_completed", "task_failed"}
+        ]
+        if len(starts) == 1 and len(terminals) == 1 and starts[0].event_id >= terminals[0].event_id:
+            conflicts.add(key)
+        if (
+            operation == "switch"
+            and terminals
+            and not any(event.event_type == "branch_selected" for event in rows)
+        ):
+            conflicts.add(key)
+        if (
+            terminals
+            and operation in {"do", "for"}
+            and not _execution_observation_complete(operation, node_id, task_identity, rows, events)
+        ):
+            conflicts.add(key)
+
+    for event in events:
+        if event.event_type not in {
+            "scope_entered",
+            "scope_exited",
+            "iteration_started",
+            "iteration_completed",
+        }:
+            continue
+        assert event.node_id is not None
+        assert event.execution_id is not None
+        assert event.task_identity is not None
+        key = (event.node_id, event.execution_id, event.task_identity)
+        operation = event.metadata.get("operation")
+        ordinal = event.metadata.get("iteration_ordinal")
+        if event.event_type in {"iteration_started", "iteration_completed"}:
+            parts = _iteration_identity_parts(event.task_identity, scope=False)
+            if (
+                operation != "for"
+                or type(ordinal) is not int
+                or parts is None
+                or parts[1] != ordinal
+                or task_operations.get((event.node_id, parts[0])) != "for"
+            ):
+                conflicts.add(key)
+        elif operation == "do":
+            if (
+                ordinal is not None
+                or not event.task_identity.endswith(".do")
+                or task_operations.get((event.node_id, event.task_identity[:-3])) != "do"
+            ):
+                conflicts.add(key)
+        else:
+            parts = _iteration_identity_parts(event.task_identity, scope=True)
+            if (
+                operation not in {None, "for"}
+                or type(ordinal) is not int
+                or parts is None
+                or parts[1] != ordinal
+                or task_operations.get((event.node_id, parts[0])) != "for"
+            ):
+                conflicts.add(key)
+    return conflicts
+
+
+def _execution_observation_complete(
+    operation: str,
+    node_id: str,
+    task_identity: str,
+    task_events: list[_Event],
+    all_events: list[_Event],
+) -> bool:
+    starts = [event for event in task_events if event.event_type == "task_started"]
+    terminals = [
+        event for event in task_events if event.event_type in {"task_completed", "task_failed"}
+    ]
+    if len(starts) != 1 or len(terminals) != 1:
+        return False
+    start = starts[0]
+    terminal = terminals[0]
+    if start.event_id >= terminal.event_id:
+        return False
+    if operation == "do":
+        scope_identity = f"{task_identity}.do"
+        scope_events = [
+            event
+            for event in all_events
+            if event.node_id == node_id
+            and event.task_identity == scope_identity
+            and event.event_type in {"scope_entered", "scope_exited"}
+        ]
+        entered = [event for event in scope_events if event.event_type == "scope_entered"]
+        exited = [event for event in scope_events if event.event_type == "scope_exited"]
+        return (
+            len(entered) == 1
+            and len(exited) == 1
+            and start.event_id < entered[0].event_id < exited[0].event_id < terminal.event_id
+        )
+    if operation != "for":
+        return True
+
+    loop_rows = [
+        event
+        for event in all_events
+        if event.node_id == node_id
+        and event.event_type
+        in {"iteration_started", "iteration_completed", "scope_entered", "scope_exited"}
+        and (
+            parts := _iteration_identity_parts(
+                event.task_identity or "",
+                scope=event.event_type in {"scope_entered", "scope_exited"},
+            )
+        )
+        is not None
+        and parts[0] == task_identity
+    ]
+    ordinals = {
+        event.metadata.get("iteration_ordinal")
+        for event in loop_rows
+        if type(event.metadata.get("iteration_ordinal")) is int
+    }
+    child_node_prefix = f"{node_id}/do/"
+    for event in all_events:
+        if (
+            event.event_type != "task_started"
+            or event.node_id is None
+            or not event.node_id.startswith(child_node_prefix)
+            or event.task_identity is None
+        ):
+            continue
+        observed_ordinal = _child_iteration_ordinal(task_identity, event.task_identity)
+        if observed_ordinal is not None:
+            ordinals.add(observed_ordinal)
+    if any(type(event.metadata.get("iteration_ordinal")) is not int for event in loop_rows):
+        return False
+    for ordinal in ordinals:
+        iteration_identity = f"{task_identity}.iteration[{ordinal}]"
+        iteration_rows = [
+            event for event in loop_rows if event.metadata.get("iteration_ordinal") == ordinal
+        ]
+        expected_identity = {
+            "iteration_started": iteration_identity,
+            "iteration_completed": iteration_identity,
+            "scope_entered": f"{iteration_identity}.do",
+            "scope_exited": f"{iteration_identity}.do",
+        }
+        if any(
+            event.task_identity != expected_identity[event.event_type] for event in iteration_rows
+        ):
+            return False
+        by_type = {
+            event_type: [event for event in iteration_rows if event.event_type == event_type]
+            for event_type in expected_identity
+        }
+        if any(len(by_type[event_type]) != 1 for event_type in expected_identity):
+            return False
+        ordered = (
+            start,
+            by_type["iteration_started"][0],
+            by_type["scope_entered"][0],
+            by_type["scope_exited"][0],
+            by_type["iteration_completed"][0],
+            terminal,
+        )
+        if any(
+            left.event_id >= right.event_id
+            for left, right in zip(ordered, ordered[1:], strict=False)
+        ):
+            return False
+    return True
+
+
+def _iteration_identity_parts(value: str, *, scope: bool) -> tuple[str, int] | None:
+    suffix = r"\.do" if scope else ""
+    match = re.fullmatch(rf"(.+)\.iteration\[([0-9]+)\]{suffix}", value, re.ASCII)
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _child_iteration_ordinal(loop_identity: str, child_identity: str) -> int | None:
+    prefix = f"{loop_identity}.iteration["
+    if not child_identity.startswith(prefix):
+        return None
+    match = re.match(r"([0-9]+)\]\.do\[[0-9]+\]\.", child_identity[len(prefix) :], re.ASCII)
+    return None if match is None else int(match.group(1))
+
+
+def _workflow_marker_reason(events: list[_Event]) -> str | None:
+    markers = [event for event in events if event.event_type == "workflow_completed"]
+    if not markers:
+        return "workflow_not_confirmed"
+    if len(markers) != 1 or not events or events[-1] is not markers[0]:
+        return "evidence_conflict"
+    timestamps = [datetime.fromisoformat(event.occurred_at) for event in events]
+    if timestamps != sorted(timestamps):
+        return "evidence_conflict"
+    marker_time = datetime.fromisoformat(markers[0].occurred_at)
+    if any(datetime.fromisoformat(event.occurred_at) > marker_time for event in events[:-1]):
+        return "evidence_conflict"
+    return None
+
+
+def _complete_workflow_evidence(
+    snapshot: Any,
+    events: list[_Event],
+    static_nodes: list[dict[str, Any]],
+    jobs: list[_Job],
+    dbos_status: str | None,
+    conflicts: set[tuple[str, str, str]],
+) -> bool:
+    if (
+        not _workflow_status_success(snapshot, events, dbos_status)
+        or conflicts
+        or any(event.event_type == "task_failed" for event in events)
+    ):
+        return False
+    if any(
+        job.state != "SUCCEEDED" or not job.receipt_verified or job.reconciliation for job in jobs
+    ):
+        return False
+
+    by_identity: dict[str, list[_Job]] = defaultdict(list)
+    for job in jobs:
+        by_identity[job.task_identity].append(job)
+    call_nodes = {
+        node["node_id"]
+        for node in static_nodes
+        if node.get("operation") == "call"
+        and isinstance(node.get("attributes"), dict)
+        and node["attributes"].get("call") == "codex-job"
+    }
+    for event in events:
+        if event.node_id not in call_nodes or event.event_type != "task_started":
+            continue
+        assert event.task_identity is not None
+        matching_events = [
+            candidate
+            for candidate in events
+            if candidate.node_id == event.node_id
+            and candidate.task_identity == event.task_identity
+            and candidate.event_type == "task_completed"
+        ]
+        matching_jobs = by_identity.get(event.task_identity, [])
+        if (
+            len(matching_events) != 1
+            or len(matching_jobs) != 1
+            or matching_jobs[0].state != "SUCCEEDED"
+            or not matching_jobs[0].receipt_verified
+        ):
+            return False
+    call_identities = {
+        event.task_identity
+        for event in events
+        if event.node_id in call_nodes
+        and event.event_type == "task_started"
+        and event.task_identity is not None
+    }
+    return all(job.task_identity in call_identities for job in jobs)
+
+
+def _workflow_status_success(snapshot: Any, events: list[_Event], dbos_status: str | None) -> bool:
+    return (
+        _workflow_marker_reason(events) is None
+        and snapshot.status in _WORKFLOW_SUCCESS_STATES
+        and snapshot.worker_state == "completed"
+        and dbos_status in _SUCCESS_DBOS_STATES
+    )
+
+
+def _job_receipt_verified(state: Any, remote_state: Any, receipt_json: Any) -> bool:
+    if state not in {"SUCCEEDED", "FAILED"}:
+        return False
+    if not isinstance(receipt_json, str):
+        raise _ProjectionIssue("ledger_unavailable")
+    try:
+        receipt = _strict_json(receipt_json.encode("utf-8"))
+    except Exception:
+        raise _ProjectionIssue("ledger_unavailable") from None
+    if state == "SUCCEEDED":
+        result = receipt.get("result") if isinstance(receipt, dict) else None
+        valid = (
+            remote_state == "completed"
+            and isinstance(result, dict)
+            and set(receipt) == {"result"}
+            and set(result) == {"final_text"}
+            and isinstance(result["final_text"], str)
+        )
+    else:
+        valid = (
+            isinstance(receipt, dict)
+            and set(receipt) == {"remote_state"}
+            and receipt.get("remote_state") == remote_state
+            and remote_state in {"failed", "interrupted"}
+        )
+    if not valid:
+        raise _ProjectionIssue("ledger_unavailable")
+    return isinstance(state, str) and state == "SUCCEEDED"
+
+
 def scope_counts(events: list[_Event], node_id: str) -> tuple[int, int]:
     return (
         sum(event.node_id == node_id and event.event_type == "scope_entered" for event in events),
@@ -1124,13 +1528,69 @@ def _is_utc_timestamp(value: str) -> bool:
 
 
 def _is_task_identity(value: Any) -> bool:
+    return _valid_unicode_identifier(
+        value,
+        max_length=2_048,
+        punctuation=_IDENTITY_PUNCTUATION,
+        require_letter_or_number_start=True,
+    ) and not _has_unsafe_path_segment(value)
+
+
+def _valid_task_name(value: str) -> bool:
+    if not _valid_unicode_identifier(
+        value,
+        max_length=128,
+        punctuation=_TASK_NAME_PUNCTUATION,
+        require_letter_or_number_start=True,
+    ) or _has_unsafe_path_segment(value):
+        return False
+    return not value.startswith("/") and not value.endswith("/") and "//" not in value
+
+
+def _valid_unicode_identifier(
+    value: Any,
+    *,
+    max_length: int,
+    punctuation: frozenset[str],
+    require_letter_or_number_start: bool = False,
+) -> bool:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    if _SECRET_LIKE_RE.search(value):
+        return False
+    if require_letter_or_number_start and unicodedata.category(value[0])[0] not in {"L", "N"}:
+        return False
+    previous_base = False
+    for character in value:
+        if character in punctuation:
+            previous_base = False
+            continue
+        category = unicodedata.category(character)
+        if category[0] in {"L", "N"}:
+            previous_base = True
+            continue
+        if category[0] == "M" and previous_base:
+            continue
+        return False
+    return True
+
+
+def _has_unsafe_path_segment(value: str) -> bool:
+    segments = value.split("/")
     return (
-        isinstance(value, str)
-        and 0 < len(value) <= 2_048
-        and value[0].isascii()
-        and value[0].isalnum()
-        and all(character.isascii() and character in _IDENTITY_CHARS for character in value)
+        any(segment in {".", ".."} for segment in segments)
+        or bool(re.search(r"\.{2,}/", value))
+        or "\\" in value
+        or any(":" in segment for segment in segments)
     )
+
+
+def _has_graph_traversal_segment(value: str) -> bool:
+    return any(segment in {".", ".."} for segment in value.split("/") if segment)
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -1162,9 +1622,16 @@ def _first_event_id(events: list[_Event]) -> int:
 
 
 def _snapshot_version(
-    snapshot: Any, dbos_status: str | None, jobs: list[_Job] | tuple[_Job, ...], latest: int = 0
+    snapshot: Any,
+    dbos_status: str | None,
+    jobs: list[_Job] | tuple[_Job, ...],
+    latest: int,
+    projection: dict[str, Any],
 ) -> str:
     material = {
+        "projection": {
+            key: value for key, value in projection.items() if key != "snapshot_version"
+        },
         "workflow_status": snapshot.status,
         "worker_status": snapshot.worker_state,
         "dbos_status": dbos_status,
@@ -1176,15 +1643,32 @@ def _snapshot_version(
                 "thread_id": job.thread_id,
                 "turn_id": job.turn_id,
                 "reconciliation": job.reconciliation,
+                "receipt_verified": job.receipt_verified,
             }
             for job in sorted(jobs, key=lambda item: (item.task_identity, item.job_id))
         ],
         "latest_event_id": latest,
     }
     encoded = json.dumps(
-        material, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True
+        material, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
     )
-    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _attach_snapshot_version(
+    projection: dict[str, Any],
+    snapshot: Any,
+    dbos_status: str | None,
+    jobs: list[_Job] | tuple[_Job, ...],
+) -> dict[str, Any]:
+    projection["snapshot_version"] = "sha256:" + _snapshot_version(
+        snapshot,
+        dbos_status,
+        jobs,
+        projection.get("latest_event_id", 0),
+        projection,
+    )
+    return projection
 
 
 def _edge_is_visible(edge: dict[str, Any], node_ids: set[str]) -> bool:
@@ -1209,12 +1693,13 @@ def _public_event(event: _Event) -> dict[str, Any]:
 
 
 def _fit_task_response(result: dict[str, Any]) -> dict[str, Any]:
-    if len(_json_bytes(result)) <= _MAX_TASK_RESPONSE_BYTES:
+    response_budget = _MAX_TASK_RESPONSE_BYTES - 128
+    if len(_json_bytes(result)) <= response_budget:
         return result
     result["truncated"] = True
     result["coverage"] = "partial"
     result["coverage_reason"] = "truncated"
-    while len(_json_bytes(result)) > _MAX_TASK_RESPONSE_BYTES:
+    while len(_json_bytes(result)) > response_budget:
         last_node = result["nodes"][-1] if result["nodes"] else None
         if last_node is not None and last_node["executions"]:
             last_node["executions"].pop()

@@ -26,6 +26,7 @@ from codex_bridge.workflows.interpreter import (
 )
 from codex_bridge.workflows.node_events import NodeEventWriter
 from codex_bridge.workflows.service import WorkflowService
+from codex_bridge.workflows.task_projection import _is_task_identity
 
 
 def _definition(task_name: str = "private_task") -> dict[str, Any]:
@@ -118,7 +119,8 @@ async def test_task_projection_exposes_safe_graph_and_observed_execution_only(
 
     assert projection["schema_version"] == 1
     assert projection["workflow_status"] == "running"
-    assert projection["coverage"] == "complete"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
     assert projection["nodes"][0]["node_id"] == "/do/0/private_task"
     assert projection["nodes"][0]["operation"] == "set"
     assert projection["nodes"][0]["state"] == "unknown"
@@ -180,6 +182,23 @@ async def test_missing_journal_is_read_only_and_does_not_create_database(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_disabled_writer_cannot_make_empty_journal_look_complete(tmp_path: Path) -> None:
+    service, snapshot, run_dir = await _running_service(tmp_path)
+    writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
+    writer._disable("test_disabled")
+    writer.workflow_completed()
+    writer.close()
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
+
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == "workflow_not_confirmed"
+
+
+@pytest.mark.asyncio
 async def test_task_events_page_uses_strict_exclusive_cursor_and_safe_metadata(
     tmp_path: Path,
 ) -> None:
@@ -207,6 +226,8 @@ async def test_task_events_page_uses_strict_exclusive_cursor_and_safe_metadata(
     assert [event["event_id"] for event in second["events"]] == [2]
     assert second["next_after_id"] == 2
     assert second["events"][0]["metadata"] == {"operation": "set"}
+    assert first["coverage"] == second["coverage"] == "partial"
+    assert first["coverage_reason"] == second["coverage_reason"] == "workflow_not_confirmed"
     assert "PRIVATE_JQ_EXPRESSION" not in json.dumps(first | second)
 
 
@@ -220,6 +241,78 @@ async def test_unbounded_task_name_is_not_projected_as_an_identifier(tmp_path: P
     assert projection["coverage"] == "partial"
     assert projection["coverage_reason"] == "graph_invalid"
     assert projection["nodes"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_name", "node_id"),
+    [
+        ("日本語処理", "/do/0/日本語処理"),
+        ("分類", "/do/0/分類"),
+        ("親/子~名", "/do/0/親~1子~0名"),
+    ],
+)
+async def test_unicode_task_name_and_journal_identity_are_projected_exactly(
+    tmp_path: Path,
+    task_name: str,
+    node_id: str,
+) -> None:
+    definition = _definition(task_name)
+    service, snapshot, run_dir = await _running_service(tmp_path, definition)
+    writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
+    for event_type in ("task_started", "task_completed"):
+        writer.observe(
+            _InterpreterEvent(
+                event_type,
+                node_id=node_id,
+                task_identity=f"do[0].{task_name}",
+                operation="set",
+            )
+        )
+    writer.close()
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    node = next(item for item in projection["nodes"] if item["node_id"] == node_id)
+
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
+    assert node["executions"][0]["task_identity"] == f"do[0].{task_name}"
+    assert node["executions"][0]["completion_observed"] is True
+    assert "private_secret" not in json.dumps(projection, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_name",
+    [
+        "../escape",
+        "sk-proj-" + "A" * 32,
+        "control\nname",
+        "nul\x00name",
+        "x" * 129,
+    ],
+)
+async def test_path_secret_control_nul_and_overlong_task_names_are_rejected(
+    tmp_path: Path,
+    task_name: str,
+) -> None:
+    service, snapshot, _run_dir = await _running_service(tmp_path, _definition(task_name))
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "graph_invalid"
+    assert projection["nodes"] == []
+
+
+def test_task_identity_accepts_unicode_and_rejects_unsafe_characters() -> None:
+    assert _is_task_identity("do[0].日本語処理")
+    assert _is_task_identity("do[0].親/子~名.iteration[2].do")
+    assert not _is_task_identity("do[0].../escape")
+    assert not _is_task_identity("do[0].sk-proj-" + "A" * 32)
+    assert not _is_task_identity("do[0].control\nname")
+    assert not _is_task_identity("do[0].nul\x00name")
+    assert not _is_task_identity("do[0]." + "x" * 2_050)
 
 
 def _loop_workflow() -> dict[str, Any]:
@@ -258,6 +351,12 @@ def _loop_workflow() -> dict[str, Any]:
     }
 
 
+def _nested_do_workflow() -> dict[str, Any]:
+    definition = _definition()
+    definition["do"][0] = {"container": {"do": [{"child": {"set": {"value": "${ .value }"}}}]}}
+    return definition
+
+
 def _fake_step_runner(
     _identity: str,
     _task_name: str,
@@ -288,7 +387,8 @@ async def test_loop_switch_jump_exit_and_repeated_static_node_are_observed(tmp_p
     projection = await service.get_workflow_tasks(snapshot.workflow_id)
     by_id = {node["node_id"]: node for node in projection["nodes"]}
 
-    assert projection["coverage"] == "complete"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
     assert by_id["/do/0/iterate"]["executions"][0]["observation_complete"] is True
     assert len(by_id["/do/0/iterate/do/1/process"]["executions"]) == 2
     assert [
@@ -322,6 +422,120 @@ async def test_zero_item_loop_is_observed_without_inventing_skipped_state(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing_event_type",
+    ["scope_entered", "scope_exited"],
+)
+async def test_repeated_do_execution_requires_its_own_scope_pair(
+    tmp_path: Path,
+    missing_event_type: str,
+) -> None:
+    definition = _loop_workflow()
+    definition["do"][0]["iterate"]["do"] = [
+        {"container": {"do": [{"child": {"set": "${ $item }"}}]}}
+    ]
+    service, snapshot, _run_dir, _job = await _successful_fake_run(
+        tmp_path,
+        definition=definition,
+        input_data={"items": [1, 2]},
+        omit_event_type=missing_event_type,
+        omit_node_id="/do/0/iterate/do/0/container",
+        omit_identity_fragment=".iteration[1].do[0].container.do",
+    )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    container = next(
+        node for node in projection["nodes"] if node["node_id"] == "/do/0/iterate/do/0/container"
+    )
+    missing_execution = next(
+        execution
+        for execution in container["executions"]
+        if ".iteration[1].do[0].container" in execution["task_identity"]
+    )
+
+    assert projection["workflow_status"] == "succeeded"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "evidence_conflict"
+    assert missing_execution["completion_observed"] is True
+    assert missing_execution["observation_complete"] is False
+    assert missing_execution["state"] != "succeeded"
+    assert container["state"] != "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_repeated_do_execution_cannot_borrow_another_scope_pair(tmp_path: Path) -> None:
+    definition = _loop_workflow()
+    definition["do"][0]["iterate"]["do"] = [
+        {"container": {"do": [{"child": {"set": "${ $item }"}}]}}
+    ]
+    service, snapshot, _run_dir, _job = await _successful_fake_run(
+        tmp_path,
+        definition=definition,
+        input_data={"items": [1, 2]},
+        omit_event_type=("scope_entered", "scope_exited"),
+        omit_node_id="/do/0/iterate/do/0/container",
+        omit_identity_fragment=".iteration[1].do[0].container.do",
+    )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    container = next(
+        node for node in projection["nodes"] if node["node_id"] == "/do/0/iterate/do/0/container"
+    )
+    missing_execution = next(
+        execution
+        for execution in container["executions"]
+        if ".iteration[1].do[0].container" in execution["task_identity"]
+    )
+
+    assert projection["workflow_status"] == "succeeded"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "evidence_conflict"
+    assert missing_execution["completion_observed"] is True
+    assert missing_execution["observation_complete"] is False
+    assert missing_execution["state"] != "succeeded"
+    assert container["state"] != "succeeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing_event_type",
+    [
+        "iteration_started",
+        "iteration_completed",
+        "scope_entered",
+        "scope_exited",
+        ("iteration_started", "iteration_completed"),
+        ("scope_entered", "scope_exited"),
+        ("iteration_started", "iteration_completed", "scope_entered", "scope_exited"),
+    ],
+)
+async def test_loop_execution_requires_each_iteration_pair(
+    tmp_path: Path,
+    missing_event_type: str | tuple[str, ...],
+) -> None:
+    service, snapshot, _run_dir, _job = await _successful_fake_run(
+        tmp_path,
+        definition=_loop_workflow(),
+        input_data={"items": [1, 2]},
+        omit_event_type=missing_event_type,
+        omit_node_id="/do/0/iterate",
+        omit_iteration_ordinal=1,
+    )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    loop_node = next(node for node in projection["nodes"] if node["node_id"] == "/do/0/iterate")
+    execution = loop_node["executions"][0]
+
+    assert projection["workflow_status"] == "succeeded"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "evidence_conflict"
+    assert execution["completion_observed"] is True
+    assert execution["observation_complete"] is False
+    assert execution["state"] != "succeeded"
+    assert loop_node["state"] != "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_snapshot_version_changes_when_worker_status_changes_without_new_events(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +561,70 @@ async def test_snapshot_version_changes_when_worker_status_changes_without_new_e
     assert first["snapshot_version"] == repeated["snapshot_version"]
     assert first["snapshot_version"] != after_status_change["snapshot_version"]
     assert after_status_change["nodes"][0]["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_version_changes_when_coverage_changes_without_status_or_events(
+    tmp_path: Path,
+) -> None:
+    service, snapshot, run_dir = await _running_service(tmp_path)
+    NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id).close()
+    first = await service.get_workflow_tasks(snapshot.workflow_id)
+    repeated = await service.get_workflow_tasks(snapshot.workflow_id)
+    (run_dir / "node_events.sqlite").unlink()
+    unavailable = await service.get_workflow_tasks(snapshot.workflow_id)
+    unavailable_repeated = await service.get_workflow_tasks(snapshot.workflow_id)
+
+    assert first["workflow_status"] == unavailable["workflow_status"] == "running"
+    assert first["latest_event_id"] == unavailable["latest_event_id"] == 0
+    assert first["coverage"] == "partial"
+    assert first["coverage_reason"] == "workflow_not_confirmed"
+    assert unavailable["coverage"] == "unavailable"
+    assert unavailable["coverage_reason"] == "journal_missing"
+    assert first["snapshot_version"] == repeated["snapshot_version"]
+    assert unavailable["snapshot_version"] == unavailable_repeated["snapshot_version"]
+    assert first["snapshot_version"] != unavailable["snapshot_version"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_version_keeps_job_fingerprint_when_public_nodes_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    service, snapshot, run_dir = await _running_service(tmp_path)
+    writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
+    writer.observe(
+        _InterpreterEvent(
+            "task_started",
+            node_id="/do/1/execute",
+            task_identity="do[1].execute",
+            operation="call",
+        )
+    )
+    writer.close()
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    job = adapter.prepare_job(
+        snapshot.workflow_id,
+        "do[1].execute",
+        "PRIVATE_JOB_PROMPT",
+        run_dir,
+        port=18001,
+        workspace_root=tmp_path / "workspace",
+        allowed_roots=(str(tmp_path),),
+    )
+    assert adapter.claim_post(job["job_id"])
+    adapter.mark_accepted(job["job_id"], "thread-fixture-0001", "turn-fixture-0001", "in_progress")
+    accepted = await service.get_workflow_tasks(snapshot.workflow_id)
+    with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+        connection.execute("UPDATE jobs SET state = 'RUNNING' WHERE job_id = ?", (job["job_id"],))
+    running = await service.get_workflow_tasks(snapshot.workflow_id)
+
+    def without_version(response: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in response.items() if key != "snapshot_version"}
+
+    assert accepted["workflow_status"] == running["workflow_status"] == "running"
+    assert accepted["latest_event_id"] == running["latest_event_id"] == 1
+    assert without_version(accepted) == without_version(running)
+    assert accepted["snapshot_version"] != running["snapshot_version"]
 
 
 def _write_v1_job_ledger(
@@ -573,22 +851,66 @@ async def test_three_job_v2_ledger_projects_repeated_loop_node_executions(tmp_pa
     assert [item["job_id"] for item in node["executions"]] == [job["job_id"] for job in jobs]
 
 
-async def _successful_fake_run(tmp_path: Path):
-    service, snapshot, run_dir = await _running_service(tmp_path)
+async def _successful_fake_run(
+    tmp_path: Path,
+    *,
+    definition: dict[str, Any] | None = None,
+    input_data: dict[str, Any] | None = None,
+    omit_event_type: str | tuple[str, ...] | None = None,
+    omit_node_id: str | None = None,
+    omit_iteration_ordinal: int | None = None,
+    omit_identity_fragment: str | None = None,
+):
+    definition = definition or _definition()
+    input_data = {"value": 1} if input_data is None else input_data
+    service, snapshot, run_dir = await _running_service(
+        tmp_path,
+        definition,
+        input_data=input_data,
+    )
     writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
-    for node_id, identity, operation in (
-        ("/do/0/private_task", "do[0].private_task", "set"),
-        ("/do/1/execute", "do[1].execute", "call"),
-    ):
-        for event_type in ("task_started", "task_completed"):
-            writer.observe(
-                _InterpreterEvent(
-                    event_type,
-                    node_id=node_id,
-                    task_identity=identity,
-                    operation=operation,
+    if omit_event_type is not None:
+        omitted_types = (
+            {omit_event_type} if isinstance(omit_event_type, str) else set(omit_event_type)
+        )
+
+        def record_unless_omitted(event: _InterpreterEvent) -> None:
+            if (
+                event.event_type in omitted_types
+                and (omit_node_id is None or event.node_id == omit_node_id)
+                and (
+                    omit_iteration_ordinal is None
+                    or event.iteration_ordinal == omit_iteration_ordinal
                 )
-            )
+                and (
+                    omit_identity_fragment is None
+                    or omit_identity_fragment in (event.task_identity or "")
+                    or omit_identity_fragment in (event.scope_identity or "")
+                )
+            ):
+                return
+            writer.observe(event)
+
+        Interpreter(
+            definition,
+            step_runner=_fake_step_runner,
+            codex_job_live=True,
+            observer=record_unless_omitted,
+        ).run(input_data)
+    else:
+        for node_id, identity, operation in (
+            ("/do/0/private_task", "do[0].private_task", "set"),
+            ("/do/1/execute", "do[1].execute", "call"),
+        ):
+            for event_type in ("task_started", "task_completed"):
+                writer.observe(
+                    _InterpreterEvent(
+                        event_type,
+                        node_id=node_id,
+                        task_identity=identity,
+                        operation=operation,
+                    )
+                )
     writer.workflow_completed()
     writer.close()
 
@@ -623,7 +945,7 @@ async def _successful_fake_run(tmp_path: Path):
                 "workflow_id": snapshot.workflow_id,
                 "definition_sha256": manifest["definition_sha256"],
                 "input_sha256": manifest["input_sha256"],
-                "result": {"private": "PRIVATE_RUN_RESULT"},
+                "result": {"final_text": "PRIVATE_FINAL_TEXT"},
             }
         ),
         encoding="utf-8",
@@ -636,11 +958,15 @@ async def test_succeeded_requires_worker_dbos_and_related_verified_job(tmp_path:
     service, snapshot, _run_dir, job = await _successful_fake_run(tmp_path)
 
     projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
     by_id = {node["node_id"]: node for node in projection["nodes"]}
     call_execution = by_id["/do/1/execute"]["executions"][0]
     json_payload = json.dumps(projection, ensure_ascii=False)
 
     assert projection["workflow_status"] == "succeeded"
+    assert projection["coverage"] == "complete"
+    assert "coverage_reason" not in projection
+    assert events["coverage"] == "complete", events.get("coverage_reason")
     assert by_id["/do/0/private_task"]["state"] == "succeeded"
     assert by_id["/do/1/execute"]["state"] == "succeeded"
     assert call_execution["job_id"] == job["job_id"]
@@ -651,6 +977,110 @@ async def test_succeeded_requires_worker_dbos_and_related_verified_job(tmp_path:
     assert "PRIVATE_CODEX_PROMPT" not in json_payload
     assert "PRIVATE_FINAL_TEXT" not in json_payload
     assert "PRIVATE_RUN_RESULT" not in json_payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("incomplete_evidence", "expected_reason"),
+    [
+        ("marker_missing", "workflow_not_confirmed"),
+        ("marker_not_last", "evidence_conflict"),
+        ("duplicate_marker", "evidence_conflict"),
+        ("marker_time_reversed", "evidence_conflict"),
+        ("worker_failed", "workflow_not_confirmed"),
+        ("dbos_pending", "workflow_not_confirmed"),
+        ("job_running", "workflow_not_confirmed"),
+        ("job_maybe_sent", "workflow_not_confirmed"),
+        ("job_reconciliation", "workflow_not_confirmed"),
+        ("job_receipt_invalid", "ledger_unavailable"),
+    ],
+)
+async def test_coverage_requires_terminal_marker_and_verified_success_evidence(
+    tmp_path: Path,
+    incomplete_evidence: str,
+    expected_reason: str,
+) -> None:
+    service, snapshot, run_dir, job = await _successful_fake_run(tmp_path)
+    if incomplete_evidence == "marker_missing":
+        with sqlite3.connect(run_dir / "node_events.sqlite") as connection:
+            connection.execute("DELETE FROM node_events WHERE event_type = 'workflow_completed'")
+    elif incomplete_evidence == "marker_not_last":
+        writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
+        writer.observe(
+            _InterpreterEvent(
+                "task_started",
+                node_id="/do/0/private_task",
+                task_identity="do[0].private_task.after_marker",
+                operation="set",
+            )
+        )
+        writer.close()
+    elif incomplete_evidence == "duplicate_marker":
+        with sqlite3.connect(run_dir / "node_events.sqlite") as connection:
+            marker = connection.execute(
+                "SELECT workflow_id, run_id, schema_version, occurred_at, source, metadata_json "
+                "FROM node_events WHERE event_type = 'workflow_completed'"
+            ).fetchone()
+            assert marker is not None
+            connection.execute(
+                "INSERT INTO node_events (event_key, workflow_id, run_id, schema_version, "
+                "node_id, task_identity, execution_id, event_type, occurred_at, source, "
+                "job_id, metadata_json) VALUES (?, ?, ?, ?, NULL, NULL, NULL, "
+                "'workflow_completed', ?, ?, NULL, ?)",
+                ("e" * 64, *marker),
+            )
+    elif incomplete_evidence == "marker_time_reversed":
+        with sqlite3.connect(run_dir / "node_events.sqlite") as connection:
+            connection.execute(
+                "UPDATE node_events SET occurred_at = ? WHERE event_type = 'workflow_completed'",
+                ("2000-01-01T00:00:00+00:00",),
+            )
+    elif incomplete_evidence == "worker_failed":
+        (run_dir / "worker-entry-status.json").write_text(
+            '{"state":"failed","exit_code":1,"error_code":"worker_failed"}',
+            encoding="utf-8",
+        )
+    elif incomplete_evidence == "dbos_pending":
+        with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+            connection.execute(
+                "UPDATE workflow_status SET status = 'PENDING' WHERE workflow_uuid = ?",
+                (snapshot.workflow_id,),
+            )
+    elif incomplete_evidence == "job_running":
+        with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+            connection.execute(
+                "UPDATE jobs SET state = 'RUNNING', remote_state = 'in_progress', "
+                "receipt_json = NULL WHERE job_id = ?",
+                (job["job_id"],),
+            )
+    elif incomplete_evidence == "job_maybe_sent":
+        with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+            connection.execute(
+                "UPDATE jobs SET state = 'MAYBE_SENT', thread_id = NULL, turn_id = NULL, "
+                "remote_state = NULL, receipt_json = NULL WHERE job_id = ?",
+                (job["job_id"],),
+            )
+    elif incomplete_evidence == "job_reconciliation":
+        CodexJobAdapter(run_dir / "codex_jobs.sqlite").mark_reconciliation(
+            job["job_id"], "fixture reconciliation marker", details={"private": "hidden"}
+        )
+    else:
+        with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+            connection.execute(
+                "UPDATE jobs SET remote_state = 'failed' WHERE job_id = ?",
+                (job["job_id"],),
+            )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
+    call_node = next(node for node in projection["nodes"] if node["node_id"] == "/do/1/execute")
+
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == expected_reason
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == expected_reason
+    assert call_node["state"] != "succeeded"
+    assert call_node["executions"][0]["state"] != "succeeded"
 
 
 @pytest.mark.asyncio
@@ -780,7 +1210,8 @@ async def test_replayed_event_key_is_read_once_and_get_does_not_construct_writer
         event_count = connection.execute("SELECT COUNT(*) FROM node_events").fetchone()[0]
 
     assert event_count == 1
-    assert projection["coverage"] == "complete"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
     assert len(projection["nodes"][0]["executions"]) == 1
 
 
