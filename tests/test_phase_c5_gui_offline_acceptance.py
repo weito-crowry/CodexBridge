@@ -5,9 +5,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication, QEvent, QSize
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, QSize, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from codex_bridge.console.i18n import tr
 from codex_bridge.console.workflows_dialog import WorkflowManagementDialog
@@ -160,39 +160,139 @@ def test_dialog_layout_supports_regular_and_compact_sizes() -> None:
     app = _app()
     dialog = WorkflowManagementDialog()
     dialog.set_workflows([{"workflow_id": "workflow-layout", "status": "running"}])
-    dialog.set_result({"result": {"final_text": "offline acceptance result"}})
+    final_text = "\n".join(f"offline result line {index}" for index in range(80))
+    dialog.set_result({"result": {"final_text": final_text}})
     assert dialog.result_tabs.currentIndex() == 0
     assert dialog.graph_widget.set_snapshot(
         "workflow-layout", _scenario_snapshot("workflow-layout")
     )
     dialog.show()
     app.processEvents()
+    requested_actions: list[str] = []
+    dialog.refresh_requested.connect(lambda: requested_actions.append("refresh"))
+    dialog.start_requested.connect(lambda: requested_actions.append("start"))
 
-    try:
-        for size in (QSize(900, 760), QSize(720, 600)):
-            dialog.resize(size)
-            dialog.result_tabs.setCurrentIndex(1)
-            app.processEvents()
-            assert dialog.size() == size
-            for widget in (
-                dialog.workflow_list,
-                dialog.result_tabs,
-                dialog.graph_widget,
-                dialog.graph_widget.graph_view,
-                dialog.graph_widget.graph_view.viewport(),
-                dialog.graph_widget.node_list,
-                dialog.graph_widget.detail_view,
-                dialog.graph_widget.event_list,
-            ):
-                assert widget.geometry().width() > 0
-                assert widget.geometry().height() > 0
-            dialog.result_tabs.setCurrentIndex(0)
-            app.processEvents()
-            assert dialog.selected_workflow_id == "workflow-layout"
-            assert "offline acceptance result" in dialog.final_text_view.toPlainText()
-    finally:
-        dialog.close()
+    for size in (QSize(900, 760), QSize(720, 600)):
+        dialog.resize(size)
+        dialog.result_tabs.setCurrentIndex(1)
         app.processEvents()
+        assert dialog.size() == size
+        for widget in (
+            dialog.workflow_list,
+            dialog.detail_labels["status"],
+            dialog.result_tabs,
+            dialog.graph_widget,
+            dialog.graph_widget.graph_view,
+            dialog.graph_widget.graph_view.viewport(),
+            dialog.graph_widget.node_list,
+            dialog.graph_widget.detail_view,
+            dialog.graph_widget.event_list,
+        ):
+            assert widget.geometry().width() > 0
+            assert widget.geometry().height() > 0
+        for button in (
+            dialog.refresh_button,
+            dialog.start_button,
+            dialog.result_button,
+            dialog.copy_button,
+            dialog.close_button,
+        ):
+            assert button.isVisible()
+            assert button.width() > 0 and button.height() > 0
+            assert dialog.rect().contains(button.mapTo(dialog, button.rect().center()))
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        QTest.mouseClick(dialog.start_button, Qt.MouseButton.LeftButton)
+        expected_action_cycles = 1 if size == QSize(900, 760) else 2
+        assert requested_actions == ["refresh", "start"] * expected_action_cycles
+        dialog.result_tabs.setCurrentIndex(0)
+        app.processEvents()
+        assert dialog.selected_workflow_id == "workflow-layout"
+        assert dialog.final_text_view.toPlainText() == final_text
+
+    scroll_area = dialog.content_scroll_area
+    assert isinstance(scroll_area, QScrollArea)
+    assert scroll_area.widgetResizable()
+    content = scroll_area.widget()
+    assert content is not None
+    for widget in (dialog.workflow_list, dialog.jobs_group, dialog.result_tabs):
+        assert content.isAncestorOf(widget)
+    for button in (
+        dialog.refresh_button,
+        dialog.start_button,
+        dialog.result_button,
+        dialog.copy_button,
+        dialog.close_button,
+    ):
+        assert not content.isAncestorOf(button)
+
+    def visible_in_scroll_area(widget: Any) -> bool:
+        rectangle = QRect(widget.mapTo(scroll_area.viewport(), QPoint(0, 0)), widget.size())
+        return scroll_area.viewport().rect().intersects(rectangle)
+
+    dialog.jobs_group.hide()
+    dialog.resize(QSize(900, 760))
+    dialog.result_tabs.setCurrentIndex(1)
+    app.processEvents()
+    assert dialog.size() == QSize(900, 760)
+    assert scroll_area.verticalScrollBar().maximum() == 0
+
+    dialog.set_detail(
+        {
+            "workflow_id": "workflow-layout",
+            "status": "running",
+            "max_live_codex_jobs": 2,
+            "jobs": [
+                {
+                    "job_id": "job-offline-layout",
+                    "task_identity": "do[0].offline",
+                    "state": "RUNNING",
+                }
+            ],
+        }
+    )
+    dialog.resize(QSize(720, 600))
+    dialog.result_tabs.setCurrentIndex(1)
+    app.processEvents()
+    assert dialog.size() == QSize(720, 600)
+    assert scroll_area.verticalScrollBar().maximum() > 0
+    assert scroll_area.horizontalScrollBar().maximum() > 0
+
+    scroll_area.verticalScrollBar().setValue(0)
+    assert visible_in_scroll_area(dialog.workflow_list)
+    scroll_area.ensureWidgetVisible(dialog.job_list)
+    app.processEvents()
+    assert visible_in_scroll_area(dialog.job_list)
+    dialog.graph_widget.select_node("/do/0/for-zero")
+    scroll_area.verticalScrollBar().setValue(scroll_area.verticalScrollBar().maximum())
+    scroll_area.horizontalScrollBar().setValue(scroll_area.horizontalScrollBar().maximum())
+    app.processEvents()
+    assert visible_in_scroll_area(dialog.result_tabs)
+    assert visible_in_scroll_area(dialog.graph_widget.graph_view.viewport())
+    assert visible_in_scroll_area(dialog.graph_widget.detail_view)
+    assert dialog.graph_widget.detail_view.toPlainText()
+    assert dialog.selected_workflow_id == "workflow-layout"
+    for button in (
+        dialog.refresh_button,
+        dialog.start_button,
+        dialog.result_button,
+        dialog.copy_button,
+        dialog.close_button,
+    ):
+        assert button.isVisible()
+        assert dialog.rect().contains(button.mapTo(dialog, button.rect().center()))
+
+    dialog.result_tabs.setCurrentIndex(0)
+    scroll_area.ensureWidgetVisible(dialog.final_text_view)
+    app.processEvents()
+    assert visible_in_scroll_area(dialog.final_text_view)
+    text_scroll = dialog.final_text_view.verticalScrollBar()
+    assert text_scroll.maximum() > 0
+    text_scroll.setValue(text_scroll.maximum())
+    assert dialog.final_text_view.toPlainText() == final_text
+    assert "offline result line 79" in dialog.final_text_view.toPlainText()
+    QTest.mouseClick(dialog.close_button, Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert not dialog.isVisible()
 
 
 def test_graph_projects_offline_states_job_counts_and_virtual_edges() -> None:

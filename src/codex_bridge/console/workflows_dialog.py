@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -207,15 +208,20 @@ class WorkflowManagementDialog(QDialog):
         root.addWidget(self.bridge_state_label)
         root.addWidget(self.status_label)
 
+        self.content_scroll_area = QScrollArea(self)
+        self.content_scroll_area.setWidgetResizable(True)
+        content = QWidget(self.content_scroll_area)
+        content_layout = QVBoxLayout(content)
+
         upper = QHBoxLayout()
-        list_group = QGroupBox(tr("Workflow list"), self)
+        list_group = QGroupBox(tr("Workflow list"), content)
         list_layout = QVBoxLayout(list_group)
         self.workflow_list = QListWidget(list_group)
         self.workflow_list.currentItemChanged.connect(self._selection_changed)
         list_layout.addWidget(self.workflow_list)
         upper.addWidget(list_group, 1)
 
-        detail_group = QGroupBox(tr("Selected workflow details"), self)
+        detail_group = QGroupBox(tr("Selected workflow details"), content)
         detail_form = QFormLayout(detail_group)
         self.detail_labels = {
             key: QLabel(tr("Not available"), detail_group)
@@ -247,9 +253,9 @@ class WorkflowManagementDialog(QDialog):
             )
             detail_form.addRow(label, self.detail_labels[key])
         upper.addWidget(detail_group, 2)
-        root.addLayout(upper, 2)
+        content_layout.addLayout(upper, 2)
 
-        self.jobs_group = QGroupBox(tr("Codex jobs"), self)
+        self.jobs_group = QGroupBox(tr("Codex jobs"), content)
         jobs_layout = QVBoxLayout(self.jobs_group)
         self.job_list = QListWidget(self.jobs_group)
         self.job_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -258,9 +264,9 @@ class WorkflowManagementDialog(QDialog):
         self.job_list.setMaximumHeight(96)
         jobs_layout.addWidget(self.job_list)
         self.jobs_group.setVisible(False)
-        root.addWidget(self.jobs_group)
+        content_layout.addWidget(self.jobs_group)
 
-        self.result_tabs = QTabWidget(self)
+        self.result_tabs = QTabWidget(content)
         result_group = QGroupBox(tr("Result"), self.result_tabs)
         result_layout = QVBoxLayout(result_group)
         result_layout.addWidget(QLabel(tr("Final text"), result_group))
@@ -277,8 +283,12 @@ class WorkflowManagementDialog(QDialog):
         self.result_tabs.addTab(result_group, tr("Result"))
         self.graph_widget = WorkflowExecutionGraphWidget(self.result_tabs)
         self.result_tabs.addTab(self.graph_widget, tr("Execution graph"))
+        # Prevent the Graph page size hint from forcing regular-size scrolling.
+        self.result_tabs.setMaximumHeight(400)
         self.result_tabs.currentChanged.connect(self._result_tab_changed)
-        root.addWidget(self.result_tabs, 3)
+        content_layout.addWidget(self.result_tabs, 3)
+        self.content_scroll_area.setWidget(content)
+        root.addWidget(self.content_scroll_area, 1)
 
         buttons = QHBoxLayout()
         self.refresh_button = QPushButton(tr("Update"), self)
