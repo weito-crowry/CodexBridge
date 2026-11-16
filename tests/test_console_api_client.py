@@ -407,3 +407,89 @@ def test_api_client_rejects_oversized_http_failure_body_with_fixed_message() -> 
 
     assert failures == [("control", "Bridge control request failed")]
     assert reply.aborted and reply.deleted
+
+
+def test_api_client_gets_authenticated_bounded_graph_endpoints() -> None:
+    _application()
+    tasks_reply = FakeReply(b'{"nodes":[],"edges":[]}', status=200)
+    events_reply = FakeReply(b'{"events":[]}', status=200)
+    manager = FakeManager([tasks_reply, events_reply])
+    client = ApiClient("http://127.0.0.1:18001", manager=manager)
+    successes: list[tuple[str, object]] = []
+    client.workflow_succeeded.connect(
+        lambda key, _status, payload: successes.append((key, payload))
+    )
+    token = "A" * 32
+
+    assert client.get_control_workflow_tasks("workflow-one", token, key="tasks")
+    assert client.get_control_workflow_task_events(
+        "workflow-one", token, after_id=42, limit=75, key="events"
+    )
+    task_request, event_request = manager.requests
+    assert task_request.url().toString() == (
+        "http://127.0.0.1:18001/ui-api/control/workflows/workflow-one/tasks"
+    )
+    assert event_request.url().toString() == (
+        "http://127.0.0.1:18001/ui-api/control/workflows/workflow-one/task-events"
+        "?after_id=42&limit=75"
+    )
+    for request in manager.requests:
+        assert bytes(request.rawHeader("Authorization")) == f"Bearer {token}".encode()
+        assert bytes(request.rawHeader("Accept")) == b"application/json"
+        assert request.transferTimeout() == 10_000
+    assert manager.post_bodies == []
+    tasks_reply.finished.emit()
+    events_reply.finished.emit()
+    assert successes == [("tasks", {"nodes": [], "edges": []}), ("events", {"events": []})]
+
+
+def test_api_client_rejects_invalid_graph_event_query_without_request() -> None:
+    _application()
+    manager = FakeManager([])
+    client = ApiClient("http://127.0.0.1:18001", manager=manager)
+    failures: list[tuple[str, int, str]] = []
+    client.workflow_failed.connect(lambda *failure: failures.append(failure))
+
+    for index, (after_id, limit) in enumerate(
+        ((True, 1), (-1, 1), (2**63, 1), (0, 0), (0, 101), (0, True))
+    ):
+        assert not client.get_control_workflow_task_events(
+            "workflow-one", "token", after_id=after_id, limit=limit, key=f"invalid-{index}"
+        )
+    assert not client.get_control_workflow_tasks("../workflow", "token", key="unsafe-id")
+
+    assert manager.requests == []
+    assert [failure[2] for failure in failures] == ["invalid_request"] * 7
+
+
+def test_api_client_caps_graph_responses_and_aborts_inflight_graph_get() -> None:
+    _application()
+    oversized = FakeReply(b"x" * (256 * 1024 + 1), status=200)
+    pending = FakeReply()
+    manager = FakeManager([oversized, pending])
+    client = ApiClient("http://127.0.0.1:18001", manager=manager)
+    failures: list[tuple[str, int, str]] = []
+    client.workflow_failed.connect(lambda *failure: failures.append(failure))
+
+    assert client.get_control_workflow_tasks("workflow-one", "token", key="large-tasks")
+    oversized.readyRead.emit()
+    assert failures == [("large-tasks", 200, "response_too_large")]
+    assert oversized.aborted and oversized.deleted
+    assert client.get_control_workflow_task_events("workflow-one", "token", key="pending-events")
+    client.abort_workflow_request("pending-events")
+    assert pending.aborted and pending.deleted
+
+
+def test_api_client_caps_oversized_graph_event_response() -> None:
+    _application()
+    oversized = FakeReply(b"x" * (128 * 1024 + 1), status=200)
+    manager = FakeManager([oversized])
+    client = ApiClient("http://127.0.0.1:18001", manager=manager)
+    failures: list[tuple[str, int, str]] = []
+    client.workflow_failed.connect(lambda *failure: failures.append(failure))
+
+    assert client.get_control_workflow_task_events("workflow-one", "token", key="large-events")
+    oversized.readyRead.emit()
+
+    assert failures == [("large-events", 200, "response_too_large")]
+    assert oversized.aborted and oversized.deleted

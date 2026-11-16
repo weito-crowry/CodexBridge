@@ -24,11 +24,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .i18n import tr
+from .workflow_graph_widget import WorkflowExecutionGraphWidget
 
 _MAX_WORKFLOW_YAML_BYTES = 64 * 1024
 _KNOWN_WORKFLOW_STATUSES = frozenset(
@@ -188,6 +190,7 @@ class WorkflowManagementDialog(QDialog):
     refresh_requested = Signal()
     start_requested = Signal()
     result_requested = Signal()
+    graph_visibility_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -195,6 +198,7 @@ class WorkflowManagementDialog(QDialog):
         self.setModal(False)
         self.resize(900, 760)
         self._current_workflow_id: str | None = None
+        self._graph_tab_active = False
 
         root = QVBoxLayout(self)
         self.bridge_state_label = QLabel(tr("Bridge unavailable"), self)
@@ -256,7 +260,8 @@ class WorkflowManagementDialog(QDialog):
         self.jobs_group.setVisible(False)
         root.addWidget(self.jobs_group)
 
-        result_group = QGroupBox(tr("Result"), self)
+        self.result_tabs = QTabWidget(self)
+        result_group = QGroupBox(tr("Result"), self.result_tabs)
         result_layout = QVBoxLayout(result_group)
         result_layout.addWidget(QLabel(tr("Final text"), result_group))
         self.final_text_view = QPlainTextEdit(result_group)
@@ -269,7 +274,11 @@ class WorkflowManagementDialog(QDialog):
         self.result_json.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.result_json.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         result_layout.addWidget(self.result_json, 1)
-        root.addWidget(result_group, 3)
+        self.result_tabs.addTab(result_group, tr("Result"))
+        self.graph_widget = WorkflowExecutionGraphWidget(self.result_tabs)
+        self.result_tabs.addTab(self.graph_widget, tr("Execution graph"))
+        self.result_tabs.currentChanged.connect(self._result_tab_changed)
+        root.addWidget(self.result_tabs, 3)
 
         buttons = QHBoxLayout()
         self.refresh_button = QPushButton(tr("Update"), self)
@@ -295,6 +304,17 @@ class WorkflowManagementDialog(QDialog):
     @property
     def selected_workflow_id(self) -> str | None:
         return self._current_workflow_id
+
+    @property
+    def graph_tab_active(self) -> bool:
+        return self._graph_tab_active
+
+    def _result_tab_changed(self, index: int) -> None:
+        active = index == 1
+        if active == self._graph_tab_active:
+            return
+        self._graph_tab_active = active
+        self.graph_visibility_changed.emit(active)
 
     def set_bridge_ready(self, ready: bool) -> None:
         self.bridge_state_label.setText(
@@ -435,6 +455,7 @@ class WorkflowManagementDialog(QDialog):
             self.result_button.setEnabled(False)
         self.clear_detail()
         self.clear_result()
+        self.graph_widget.clear_data()
         if workflow_id is not None:
             self.workflow_selected.emit(workflow_id)
         else:

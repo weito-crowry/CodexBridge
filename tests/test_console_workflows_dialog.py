@@ -120,6 +120,41 @@ def test_workflow_management_dialog_updates_rows_by_id_without_clearing_selectio
     dialog.close()
 
 
+def test_workflow_dialog_graph_tab_is_read_only_and_preserves_result_selection() -> None:
+    _app()
+    dialog = WorkflowManagementDialog()
+    workflow_ids = ["workflow-one", "workflow-two"]
+    dialog.set_workflows(
+        [{"workflow_id": workflow_id, "status": "running"} for workflow_id in workflow_ids]
+    )
+    dialog.set_result({"result": {"final_text": "result stays visible"}})
+    original_result_view = dialog.final_text_view
+    visibility: list[bool] = []
+    dialog.graph_visibility_changed.connect(visibility.append)
+
+    assert dialog.result_tabs.currentIndex() == 0
+    assert not dialog.graph_tab_active
+    assert dialog.selected_workflow_id == "workflow-one"
+    dialog.result_tabs.setCurrentIndex(1)
+
+    assert dialog.graph_tab_active
+    assert visibility == [True]
+    assert dialog.selected_workflow_id == "workflow-one"
+    assert dialog.final_text_view is original_result_view
+    assert "result stays visible" in dialog.final_text_view.toPlainText()
+    dialog.result_tabs.setCurrentIndex(1)
+    assert visibility == [True]
+    dialog.workflow_list.setCurrentRow(1)
+    assert dialog.selected_workflow_id == "workflow-two"
+    assert dialog.graph_widget.snapshot_identity is None
+
+    dialog.clear_selection()
+    assert dialog.selected_workflow_id is None
+    assert dialog.graph_widget.snapshot_identity is None
+    dialog.result_tabs.setCurrentIndex(0)
+    assert visibility == [True, False]
+
+
 def test_workflow_management_dialog_displays_details_and_redacts_result_secrets() -> None:
     _app()
     dialog = WorkflowManagementDialog()
@@ -578,6 +613,9 @@ def test_workflow_dialog_translations(
     assert dialog.windowTitle() == expected_title
     assert workflow_status_label("needs_reconciliation") == expected_reconciliation
     assert dialog.refresh_button.text() in {"Update", "更新"}
+    assert dialog.result_tabs.tabText(1) == (
+        "実行グラフ" if language == "ja-JP" else "Execution graph"
+    )
     assert dialog.jobs_group.title() in {"Codex jobs", "Codexジョブ一覧"}
     assert start_dialog.job_count_combo.count() == 2
     assert start_dialog.job_count_notice.isHidden()

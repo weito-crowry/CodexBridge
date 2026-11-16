@@ -16,6 +16,8 @@ _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024
 _MAX_WORKFLOW_LIST_RESPONSE_BYTES = 64 * 1024
 _MAX_WORKFLOW_DETAIL_RESPONSE_BYTES = 4 * 1024
 _MAX_WORKFLOW_RESULT_RESPONSE_BYTES = 64 * 1024
+_MAX_WORKFLOW_TASKS_RESPONSE_BYTES = 256 * 1024
+_MAX_WORKFLOW_TASK_EVENTS_RESPONSE_BYTES = 128 * 1024
 _MAX_WORKFLOW_REQUEST_BYTES = 128 * 1024
 _WORKFLOW_GET_TRANSFER_TIMEOUT_MS = 10_000
 _WORKFLOW_POST_TRANSFER_TIMEOUT_MS = 25_000
@@ -272,6 +274,51 @@ class ApiClient(QObject):
             key=key,
             response_limit=_MAX_WORKFLOW_RESULT_RESPONSE_BYTES,
             success_statuses=frozenset({200, 202}),
+        )
+
+    def get_control_workflow_tasks(self, workflow_id: str, token: str, *, key: str) -> bool:
+        safe_id = self._workflow_path_id(workflow_id)
+        if safe_id is None:
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        return self._start_workflow_request(
+            "GET",
+            self._url(f"/ui-api/control/workflows/{safe_id}/tasks"),
+            token,
+            key=key,
+            response_limit=_MAX_WORKFLOW_TASKS_RESPONSE_BYTES,
+            success_statuses=frozenset({200}),
+        )
+
+    def get_control_workflow_task_events(
+        self,
+        workflow_id: str,
+        token: str,
+        after_id: int = 0,
+        limit: int = 100,
+        *,
+        key: str,
+    ) -> bool:
+        safe_id = self._workflow_path_id(workflow_id)
+        if (
+            safe_id is None
+            or type(after_id) is not int
+            or not 0 <= after_id <= 2**63 - 1
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+        ):
+            self.workflow_failed.emit(key, 0, "invalid_request")
+            return False
+        return self._start_workflow_request(
+            "GET",
+            self._url(
+                f"/ui-api/control/workflows/{safe_id}/task-events",
+                {"after_id": after_id, "limit": limit},
+            ),
+            token,
+            key=key,
+            response_limit=_MAX_WORKFLOW_TASK_EVENTS_RESPONSE_BYTES,
+            success_statuses=frozenset({200}),
         )
 
     @staticmethod

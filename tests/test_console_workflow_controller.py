@@ -42,6 +42,22 @@ class FakeWorkflowClient:
         self.calls.append(("result", key, token, workflow_id))
         return True
 
+    def get_control_workflow_tasks(self, workflow_id: str, token: str, *, key: str) -> bool:
+        self.calls.append(("tasks", key, token, workflow_id))
+        return True
+
+    def get_control_workflow_task_events(
+        self,
+        workflow_id: str,
+        token: str,
+        after_id: int = 0,
+        limit: int = 100,
+        *,
+        key: str,
+    ) -> bool:
+        self.calls.append(("task_events", key, token, (workflow_id, after_id, limit)))
+        return True
+
     def post_control_workflow(self, token: str, payload: object, *, key: str) -> bool:
         self.calls.append(("start", key, token, payload))
         return True
@@ -141,6 +157,57 @@ def _detail(workflow_id: str, status: str = "running") -> dict[str, object]:
     }
 
 
+def _graph_snapshot(
+    workflow_id: str = "workflow-one", run_id: str = "run-one", version: str = "1"
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "workflow_status": "running",
+        "coverage": "unavailable",
+        "coverage_reason": "journal_missing",
+        "latest_event_id": 2,
+        "snapshot_version": "sha256:" + version * 64,
+        "truncated": False,
+        "counts": {"nodes": 0, "edges": 0, "executions": 0},
+        "nodes": [],
+        "edges": [],
+    }
+
+
+def _graph_events(
+    workflow_id: str = "workflow-one", run_id: str = "run-one", after_id: int = 0
+) -> dict[str, object]:
+    event_rows: list[dict[str, object]] = []
+    if after_id < 2:
+        event_id = after_id + 1
+        event_rows = [
+            {
+                "event_id": event_id,
+                "event_type": "workflow_completed",
+                "node_id": None,
+                "task_identity": None,
+                "execution_id": None,
+                "occurred_at": "2026-11-17T00:00:00Z",
+                "source": "interpreter",
+                "metadata": {},
+            }
+        ]
+    return {
+        "schema_version": 1,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "events": event_rows,
+        "next_after_id": event_rows[-1]["event_id"] if event_rows else after_id,
+        "has_more": bool(event_rows and event_rows[-1]["event_id"] < 2),
+        "truncated": False,
+        "coverage": "unavailable",
+        "coverage_reason": "journal_missing",
+        "latest_event_id": 2,
+    }
+
+
 def test_workflow_controller_loads_list_detail_and_result_in_order(
     managed_controller: ControllerFactory,
 ) -> None:
@@ -158,6 +225,175 @@ def test_workflow_controller_loads_list_detail_and_result_in_order(
 
     assert "workflow complete" in controller.dialog.final_text_view.toPlainText()
     assert controller.dialog.result_json.toPlainText().startswith("{")
+    controller.shutdown()
+
+
+def test_workflow_controller_polls_graph_only_when_visible_and_pages_one_event_batch_per_tick(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one"))
+    assert not any(call[0] in {"tasks", "task_events"} for call in client.calls)
+
+    controller.dialog.result_tabs.setCurrentIndex(1)
+    tasks_call = client.calls[-1]
+    assert tasks_call[0] == "tasks"
+    client.succeed(tasks_call, 200, _graph_snapshot())
+    first_events_call = client.calls[-1]
+    assert first_events_call[0] == "task_events"
+    assert first_events_call[3] == ("workflow-one", 0, 100)
+    first_events = _graph_events()
+    client.succeed(first_events_call, 200, first_events)
+    assert controller.dialog.graph_widget.event_cursor == 1
+    assert client.calls[-1] == first_events_call
+
+    controller._refresh_if_ready()
+    list_call = client.calls[-1]
+    assert list_call[0] == "list"
+    client.succeed(list_call, 200, _list_payload("workflow-one"))
+    tasks_call = client.calls[-1]
+    assert tasks_call[0] == "tasks"
+    client.succeed(tasks_call, 200, _graph_snapshot(version="2"))
+    second_events_call = client.calls[-1]
+    assert second_events_call[0] == "task_events"
+    assert second_events_call[3] == ("workflow-one", 1, 100)
+    client.succeed(second_events_call, 200, _graph_events(after_id=1))
+    assert controller.dialog.graph_widget.event_cursor == 2
+
+    controller._refresh_if_ready()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    pending_graph = client.calls[-1]
+    assert pending_graph[0] == "tasks"
+    controller.dialog.refresh_button.click()
+    assert pending_graph[1] in client.aborted
+    assert client.calls[-1][0] == "list"
+    refreshed_list = client.calls[-1]
+    client.succeed(refreshed_list, 200, _list_payload("workflow-one"))
+    assert client.calls[-1][0] == "detail"
+    client.succeed(client.calls[-1], 200, _detail("workflow-one"))
+    assert client.calls[-1][0] == "tasks"
+    controller.shutdown()
+
+
+def test_workflow_controller_graph_errors_do_not_change_workflow_state_and_start_has_priority(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one"))
+    controller.dialog.result_tabs.setCurrentIndex(1)
+    graph_call = client.calls[-1]
+    client.fail(graph_call, 503, "workflow_service_unavailable")
+
+    assert controller.dialog.detail_labels["status"].text() == "Workflow status: running"
+    assert (
+        "Workflow service is unavailable"
+        in controller.dialog.graph_widget.graph_status_label.text()
+    )
+    assert controller.timer.isActive()
+
+    controller._refresh_if_ready()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    graph_call = client.calls[-1]
+    assert graph_call[0] == "tasks"
+    controller.dialog.start_button.click()
+    assert graph_call[1] in client.aborted
+    assert controller._active_start_dialog is not None
+    assert not any(call[0] == "start" for call in client.calls)
+    controller.shutdown()
+
+
+def test_workflow_controller_result_request_preempts_graph_poll(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one", "succeeded"))
+    assert client.calls[-1][0] == "result"
+    client.succeed(client.calls[-1], 200, {"result": {"final_text": "done"}})
+    controller.dialog.result_tabs.setCurrentIndex(1)
+    graph_call = client.calls[-1]
+    assert graph_call[0] == "tasks"
+
+    controller.dialog.result_button.click()
+
+    assert graph_call[1] in client.aborted
+    assert client.calls[-1][0] == "result"
+    controller.shutdown()
+
+
+def test_workflow_controller_periodic_list_poll_preempts_slow_graph_get(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one"))
+    controller.dialog.result_tabs.setCurrentIndex(1)
+    slow_graph = client.calls[-1]
+    assert slow_graph[0] == "tasks"
+
+    controller._refresh_if_ready()
+
+    assert slow_graph[1] in client.aborted
+    assert client.calls[-1][0] == "list"
+    controller.shutdown()
+
+
+def test_workflow_controller_aborts_stale_graph_requests_on_selection_token_and_close(
+    managed_controller: ControllerFactory,
+) -> None:
+    window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one", "workflow-two"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one"))
+    controller.dialog.result_tabs.setCurrentIndex(1)
+    stale_tasks = client.calls[-1]
+    assert stale_tasks[0] == "tasks"
+
+    controller.dialog.workflow_list.setCurrentRow(1)
+    assert stale_tasks[1] in client.aborted
+    assert controller.dialog.selected_workflow_id == "workflow-two"
+    client.succeed(stale_tasks, 200, _graph_snapshot())
+    assert controller.dialog.graph_widget.snapshot_identity is None
+    client.succeed(client.calls[-1], 200, _detail("workflow-two"))
+    active_tasks = client.calls[-1]
+    assert active_tasks[0] == "tasks"
+
+    window._control_token = "token-two"
+    controller.notify_readiness_changed()
+    assert active_tasks[1] in client.aborted
+    list_call = client.calls[-1]
+    assert list_call[0] == "list" and list_call[2] == "token-two"
+    client.succeed(active_tasks, 200, _graph_snapshot("workflow-two"))
+    assert controller.dialog.graph_widget.snapshot_identity is None
+    controller.dialog.close()
+    assert list_call[1] in client.aborted
+    controller.shutdown()
+
+
+def test_workflow_controller_graph_403_blocks_auth_and_rejects_wrong_workflow_dto(
+    managed_controller: ControllerFactory,
+) -> None:
+    _window, client, controller = managed_controller()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    client.succeed(client.calls[-1], 200, _detail("workflow-one"))
+    controller.dialog.result_tabs.setCurrentIndex(1)
+    graph_call = client.calls[-1]
+    wrong_workflow = _graph_snapshot(workflow_id="workflow-two")
+    client.succeed(graph_call, 200, wrong_workflow)
+
+    assert "invalid" in controller.dialog.graph_widget.graph_status_label.text().lower()
+    assert controller.dialog.detail_labels["status"].text() == "Workflow status: running"
+    assert not any(call[0] == "task_events" for call in client.calls)
+
+    controller._refresh_if_ready()
+    client.succeed(client.calls[-1], 200, _list_payload("workflow-one"))
+    graph_call = client.calls[-1]
+    assert graph_call[0] == "tasks"
+    client.fail(graph_call, 403, "forbidden")
+    assert controller._auth_blocked_token == "token-one"
+    assert not controller.timer.isActive()
+    assert "not authorized" in controller.dialog.graph_widget.graph_status_label.text().lower()
     controller.shutdown()
 
 

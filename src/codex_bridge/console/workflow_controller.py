@@ -46,6 +46,7 @@ class WorkflowManagementController(QObject):
         self._dialog.result_requested.connect(self._request_selected_result)
         self._dialog.workflow_selected.connect(self._select_workflow)
         self._dialog.selection_cleared.connect(self._clear_workflow_selection)
+        self._dialog.graph_visibility_changed.connect(self._on_graph_visibility_changed)
         self._dialog.finished.connect(self._on_dialog_closed)
         self._signal_connections: list[tuple[Any, Any]] = []
         self._timer = QTimer(self)
@@ -63,6 +64,8 @@ class WorkflowManagementController(QObject):
         self._result_loaded_for: str | None = None
         self._active_start_dialog: StartWorkflowDialog | None = None
         self._auth_blocked_token: str | None = None
+        self._graph_event_cursor = 0
+        self._graph_run_id: str | None = None
         self._shutdown = False
 
     @property
@@ -143,6 +146,7 @@ class WorkflowManagementController(QObject):
             notify_start_outcome=True,
             retry_allowed=ready,
         )
+        self._reset_graph_state(clear_widget=True)
         if self._auth_blocked_token is not None and snapshot[1] != self._auth_blocked_token:
             self._auth_blocked_token = None
         self._dialog.set_bridge_ready(ready)
@@ -164,6 +168,8 @@ class WorkflowManagementController(QObject):
         if not self._availability[0]:
             self._dialog.set_message(tr("Bridge unavailable"))
             return
+        if self._inflight is not None and self._inflight.kind in {"tasks", "task_events"}:
+            self._cancel_inflight()
         self._manual_detail_refresh_id = self._selected_workflow_id
         # This is an explicit user request. Authentication failures suppress polling,
         # while a manual refresh remains available after reviewing the message.
@@ -178,6 +184,8 @@ class WorkflowManagementController(QObject):
         before = self._availability
         self.notify_readiness_changed()
         if self._availability[0] and before == self._availability:
+            if self._inflight is not None and self._inflight.kind in {"tasks", "task_events"}:
+                self._cancel_inflight()
             self._request_list()
 
     def _request_list(self) -> None:
@@ -192,10 +200,16 @@ class WorkflowManagementController(QObject):
             return
         self._selection_generation += 1
         self._selected_workflow_id = workflow_id
+        self._reset_graph_state(clear_widget=True)
         self._result_loaded_for = None
         if self._manual_detail_refresh_id != workflow_id:
             self._manual_detail_refresh_id = None
-        if self._inflight is not None and self._inflight.kind in {"detail", "result"}:
+        if self._inflight is not None and self._inflight.kind in {
+            "detail",
+            "result",
+            "tasks",
+            "task_events",
+        }:
             self._cancel_inflight()
         if self._inflight is None:
             self._pending_detail_workflow_id = None
@@ -214,11 +228,17 @@ class WorkflowManagementController(QObject):
             return
         self._selection_generation += 1
         self._selected_workflow_id = None
+        self._reset_graph_state(clear_widget=True)
         self._pending_selected_workflow_id = None
         self._pending_detail_workflow_id = None
         self._manual_detail_refresh_id = None
         self._result_loaded_for = None
-        if self._inflight is not None and self._inflight.kind in {"detail", "result"}:
+        if self._inflight is not None and self._inflight.kind in {
+            "detail",
+            "result",
+            "tasks",
+            "task_events",
+        }:
             self._cancel_inflight()
         self._update_buttons()
 
@@ -243,6 +263,8 @@ class WorkflowManagementController(QObject):
             self._request_result(workflow_id)
 
     def _request_result(self, workflow_id: str) -> None:
+        if self._inflight is not None and self._inflight.kind in {"tasks", "task_events"}:
+            self._cancel_inflight()
         if not self._can_request() or self._inflight is not None:
             return
         self._send_request(
@@ -252,6 +274,56 @@ class WorkflowManagementController(QObject):
                 workflow_id, token, key=key
             ),
         )
+
+    def _on_graph_visibility_changed(self, active: bool) -> None:
+        if not active:
+            if self._inflight is not None and self._inflight.kind in {"tasks", "task_events"}:
+                self._cancel_inflight()
+            return
+        self._request_graph_tasks()
+
+    def _request_graph_tasks(self) -> None:
+        workflow_id = self._selected_workflow_id
+        if (
+            workflow_id is None
+            or not self._dialog.graph_tab_active
+            or self._active_start_dialog is not None
+            or self._inflight is not None
+            or not self._can_request()
+        ):
+            return
+        self._send_request(
+            "tasks",
+            workflow_id,
+            lambda key, token: self._client.get_control_workflow_tasks(workflow_id, token, key=key),
+        )
+
+    def _request_graph_events(self, workflow_id: str) -> None:
+        if (
+            workflow_id != self._selected_workflow_id
+            or not self._dialog.graph_tab_active
+            or self._active_start_dialog is not None
+            or self._inflight is not None
+            or not self._can_request()
+        ):
+            return
+        self._send_request(
+            "task_events",
+            workflow_id,
+            lambda key, token: self._client.get_control_workflow_task_events(
+                workflow_id,
+                token,
+                after_id=self._graph_event_cursor,
+                limit=100,
+                key=key,
+            ),
+        )
+
+    def _reset_graph_state(self, *, clear_widget: bool) -> None:
+        self._graph_event_cursor = 0
+        self._graph_run_id = None
+        if clear_widget:
+            self._dialog.graph_widget.clear_data()
 
     def _send_request(self, kind: str, workflow_id: str | None, send: Any) -> None:
         token = self._availability[1]
@@ -296,7 +368,9 @@ class WorkflowManagementController(QObject):
             or request.epoch != self._epoch
         ):
             return False
-        if request.kind in {"detail", "result"}:
+        if request.kind in {"detail", "result", "tasks", "task_events"}:
+            if request.kind in {"tasks", "task_events"} and not self._dialog.graph_tab_active:
+                return False
             return (
                 request.selection_generation == self._selection_generation
                 and request.workflow_id == self._selected_workflow_id
@@ -319,6 +393,10 @@ class WorkflowManagementController(QObject):
             self._apply_workflow_detail(request, payload)
         elif request.kind == "result":
             self._apply_workflow_result(request, status_code, payload)
+        elif request.kind == "tasks":
+            self._apply_workflow_tasks(request, payload)
+        elif request.kind == "task_events":
+            self._apply_workflow_task_events(request, payload)
         elif request.kind == "start":
             self._apply_start_response(payload)
 
@@ -354,6 +432,8 @@ class WorkflowManagementController(QObject):
         self._dialog.set_message(
             tr("Showing the newest 50 workflows") if truncated else tr("Workflow list updated")
         )
+        if self._inflight is None:
+            self._request_graph_tasks()
 
     def _apply_workflow_detail(self, request: _WorkflowRequest, payload: object) -> None:
         if not isinstance(payload, Mapping) or payload.get("workflow_id") != request.workflow_id:
@@ -363,6 +443,8 @@ class WorkflowManagementController(QObject):
         status = payload.get("status")
         if status == "succeeded" and request.workflow_id != self._result_loaded_for:
             self._request_result(request.workflow_id or "")
+        if self._inflight is None and request.workflow_id is not None:
+            self._request_graph_tasks()
 
     def _apply_workflow_result(
         self,
@@ -372,6 +454,8 @@ class WorkflowManagementController(QObject):
     ) -> None:
         if status_code == 202:
             self._dialog.set_message(workflow_error_message("workflow_in_progress"))
+            if request.workflow_id is not None:
+                self._request_graph_tasks()
             return
         if not isinstance(payload, Mapping):
             self._dialog.set_message(workflow_error_message("invalid_json"))
@@ -379,6 +463,30 @@ class WorkflowManagementController(QObject):
         self._dialog.set_result(payload)
         self._result_loaded_for = request.workflow_id
         self._dialog.set_message(tr("Workflow result updated"))
+        if request.workflow_id is not None:
+            self._request_graph_tasks()
+
+    def _apply_workflow_tasks(self, request: _WorkflowRequest, payload: object) -> None:
+        workflow_id = request.workflow_id
+        if workflow_id is None or not self._dialog.graph_widget.set_snapshot(workflow_id, payload):
+            self._dialog.graph_widget.set_error(workflow_error_message("invalid_response"))
+            return
+        identity = self._dialog.graph_widget.snapshot_identity
+        if identity is None:
+            self._dialog.graph_widget.set_error(workflow_error_message("invalid_response"))
+            return
+        _identity_workflow, run_id, _version = identity
+        if self._graph_run_id != run_id:
+            self._graph_event_cursor = self._dialog.graph_widget.event_cursor
+            self._graph_run_id = run_id
+        self._request_graph_events(workflow_id)
+
+    def _apply_workflow_task_events(self, request: _WorkflowRequest, payload: object) -> None:
+        workflow_id = request.workflow_id
+        if workflow_id is None or not self._dialog.graph_widget.set_events(payload):
+            self._dialog.graph_widget.set_error(workflow_error_message("invalid_response"))
+            return
+        self._graph_event_cursor = self._dialog.graph_widget.event_cursor
 
     def _on_workflow_failed(self, key: str, status_code: int, code: str) -> None:
         request = self._inflight
@@ -391,7 +499,11 @@ class WorkflowManagementController(QObject):
         if code == "forbidden" or status_code == 403:
             self._auth_blocked_token = request.token
         message = workflow_error_message(code)
-        if request.kind == "detail" and isinstance(request.workflow_id, str):
+        if request.kind in {"tasks", "task_events"}:
+            if code == "forbidden" or status_code == 403:
+                self._reset_graph_state(clear_widget=True)
+            self._dialog.graph_widget.set_error(message)
+        elif request.kind == "detail" and isinstance(request.workflow_id, str):
             self._dialog.set_error_classification(code)
             self._dialog.set_message(message)
         elif request.kind == "result":
@@ -418,6 +530,8 @@ class WorkflowManagementController(QObject):
 
     def _start_new_workflow(self) -> None:
         self.notify_readiness_changed()
+        if self._inflight is not None and self._inflight.kind in {"tasks", "task_events"}:
+            self._cancel_inflight()
         if self._inflight is not None:
             self._dialog.set_message(tr("A workflow request is already in progress"))
             return
@@ -439,6 +553,8 @@ class WorkflowManagementController(QObject):
         dialog = self._active_start_dialog
         if dialog is None or not isinstance(payload, Mapping):
             return
+        if self._inflight is not None and self._inflight.kind in {"tasks", "task_events"}:
+            self._cancel_inflight()
         if self._inflight is not None:
             dialog.show_request_failure("network_error", outcome_unknown=True, retry_allowed=True)
             return
@@ -495,7 +611,7 @@ class WorkflowManagementController(QObject):
         ready = self._availability[0]
         enabled = (
             ready
-            and self._inflight is None
+            and (self._inflight is None or self._inflight.kind in {"tasks", "task_events"})
             and self._auth_blocked_token != self._availability[1]
             and self._active_start_dialog is None
             and not self._shutdown
@@ -532,6 +648,7 @@ class WorkflowManagementController(QObject):
         self._epoch += 1
         self._cancel_inflight()
         self._selected_workflow_id = None
+        self._reset_graph_state(clear_widget=True)
         self._pending_detail_workflow_id = None
         self._manual_detail_refresh_id = None
         self._result_loaded_for = None
