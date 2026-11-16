@@ -353,9 +353,7 @@ def _git_head() -> str:
     for path in changed_paths:
         if path not in allowed_paths and not (
             re.fullmatch(r"docs/phase_b5_[A-Za-z0-9._-]+\.md", path, re.ASCII)
-            or re.fullmatch(
-                r"docs/phase_b5_workflow_acceptance-[0-9a-f]{32}\.json", path, re.ASCII
-            )
+            or re.fullmatch(r"docs/phase_b5_workflow_acceptance-[0-9a-f]{32}\.json", path, re.ASCII)
         ):
             raise SmokeAbort("BLOCKED", "runner_source_tree_outside_allowed_scope")
 
