@@ -41,7 +41,7 @@ from scripts import phase5f5_integrated_isolated_smoke as phase5f5
 from scripts.phase5e_smoke_support import ports_are_safe, roots_are_separate
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-PARENT_HEAD = "6d8b6b941a84d81694de5126e07998e3399ebf3e"
+PARENT_HEAD = "ce05ba54d9d47f9160a9b1a3f571f0239cad4983"
 BRIDGE_HOST = "127.0.0.1"
 EXPECTED_PROMPT = "Reply with exactly B5_VERIFY_OK"
 EXPECTED_RESULT = "B5_VERIFY_OK"
