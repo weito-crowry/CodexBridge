@@ -333,8 +333,50 @@ def _git_head() -> str:
     ancestor = _run_command(["git", "merge-base", "--is-ancestor", PARENT_HEAD, head], timeout=10.0)
     if ancestor.returncode != 0:
         raise SmokeAbort("BLOCKED", "expected_parent_head_not_in_current_history")
-    if head != PARENT_HEAD:
-        raise SmokeAbort("BLOCKED", "runner_source_head_is_not_expected_parent")
+
+    source_diff = _run_command(
+        ["git", "diff", "--name-only", "-z", PARENT_HEAD, head], timeout=10.0
+    )
+    if source_diff.returncode != 0 or not isinstance(source_diff.stdout, str):
+        raise SmokeAbort("BLOCKED", "runner_source_tree_check_failed")
+    diff_output = source_diff.stdout
+    if diff_output and not diff_output.endswith("\0"):
+        raise SmokeAbort("BLOCKED", "runner_source_tree_check_failed")
+    changed_paths = diff_output[:-1].split("\0") if diff_output else []
+    if any(not path for path in changed_paths):
+        raise SmokeAbort("BLOCKED", "runner_source_tree_check_failed")
+
+    allowed_paths = {
+        "scripts/phase_b5_workflow_isolated_smoke.py",
+        "tests/test_phase_b5_workflow_isolated_smoke.py",
+    }
+    for path in changed_paths:
+        if path not in allowed_paths and not (
+            re.fullmatch(r"docs/phase_b5_[A-Za-z0-9._-]+\.md", path, re.ASCII)
+            or re.fullmatch(
+                r"docs/phase_b5_workflow_acceptance-[0-9a-f]{32}\.json", path, re.ASCII
+            )
+        ):
+            raise SmokeAbort("BLOCKED", "runner_source_tree_outside_allowed_scope")
+
+    worktree = _run_command(
+        [
+            "git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--",
+            "src",
+            "scripts",
+            "tests",
+        ],
+        timeout=10.0,
+    )
+    if worktree.returncode != 0 or not isinstance(worktree.stdout, str):
+        raise SmokeAbort("BLOCKED", "runner_worktree_status_check_failed")
+    if worktree.stdout:
+        raise SmokeAbort("BLOCKED", "runner_uncommitted_sensitive_changes")
     return head
 
 

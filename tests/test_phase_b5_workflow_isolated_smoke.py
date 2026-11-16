@@ -593,3 +593,144 @@ def test_wait_workflow_success_bounds_status_observation_growth(
     assert observations["omitted_count"] == 6
     assert len(calls) == 70
     assert all(method == "GET" for method, _route in calls)
+
+
+def _fake_git_result(returncode: int = 0, stdout: str = "") -> SimpleNamespace:
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+
+def _patch_git_head_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    head: str,
+    ancestor_returncode: int = 0,
+    diff_stdout: str = "",
+    diff_returncode: int = 0,
+    status_stdout: str = "",
+    status_returncode: int = 0,
+) -> list[tuple[str, ...]]:
+    calls: list[tuple[str, ...]] = []
+    ancestor_command = ("git", "merge-base", "--is-ancestor", runner.PARENT_HEAD, head)
+    diff_command = ("git", "diff", "--name-only", "-z", runner.PARENT_HEAD, head)
+    status_command = (
+        "git",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--",
+        "src",
+        "scripts",
+        "tests",
+    )
+
+    def fake_run(command: list[str], *, timeout: float) -> SimpleNamespace:
+        del timeout
+        argv = tuple(command)
+        calls.append(argv)
+        if argv == ("git", "rev-parse", "HEAD"):
+            return _fake_git_result(stdout=head)
+        if argv == ancestor_command:
+            return _fake_git_result(returncode=ancestor_returncode)
+        if argv == diff_command:
+            return _fake_git_result(returncode=diff_returncode, stdout=diff_stdout)
+        if argv == status_command:
+            return _fake_git_result(returncode=status_returncode, stdout=status_stdout)
+        pytest.fail(f"unexpected git command: {argv!r}")
+
+    monkeypatch.setattr(runner, "_run_command", fake_run)
+    return calls
+
+
+def test_git_head_accepts_descendant_with_only_approved_committed_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    head = "a" * 40
+    paths = [
+        "scripts/phase_b5_workflow_isolated_smoke.py",
+        "tests/test_phase_b5_workflow_isolated_smoke.py",
+        "docs/phase_b5_r4_acceptance.md",
+        "docs/phase_b5_workflow_acceptance-0123456789abcdef0123456789abcdef.json",
+    ]
+    _patch_git_head_commands(monkeypatch, head=head, diff_stdout="\0".join(paths) + "\0")
+
+    assert runner._git_head() == head
+
+
+def test_git_head_accepts_parent_with_empty_committed_diff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_git_head_commands(monkeypatch, head=runner.PARENT_HEAD)
+
+    assert runner._git_head() == runner.PARENT_HEAD
+
+
+def test_git_head_rejects_head_outside_parent_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    head = "b" * 40
+    calls = _patch_git_head_commands(monkeypatch, head=head, ancestor_returncode=1)
+
+    with pytest.raises(runner.SmokeAbort, match="expected_parent_head_not_in_current_history"):
+        runner._git_head()
+
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "changed_path",
+    ["src/codex_bridge/workflows/service.py", "docs/unrelated.md"],
+)
+def test_git_head_rejects_committed_paths_outside_b5_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_path: str,
+) -> None:
+    head = "c" * 40
+    _patch_git_head_commands(
+        monkeypatch,
+        head=head,
+        diff_stdout=changed_path + "\0",
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="runner_source_tree_outside_allowed_scope"):
+        runner._git_head()
+
+
+def test_git_head_rejects_committed_diff_command_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_git_head_commands(monkeypatch, head="d" * 40, diff_returncode=1)
+
+    with pytest.raises(runner.SmokeAbort, match="runner_source_tree_check_failed"):
+        runner._git_head()
+
+
+def test_git_head_rejects_unterminated_name_only_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_git_head_commands(
+        monkeypatch,
+        head="e" * 40,
+        diff_stdout="scripts/phase_b5_workflow_isolated_smoke.py",
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="runner_source_tree_check_failed"):
+        runner._git_head()
+
+
+def test_git_head_rejects_invalid_head_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_git_head_commands(monkeypatch, head="not-a-commit")
+
+    with pytest.raises(runner.SmokeAbort, match="git_head_read_failed"):
+        runner._git_head()
+
+
+def test_git_head_rejects_uncommitted_sensitive_tree_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_git_head_commands(
+        monkeypatch,
+        head="f" * 40,
+        status_stdout="?? src/codex_bridge/untracked_module.py\0",
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="runner_uncommitted_sensitive_changes"):
+        runner._git_head()
