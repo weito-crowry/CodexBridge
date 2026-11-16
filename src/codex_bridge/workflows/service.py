@@ -585,6 +585,58 @@ class WorkflowService:
         except (OSError, sqlite3.Error, ValueError):
             raise WorkflowServiceUnavailable("workflow result is unavailable") from None
 
+    async def get_workflow_tasks(self, workflow_id: str) -> dict[str, Any]:
+        normalized = _normalize_workflow_id(workflow_id)
+        try:
+            row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
+            if row is None:
+                raise WorkflowNotFoundError("workflow was not found")
+            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            from .task_projection import project_workflow_tasks
+
+            return await asyncio.to_thread(
+                project_workflow_tasks,
+                self._state_root,
+                row,
+                inspection,
+            )
+        except (WorkflowNotFoundError, WorkflowServiceUnavailable):
+            raise
+        except (OSError, sqlite3.Error, ValueError):
+            raise WorkflowServiceUnavailable("workflow task projection is unavailable") from None
+
+    async def get_workflow_task_events(
+        self,
+        workflow_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        if type(after_id) is not int or not 0 <= after_id <= 2**63 - 1:
+            raise WorkflowRequestError("after_id must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise WorkflowRequestError("event limit must be an integer from 1 to 100")
+        normalized = _normalize_workflow_id(workflow_id)
+        try:
+            row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
+            if row is None:
+                raise WorkflowNotFoundError("workflow was not found")
+            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            from .task_projection import project_workflow_task_events
+
+            return await asyncio.to_thread(
+                project_workflow_task_events,
+                self._state_root,
+                row,
+                inspection,
+                after_id=after_id,
+                limit=limit,
+            )
+        except (WorkflowNotFoundError, WorkflowServiceUnavailable):
+            raise
+        except (OSError, sqlite3.Error, ValueError):
+            raise WorkflowServiceUnavailable("workflow task events are unavailable") from None
+
     async def _replay(self, row: _RequestRow, request_digest: str) -> WorkflowSnapshot:
         if row.request_digest != request_digest:
             raise WorkflowRequestConflict(

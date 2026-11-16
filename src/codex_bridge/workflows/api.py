@@ -23,10 +23,17 @@ from .service import (
 
 _MAX_BODY_BYTES = 128 * 1024
 _MAX_WORKFLOW_YAML_BYTES = 64 * 1024
+_MAX_TASK_EVENT_QUERY_LIMIT = 100
 
 
 class WorkflowPayloadTooLarge(WorkflowRequestError):
     """A request body exceeded the shared Workflow JSON parser limit."""
+
+
+class WorkflowTaskQueryError(WorkflowRequestError):
+    def __init__(self, error_code: str) -> None:
+        super().__init__("workflow task query is invalid")
+        self.error_code = error_code
 
 
 def create_workflow_routes(
@@ -175,9 +182,60 @@ def create_workflow_routes(
         except Exception:
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
+    async def workflow_tasks(request: Request) -> Response:
+        forbidden = _authorization_error(request, token, ui_port, authorize)
+        if forbidden is not None:
+            return forbidden
+        try:
+            projection = await service.get_workflow_tasks(request.path_params["workflow_id"])
+            return JSONResponse(projection)
+        except ValueError:
+            return JSONResponse({"error": "invalid_workflow_id"}, status_code=400)
+        except WorkflowNotFoundError:
+            return JSONResponse({"error": "workflow_not_found"}, status_code=404)
+        except WorkflowServiceUnavailable:
+            return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
+        except Exception:
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    async def workflow_task_events(request: Request) -> Response:
+        forbidden = _authorization_error(request, token, ui_port, authorize)
+        if forbidden is not None:
+            return forbidden
+        try:
+            after_id, limit = _parse_task_event_query(request)
+            projection = await service.get_workflow_task_events(
+                request.path_params["workflow_id"],
+                after_id=after_id,
+                limit=limit,
+            )
+            return JSONResponse(projection)
+        except WorkflowTaskQueryError as error:
+            return JSONResponse({"error": error.error_code}, status_code=400)
+        except WorkflowRequestError:
+            return JSONResponse({"error": "invalid_query"}, status_code=400)
+        except ValueError:
+            return JSONResponse({"error": "invalid_workflow_id"}, status_code=400)
+        except WorkflowNotFoundError:
+            return JSONResponse({"error": "workflow_not_found"}, status_code=404)
+        except WorkflowServiceUnavailable:
+            return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
+        except Exception:
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
     return [
         Route("/ui-api/control/workflows", start, methods=["POST"]),
         Route("/ui-api/control/workflows", list_workflows, methods=["GET"]),
+        Route(
+            "/ui-api/control/workflows/{workflow_id}/tasks",
+            workflow_tasks,
+            methods=["GET"],
+        ),
+        Route(
+            "/ui-api/control/workflows/{workflow_id}/task-events",
+            workflow_task_events,
+            methods=["GET"],
+        ),
         Route("/ui-api/control/workflows/{workflow_id}/result", workflow_result, methods=["GET"]),
         Route("/ui-api/control/workflows/{workflow_id}", workflow_detail, methods=["GET"]),
     ]
@@ -249,6 +307,42 @@ def _parse_limit(request: Request) -> int:
     if not 1 <= limit <= 100:
         raise WorkflowRequestError("limit is invalid")
     return limit
+
+
+def _parse_task_event_query(request: Request) -> tuple[int, int]:
+    items = list(request.query_params.multi_items())
+    if any(key not in {"after_id", "limit"} for key, _value in items):
+        raise WorkflowTaskQueryError("invalid_query")
+    values: dict[str, list[str]] = {"after_id": [], "limit": []}
+    for key, value in items:
+        values[key].append(value)
+    if len(values["after_id"]) > 1:
+        raise WorkflowTaskQueryError("invalid_cursor")
+    if len(values["limit"]) > 1:
+        raise WorkflowTaskQueryError("invalid_limit")
+    after_id = 0
+    if values["after_id"]:
+        raw_after_id = values["after_id"][0]
+        if not raw_after_id.isascii() or not raw_after_id.isdigit():
+            raise WorkflowTaskQueryError("invalid_cursor")
+        try:
+            after_id = int(raw_after_id)
+        except ValueError:
+            raise WorkflowTaskQueryError("invalid_cursor") from None
+        if after_id > 2**63 - 1:
+            raise WorkflowTaskQueryError("invalid_cursor")
+    limit = 100
+    if values["limit"]:
+        raw_limit = values["limit"][0]
+        if not raw_limit.isascii() or not raw_limit.isdigit():
+            raise WorkflowTaskQueryError("invalid_limit")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            raise WorkflowTaskQueryError("invalid_limit") from None
+        if not 1 <= limit <= _MAX_TASK_EVENT_QUERY_LIMIT:
+            raise WorkflowTaskQueryError("invalid_limit")
+    return after_id, limit
 
 
 def _snapshot_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
