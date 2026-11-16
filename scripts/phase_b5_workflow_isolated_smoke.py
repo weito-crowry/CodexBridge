@@ -63,9 +63,21 @@ LEGACY_CODEX_TOOL_NAMES = frozenset(
     {"codex_threads", "codex_status", "codex_start", "codex_continue"}
 )
 MAX_WORKFLOW_WAIT_SECONDS = 600.0
+MAX_STATUS_OBSERVATION_TRANSITIONS = 64
 MAX_OFFLINE_COMMAND_SECONDS = 900.0
 MAX_RESPONSE_BYTES = 1024 * 1024
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)\b[A-Z]:\\[^\r\n\"']+")
+_WORKFLOW_STATUS_VALUES = frozenset(
+    {
+        "queued",
+        "starting",
+        "running",
+        "needs_reconciliation",
+        "succeeded",
+        "failed",
+        "failed_to_start",
+    }
+)
 SmokeAbort = phase5f5.SmokeAbort
 
 
@@ -1251,34 +1263,117 @@ def _wait_workflow_success(
     evidence: dict[str, Any],
     writer: phase5f5._EvidenceWriter,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deadline = time.monotonic() + MAX_WORKFLOW_WAIT_SECONDS
+    started_at = time.monotonic()
+    deadline = started_at + MAX_WORKFLOW_WAIT_SECONDS
     detail_path = f"/ui-api/control/workflows/{quote(workflow_id, safe='')}"
     result_path = detail_path + "/result"
     last_status = "NOT_OBSERVED"
+    gate = evidence["saved_execution_gate"]
+    observations: dict[str, Any] = {"transitions": [], "omitted_count": 0}
+    gate["status_observations"] = observations
     while time.monotonic() < deadline:
-        status, detail, _ = _http_json(context, "GET", detail_path, token=context.control_token)
-        if status != 200 or not isinstance(detail, dict):
+        poll_started_at = time.monotonic()
+        try:
+            status, detail, _ = _http_json(context, "GET", detail_path, token=context.control_token)
+        except SmokeAbort:
+            _record_status_observation(
+                observations,
+                elapsed_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                status="unknown",
+                http_status=None,
+            )
+            _safe_write(
+                writer, evidence, secrets_to_reject=(context.control_token, context.mcp_token)
+            )
+            raise
+        safe_http_status = status if type(status) is int and 100 <= status <= 599 else None
+        if safe_http_status != 200 or not isinstance(detail, dict):
+            _record_status_observation(
+                observations,
+                elapsed_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                status="unknown",
+                http_status=safe_http_status,
+            )
+            _safe_write(
+                writer, evidence, secrets_to_reject=(context.control_token, context.mcp_token)
+            )
             raise SmokeAbort("BLOCKED", "workflow_status_readback_unavailable")
-        last_status = str(detail.get("status", "unknown"))
-        if last_status in {"needs_reconciliation", "failed", "failed_to_start"}:
-            evidence["saved_execution_gate"]["workflow_status"] = last_status
-            evidence["saved_execution_gate"]["result_gate"] = "NOT_OBSERVED"
+        raw_status = detail.get("status")
+        last_status = (
+            raw_status
+            if isinstance(raw_status, str) and raw_status in _WORKFLOW_STATUS_VALUES
+            else "unknown"
+        )
+        _record_status_observation(
+            observations,
+            elapsed_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+            status=last_status,
+            http_status=safe_http_status,
+        )
+        if last_status in {"failed", "failed_to_start"}:
+            gate["workflow_status"] = last_status
+            gate["result_gate"] = "NOT_OBSERVED"
             _safe_write(
                 writer, evidence, secrets_to_reject=(context.control_token, context.mcp_token)
             )
             raise SmokeAbort("BLOCKED", "workflow_did_not_reach_confirmed_success")
         if last_status == "succeeded":
+            _safe_write(
+                writer, evidence, secrets_to_reject=(context.control_token, context.mcp_token)
+            )
             result_status, result, _ = _http_json(
                 context, "GET", result_path, token=context.control_token
             )
             if result_status == 200 and isinstance(result, dict):
                 return detail, result
             raise SmokeAbort("FAIL", "workflow_result_endpoint_mismatch")
-        time.sleep(0.5)
-    evidence["saved_execution_gate"]["workflow_status"] = last_status
-    evidence["saved_execution_gate"]["result_gate"] = "NOT_OBSERVED"
+        _safe_write(writer, evidence, secrets_to_reject=(context.control_token, context.mcp_token))
+        now = time.monotonic()
+        remaining = deadline - now
+        until_next_poll = max(0.0, 0.5 - (now - poll_started_at))
+        if remaining > 0 and until_next_poll > 0:
+            time.sleep(min(until_next_poll, remaining))
+    gate["workflow_status"] = last_status
+    gate["result_gate"] = "NOT_OBSERVED"
     _safe_write(writer, evidence, secrets_to_reject=(context.control_token, context.mcp_token))
-    raise SmokeAbort("BLOCKED", "workflow_result_wait_timed_out")
+    timeout_reason = (
+        "workflow_reconciliation_unresolved_at_deadline"
+        if last_status in {"needs_reconciliation", "unknown"}
+        else "workflow_result_wait_timed_out"
+    )
+    raise SmokeAbort("BLOCKED", timeout_reason)
+
+
+def _record_status_observation(
+    observations: dict[str, Any],
+    *,
+    elapsed_ms: int,
+    status: str,
+    http_status: int | None,
+) -> None:
+    transitions = observations["transitions"]
+    omitted_count = observations["omitted_count"]
+    if (
+        transitions
+        and omitted_count == 0
+        and transitions[-1]["status"] == status
+        and transitions[-1]["http_status"] == http_status
+    ):
+        transitions[-1]["last_elapsed_ms"] = elapsed_ms
+        transitions[-1]["count"] += 1
+        return
+    if len(transitions) < MAX_STATUS_OBSERVATION_TRANSITIONS:
+        transitions.append(
+            {
+                "first_elapsed_ms": elapsed_ms,
+                "last_elapsed_ms": elapsed_ms,
+                "status": status,
+                "http_status": http_status,
+                "count": 1,
+            }
+        )
+        return
+    observations["omitted_count"] = omitted_count + 1
 
 
 def _read_sqlite(path: Path, query: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:

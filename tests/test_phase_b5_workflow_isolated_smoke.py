@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -255,3 +257,339 @@ def test_graceful_shutdown_checks_mock_owned_process_and_never_forces_kill(
         "descendant_count_before_shutdown": 1,
         "orphan_processes": 0,
     }
+
+
+def _fake_wait_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[tuple[int, object]],
+    *,
+    max_wait: float,
+    transport_latency: float = 0.0,
+    result_response: tuple[int, object] = (
+        200,
+        {"workflow_id": "workflow-test", "result": {"final_text": "B5_VERIFY_OK"}},
+    ),
+):
+    clock = {"now": 0.0}
+    response_index = {"value": 0}
+    calls: list[tuple[str, str]] = []
+    write_snapshots: list[dict[str, object]] = []
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    def fake_http_json(_context, method, route, **_kwargs):
+        assert method == "GET"
+        calls.append((method, route))
+        clock["now"] += transport_latency
+        if route.endswith("/result"):
+            status, body = result_response
+            return status, body, {}
+        index = response_index["value"]
+        response_index["value"] += 1
+        status, body = responses[index]
+        return status, body, {}
+
+    def fake_safe_write(_writer, evidence, **_kwargs) -> None:
+        runner.assert_safe_evidence(evidence, secrets_to_reject=("control-test", "mcp-test"))
+        write_snapshots.append(deepcopy(evidence.get("saved_execution_gate", {})))
+
+    monkeypatch.setattr(runner.time, "monotonic", monotonic)
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    monkeypatch.setattr(runner, "MAX_WORKFLOW_WAIT_SECONDS", max_wait)
+    monkeypatch.setattr(runner, "_http_json", fake_http_json)
+    monkeypatch.setattr(runner, "_safe_write", fake_safe_write)
+    context = SimpleNamespace(control_token="control-test", mcp_token="mcp-test")
+    evidence: dict[str, object] = {"saved_execution_gate": {}}
+
+    def wait():
+        return runner._wait_workflow_success(
+            context,
+            workflow_id="workflow-test",
+            evidence=evidence,
+            writer=object(),
+        )
+
+    return wait, evidence, calls, write_snapshots, clock
+
+
+def test_wait_workflow_success_recovers_after_transient_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, calls, writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [
+            (200, {"status": "needs_reconciliation"}),
+            (200, {"status": "running"}),
+            (200, {"status": "succeeded"}),
+        ],
+        max_wait=2.0,
+        transport_latency=0.125,
+    )
+
+    detail, result = wait()
+
+    assert detail == {"status": "succeeded"}
+    assert result["result"]["final_text"] == "B5_VERIFY_OK"
+    assert [method for method, _route in calls] == ["GET", "GET", "GET", "GET"]
+    assert calls[-1][1].endswith("/result")
+    observations = evidence["saved_execution_gate"]["status_observations"]
+    assert [item["status"] for item in observations["transitions"]] == [
+        "needs_reconciliation",
+        "running",
+        "succeeded",
+    ]
+    assert [item["first_elapsed_ms"] for item in observations["transitions"]] == [
+        125,
+        625,
+        1125,
+    ]
+    assert observations["omitted_count"] == 0
+    assert len(writes) == 3
+
+
+def test_wait_workflow_success_blocks_when_reconciliation_is_unresolved_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [(200, {"status": "needs_reconciliation"})] * 2,
+        max_wait=1.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_reconciliation_unresolved_at_deadline"):
+        wait()
+
+    gate = evidence["saved_execution_gate"]
+    assert gate["workflow_status"] == "needs_reconciliation"
+    assert gate["result_gate"] == "NOT_OBSERVED"
+    assert len(calls) == 2
+    assert all(method == "GET" for method, _route in calls)
+    observation = gate["status_observations"]["transitions"][0]
+    assert observation["count"] == 2
+    assert observation["first_elapsed_ms"] == 0
+    assert observation["last_elapsed_ms"] == 500
+
+
+@pytest.mark.parametrize("failure_status", ["failed", "failed_to_start"])
+def test_wait_workflow_success_blocks_immediately_when_reconciliation_becomes_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_status: str,
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [
+            (200, {"status": "needs_reconciliation"}),
+            (200, {"status": failure_status}),
+        ],
+        max_wait=10.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_did_not_reach_confirmed_success"):
+        wait()
+
+    assert evidence["saved_execution_gate"]["workflow_status"] == failure_status
+    assert len(calls) == 2
+    assert all(method == "GET" for method, _route in calls)
+    assert not any(route.endswith("/result") for _method, route in calls)
+
+
+def test_wait_workflow_success_classifies_unknown_at_deadline_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [(200, {"status": "PRIVATE_UNKNOWN_STATUS"})] * 2,
+        max_wait=1.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_reconciliation_unresolved_at_deadline"):
+        wait()
+
+    gate = evidence["saved_execution_gate"]
+    assert gate["workflow_status"] == "unknown"
+    assert gate["result_gate"] == "NOT_OBSERVED"
+    assert "PRIVATE_UNKNOWN_STATUS" not in str(evidence)
+    assert gate["status_observations"]["transitions"][0]["count"] == 2
+    assert all(method == "GET" for method, _route in calls)
+
+
+def test_wait_workflow_success_keeps_normal_timeout_when_only_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [(200, {"status": "running"})] * 2,
+        max_wait=1.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_result_wait_timed_out"):
+        wait()
+
+    gate = evidence["saved_execution_gate"]
+    assert gate["workflow_status"] == "running"
+    assert gate["result_gate"] == "NOT_OBSERVED"
+    assert len(calls) == 2
+
+
+def test_wait_workflow_success_times_out_as_running_after_reconciliation_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [
+            (200, {"status": "needs_reconciliation"}),
+            (200, {"status": "running"}),
+        ],
+        max_wait=1.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_result_wait_timed_out"):
+        wait()
+
+    assert evidence["saved_execution_gate"]["workflow_status"] == "running"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("http_status", "body"),
+    [
+        (503, {"detail": "PRIVATE_RESPONSE_BODY"}),
+        (200, ["PRIVATE_RESPONSE_BODY"]),
+    ],
+)
+def test_wait_workflow_success_blocks_on_unreadable_status_without_body_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    http_status: int,
+    body: object,
+) -> None:
+    wait, evidence, calls, writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [(http_status, body)],
+        max_wait=10.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_status_readback_unavailable"):
+        wait()
+
+    gate = evidence["saved_execution_gate"]
+    assert gate["status_observations"]["transitions"] == [
+        {
+            "first_elapsed_ms": 0,
+            "last_elapsed_ms": 0,
+            "status": "unknown",
+            "http_status": http_status,
+            "count": 1,
+        }
+    ]
+    assert "PRIVATE_RESPONSE_BODY" not in str(gate)
+    assert len(calls) == 1
+    assert writes
+
+
+def test_wait_workflow_success_normalizes_unknown_status_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [
+            (200, {"status": "PRIVATE_UNKNOWN_STATUS"}),
+            (200, {"status": "succeeded"}),
+        ],
+        max_wait=2.0,
+    )
+
+    _detail, result = wait()
+
+    observations = evidence["saved_execution_gate"]["status_observations"]
+    assert [item["status"] for item in observations["transitions"]] == ["unknown", "succeeded"]
+    assert "PRIVATE_UNKNOWN_STATUS" not in str(evidence)
+    assert result["result"]["final_text"] == "B5_VERIFY_OK"
+    assert all(method == "GET" for method, _route in calls)
+
+
+def test_wait_workflow_success_records_transport_error_without_changing_safe_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait, evidence, _calls, writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [],
+        max_wait=10.0,
+    )
+    calls: list[tuple[str, str]] = []
+
+    def failed_transport(_context, method, route, **_kwargs):
+        assert method == "GET"
+        calls.append((method, route))
+        raise runner.SmokeAbort("BLOCKED", "control_api_transport_outcome_unknown")
+
+    monkeypatch.setattr(runner, "_http_json", failed_transport)
+
+    with pytest.raises(runner.SmokeAbort, match="control_api_transport_outcome_unknown"):
+        wait()
+
+    observations = evidence["saved_execution_gate"]["status_observations"]
+    assert observations["transitions"] == [
+        {
+            "first_elapsed_ms": 0,
+            "last_elapsed_ms": 0,
+            "status": "unknown",
+            "http_status": None,
+            "count": 1,
+        }
+    ]
+    assert calls == [("GET", "/ui-api/control/workflows/workflow-test")]
+    assert writes
+
+
+@pytest.mark.parametrize(
+    "result_response",
+    [
+        (503, {"detail": "PRIVATE_RESULT_BODY"}),
+        (200, ["PRIVATE_RESULT_BODY"]),
+    ],
+)
+def test_wait_workflow_success_requires_result_200_dict(
+    monkeypatch: pytest.MonkeyPatch,
+    result_response: tuple[int, object],
+) -> None:
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [(200, {"status": "succeeded"})],
+        max_wait=2.0,
+        result_response=result_response,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_result_endpoint_mismatch"):
+        wait()
+
+    assert [method for method, _route in calls] == ["GET", "GET"]
+    assert calls[-1][1].endswith("/result")
+    assert (
+        evidence["saved_execution_gate"]["status_observations"]["transitions"][0]["status"]
+        == "succeeded"
+    )
+    assert "PRIVATE_RESULT_BODY" not in str(evidence)
+
+
+def test_wait_workflow_success_bounds_status_observation_growth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses = ["queued" if index % 2 == 0 else "running" for index in range(70)]
+    wait, evidence, calls, _writes, _clock = _fake_wait_environment(
+        monkeypatch,
+        [(200, {"status": status}) for status in statuses],
+        max_wait=35.0,
+    )
+
+    with pytest.raises(runner.SmokeAbort, match="workflow_result_wait_timed_out"):
+        wait()
+
+    observations = evidence["saved_execution_gate"]["status_observations"]
+    assert len(observations["transitions"]) == 64
+    assert observations["omitted_count"] == 6
+    assert len(calls) == 70
+    assert all(method == "GET" for method, _route in calls)
