@@ -228,7 +228,10 @@ def project_workflow_tasks(
                 groups_by_node[event.node_id].append(group_key)
             event_groups[group_key].append(event)
 
-    conflicts = _event_projection_conflicts(events, static_nodes)
+    workflow_status_success = _workflow_status_success(snapshot, events, dbos_status)
+    conflicts = _event_projection_conflicts(
+        events, static_nodes, require_completed_tasks=workflow_status_success
+    )
     task_exec_refs: list[tuple[dict[str, Any], str, str, list[_Event]]] = []
     for node in static_nodes:
         for key in groups_by_node.get(node["node_id"], ()):
@@ -264,7 +267,7 @@ def project_workflow_tasks(
         (node["node_id"], execution_id, identity)
         for node, execution_id, identity, _ in task_exec_refs[:_MAX_EXECUTIONS]
     }
-    global_success = _workflow_status_success(snapshot, events, dbos_status)
+    global_success = workflow_status_success
     coverage_complete = _complete_workflow_evidence(
         snapshot, events, static_nodes, jobs, dbos_status, conflicts
     )
@@ -535,7 +538,10 @@ def project_workflow_task_events(
         except Exception:
             ledger_reason = ledger_reason or "ledger_unavailable"
 
-    conflicts = _event_projection_conflicts(events, nodes)
+    workflow_status_success = _workflow_status_success(snapshot, events, dbos_status)
+    conflicts = _event_projection_conflicts(
+        events, nodes, require_completed_tasks=workflow_status_success
+    )
     call_node_ids = {
         node["node_id"]
         for node in nodes
@@ -1173,7 +1179,10 @@ def _validate_event_relationships(
 
 
 def _event_projection_conflicts(
-    events: list[_Event], static_nodes: list[dict[str, Any]]
+    events: list[_Event],
+    static_nodes: list[dict[str, Any]],
+    *,
+    require_completed_tasks: bool = False,
 ) -> set[tuple[str, str, str]]:
     conflicts, _scope_pairs, _iteration_pairs = _validate_event_relationships(events)
     operation_by_node = {node["node_id"]: node["operation"] for node in static_nodes}
@@ -1203,9 +1212,17 @@ def _event_projection_conflicts(
         key = (node_id, execution_id, task_identity)
         operation = operation_by_node.get(node_id)
         starts = [event for event in rows if event.event_type == "task_started"]
+        completes = [event for event in rows if event.event_type == "task_completed"]
+        failures = [event for event in rows if event.event_type == "task_failed"]
         terminals = [
             event for event in rows if event.event_type in {"task_completed", "task_failed"}
         ]
+        if (
+            require_completed_tasks
+            and starts
+            and (len(starts) != 1 or len(completes) != 1 or failures)
+        ):
+            conflicts.add(key)
         if len(starts) == 1 and len(terminals) == 1 and starts[0].event_id >= terminals[0].event_id:
             conflicts.add(key)
         if (
@@ -1411,11 +1428,7 @@ def _complete_workflow_evidence(
     dbos_status: str | None,
     conflicts: set[tuple[str, str, str]],
 ) -> bool:
-    if (
-        not _workflow_status_success(snapshot, events, dbos_status)
-        or conflicts
-        or any(event.event_type == "task_failed" for event in events)
-    ):
+    if not _workflow_status_success(snapshot, events, dbos_status) or conflicts:
         return False
     if any(
         job.state != "SUCCEEDED" or not job.receipt_verified or job.reconciliation for job in jobs
@@ -1440,6 +1453,7 @@ def _complete_workflow_evidence(
             candidate
             for candidate in events
             if candidate.node_id == event.node_id
+            and candidate.execution_id == event.execution_id
             and candidate.task_identity == event.task_identity
             and candidate.event_type == "task_completed"
         ]

@@ -132,6 +132,36 @@ async def test_task_projection_exposes_safe_graph_and_observed_execution_only(
 
 
 @pytest.mark.asyncio
+async def test_started_only_task_is_running_without_terminal_marker_conflict(
+    tmp_path: Path,
+) -> None:
+    service, snapshot, run_dir = await _running_service(tmp_path)
+    writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
+    writer.observe(
+        _InterpreterEvent(
+            "task_started",
+            node_id="/do/0/private_task",
+            task_identity="do[0].private_task",
+            operation="set",
+        )
+    )
+    writer.close()
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
+    node = next(item for item in projection["nodes"] if item["node_id"] == "/do/0/private_task")
+
+    assert projection["workflow_status"] == "running"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
+    assert node["state"] == "running"
+    assert node["executions"][0]["state"] == "running"
+    assert node["executions"][0]["evidence_conflict"] is False
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == "workflow_not_confirmed"
+
+
+@pytest.mark.asyncio
 async def test_event_operation_mismatch_is_an_evidence_conflict(tmp_path: Path) -> None:
     service, snapshot, run_dir = await _running_service(tmp_path)
     writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
@@ -858,6 +888,7 @@ async def _successful_fake_run(
     input_data: dict[str, Any] | None = None,
     omit_event_type: str | tuple[str, ...] | None = None,
     omit_node_id: str | None = None,
+    fail_node_id: str | None = None,
     omit_iteration_ordinal: int | None = None,
     omit_identity_fragment: str | None = None,
 ):
@@ -869,9 +900,13 @@ async def _successful_fake_run(
         input_data=input_data,
     )
     writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
-    if omit_event_type is not None:
+    if omit_event_type is not None or fail_node_id is not None:
         omitted_types = (
-            {omit_event_type} if isinstance(omit_event_type, str) else set(omit_event_type)
+            set()
+            if omit_event_type is None
+            else {omit_event_type}
+            if isinstance(omit_event_type, str)
+            else set(omit_event_type)
         )
 
         def record_unless_omitted(event: _InterpreterEvent) -> None:
@@ -888,6 +923,17 @@ async def _successful_fake_run(
                     or omit_identity_fragment in (event.scope_identity or "")
                 )
             ):
+                return
+            if event.event_type == "task_completed" and event.node_id == fail_node_id:
+                writer.observe(
+                    _InterpreterEvent(
+                        "task_failed",
+                        node_id=event.node_id,
+                        task_identity=event.task_identity,
+                        operation=event.operation,
+                        failure_phase="operation",
+                    )
+                )
                 return
             writer.observe(event)
 
@@ -977,6 +1023,122 @@ async def test_succeeded_requires_worker_dbos_and_related_verified_job(tmp_path:
     assert "PRIVATE_CODEX_PROMPT" not in json_payload
     assert "PRIVATE_FINAL_TEXT" not in json_payload
     assert "PRIVATE_RUN_RESULT" not in json_payload
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_with_started_only_noncall_task_is_incomplete_evidence(
+    tmp_path: Path,
+) -> None:
+    service, snapshot, run_dir, _job = await _successful_fake_run(
+        tmp_path,
+        omit_event_type="task_completed",
+        omit_node_id="/do/0/private_task",
+    )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
+    by_id = {node["node_id"]: node for node in projection["nodes"]}
+    event_ids = [event["event_id"] for event in events["events"]]
+
+    assert event_ids == list(range(1, events["latest_event_id"] + 1))
+    assert events["events"][-1]["event_type"] == "workflow_completed"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "evidence_conflict"
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == "evidence_conflict"
+    assert by_id["/do/0/private_task"]["state"] != "succeeded"
+    assert by_id["/do/1/execute"]["state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_terminal_run_with_task_failure_is_incomplete_evidence(tmp_path: Path) -> None:
+    service, snapshot, _run_dir, _job = await _successful_fake_run(
+        tmp_path,
+        fail_node_id="/do/0/private_task",
+    )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
+    failed_node = next(
+        node for node in projection["nodes"] if node["node_id"] == "/do/0/private_task"
+    )
+
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "evidence_conflict"
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == "evidence_conflict"
+    assert failed_node["state"] != "succeeded"
+    assert failed_node["executions"][0]["completion_observed"] is True
+    assert failed_node["executions"][0]["state"] != "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_failed_workflow_keeps_local_task_failure_state(tmp_path: Path) -> None:
+    service, snapshot, run_dir = await _running_service(tmp_path)
+    writer = NodeEventWriter(run_dir, workflow_id=snapshot.workflow_id, run_id=snapshot.run_id)
+    for node_id, task_identity, operation in (
+        ("/do/0/private_task", "do[0].private_task", "set"),
+        ("/do/1/execute", "do[1].execute", "call"),
+    ):
+        writer.observe(
+            _InterpreterEvent(
+                "task_started",
+                node_id=node_id,
+                task_identity=task_identity,
+                operation=operation,
+            )
+        )
+        writer.observe(
+            _InterpreterEvent(
+                "task_failed",
+                node_id=node_id,
+                task_identity=task_identity,
+                operation=operation,
+                failure_phase="operation",
+            )
+        )
+    writer.close()
+
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    job = adapter.prepare_job(
+        snapshot.workflow_id,
+        "do[1].execute",
+        "PRIVATE_CODEX_PROMPT",
+        run_dir,
+        port=18001,
+        workspace_root=tmp_path / "workspace",
+        allowed_roots=(str(tmp_path),),
+    )
+    assert adapter.claim_post(job["job_id"])
+    adapter.mark_accepted(job["job_id"], "thread-fixture-0001", "turn-fixture-0001", "in_progress")
+    adapter._mark_failed(job["job_id"], "failed")
+    with sqlite3.connect(run_dir / "dbos.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS workflow_status "
+            "(workflow_uuid TEXT PRIMARY KEY, status TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO workflow_status VALUES (?, 'ERROR')", (snapshot.workflow_id,)
+        )
+    (run_dir / "worker-entry-status.json").write_text(
+        '{"state":"failed","exit_code":1,"error_code":"worker_failed"}',
+        encoding="utf-8",
+    )
+
+    projection = await service.get_workflow_tasks(snapshot.workflow_id)
+    events = await service.get_workflow_task_events(snapshot.workflow_id)
+    failed_node = next(
+        node for node in projection["nodes"] if node["node_id"] == "/do/0/private_task"
+    )
+
+    assert projection["workflow_status"] == "failed"
+    assert projection["coverage"] == "partial"
+    assert projection["coverage_reason"] == "workflow_not_confirmed"
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == "workflow_not_confirmed"
+    assert failed_node["state"] == "failed"
+    assert failed_node["executions"][0]["state"] == "failed"
+    assert failed_node["executions"][0]["evidence_conflict"] is False
 
 
 @pytest.mark.asyncio
