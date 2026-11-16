@@ -1,0 +1,344 @@
+{
+  "attempt_id": "d13a3795821d4b578010f832c321d8a5",
+  "finished_at_utc": "2026-11-16T12:58:28.183+00:00",
+  "isolation": {
+    "distinct_control_and_mcp_tokens": true,
+    "github_mcp_disabled": true,
+    "isolated_auth_copy_verified": true,
+    "isolated_state_empty": true,
+    "lan_disabled": true,
+    "production_defaults_18000_18001_avoided": true,
+    "state_and_workspace_separate": true,
+    "status": "PASS",
+    "temp_root_label": "codexbridge-phase-b5-o9za2h0c",
+    "workspace_label": "workspace"
+  },
+  "mcp_control_gate": {
+    "checks": {
+      "comment_only_revision_hashes": {
+        "canonical_hash_unchanged": true,
+        "canonical_sha256_prefix": "8cf15283a268",
+        "revision_one_source_sha256_prefix": "e3cedd6edcb5",
+        "revision_two_source_sha256_prefix": "ae431f5f21b6",
+        "source_hash_changed": true,
+        "status": "PASS"
+      },
+      "control_and_mcp_authority_separated": {
+        "status": "PASS"
+      },
+      "control_bearer_origin_host": {
+        "bad_host": 400,
+        "bad_origin": 403,
+        "status": "PASS",
+        "wrong_bearer": 403
+      },
+      "etag_stale_and_mutation_replay": {
+        "different_payload_same_mutation_status": 409,
+        "latest_revision": 2,
+        "same_mutation_replay_revision": 2,
+        "same_mutation_replay_status": 200,
+        "stale_status": 412,
+        "status": "PASS"
+      },
+      "http_definition_list_history_graph": {
+        "status": "PASS"
+      },
+      "mcp_catalog": {
+        "dedicated_bearer_and_allowed_loopback_origin": true,
+        "legacy_codex_tools_present": true,
+        "new_workflow_tool_count": 10,
+        "status": "PASS"
+      },
+      "mcp_validate_create": {
+        "revision": 1,
+        "status": "PASS"
+      },
+      "permission_negative_catalog": {
+        "method": "targeted_offline_catalog_regression_tests",
+        "real_permission_process": "NOT_RUN",
+        "status": "PASS"
+      }
+    },
+    "definition": {
+      "definition_id_prefix": "2fa9f572",
+      "revision_one_etag_sha256_prefix": "2fb46a72a62b",
+      "revision_two_etag_sha256_prefix": "fdd41f2370d8"
+    },
+    "status": "PASS"
+  },
+  "offline_gate": {
+    "preflight": {
+      "active_codex_cli": "PASS",
+      "authentication_source": "AVAILABLE",
+      "parent_head_matches": "PASS",
+      "production_default_ports": "DEFERRED_TO_ISOLATION_PORT_RESERVATION",
+      "windows_python_and_dependencies": "PASS"
+    },
+    "static": {
+      "compileall": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "git_diff_cached_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "git_diff_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "mypy": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "ruff_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "ruff_format": {
+        "exit_code": 0,
+        "status": "PASS"
+      },
+      "uv_lock_check": {
+        "exit_code": 0,
+        "status": "PASS"
+      }
+    },
+    "status": "PASS",
+    "tests": {
+      "groups": {
+        "console_smoke_and_b5_runner": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 269,
+            "skipped": 1,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "ows_regression": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 155,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "service_api_multijob_manager": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 439,
+            "skipped": 5,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        },
+        "workflow_api_mcp_saved_definitions": {
+          "counts": {
+            "errors": 0,
+            "failed": 0,
+            "passed": 107,
+            "skipped": 2,
+            "xfailed": 0,
+            "xpassed": 0
+          },
+          "exit_code": 0,
+          "status": "PASS"
+        }
+      },
+      "totals": {
+        "errors": 0,
+        "failed": 0,
+        "passed": 970,
+        "skipped": 8,
+        "xfailed": 0,
+        "xpassed": 0
+      }
+    }
+  },
+  "parent_head": "ce05ba54d9d47f9160a9b1a3f571f0239cad4983",
+  "phase": "B5",
+  "ports": {
+    "initial_random_loopback_pair": [
+      61739,
+      61740
+    ],
+    "production_defaults_avoided": true
+  },
+  "processes": {
+    "cleanup": {
+      "forced_termination": false,
+      "reaped": true
+    },
+    "initial_bridge": {
+      "descendant_count_before_shutdown": 8,
+      "forced_termination": false,
+      "identity_verified": true,
+      "orphan_processes": 0,
+      "reaped": true
+    },
+    "restart_bridge": {
+      "descendant_count_before_shutdown": 3,
+      "forced_termination": false,
+      "identity_verified": true,
+      "orphan_processes": 0,
+      "reaped": true
+    }
+  },
+  "reason": null,
+  "restart_gate": {
+    "checks": {
+      "mcp_http_run_readback": "PASS",
+      "qt_offscreen_readback": "PASS",
+      "request_and_job_ledgers_unchanged": "PASS",
+      "restart_worker_count": 0,
+      "saved_revision_history": "PASS",
+      "workflow_start_posts_on_restart": 0
+    },
+    "status": "PASS"
+  },
+  "runner_sha256": "25807e7f3ad98aff52152f98b88816ae3a13cedc266ed066a2e16b987790d8c3",
+  "runtime": {
+    "active_codex_cli": "PASS",
+    "codex_authentication_source": "AVAILABLE",
+    "ows_dsl_version": "1.0.3",
+    "platform": "windows_native",
+    "python_version": "3.14.10",
+    "repository_venv": true,
+    "workflow_and_console_dependencies": {
+      "PySide6": "6.11.2",
+      "PyYAML": "6.0.3",
+      "dbos": "3.4.0",
+      "httpx2": "2.12.0",
+      "jq": "1.13.0",
+      "jsonschema": "4.25.1",
+      "mcp": "2.1.1",
+      "psutil": "7.2.2"
+    }
+  },
+  "saved_execution_gate": {
+    "cross_api_readback": {
+      "http_list_detail_result": true,
+      "mcp_list_get_result": true,
+      "qt_offscreen": "PASS",
+      "status": "PASS"
+    },
+    "durable_readback": {
+      "codex_start_marker_count": 1,
+      "codex_success_event_count": 1,
+      "dbos_status": "SUCCESS",
+      "definition_sha256_prefix": "8cf15283a268",
+      "definition_source_sha256_prefix": "ae431f5f21b6",
+      "job_count": 1,
+      "job_event_count": 5,
+      "job_id_prefix": "989dfc15",
+      "job_state": "SUCCEEDED",
+      "request_digest_prefix": "b5a5790e3a17",
+      "request_state": "running",
+      "result_exact_match": true,
+      "result_sha256_prefix": "2418381a204f",
+      "run_id_prefix": "run-88ffeb2c",
+      "worker_exit_code": 0,
+      "worker_spawn_event_count": 1,
+      "worker_state": "completed",
+      "workflow_id_prefix": "2eb7931c"
+    },
+    "initial_acceptance": {
+      "revision": 2,
+      "run_id_prefix": "run-88ffeb2c",
+      "status": 202,
+      "workflow_id_prefix": "2eb7931c"
+    },
+    "mcp_replay": {
+      "additional_codex_jobs": 0,
+      "additional_workflows": 0,
+      "existing_workflow_reused": true,
+      "status": "PASS"
+    },
+    "posts": {
+      "actual_codex_job_observation": "NOT_OBSERVED",
+      "actual_codex_jobs": 1,
+      "initial_http_workflow_posts": 1,
+      "initial_post_outcome": "ACCEPTED",
+      "new_client_request_ids_after_initial": 0,
+      "same_id_conflict_http_posts": 2,
+      "same_id_mcp_replay_calls": 1,
+      "same_id_mcp_replay_outcome": "REUSED",
+      "unique_initial_client_request_ids": 1
+    },
+    "readiness_preflight": {
+      "owned_app_server_identity": true,
+      "owned_bridge_and_listener_identity": true,
+      "production_defaults_avoided_by_dynamic_ports": true,
+      "request_ledger_empty": true,
+      "saved_revision_hashes_verified": true,
+      "status": "PASS",
+      "worker_count_before_post": 0,
+      "workflow_dependencies_ready": true,
+      "workspace_empty_and_isolated": true
+    },
+    "result_gate": "PASS",
+    "same_id_conflicts": {
+      "inline_status": 409,
+      "revision_status": 409,
+      "status": "PASS"
+    },
+    "status": "PASS",
+    "status_observations": {
+      "omitted_count": 0,
+      "transitions": [
+        {
+          "count": 2,
+          "first_elapsed_ms": 75,
+          "http_status": 200,
+          "last_elapsed_ms": 562,
+          "status": "running"
+        },
+        {
+          "count": 1,
+          "first_elapsed_ms": 1067,
+          "http_status": 200,
+          "last_elapsed_ms": 1067,
+          "status": "needs_reconciliation"
+        },
+        {
+          "count": 9,
+          "first_elapsed_ms": 1663,
+          "http_status": 200,
+          "last_elapsed_ms": 5756,
+          "status": "running"
+        },
+        {
+          "count": 1,
+          "first_elapsed_ms": 6261,
+          "http_status": 200,
+          "last_elapsed_ms": 6261,
+          "status": "succeeded"
+        }
+      ]
+    },
+    "worker_ownership": {
+      "interpreter_allowlist_verified": true,
+      "observed_snapshot_count": 32,
+      "owned_bridge_ancestry_verified": true,
+      "pid_parent_creation_time_verified": true,
+      "process_model": "venv_child",
+      "status": "PASS"
+    },
+    "workflow_status": "succeeded"
+  },
+  "schema_version": 1,
+  "source_head": "9dbb1b85433ab71694faa85b25bcb5812422fafc",
+  "started_at_utc": "2026-11-16T12:46:13.465+00:00",
+  "status": "PASS"
+}
