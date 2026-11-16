@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -43,12 +44,14 @@ from .job_adapter import (
     JobTimeoutError,
     submit_and_wait,
 )
+from .node_events import NodeEventWriter
 from .process_identity import get_process_identity
 
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
 APPLICATION_VERSION = "1.0.3-subset"
 EXECUTOR_ID = "codexbridge-ows-phase3-executor"
 _SHUTDOWN_LAUNCH_ID = re.compile(r"worker-shutdown-([0-9a-f]{32})\.request\Z", re.ASCII)
+_LOGGER = logging.getLogger(__name__)
 
 
 def canonical_json(value: Any) -> str:
@@ -825,6 +828,7 @@ def execute_ows_workflow(
     trace_path: str,
     control: dict[str, Any],
     max_tasks: int,
+    node_events_enabled: bool = False,
 ) -> Any:
     if sha256_text(definition_text) != definition_sha256:
         raise OwsError("persisted OWS definition hash mismatch")
@@ -840,6 +844,8 @@ def execute_ows_workflow(
     durable_wait = control.get("mock_job_durable_wait", False)
     if not isinstance(durable_wait, bool):
         raise OwsError("mock_job_durable_wait must be a boolean")
+    if not isinstance(node_events_enabled, bool):
+        raise OwsError("node event journal flag must be a boolean")
     if codex_job_live and durable_wait:
         raise OwsError("codex-job live mode cannot be mixed with mock-job durable-wait mode")
     validate_workflow(
@@ -918,14 +924,45 @@ def execute_ows_workflow(
         )
         return checkpoint["result"]
 
-    interpreter = Interpreter(
-        definition,
-        max_tasks=max_tasks,
-        step_runner=run_named_step,
-        codex_job_live=codex_job_live,
-        max_live_codex_jobs=max_live_codex_jobs,
-    )
-    return interpreter.run(input_data)
+    node_event_writer: NodeEventWriter | None = None
+    # Persisted pre-C2 DBOS invocations omit the flag and remain journal-free.
+    if node_events_enabled:
+        run_dir = Path(trace_path).parent
+        try:
+            active_workflow_id = DBOS.workflow_id
+            if not isinstance(active_workflow_id, str) or not active_workflow_id:
+                _LOGGER.warning("node event journal disabled reason=workflow_id_unavailable")
+            else:
+                node_event_writer = NodeEventWriter(
+                    run_dir,
+                    workflow_id=active_workflow_id,
+                    run_id=run_dir.name,
+                )
+        except Exception:
+            _LOGGER.warning("node event journal disabled reason=initialization_failed")
+
+    try:
+        interpreter = Interpreter(
+            definition,
+            max_tasks=max_tasks,
+            step_runner=run_named_step,
+            codex_job_live=codex_job_live,
+            max_live_codex_jobs=max_live_codex_jobs,
+            observer=None if node_event_writer is None else node_event_writer.observe,
+        )
+        result = interpreter.run(input_data)
+        if node_event_writer is not None:
+            try:
+                node_event_writer.workflow_completed()
+            except Exception:
+                _LOGGER.warning("node event journal disabled reason=completion_write_failed")
+        return result
+    finally:
+        if node_event_writer is not None:
+            try:
+                node_event_writer.close()
+            except Exception:
+                _LOGGER.warning("node event journal disabled reason=close_failed")
 
 
 def _read_workflow_status(database_path: Path, workflow_id: str) -> str | None:
@@ -1107,6 +1144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 str(run_dir / "task-events.jsonl"),
                 control,
                 int(manifest.get("max_tasks", 10_000)),
+                True,
             )
             stage = "workflow_start"
             if codex_job_live:

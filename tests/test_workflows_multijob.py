@@ -1085,7 +1085,17 @@ def _run_fake_worker(
         str(run_dir / "task-events.jsonl"),
         control,
         10,
+        True,
     )
+
+
+def _node_event_snapshot(run_dir: Path) -> list[tuple[Any, ...]]:
+    with sqlite3.connect(run_dir / "node_events.sqlite") as connection:
+        return connection.execute(
+            "SELECT event_id, event_key, workflow_id, run_id, schema_version, node_id, "
+            "task_identity, execution_id, event_type, occurred_at, source, job_id, metadata_json "
+            "FROM node_events ORDER BY event_id"
+        ).fetchall()
 
 
 def test_worker_completes_first_receipt_before_starting_second_and_replays_without_post(
@@ -1119,10 +1129,15 @@ def test_worker_completes_first_receipt_before_starting_second_and_replays_witho
     jobs = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
         _FakeDBOS.workflow_id
     )
+    journal_after_first = _node_event_snapshot(run_dir)
     post_count = sum(kind == "POST" for kind, _ in events)
     second_result = _run_fake_worker(
         run_dir, workspace_root, steps=steps, monkeypatch=monkeypatch, reset_http=False
     )
+    replayed_jobs = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite").get_jobs_for_workflow(
+        _FakeDBOS.workflow_id
+    )
+    journal_after_replay = _node_event_snapshot(run_dir)
 
     assert first_result["status"] == "SUCCEEDED"
     assert first_result["result"]["final_text"] == "result for 翻訳して: 東京\n"
@@ -1140,6 +1155,12 @@ def test_worker_completes_first_receipt_before_starting_second_and_replays_witho
     assert [job["thread_id"] for job in jobs] == ["thread-00000001", "thread-00000002"]
     assert [job["turn_id"] for job in jobs] == ["turn-00000001", "turn-00000002"]
     assert all(job["receipt"]["result"]["final_text"] for job in jobs)
+    assert [
+        row[6]
+        for row in journal_after_first
+        if row[8] == "task_completed" and row[6] in {"do[0].first", "do[1].second"}
+    ] == ["do[0].first", "do[1].second"]
+    assert sum(row[8] == "workflow_completed" for row in journal_after_first) == 1
     assert all(event[1]["sandbox_mode"] == "inherit" for event in events if event[0] == "POST")
     assert all(event[1]["confirm_full_access"] is False for event in events if event[0] == "POST")
     assert all(event[1]["cwd"] == str(workspace_root) for event in events if event[0] == "POST")
@@ -1147,6 +1168,8 @@ def test_worker_completes_first_receipt_before_starting_second_and_replays_witho
     assert events.count(("GET", "/ui-api/status")) == 2
     assert events.count(("GET", "/ui-api/control/capabilities")) == 2
     assert second_result == first_result
+    assert journal_after_replay == journal_after_first
+    assert replayed_jobs == jobs
     assert sum(kind == "POST" for kind, _ in _FakeCodexHTTPClient.events) == post_count
     assert steps.cache_hits >= 4
 
@@ -1176,6 +1199,7 @@ def test_worker_completes_three_sorted_jobs_and_replays_without_new_posts(
         steps=steps,
         monkeypatch=monkeypatch,
     )
+    journal_after_first = _node_event_snapshot(run_dir)
     events = list(_FakeCodexHTTPClient.events)
     replayed = _run_fake_worker(
         run_dir,
@@ -1187,6 +1211,7 @@ def test_worker_completes_three_sorted_jobs_and_replays_without_new_posts(
         monkeypatch=monkeypatch,
         reset_http=False,
     )
+    journal_after_replay = _node_event_snapshot(run_dir)
     adapter = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite")
     jobs = adapter.get_jobs_for_workflow(_FakeDBOS.workflow_id)
     job_statuses = [adapter.get_job_status(job_id=job["job_id"]) for job in jobs]
@@ -1222,8 +1247,70 @@ def test_worker_completes_three_sorted_jobs_and_replays_without_new_posts(
     assert len(post_indexes) == len(observe_indexes) == 3
     assert all(post_indexes[index] < observe_indexes[index] for index in range(3))
     assert replayed == first_result
+    assert journal_after_replay == journal_after_first
+    assert {
+        row[6] for row in journal_after_first if row[8] == "task_completed" and row[6] is not None
+    }.issuperset(
+        {
+            "do[0].processIssues.iteration[1].do[1].processIssue",
+            "do[0].processIssues.iteration[2].do[1].processIssue",
+            "do[0].processIssues.iteration[3].do[1].processIssue",
+        }
+    )
     assert sum(kind == "POST" for kind, _event in _FakeCodexHTTPClient.events) == 3
     assert steps.cache_hits >= 6
+
+
+def test_worker_completes_one_fake_codex_job_and_replays_without_duplicate_journal_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_bridge.workflows import worker
+
+    run_dir = tmp_path / "state-single"
+    workspace_root = tmp_path / "workspace-single"
+    run_dir.mkdir()
+    workspace_root.mkdir()
+    definition = _two_job_workflow()
+    definition["document"]["name"] = "single-job"
+    definition["do"] = definition["do"][:1]
+    _FakeCodexHTTPClient.outcomes = {"日本の首都を答えて": {"final_text": "PRIVATE-FAKE-RESPONSE"}}
+    steps = _FakeDurableSteps()
+
+    first_result = _run_fake_worker(
+        run_dir,
+        workspace_root,
+        definition=definition,
+        input_data={},
+        max_live_codex_jobs=1,
+        steps=steps,
+        monkeypatch=monkeypatch,
+    )
+    adapter = worker.CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    first_jobs = adapter.get_jobs_for_workflow(_FakeDBOS.workflow_id)
+    first_journal = _node_event_snapshot(run_dir)
+    replayed = _run_fake_worker(
+        run_dir,
+        workspace_root,
+        definition=definition,
+        input_data={},
+        max_live_codex_jobs=1,
+        steps=steps,
+        monkeypatch=monkeypatch,
+        reset_http=False,
+    )
+
+    assert first_result["status"] == "SUCCEEDED"
+    assert first_result["result"]["final_text"] == "PRIVATE-FAKE-RESPONSE"
+    assert [job["task_identity"] for job in first_jobs] == ["do[0].first"]
+    assert [row[6] for row in first_journal if row[8] == "task_completed"] == ["do[0].first"]
+    assert replayed == first_result
+    assert _node_event_snapshot(run_dir) == first_journal
+    assert adapter.get_jobs_for_workflow(_FakeDBOS.workflow_id) == first_jobs
+    journal_bytes = (run_dir / "node_events.sqlite").read_bytes()
+    assert b"PRIVATE-FAKE-RESPONSE" not in journal_bytes
+    assert "日本の首都を答えて".encode() not in journal_bytes
+    assert sum(kind == "POST" for kind, _ in _FakeCodexHTTPClient.events) == 1
 
 
 def test_worker_completes_three_items_in_input_order_and_replays_without_new_posts(

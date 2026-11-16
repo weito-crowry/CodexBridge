@@ -56,6 +56,23 @@ class _ScopeResult:
     exited: bool = False
 
 
+@dataclass(frozen=True)
+class _InterpreterEvent:
+    event_type: str
+    node_id: str | None = None
+    task_identity: str | None = None
+    scope_identity: str | None = None
+    operation: str | None = None
+    iteration_ordinal: int | None = None
+    branch_class: str | None = None
+    case_index: int | None = None
+    failure_phase: str | None = None
+
+
+def _escape_node_pointer_segment(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
 @dataclass
 class _WorkflowContext:
     value: Any
@@ -1047,6 +1064,7 @@ class Interpreter:
         step_runner: StepRunner | None = None,
         codex_job_live: bool = False,
         max_live_codex_jobs: int = 1,
+        observer: Callable[[_InterpreterEvent], None] | None = None,
     ) -> None:
         validate_workflow(
             definition,
@@ -1059,6 +1077,7 @@ class Interpreter:
         self.max_tasks = max_tasks
         self.step_runner = step_runner
         self.max_live_codex_jobs = max_live_codex_jobs
+        self.observer = observer
         self._task_count = 0
 
     def run(self, input_data: Any) -> Any:
@@ -1073,11 +1092,22 @@ class Interpreter:
         if "from" in workflow_input_config:
             workflow_input = evaluate_jq(workflow_input_config["from"], input_data)
         context = _WorkflowContext(workflow_input)
-        result = self._run_scope(self.definition["do"], workflow_input, {}, context, "do").value
+        result = self._run_scope(
+            self.definition["do"], workflow_input, {}, context, "do", "/do"
+        ).value
         workflow_output_config = self.definition.get("output", {})
         if "as" in workflow_output_config:
             return evaluate_jq(workflow_output_config["as"], result, {"context": context.value})
         return result
+
+    def _observe(self, event: _InterpreterEvent) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer(event)
+        except Exception:
+            # Observation must not affect workflow evaluation or control flow.
+            return
 
     def _run_scope(
         self,
@@ -1086,6 +1116,7 @@ class Interpreter:
         variables: dict[str, Any],
         context: _WorkflowContext,
         scope_path: str,
+        scope_node_pointer: str,
     ) -> _ScopeResult:
         names = [next(iter(task)) for task in tasks]
         name_to_index = {name: index for index, name in enumerate(names)}
@@ -1098,26 +1129,79 @@ class Interpreter:
             task_name, task_spec = next(iter(tasks[index].items()))
             operation, _ = _task_action(task_name, task_spec)
             task_path = f"{scope_path}[{index}].{task_name}"
+            node_id = f"{scope_node_pointer}/{index}/{_escape_node_pointer_segment(task_name)}"
+            self._observe(
+                _InterpreterEvent(
+                    "task_started",
+                    node_id=node_id,
+                    task_identity=task_path,
+                    operation=operation,
+                )
+            )
             task_input = current
             task_input_variables = dict(variables)
             task_input_variables["context"] = context.value
             input_config = task_spec.get("input", {})
             if "from" in input_config:
-                task_input = evaluate_jq(input_config["from"], current, task_input_variables)
+                try:
+                    task_input = evaluate_jq(input_config["from"], current, task_input_variables)
+                except Exception:
+                    self._observe(
+                        _InterpreterEvent(
+                            "task_failed",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            operation=operation,
+                            failure_phase="input",
+                        )
+                    )
+                    raise
             task_variables = dict(variables)
             task_variables["context"] = context.value
             task_variables["input"] = task_input
-            action_result = self._execute_step(
-                task_path, task_name, operation, task_spec, task_input, task_variables
-            )
+            try:
+                action_result = self._execute_step(
+                    task_path, task_name, operation, task_spec, task_input, task_variables
+                )
+            except Exception:
+                if self.step_runner is None and operation in {"set", "for", "switch"}:
+                    self._observe(
+                        _InterpreterEvent(
+                            "task_failed",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            operation=operation,
+                            failure_phase="operation",
+                        )
+                    )
+                raise
 
             if operation == "do":
+                child_scope_identity = f"{task_path}.do"
+                child_node_pointer = f"{node_id}/do"
+                self._observe(
+                    _InterpreterEvent(
+                        "scope_entered",
+                        node_id=node_id,
+                        scope_identity=child_scope_identity,
+                        operation="do",
+                    )
+                )
                 nested = self._run_scope(
                     task_spec["do"],
                     task_input,
                     dict(variables),
                     context,
-                    f"{task_path}.do",
+                    child_scope_identity,
+                    child_node_pointer,
+                )
+                self._observe(
+                    _InterpreterEvent(
+                        "scope_exited",
+                        node_id=node_id,
+                        scope_identity=child_scope_identity,
+                        operation="do",
+                    )
                 )
                 raw_task_output = nested.value
             elif operation == "for":
@@ -1129,14 +1213,55 @@ class Interpreter:
                     loop_variables = dict(variables)
                     loop_variables[each_name] = item
                     loop_variables[at_name] = loop_index
+                    iteration_identity = f"{task_path}.iteration[{loop_index}]"
+                    child_scope_identity = f"{iteration_identity}.do"
+                    self._observe(
+                        _InterpreterEvent(
+                            "iteration_started",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            scope_identity=iteration_identity,
+                            operation="for",
+                            iteration_ordinal=loop_index,
+                        )
+                    )
+                    self._observe(
+                        _InterpreterEvent(
+                            "scope_entered",
+                            node_id=node_id,
+                            scope_identity=child_scope_identity,
+                            operation="for",
+                            iteration_ordinal=loop_index,
+                        )
+                    )
                     nested = self._run_scope(
                         task_spec["do"],
                         task_input,
                         loop_variables,
                         context,
-                        f"{task_path}.iteration[{loop_index}].do",
+                        child_scope_identity,
+                        f"{node_id}/do",
+                    )
+                    self._observe(
+                        _InterpreterEvent(
+                            "scope_exited",
+                            node_id=node_id,
+                            scope_identity=child_scope_identity,
+                            operation="for",
+                            iteration_ordinal=loop_index,
+                        )
                     )
                     loop_outputs.append(nested.value)
+                    self._observe(
+                        _InterpreterEvent(
+                            "iteration_completed",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            scope_identity=iteration_identity,
+                            operation="for",
+                            iteration_ordinal=loop_index,
+                        )
+                    )
                 raw_task_output = loop_outputs
             elif operation == "switch":
                 raw_task_output = task_input
@@ -1147,9 +1272,21 @@ class Interpreter:
             if "as" in output_config:
                 raw_output_variables = dict(variables)
                 raw_output_variables.update({"context": context.value, "input": task_input})
-                transformed_task_output = evaluate_jq(
-                    output_config["as"], raw_task_output, raw_output_variables
-                )
+                try:
+                    transformed_task_output = evaluate_jq(
+                        output_config["as"], raw_task_output, raw_output_variables
+                    )
+                except Exception:
+                    self._observe(
+                        _InterpreterEvent(
+                            "task_failed",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            operation=operation,
+                            failure_phase="output",
+                        )
+                    )
+                    raise
             else:
                 transformed_task_output = raw_task_output
 
@@ -1163,14 +1300,53 @@ class Interpreter:
                         "output": transformed_task_output,
                     }
                 )
-                context.value = evaluate_jq(
-                    export_config["as"], transformed_task_output, export_variables
-                )
+                try:
+                    context.value = evaluate_jq(
+                        export_config["as"], transformed_task_output, export_variables
+                    )
+                except Exception:
+                    self._observe(
+                        _InterpreterEvent(
+                            "task_failed",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            operation=operation,
+                            failure_phase="export",
+                        )
+                    )
+                    raise
 
             current = transformed_task_output
+            self._observe(
+                _InterpreterEvent(
+                    "task_completed",
+                    node_id=node_id,
+                    task_identity=task_path,
+                    operation=operation,
+                )
+            )
 
             if operation == "switch":
                 directive = action_result["__ows_control__"]
+                if isinstance(directive, str) and (
+                    directive in {"exit", "continue"} or directive in name_to_index
+                ):
+                    self._observe(
+                        _InterpreterEvent(
+                            "branch_selected",
+                            node_id=node_id,
+                            task_identity=task_path,
+                            operation=operation,
+                            branch_class=(
+                                "exit"
+                                if directive == "exit"
+                                else "continue"
+                                if directive == "continue"
+                                else "jump"
+                            ),
+                            case_index=self._switch_case_index(task_spec["switch"], directive),
+                        )
+                    )
                 if directive == "exit":
                     return _ScopeResult(current, exited=True)
                 if directive == "continue":
@@ -1187,6 +1363,20 @@ class Interpreter:
             else:
                 index = name_to_index[directive]
         return _ScopeResult(current)
+
+    @staticmethod
+    def _switch_case_index(cases: list[dict[str, Any]], directive: str) -> int | None:
+        matches = [
+            case_index
+            for case_index, case in enumerate(cases)
+            if next(iter(case.values())).get("then") == directive
+        ]
+        if len(matches) != 1:
+            return None
+        has_default = any("when" not in next(iter(case.values())) for case in cases)
+        if directive == "continue" and not has_default:
+            return None
+        return matches[0]
 
     def _execute_step(
         self,
