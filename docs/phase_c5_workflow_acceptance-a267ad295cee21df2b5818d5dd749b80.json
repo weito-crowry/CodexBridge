@@ -1,0 +1,50 @@
+{
+  "phase": "C5-P2A",
+  "approval_id": "a267ad295cee21df2b5818d5dd749b80",
+  "approved_source_head": "635fb96de628154d8c9b9aa9aed67c0c21d42a85",
+  "runner_source_sha256": "8036c73fa27e2a8b6476f06c3eb941190d346673985f47b8ec5616470e5b6367",
+  "status": "BLOCKED",
+  "budget": {
+    "planned_runs": 3,
+    "max_initial_workflow_posts": 3,
+    "max_codex_jobs": 6,
+    "observed_initial_workflow_posts": 0,
+    "observed_codex_jobs": 0
+  },
+  "gates": {
+    "gate0": "BLOCKED",
+    "gate1": "NOT_RUN",
+    "gate2": "NOT_RUN",
+    "gate3": "NOT_RUN"
+  },
+  "runs": [
+    {
+      "name": "A",
+      "expected_job_count": 1,
+      "status": "NOT_RUN",
+      "initial_post_count": 0,
+      "observed_job_count": 0
+    },
+    {
+      "name": "B",
+      "expected_job_count": 2,
+      "status": "NOT_RUN",
+      "initial_post_count": 0,
+      "observed_job_count": 0
+    },
+    {
+      "name": "C",
+      "expected_job_count": 3,
+      "status": "NOT_RUN",
+      "initial_post_count": 0,
+      "observed_job_count": 0
+    }
+  ],
+  "gui_human_checklist": [
+    "Open the isolated GUI and inspect Graph and Result tabs.",
+    "Check node selection, 3-second refresh stability, and both 900x760 and 720x600 layouts.",
+    "Check Japanese text, scrolling, and the distinction between unknown and needs_reconciliation.",
+    "Record a human visual decision separately; offscreen Qt is not a human PASS."
+  ],
+  "terminal_code": "isolated_root_unavailable"
+}
