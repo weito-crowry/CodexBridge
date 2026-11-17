@@ -88,13 +88,17 @@ def _cases() -> tuple[runner.RunCase, ...]:
 class _FakeLiveAdapterHarness:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.workspace = tmp_path / "fake-live-workspace"
-        self.state_root = tmp_path / "fake-live-state"
+        self.temp_root = tmp_path
+        localappdata = self.temp_root / "localappdata"
+        localappdata.mkdir()
+        self.state_root = localappdata / "CodexBridge" / "workflows"
+        self.state_root.mkdir(parents=True)
         self.workspace.mkdir()
-        self.state_root.mkdir()
         self.expected_ports = (19081, 19082)
         self.expected_identity = {"pid": 7311, "create_time": 123.0}
         process = SimpleNamespace(pid=self.expected_identity["pid"])
         self.context = SimpleNamespace(
+            temp_root=self.temp_root,
             process=process,
             identity=dict(self.expected_identity),
             ports=self.expected_ports,
@@ -280,6 +284,7 @@ def _seed_live_prepost_run(
     case_index: int,
     *,
     include_prior_rows: bool = True,
+    prior_row_state: str = "running",
 ) -> tuple[runner.RunCase, str]:
     cases = _cases()
     for prior_index, prior_case in enumerate(cases[:case_index], start=1):
@@ -291,7 +296,7 @@ def _seed_live_prepost_run(
         harness.ledger.record_observed_jobs(prior_case, prior_case.expected_jobs)
         harness.ledger.mark_success(prior_case)
         if include_prior_rows:
-            harness.add_request(prior_id, workflow_id, run_id)
+            harness.add_request(prior_id, workflow_id, run_id, prior_row_state)
     case = cases[case_index]
     client_request_id = runner.client_request_id_for(APPROVAL_ID, case)
     harness.ledger.before_post(case, client_request_id)
@@ -361,6 +366,54 @@ def test_execute_runs_uses_live_adapter_for_ordered_a_b_c_prepost_counts(
     assert harness.guard_calls.count("dependencies") == 3
     assert harness.guard_calls.count("worker") == 3
     assert outcome["gate2"] == "PASS"
+
+
+@pytest.mark.parametrize("request_state", ["running", "succeeded"])
+def test_live_adapter_accepts_prior_request_row_state_and_identity(
+    request_state: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+    case, client_request_id = _seed_live_prepost_run(harness, 1, prior_row_state=request_state)
+
+    status_code, accepted = harness.adapter.start(case, client_request_id)
+
+    assert status_code == 202
+    assert accepted["workflow_id"] == "workflow-live-2"
+    assert len(harness.posts) == 1
+    assert harness.adapter.initial_posts == 2
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("workflow_id", "workflow-other"),
+        ("run_id", "run-other"),
+        ("state", "failed"),
+        ("state", "unknown"),
+        ("state", "needs_reconciliation"),
+    ],
+)
+def test_live_adapter_rejects_prior_request_row_identity_or_state_mismatch(
+    mutation: str,
+    value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+    case, client_request_id = _seed_live_prepost_run(harness, 1)
+    prior_id = runner.client_request_id_for(APPROVAL_ID, _cases()[0])
+    column = mutation
+    with sqlite3.connect(harness.state_root / "requests.sqlite") as connection:
+        connection.execute(
+            f"UPDATE workflow_requests SET {column} = ? WHERE client_request_id = ?",
+            (value, prior_id),
+        )
+
+    with pytest.raises(runner.RunnerAbort):
+        harness.adapter.start(case, client_request_id)
+
+    assert harness.posts == []
+    assert harness.adapter.initial_posts == 1
 
 
 @pytest.mark.parametrize(
@@ -978,18 +1031,301 @@ def test_head_and_dirty_source_guard_rejects_mismatch() -> None:
 
 
 def test_isolation_guard_rejects_production_ports_and_overlapping_roots(tmp_path: Path) -> None:
-    root = tmp_path / "isolated"
-    root.mkdir()
-    state = root / "state"
-    workspace = root / "workspace"
-    state.mkdir()
-    workspace.mkdir()
-    runner.validate_isolated_layout(root, state, workspace, (24001, 24002))
+    root, _localappdata, workspace, _codexbridge_root, state = _fresh_isolated_roots(tmp_path)
+    runner.validate_isolated_layout(
+        root, state, workspace, (24001, 24002), require_state_root=False
+    )
 
     with pytest.raises(runner.RunnerAbort):
-        runner.validate_isolated_layout(root, state, workspace, (18000, 24002))
+        runner.validate_isolated_layout(
+            root, state, workspace, (18000, 24002), require_state_root=False
+        )
     with pytest.raises(runner.RunnerAbort):
-        runner.validate_isolated_layout(root, root, workspace, (24001, 24002))
+        runner.validate_isolated_layout(
+            root, root, workspace, (24001, 24002), require_state_root=False
+        )
+
+
+def _fresh_isolated_roots(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    temp_root = tmp_path / "isolated"
+    temp_root.mkdir()
+    localappdata = temp_root / "localappdata"
+    localappdata.mkdir()
+    workspace = temp_root / "workspace"
+    workspace.mkdir()
+    codexbridge_root = localappdata / "CodexBridge"
+    state_root = codexbridge_root / "workflows"
+    return temp_root, localappdata, workspace, codexbridge_root, state_root
+
+
+def test_layout_accepts_fresh_uncreated_state_root_before_bridge_start(tmp_path: Path) -> None:
+    temp_root, _localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+
+    assert not codexbridge_root.exists()
+    assert not state_root.exists()
+    runner.validate_isolated_layout(
+        temp_root, state_root, workspace, (24001, 24002), require_state_root=False
+    )
+    assert not codexbridge_root.exists()
+    assert not state_root.exists()
+
+
+def test_layout_requires_state_root_only_after_bridge_start(tmp_path: Path) -> None:
+    temp_root, _localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+
+    with pytest.raises(runner.RunnerAbort):
+        runner.validate_isolated_layout(
+            temp_root, state_root, workspace, (24001, 24002), require_state_root=True
+        )
+    assert not codexbridge_root.exists()
+
+    state_root.mkdir(parents=True)
+    runner.validate_isolated_layout(
+        temp_root, state_root, workspace, (24001, 24002), require_state_root=True
+    )
+
+
+@pytest.mark.parametrize("precreated", ["codexbridge", "workflows"])
+def test_layout_rejects_precreated_state_hierarchy_before_bridge_start(
+    tmp_path: Path, precreated: str
+) -> None:
+    temp_root, _localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    target = codexbridge_root if precreated == "codexbridge" else state_root
+    target.mkdir(parents=True)
+
+    with pytest.raises(runner.RunnerAbort):
+        runner.validate_isolated_layout(
+            temp_root, state_root, workspace, (24001, 24002), require_state_root=False
+        )
+
+
+@pytest.mark.parametrize(
+    ("unsafe_case", "ports"),
+    [
+        ("state_path_shifted", (24001, 24002)),
+        ("workspace_outside", (24001, 24002)),
+        ("workspace_localappdata_overlap", (24001, 24002)),
+        ("workspace_missing", (24001, 24002)),
+        ("workspace_dirty", (24001, 24002)),
+        ("state_workspace_overlap", (24001, 24002)),
+        ("duplicate_port", (24001, 24001)),
+        ("production_port", (18000, 24002)),
+    ],
+)
+def test_layout_rejects_unsafe_roots_ports_and_workspace(
+    tmp_path: Path, unsafe_case: str, ports: tuple[int, int]
+) -> None:
+    temp_root, localappdata, workspace, _codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    selected_workspace = workspace
+    selected_state = state_root
+    require_state_root = False
+    if unsafe_case == "state_path_shifted":
+        selected_state = tmp_path / "elsewhere" / "workflows"
+    elif unsafe_case == "workspace_outside":
+        selected_workspace = tmp_path / "outside-workspace"
+        selected_workspace.mkdir()
+    elif unsafe_case == "workspace_localappdata_overlap":
+        selected_workspace = localappdata
+    elif unsafe_case == "workspace_missing":
+        workspace.rmdir()
+    elif unsafe_case == "workspace_dirty":
+        (workspace / "unexpected.txt").write_text("occupied", encoding="utf-8")
+    elif unsafe_case == "state_workspace_overlap":
+        state_root.mkdir(parents=True)
+        selected_workspace = state_root
+        require_state_root = True
+
+    with pytest.raises(runner.RunnerAbort):
+        runner.validate_isolated_layout(
+            temp_root,
+            selected_state,
+            selected_workspace,
+            ports,
+            require_state_root=require_state_root,
+        )
+
+
+@pytest.mark.parametrize(
+    "component", ["temp_root", "localappdata", "workspace", "codexbridge", "state_root"]
+)
+def test_layout_rejects_reparse_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    temp_root, localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    state_root.mkdir(parents=True)
+    targets = {
+        "temp_root": temp_root,
+        "localappdata": localappdata,
+        "workspace": workspace,
+        "codexbridge": codexbridge_root,
+        "state_root": state_root,
+    }
+    target = targets[component]
+    real_is_reparse_point = runner._is_reparse_point
+    monkeypatch.setattr(
+        runner,
+        "_is_reparse_point",
+        lambda path: Path(path) == target or real_is_reparse_point(path),
+    )
+
+    with pytest.raises(runner.RunnerAbort):
+        runner.validate_isolated_layout(
+            temp_root, state_root, workspace, (24001, 24002), require_state_root=True
+        )
+
+
+def test_layout_rejects_state_root_without_write_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    temp_root, _localappdata, workspace, _codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    state_root.mkdir(parents=True)
+    real_access = runner.os.access
+
+    def deny_state_access(path: str | bytes | Path, mode: int, *args: Any, **kwargs: Any) -> bool:
+        if Path(path) == state_root and mode == runner.os.R_OK | runner.os.W_OK | runner.os.X_OK:
+            return False
+        return real_access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(runner.os, "access", deny_state_access)
+    with pytest.raises(runner.RunnerAbort):
+        runner.validate_isolated_layout(
+            temp_root, state_root, workspace, (24001, 24002), require_state_root=True
+        )
+
+
+def test_layout_rejects_an_actual_symlinked_state_parent(tmp_path: Path) -> None:
+    temp_root, localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    target = tmp_path / "other-localappdata"
+    target.mkdir()
+    localappdata.rmdir()
+    try:
+        localappdata.symlink_to(target, target_is_directory=True)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"Windows could not create a symlink in the test temp directory: {error}")
+
+    with pytest.raises(runner.RunnerAbort):
+        runner.validate_isolated_layout(
+            temp_root, state_root, workspace, (24001, 24002), require_state_root=False
+        )
+
+
+@pytest.mark.parametrize(
+    ("bridge_creates_state_root", "localappdata_matches"),
+    [(True, True), (False, True), (False, False)],
+)
+def test_execute_live_checks_state_root_after_mock_start_before_run_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bridge_creates_state_root: bool,
+    localappdata_matches: bool,
+) -> None:
+    temp_root, localappdata, workspace, _codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    appdata = temp_root / "appdata"
+    appdata.mkdir()
+    temp_dir = temp_root / "tmp"
+    temp_dir.mkdir()
+    context = SimpleNamespace(
+        temp_root=temp_root,
+        state_root=state_root,
+        workspace=workspace,
+        ports=(24001, 24002),
+        environment={
+            "LOCALAPPDATA": str(localappdata if localappdata_matches else appdata),
+            "APPDATA": str(appdata),
+            "TEMP": str(temp_dir),
+            "TMP": str(temp_dir),
+            "CODEX_HOME": str(temp_root / "codex_home"),
+        },
+        control_token="fake-control-token",
+        mcp_token="fake-mcp-token",
+        codex_executable=temp_root / "fake-codex.exe",
+        process=None,
+        identity=None,
+    )
+    ledger = runner.AttemptLedger.create(tmp_path / "budget", APPROVAL_ID, HEAD, SOURCE_HASH)
+    trace: list[Any] = []
+    real_validate = runner.validate_isolated_layout
+
+    def fake_create_ledger(
+        cls: type[runner.AttemptLedger], *_args: Any, **_kwargs: Any
+    ) -> runner.AttemptLedger:
+        return ledger
+
+    def tracked_validate(
+        root: Path,
+        state: Path,
+        work: Path,
+        ports: tuple[int, int],
+        *,
+        require_state_root: bool,
+    ) -> None:
+        trace.append(("validate", require_state_root))
+        real_validate(root, state, work, ports, require_state_root=require_state_root)
+        if not require_state_root:
+            assert not state.exists()
+
+    def fake_start_bridge(_context: Any, *, restart: bool = False) -> None:
+        assert restart is False
+        trace.append("bridge_start")
+        if bridge_creates_state_root:
+            state_root.mkdir(parents=True)
+
+    def fake_execute_runs(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        trace.append("execute_runs")
+        raise runner.RunnerAbort("BLOCKED", "offline_test_stop_before_post")
+
+    monkeypatch.setattr(runner.AttemptLedger, "create", classmethod(fake_create_ledger))
+    monkeypatch.setattr(
+        runner,
+        "live_preflight",
+        lambda *_args: {
+            "approved_head": HEAD,
+            "runner_source_sha256": SOURCE_HASH,
+            "codex_executable": context.codex_executable,
+            "source_home": temp_root / "source-home",
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_b5",
+        lambda: SimpleNamespace(
+            _make_isolated_context=lambda *_args: trace.append("context_created") or context
+        ),
+    )
+    monkeypatch.setattr(runner, "validate_isolated_layout", tracked_validate)
+    monkeypatch.setattr(runner, "start_isolated_bridge", fake_start_bridge)
+    monkeypatch.setattr(runner, "execute_runs", fake_execute_runs)
+    monkeypatch.setattr(runner, "_write_live_evidence", lambda *_args, **_kwargs: None)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    assert ledger.post_count == 0
+    expected = [
+        "context_created",
+        ("validate", False),
+    ]
+    if localappdata_matches:
+        expected.extend(["bridge_start", ("validate", True)])
+        if bridge_creates_state_root:
+            expected.append("execute_runs")
+    assert trace == expected
 
 
 def test_auth_source_requires_owned_regular_bounded_file(tmp_path: Path) -> None:

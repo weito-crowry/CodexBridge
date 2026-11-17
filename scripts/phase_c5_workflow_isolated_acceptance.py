@@ -717,20 +717,53 @@ def validate_isolated_layout(
     state_root: Path,
     workspace: Path,
     ports: tuple[int, int],
+    *,
+    require_state_root: bool,
 ) -> None:
+    if type(require_state_root) is not bool:
+        raise RunnerAbort("BLOCKED", "isolated_state_root_phase_invalid")
     try:
         root = temp_root.resolve(strict=True)
-        state = state_root.resolve(strict=True)
+        localappdata_path = root / "localappdata"
+        localappdata = localappdata_path.resolve(strict=True)
+        codexbridge_root = localappdata / "CodexBridge"
+        expected_state = codexbridge_root / "workflows"
+        state = state_root.resolve(strict=require_state_root)
         work = workspace.resolve(strict=True)
     except (OSError, RuntimeError):
         raise RunnerAbort("BLOCKED", "isolated_root_unavailable") from None
+    try:
+        workspace_is_empty = next(work.iterdir(), None) is None
+    except OSError:
+        raise RunnerAbort("BLOCKED", "isolated_workspace_unavailable") from None
     if (
-        any(_is_reparse_point(path) for path in (temp_root, state_root, workspace))
+        any(
+            _is_reparse_point(path)
+            for path in (temp_root, localappdata_path, workspace, codexbridge_root, state_root)
+        )
+        or root != temp_root
+        or localappdata != localappdata_path
+        or not localappdata.is_dir()
+        or work != workspace
         or not root.is_dir()
-        or not state.is_dir()
         or not work.is_dir()
+        or not workspace_is_empty
+        or state != expected_state
+        or state_root != expected_state
+        or (
+            require_state_root
+            and (
+                not state.is_dir()
+                or not codexbridge_root.is_dir()
+                or not os.access(state, os.R_OK | os.W_OK | os.X_OK)
+            )
+        )
+        or (not require_state_root and (codexbridge_root.exists() or state_root.exists()))
         or not state.is_relative_to(root)
         or not work.is_relative_to(root)
+        or localappdata == work
+        or localappdata.is_relative_to(work)
+        or work.is_relative_to(localappdata)
         or state == work
         or state.is_relative_to(work)
         or work.is_relative_to(state)
@@ -1500,6 +1533,13 @@ class LiveAdapter:
     def _assert_bridge_ready(self, case: RunCase, client_request_id: str) -> None:
         b5 = _b5()
         context = self.context
+        validate_isolated_layout(
+            context.temp_root,
+            context.state_root,
+            context.workspace,
+            context.ports,
+            require_state_root=True,
+        )
         if context.process is None or context.identity is None:
             raise RunnerAbort("BLOCKED", "owned_bridge_identity_missing_before_post")
         b5.phase5f5._assert_bridge_identity(context.process, context.identity)
@@ -1552,6 +1592,7 @@ class LiveAdapter:
         if client_request_id != current_expected_id:
             raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
         expected_prior_ids: set[str] = set()
+        expected_prior_rows: dict[str, tuple[str, str]] = {}
         expected_prior_jobs = 0
         for index, expected_case in enumerate(cases):
             record = runs.get(expected_case.name)
@@ -1573,6 +1614,10 @@ class LiveAdapter:
                 ):
                     raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
                 expected_prior_ids.add(expected_id)
+                expected_prior_rows[expected_id] = (
+                    str(record["workflow_id"]),
+                    str(record["run_id"]),
+                )
                 expected_prior_jobs += expected_case.expected_jobs
             elif index == current_index:
                 if (
@@ -1610,7 +1655,16 @@ class LiveAdapter:
         request_ids: list[str] = []
         for row in request_rows:
             request_id = row.get("client_request_id") if isinstance(row, dict) else None
-            if not _valid_identifier(request_id):
+            workflow_id = row.get("workflow_id") if isinstance(row, dict) else None
+            run_id = row.get("run_id") if isinstance(row, dict) else None
+            state = row.get("state") if isinstance(row, dict) else None
+            if (
+                not _valid_identifier(request_id)
+                or not _valid_identifier(workflow_id)
+                or not _valid_identifier(run_id)
+                or state not in {"running", "succeeded"}
+                or expected_prior_rows.get(str(request_id)) != (workflow_id, run_id)
+            ):
                 raise RunnerAbort("BLOCKED", "unexpected_isolated_workflow_request_count")
             request_ids.append(str(request_id))
         observed_request_ids = set(request_ids)
@@ -1945,8 +1999,24 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         context = b5._make_isolated_context(preflight["codex_executable"], preflight["source_home"])
         secrets_to_reject = (context.control_token, context.mcp_token)
         validate_isolated_layout(
-            context.temp_root, context.state_root, context.workspace, context.ports
+            context.temp_root,
+            context.state_root,
+            context.workspace,
+            context.ports,
+            require_state_root=False,
         )
+        expected_localappdata = context.temp_root.resolve(strict=True) / "localappdata"
+        localappdata_value = context.environment.get("LOCALAPPDATA")
+        try:
+            actual_localappdata = (
+                Path(localappdata_value).resolve(strict=True)
+                if isinstance(localappdata_value, str)
+                else None
+            )
+        except (OSError, RuntimeError):
+            actual_localappdata = None
+        if actual_localappdata != expected_localappdata:
+            raise RunnerAbort("BLOCKED", "isolated_localappdata_mismatch")
         for key in ("LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "CODEX_HOME"):
             value = context.environment.get(key)
             if not isinstance(value, str) or not Path(value).resolve().is_relative_to(
@@ -1956,6 +2026,13 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         if context.control_token == context.mcp_token:
             raise RunnerAbort("BLOCKED", "isolated_tokens_not_distinct")
         start_isolated_bridge(context)
+        validate_isolated_layout(
+            context.temp_root,
+            context.state_root,
+            context.workspace,
+            context.ports,
+            require_state_root=True,
+        )
         adapter = LiveAdapter(context, ledger)
         outcome = execute_runs(build_run_cases(), ledger, adapter)
         evidence["gates"]["gate0"] = "PASS"

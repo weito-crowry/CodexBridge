@@ -39,6 +39,12 @@ The C5 final visible GUI inspection remains unperformed. Existing B5 `_qt_readba
 
 Offline tests use the real `LiveAdapter.start`, `_assert_bridge_ready`, and `execute_runs` with a fake B5 preflight, fake owned process identity, temporary SQLite state, and fake HTTP start function. They verify pre-POST DB row counts of 0/1/2 for A/B/C, budget totals of three initial POSTs and six jobs, rejection cases with zero fake POSTs, and no resend after an unknown transport outcome. No Bridge, Worker, real HTTP POST, or Codex job was started for this correction.
 
+## Issue #158 isolated state-root preflight correction
+
+The B5 context helper returns `temp_root/localappdata/CodexBridge/workflows` before Bridge startup without creating the Bridge-owned state hierarchy. C5 now validates that exact path in two phases: before startup, the hierarchy must be absent and the runner does not create it; after mocked or approved Bridge startup, the exact path must exist as an accessible, non-reparse directory before run execution. The context `LOCALAPPDATA` must resolve to the isolated `temp_root/localappdata`. Both phases retain isolated workspace, root-boundary, production-port, and reparse checks.
+
+The pre-POST check revalidates the strict post-start layout before each run. For prior successful runs, request rows must match the persistent ledger's `client_request_id`, `workflow_id`, and `run_id`; the DB state may be `running` or `succeeded`. Foreign or duplicate rows, identity mismatch, and any other state stop before the fake POST boundary. New offline tests use temporary roots and SQLite, fake B5 context creation/start, and a fake run boundary. They do not start a Bridge or Worker, issue a Workflow POST, or create a Codex job.
+
 Related offline regression tests selected for the implementation turn:
 
 - `tests/test_phase_b5_workflow_isolated_smoke.py`
