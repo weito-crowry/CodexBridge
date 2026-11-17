@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPalette,
     QPen,
+    QShowEvent,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -502,6 +503,7 @@ class WorkflowExecutionGraphWidget(QWidget):
         self._graph_truncated = False
         self._omitted_graph_count = 0
         self._has_more = False
+        self._pending_initial_center_node_id: str | None = None
 
         layout = QVBoxLayout(self)
         self.metadata_label = QLabel(tr("Select a workflow to view its execution graph."), self)
@@ -540,6 +542,15 @@ class WorkflowExecutionGraphWidget(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        node_id = self._pending_initial_center_node_id
+        self._pending_initial_center_node_id = None
+        if node_id is not None:
+            node_item = self._node_items.get(node_id)
+            if node_item is not None:
+                self.graph_view.centerOn(node_item)
 
     @property
     def node_items(self) -> dict[str, _WorkflowNodeItem]:
@@ -657,6 +668,7 @@ class WorkflowExecutionGraphWidget(QWidget):
         )
 
     def _rebuild_graph(self, snapshot: Mapping[str, Any]) -> None:
+        self._pending_initial_center_node_id = None
         self.graph_scene.clear()
         self._node_items.clear()
         self._edge_items.clear()
@@ -780,7 +792,25 @@ class WorkflowExecutionGraphWidget(QWidget):
             self.graph_scene.addItem(label)
         bounds = self.graph_scene.itemsBoundingRect()
         self.graph_scene.setSceneRect(bounds.adjusted(-48.0, -48.0, 64.0, 48.0))
-        self.graph_view.fitInView(self.graph_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.graph_view.resetTransform()
+        first_node_id = min(
+            node_by_id,
+            key=lambda node_id: (
+                cast(int, node_by_id[node_id]["order"]),
+                cast(str, node_by_id[node_id]["parent_scope"]),
+                node_id,
+            ),
+            default=None,
+        )
+        if first_node_id is None:
+            return
+        self.graph_view.centerOn(self._node_items[first_node_id])
+        if (
+            not self.isVisible()
+            or self.graph_view.viewport().width() <= 0
+            or self.graph_view.viewport().height() <= 0
+        ):
+            self._pending_initial_center_node_id = first_node_id
 
     @staticmethod
     def _layout_nodes(nodes: list[dict[str, Any]]) -> dict[str, tuple[float, float]]:
@@ -1065,6 +1095,7 @@ class WorkflowExecutionGraphWidget(QWidget):
 
     def clear_data(self) -> None:
         self._selected_node_id = None
+        self._pending_initial_center_node_id = None
         previous_signals_blocked = self.node_list.blockSignals(True)
         try:
             self.node_list.clear()

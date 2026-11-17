@@ -3,14 +3,17 @@ from __future__ import annotations
 import importlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, QSize, Qt
+import pytest
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, QSize, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QGraphicsView, QScrollArea
 
 from codex_bridge.console.i18n import tr
 from codex_bridge.console.workflows_dialog import WorkflowManagementDialog
+from scripts import phase_c5_gui_visible_review as visible_review
 
 
 def _app() -> QApplication:
@@ -154,6 +157,209 @@ def _simple_snapshot(workflow_id: str, run_id: str, version: str) -> dict[str, o
         ],
         "edges": [],
     }
+
+
+def _graph_node_view_rect(graph_view: Any, node_item: Any) -> QRect:
+    scene_bounds = node_item.sceneBoundingRect()
+    return QRect(
+        graph_view.mapFromScene(scene_bounds.topLeft()),
+        graph_view.mapFromScene(scene_bounds.bottomRight()),
+    ).normalized()
+
+
+def _send_graph_wheel(app: QApplication, graph_view: QGraphicsView, delta: int) -> None:
+    viewport = graph_view.viewport()
+    position = QPoint(viewport.width() // 2, viewport.height() // 2)
+    event = QWheelEvent(
+        QPointF(position),
+        QPointF(viewport.mapToGlobal(position)),
+        QPoint(0, 0),
+        QPoint(0, delta),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.ControlModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    QApplication.sendEvent(viewport, event)
+    app.processEvents()
+
+
+def _partial_snapshot(workflow_id: str, run_id: str, version: str) -> dict[str, object]:
+    snapshot = _scenario_snapshot(workflow_id, run_id, version)
+    snapshot["coverage"] = "partial"
+    snapshot["coverage_reason"] = "workflow_not_confirmed"
+    snapshot["latest_event_id"] = 1
+    return snapshot
+
+
+def test_hidden_initial_graph_is_readable_centered_and_scrollable_at_both_sizes() -> None:
+    app = _app()
+    scenarios = visible_review.build_scenarios()
+
+    for size_name, size in (("regular", QSize(900, 760)), ("compact", QSize(720, 600))):
+        dialog = WorkflowManagementDialog()
+        harness = visible_review.VisibleReviewHarness(dialog, size_name)
+        graph = dialog.graph_widget
+        view = graph.graph_view
+        assert dialog.result_tabs.currentIndex() == 0
+        assert not graph.isVisible()
+        assert view.transform().m11() == pytest.approx(1.0)
+
+        dialog.resize(size)
+        dialog.show()
+        app.processEvents()
+        assert not graph.isVisible()
+        dialog.result_tabs.setCurrentIndex(1)
+        app.processEvents()
+
+        assert graph.isVisible()
+        assert view.transform().m11() == pytest.approx(1.0)
+        first_node = graph.node_items["/do/0/for-zero"]
+        first_node_view_rect = _graph_node_view_rect(view, first_node)
+        assert first_node_view_rect.width() >= 160
+        assert view.viewport().rect().intersects(first_node_view_rect)
+
+        for row in (1, 2):
+            scenario = scenarios[row]
+            fixture = visible_review.build_fixture(scenario)
+            event_payload = fixture["events"]
+            assert isinstance(event_payload, dict)
+            dialog.workflow_list.setCurrentRow(row)
+            app.processEvents()
+            assert graph.snapshot_identity is not None
+            assert graph.snapshot_identity[:2] == (scenario.workflow_id, scenario.run_id)
+            assert view.transform().m11() == pytest.approx(1.0)
+            assert graph.event_cursor == event_payload["next_after_id"]
+
+        assert len(graph.node_items) == 5
+        assert view.verticalScrollBar().maximum() > view.verticalScrollBar().minimum()
+        assert view.dragMode() == QGraphicsView.DragMode.ScrollHandDrag
+        graph.node_list.setCurrentRow(1)
+        app.processEvents()
+        assert graph.selected_node_id == "/do/0/for-many"
+        assert "for-many" in graph.detail_view.toPlainText()
+
+        scrollbar = view.verticalScrollBar()
+        scrollbar.setValue((scrollbar.minimum() + scrollbar.maximum()) // 2)
+        before_pan = scrollbar.value()
+        start = QPoint(view.viewport().width() - 15, view.viewport().height() - 15)
+        end = QPoint(start.x(), start.y() - 80)
+        QTest.mousePress(
+            view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start
+        )
+        QTest.mouseMove(view.viewport(), end, delay=20)
+        QTest.mouseRelease(
+            view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, end
+        )
+        app.processEvents()
+        assert scrollbar.value() != before_pan
+
+        _send_graph_wheel(app, view, 120)
+        assert view.transform().m11() == pytest.approx(1.15)
+        dialog.result_tabs.setCurrentIndex(0)
+        app.processEvents()
+        dialog.result_tabs.setCurrentIndex(1)
+        app.processEvents()
+        assert view.transform().m11() == pytest.approx(1.15)
+        _send_graph_wheel(app, view, -120)
+        assert view.transform().m11() == pytest.approx(1.0)
+
+        view.scale(1.35, 1.35)
+        before_refresh_transform = view.transform()
+        before_refresh_scroll = scrollbar.value()
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        app.processEvents()
+        assert view.transform() == before_refresh_transform
+        assert scrollbar.value() == before_refresh_scroll
+
+        other_size = QSize(720, 600) if size == QSize(900, 760) else QSize(900, 760)
+        dialog.resize(other_size)
+        app.processEvents()
+        assert view.transform().m11() == pytest.approx(1.35)
+
+        dialog.workflow_list.setCurrentRow(0)
+        app.processEvents()
+        assert view.transform().m11() == pytest.approx(1.0)
+        assert graph.snapshot_identity is not None
+        assert graph.snapshot_identity[:2] == (
+            scenarios[0].workflow_id,
+            scenarios[0].run_id,
+        )
+        dialog.close()
+        app.processEvents()
+        assert harness.dialog is dialog
+
+
+def test_same_run_refresh_version_change_preserves_view_and_new_run_resets_scale() -> None:
+    app = _app()
+    dialog = WorkflowManagementDialog()
+    dialog.resize(QSize(900, 760))
+    dialog.show()
+    app.processEvents()
+    dialog.result_tabs.setCurrentIndex(1)
+    app.processEvents()
+    graph = dialog.graph_widget
+    view = graph.graph_view
+    workflow_id = "workflow-view-preserve"
+    run_id = "run-view-preserve"
+    snapshot = _partial_snapshot(workflow_id, run_id, "a")
+    events = _one_graph_event_page(workflow_id, run_id)
+    assert graph.set_snapshot(workflow_id, snapshot)
+    assert graph.set_events(events)
+    graph.node_list.setCurrentRow(1)
+    app.processEvents()
+    node_item = graph.node_items["/do/0/for-many"]
+    view.scale(1.35, 1.35)
+    scrollbar = view.verticalScrollBar()
+    assert scrollbar.maximum() > scrollbar.minimum()
+    scrollbar.setValue(min(scrollbar.maximum(), scrollbar.minimum() + 80))
+    expected_transform = view.transform()
+    expected_scroll = scrollbar.value()
+
+    assert graph.set_snapshot(workflow_id, dict(snapshot))
+    assert graph.set_events(events)
+    assert graph.node_items["/do/0/for-many"] is node_item
+    assert graph.selected_node_id == "/do/0/for-many"
+    assert view.transform() == expected_transform
+    assert scrollbar.value() == expected_scroll
+    assert graph.event_cursor == 1
+
+    version_update = dict(snapshot)
+    snapshot_nodes = cast(list[dict[str, object]], snapshot["nodes"])
+    updated_nodes = [dict(node) for node in snapshot_nodes]
+    updated_nodes[1] = dict(updated_nodes[1], state="running", completion_observed=False)
+    version_update["nodes"] = updated_nodes
+    version_update["snapshot_version"] = "sha256:" + "b" * 64
+    assert graph.set_snapshot(workflow_id, version_update)
+    assert graph.node_items["/do/0/for-many"] is node_item
+    assert graph.selected_node_id == "/do/0/for-many"
+    assert view.transform() == expected_transform
+    assert scrollbar.value() == expected_scroll
+    assert graph.event_cursor == 1
+
+    dialog.result_tabs.setCurrentIndex(0)
+    app.processEvents()
+    dialog.resize(QSize(720, 600))
+    app.processEvents()
+    dialog.result_tabs.setCurrentIndex(1)
+    app.processEvents()
+    assert view.transform().m11() == pytest.approx(1.35)
+
+    next_run = _partial_snapshot(workflow_id, "run-view-next", "c")
+    assert graph.set_snapshot(workflow_id, next_run)
+    assert graph.snapshot_identity is not None
+    assert graph.snapshot_identity[:2] == (workflow_id, "run-view-next")
+    assert graph.selected_node_id is None
+    assert view.transform().m11() == pytest.approx(1.0)
+    assert graph.event_cursor == 0
+    assert graph.event_list.count() == 0
+    assert graph.set_events(_one_graph_event_page(workflow_id, "run-view-next"))
+    graph.node_list.setCurrentRow(1)
+    app.processEvents()
+    assert graph.selected_node_id == "/do/0/for-many"
+    assert graph.event_cursor == 1
+    dialog.close()
+    app.processEvents()
 
 
 def test_dialog_layout_supports_regular_and_compact_sizes() -> None:
