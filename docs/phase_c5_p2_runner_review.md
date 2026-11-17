@@ -25,6 +25,14 @@ The live evidence writer uses a fixed-field sanitizer and refuses secret-bearing
 
 The runner-only suite uses fixed fake adapters and temporary marker files to exercise the 1/2/3 budget, duplicate approval rejection, pre-POST persistent consumption, transport-unknown stop, transient reconciliation polling, fail-fast status handling, result/job count checks, graph/event node identity, root/port guards, owner mismatch shutdown refusal, evidence sanitization, and harmless CLI paths. The zero-iteration and false-switch cases use the OWS interpreter with a fake call handler and start no Codex process.
 
+## Issue #156 review correction
+
+The first review found that `_verify_live_run` hashed only `workflow`, `input`, and `workspace_root`. Product `WorkflowService._prepare_request` also includes `max_live_codex_jobs` for limits 2 and 3. The runner now builds an explicit digest payload and adds that key only for the two multi-job cases; the one-job digest keeps the original three fields.
+
+The new offline digest tests call the real `WorkflowService._prepare_request` with each fixed 1/2/3-job definition, input, and a temporary canonical workspace, then compare its digest with the helper used by `_verify_live_run`. They also prepare deliberately different job limits and verify their digests do not match. A fake `requests.sqlite`, manifest, Worker status, DBOS status, job ledger, and task projection exercise `_verify_live_run`: matching request-row and manifest digests pass, while either mismatch is rejected. These tests do not call `start_workflow` and use no network, Bridge, Worker, or Codex process.
+
+The C5 final visible GUI inspection remains unperformed. Existing B5 `_qt_readback` covers list, detail, and result, but does not directly verify the C4 Execution graph GUI/API integration. This correction does not expand that integration; Gate 1 remains `NOT_RUN` until a separate human visual check.
+
 Related offline regression tests selected for the implementation turn:
 
 - `tests/test_phase_b5_workflow_isolated_smoke.py`

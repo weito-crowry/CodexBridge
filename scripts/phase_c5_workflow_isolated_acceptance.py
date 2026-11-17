@@ -1567,6 +1567,19 @@ def count_isolated_codex_jobs(state_root: Path) -> int:
     return total
 
 
+def _workflow_request_digest(
+    case: RunCase, definition: Mapping[str, Any], workspace_root: str
+) -> str:
+    digest_payload: dict[str, Any] = {
+        "workflow": definition,
+        "input": case.input_data,
+        "workspace_root": workspace_root,
+    }
+    if case.expected_jobs in {2, 3}:
+        digest_payload["max_live_codex_jobs"] = case.expected_jobs
+    return _sha256(_canonical_json(digest_payload).encode("utf-8"))
+
+
 def _verify_live_run(
     context: Any,
     case: RunCase,
@@ -1606,11 +1619,9 @@ def _verify_live_run(
     definition = yaml.safe_load(case.workflow_yaml)
     definition_hash = _sha256((_canonical_json(definition) + "\n").encode("utf-8"))
     input_hash = _sha256(_canonical_json(case.input_data).encode("utf-8"))
-    request_digest = _sha256(
-        _canonical_json(
-            {"workflow": definition, "input": case.input_data, "workspace_root": work_root}
-        ).encode("utf-8")
-    )
+    request_digest = _workflow_request_digest(case, definition, work_root)
+    if request_rows[0].get("request_digest") != request_digest:
+        raise RunnerAbort("FAIL", "workflow_request_digest_mismatch")
     if (
         not isinstance(manifest, dict)
         or manifest.get("workflow_id") != workflow_id

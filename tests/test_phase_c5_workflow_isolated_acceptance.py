@@ -5,12 +5,14 @@ import sqlite3
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import yaml
 
 from codex_bridge.workflows.interpreter import Interpreter, compute_task_action
+from codex_bridge.workflows.service import WorkflowService
 from scripts import phase_c5_workflow_isolated_acceptance as runner
 
 APPROVAL_ID = "a" * 32
@@ -104,6 +106,217 @@ def test_fixed_workflows_validate_as_exact_one_two_three_job_cases() -> None:
             {"number": 3, "enabled": True},
         ]
     }
+
+
+def test_runner_digest_matches_service_prepare_request_for_one_two_three_jobs(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "fixed-c5-workspace"
+    state_root = tmp_path / "fixed-c5-state"
+    workspace.mkdir()
+    state_root.mkdir()
+    service = WorkflowService(
+        SimpleNamespace(state_root=state_root, allowed_roots=(str(tmp_path),)),
+        codex_bridge_port=18001,
+    )
+    canonical_workspace = str(workspace.resolve(strict=True))
+
+    for case in _cases():
+        definition = yaml.safe_load(case.workflow_yaml)
+        prepared = service._prepare_request(
+            client_request_id=f"c5-request-{case.name.lower()}",
+            workflow_yaml=case.workflow_yaml,
+            input_data=case.input_data,
+            workspace_root=canonical_workspace,
+            max_live_codex_jobs=case.expected_jobs,
+        )
+        runner_digest = runner._workflow_request_digest(case, definition, canonical_workspace)
+        assert prepared.request_digest == runner_digest
+
+        wrong_max_live_codex_jobs = 1 if case.expected_jobs == 2 else 2
+        wrong_prepared = service._prepare_request(
+            client_request_id=f"c5-request-wrong-{case.name.lower()}",
+            workflow_yaml=case.workflow_yaml,
+            input_data=case.input_data,
+            workspace_root=canonical_workspace,
+            max_live_codex_jobs=wrong_max_live_codex_jobs,
+            validate_definition=False,
+        )
+        assert wrong_prepared.request_digest != runner_digest
+
+
+@pytest.mark.parametrize("case_index", [0, 1, 2])
+def test_verify_live_run_requires_matching_service_digest_in_ledger_and_manifest(
+    case_index: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _cases()[case_index]
+    workspace = tmp_path / "c5-verify-workspace"
+    state_root = tmp_path / "c5-verify-state"
+    workspace.mkdir()
+    state_root.mkdir()
+    work_root = str(workspace.resolve(strict=True))
+    service = WorkflowService(
+        SimpleNamespace(state_root=state_root, allowed_roots=(str(tmp_path),)),
+        codex_bridge_port=18001,
+    )
+    client_request_id = f"c5-verify-{case.name.lower()}"
+    workflow_id = f"workflow-{case.name}"
+    run_id = f"run-{case.name}"
+    definition = yaml.safe_load(case.workflow_yaml)
+    prepared = service._prepare_request(
+        client_request_id=client_request_id,
+        workflow_yaml=case.workflow_yaml,
+        input_data=case.input_data,
+        workspace_root=work_root,
+        max_live_codex_jobs=case.expected_jobs,
+    )
+    run_dir = state_root / run_id
+    run_dir.mkdir()
+    result = {"workflow_id": workflow_id, "status": "succeeded"}
+    definition_hash = runner._sha256((runner._canonical_json(definition) + "\n").encode())
+    input_hash = runner._sha256(runner._canonical_json(case.input_data).encode())
+    manifest = {
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "workflow_source": "ui-api",
+        "mode": "codex-job-live",
+        "workspace_root": work_root,
+        "definition_sha256": definition_hash,
+        "input_sha256": input_hash,
+        "request_digest": prepared.request_digest,
+    }
+    for filename, value in (
+        ("manifest.json", manifest),
+        ("result.json", result),
+        ("worker-entry-status.json", {"state": "completed", "exit_code": 0}),
+        ("workflow.yaml", definition),
+        ("input.json", case.input_data),
+    ):
+        (run_dir / filename).write_text(json.dumps(value), encoding="utf-8")
+
+    requests_db = state_root / "requests.sqlite"
+    with sqlite3.connect(requests_db) as connection:
+        connection.execute(
+            "CREATE TABLE workflow_requests "
+            "(client_request_id TEXT, workflow_id TEXT, run_id TEXT, "
+            "request_digest TEXT, state TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO workflow_requests VALUES (?, ?, ?, ?, ?)",
+            (client_request_id, workflow_id, run_id, prepared.request_digest, "succeeded"),
+        )
+
+    jobs: list[dict[str, Any]] = []
+    job_events: list[dict[str, Any]] = []
+    for index, expected_text in enumerate(case.expected_texts, start=1):
+        job_id = f"job-{case.name}-{index}"
+        task_identity = f"task-{index}"
+        jobs.append(
+            {
+                "job_id": job_id,
+                "workflow_id": workflow_id,
+                "state": "SUCCEEDED",
+                "task_identity": task_identity,
+                "request_key": f"{workflow_id}::{task_identity}",
+                "remote_state": "completed",
+                "receipt_json": json.dumps({"result": {"final_text": expected_text}}),
+            }
+        )
+        job_events.extend(
+            {"job_id": job_id, "state": state} for state in ("MAYBE_SENT", "SUCCEEDED")
+        )
+
+    nodes: list[dict[str, Any]] = []
+    task_events: list[dict[str, Any]] = []
+    job_index = 0
+    for node_id in case.static_node_ids:
+        executions: list[dict[str, Any]] = []
+        if node_id in case.call_node_ids:
+            execution_count = case.expected_jobs if case.name == "C" else 1
+            for _ in range(execution_count):
+                job = jobs[job_index]
+                job_index += 1
+                executions.append(
+                    {
+                        "execution_id": f"execution-{job['job_id']}",
+                        "state": "succeeded",
+                        "observation_complete": True,
+                        "job_id": job["job_id"],
+                    }
+                )
+                task_events.append({"node_id": node_id, "event_type": "task_completed"})
+        nodes.append({"node_id": node_id, "executions": executions})
+    tasks = {
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "coverage": "complete",
+        "truncated": False,
+        "nodes": nodes,
+    }
+    events = {
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "coverage": "complete",
+        "truncated": False,
+        "has_more": False,
+        "events": task_events,
+    }
+
+    def read_sqlite(path: Path, query: str, parameters: tuple[Any, ...]) -> list[dict[str, Any]]:
+        with sqlite3.connect(path) as connection:
+            connection.row_factory = sqlite3.Row
+            return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+
+    def read_json(path: Path, *, maximum: int = 1024 * 1024) -> Any:
+        if path.stat().st_size > maximum:
+            raise ValueError("fixture exceeds requested read limit")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    fake_b5 = SimpleNamespace(
+        _read_json=read_json,
+        _read_sqlite=read_sqlite,
+        _read_codex_job_ledger=lambda _path: (jobs, job_events),
+        isolated=SimpleNamespace(
+            _run_directory=lambda root, requested_run_id: root / requested_run_id,
+            _read_dbos_status=lambda _run_dir, _workflow_id: "SUCCESS",
+        ),
+    )
+    monkeypatch.setattr(runner, "_b5", lambda: fake_b5)
+    monkeypatch.setattr(runner, "_read_events_http", lambda *_args: (tasks, events))
+    monkeypatch.setattr(runner, "_read_events_mcp", lambda *_args: (tasks, events))
+    context = SimpleNamespace(workspace=workspace, state_root=state_root)
+    accepted = {
+        "client_request_id": client_request_id,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+    }
+    detail = {"workflow_id": workflow_id, "run_id": run_id, "status": "succeeded"}
+
+    verified = runner._verify_live_run(context, case, accepted, detail, result)
+    assert verified["job_count"] == case.expected_jobs
+
+    with sqlite3.connect(requests_db) as connection:
+        connection.execute("UPDATE workflow_requests SET request_digest = ?", ("0" * 64,))
+    with pytest.raises(runner.RunnerAbort, match="workflow_request_digest_mismatch"):
+        runner._verify_live_run(context, case, accepted, detail, result)
+
+    with sqlite3.connect(requests_db) as connection:
+        connection.execute(
+            "UPDATE workflow_requests SET request_digest = ?", (prepared.request_digest,)
+        )
+    wrong_max_live_codex_jobs = 1 if case.expected_jobs == 2 else 2
+    wrong_prepared = service._prepare_request(
+        client_request_id=f"c5-verify-wrong-{case.name.lower()}",
+        workflow_yaml=case.workflow_yaml,
+        input_data=case.input_data,
+        workspace_root=work_root,
+        max_live_codex_jobs=wrong_max_live_codex_jobs,
+        validate_definition=False,
+    )
+    manifest["request_digest"] = wrong_prepared.request_digest
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(runner.RunnerAbort, match="workflow_manifest_worker_or_dbos_mismatch"):
+        runner._verify_live_run(context, case, accepted, detail, result)
 
 
 @pytest.mark.parametrize("mutation", ["extra_call", "input_count", "switch_path"])
