@@ -11,7 +11,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from codex_bridge.console.workflows_dialog import WorkflowManagementDialog
+from codex_bridge.console.i18n import tr
+from codex_bridge.console.workflows_dialog import WorkflowManagementDialog, workflow_status_label
 from scripts import phase_c5_gui_visible_review as review
 
 
@@ -185,6 +186,16 @@ def test_fixed_fixtures_render_in_real_graph_widget() -> None:
         assert dialog.graph_widget.node_list.count() == 5
         assert dialog.graph_widget.event_list.count() == len(fixture["events"]["events"])
         assert "合成データ" in dialog.status_label.text()
+        detail = fixture["detail"]
+        assert isinstance(detail, dict)
+        terminal = detail["terminal"]
+        expected_terminal = scenario.status in {"succeeded", "failed", "failed_to_start"}
+        assert type(terminal) is bool
+        assert terminal is expected_terminal
+        QTest.mouseClick(dialog.refresh_button, Qt.MouseButton.LeftButton)
+        app.processEvents()
+        assert dialog.detail_labels["status"].text() == workflow_status_label(scenario.status)
+        assert dialog.detail_labels["terminal"].text() == tr("Yes" if expected_terminal else "No")
         assert not dialog.start_button.isEnabled()
 
     assert {"for", "switch", "do", "call"} <= seen_operations

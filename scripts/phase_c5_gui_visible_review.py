@@ -357,7 +357,7 @@ def build_fixture(scenario: Scenario) -> dict[str, object]:
             "worker_state": "completed"
             if scenario.status in {"succeeded", "failed"}
             else "unknown",
-            "terminal": scenario.status.upper(),
+            "terminal": scenario.status in {"succeeded", "failed", "failed_to_start"},
             "max_live_codex_jobs": scenario.jobs if scenario.jobs else 1,
             "jobs": jobs,
         },
