@@ -1423,6 +1423,333 @@ def _install_fake_execute_live(
     return context, trace, captured_evidence, ledger, process
 
 
+def _fake_successful_live_outcome(ledger: runner.AttemptLedger) -> dict[str, Any]:
+    completed_runs: list[dict[str, Any]] = []
+    for case in runner.build_run_cases():
+        request_id = runner.client_request_id_for(APPROVAL_ID, case)
+        workflow_id = f"workflow-evidence-{case.name}"
+        run_id = f"run-evidence-{case.name}"
+        ledger.before_post(case, request_id)
+        ledger.mark_accepted(case, request_id, workflow_id, run_id)
+        ledger.record_observed_jobs(case, case.expected_jobs)
+        ledger.mark_success(case)
+        completed_runs.append(
+            {
+                "name": case.name,
+                "expected_jobs": case.expected_jobs,
+                "observed_jobs": case.expected_jobs,
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "result_matches": True,
+                "graph_matches": True,
+            }
+        )
+    ledger.data["status"] = "runs_succeeded_gui_not_run"
+    ledger._save("all_runs_succeeded_readonly_restart_passed")
+    return {
+        "gate1": "NOT_RUN",
+        "gate2": "PASS",
+        "gate3": "PASS",
+        "completed_runs": completed_runs,
+        "restart": {
+            "status": "PASS",
+            "new_post_count": 0,
+            "new_job_count": 0,
+            "snapshots_unchanged": True,
+        },
+    }
+
+
+def test_execute_live_success_normalizes_and_writes_safe_public_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    docs = repo_root / "docs"
+    docs.mkdir(parents=True)
+    writer = runner._write_live_evidence
+    run_executor = runner.execute_runs
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repo_root)
+
+    fake_adapters: list[Any] = []
+
+    class FakeLiveAdapter:
+        def __init__(self, context: Any, _ledger: runner.AttemptLedger) -> None:
+            self.context = context
+            self._worker_observer = None
+            self.rows: dict[str, tuple[runner.RunCase, str]] = {}
+            self.start_count = 0
+            self.restart_count = 0
+            fake_adapters.append(self)
+
+        def start(self, case: runner.RunCase, _request_id: str) -> tuple[int, dict[str, str]]:
+            workflow_id = f"workflow-evidence-{case.name}"
+            run_id = f"run-evidence-{case.name}"
+            self.rows[workflow_id] = (case, run_id)
+            self.start_count += 1
+            return 202, {"workflow_id": workflow_id, "run_id": run_id}
+
+        def get_status(self, workflow_id: str) -> tuple[int, dict[str, str]]:
+            _case, run_id = self.rows[workflow_id]
+            return 200, {
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "status": "succeeded",
+            }
+
+        def get_result(self, workflow_id: str) -> tuple[int, dict[str, str]]:
+            return 200, {"workflow_id": workflow_id, "status": "succeeded"}
+
+        def verify(
+            self,
+            case: runner.RunCase,
+            accepted: dict[str, Any],
+            detail: dict[str, Any],
+            _api_result: dict[str, Any],
+        ) -> dict[str, Any]:
+            assert accepted["workflow_id"] == f"workflow-evidence-{case.name}"
+            assert detail["run_id"] == f"run-evidence-{case.name}"
+            run_dir = self.context.state_root / f"run-ledger-{case.name.lower()}"
+            run_dir.mkdir()
+            with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+                connection.execute("CREATE TABLE jobs (job_id TEXT NOT NULL)")
+                connection.executemany(
+                    "INSERT INTO jobs VALUES (?)",
+                    [
+                        (f"fake-job-{case.name.lower()}-{index}",)
+                        for index in range(case.expected_jobs)
+                    ],
+                )
+            return {
+                "job_count": case.expected_jobs,
+                "result_matches": True,
+                "graph_matches": True,
+            }
+
+        def readonly_restart(self, completed: list[dict[str, Any]]) -> dict[str, Any]:
+            assert [row["name"] for row in completed] == ["A", "B", "C"]
+            self.restart_count += 1
+            return {
+                "status": "PASS",
+                "new_post_count": 0,
+                "new_job_count": 0,
+                "snapshots_unchanged": True,
+            }
+
+    _context, _trace, _captured, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(runner, "LiveAdapter", FakeLiveAdapter)
+    monkeypatch.setattr(runner, "execute_runs", run_executor)
+    monkeypatch.setattr(runner, "_write_live_evidence", writer)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    evidence_path = docs / f"phase_c5_workflow_acceptance-{APPROVAL_ID}.json"
+    summary_path = docs / f"phase_c5_p2_live_acceptance-{APPROVAL_ID}.md"
+    assert result == 0
+    assert evidence_path.is_file()
+    assert summary_path.is_file()
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    runner.assert_safe_evidence(
+        evidence, secrets_to_reject=("fake-control-token", "fake-mcp-token")
+    )
+    assert evidence["status"] == "LIVE_RUNS_PASS_GUI_NOT_RUN"
+    assert evidence["gate0_stage"] == "runs_completed"
+    assert evidence["owned_bridge_started"] is True
+    assert evidence["owned_bridge_shutdown_confirmed"] is True
+    assert evidence["read_only_ledger_job_rows"] == 6
+    assert evidence["gates"] == {
+        "gate0": "PASS",
+        "gate1": "NOT_RUN",
+        "gate2": "PASS",
+        "gate3": "PASS",
+    }
+    assert evidence["budget"]["observed_initial_workflow_posts"] == 3
+    assert evidence["budget"]["verified_completed_job_count"] == 6
+    public_run_keys = {
+        "name",
+        "status",
+        "initial_post_count",
+        "expected_job_count",
+        "verified_completed_job_count",
+        "workflow_id",
+        "run_id",
+        "result_matches",
+        "graph_matches",
+    }
+    assert [row["name"] for row in evidence["runs"]] == ["A", "B", "C"]
+    for row, expected_jobs in zip(evidence["runs"], (1, 2, 3), strict=True):
+        assert set(row) == public_run_keys
+        assert row["status"] == "SUCCEEDED"
+        assert row["initial_post_count"] == 1
+        assert row["expected_job_count"] == expected_jobs
+        assert row["verified_completed_job_count"] == expected_jobs
+        assert row["result_matches"] is True
+        assert row["graph_matches"] is True
+        assert "expected_jobs" not in row
+        assert "observed_jobs" not in row
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "Verified completed jobs: 6/6" in summary
+    assert "Read-only isolated ledger job rows: 6" in summary
+    assert not runner.WINDOWS_PATH_PATTERN.search(summary)
+    assert not runner.POSIX_PATH_PATTERN.search(summary)
+    assert ledger.post_count == 3
+    assert ledger.job_count == 6
+    assert len(fake_adapters) == 1
+    assert fake_adapters[0].start_count == 3
+    assert fake_adapters[0].restart_count == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_run",
+        "duplicate_run",
+        "out_of_order",
+        "expected_jobs_mismatch",
+        "observed_jobs_mismatch",
+        "invalid_workflow_id",
+        "duplicate_identity",
+        "result_mismatch",
+        "graph_mismatch",
+    ],
+)
+def test_success_outcome_normalizer_rejects_inconsistent_runs(
+    tmp_path: Path, mutation: str
+) -> None:
+    ledger = runner.AttemptLedger.create(tmp_path / "budget", APPROVAL_ID, HEAD, SOURCE_HASH)
+    outcome = _fake_successful_live_outcome(ledger)
+    completed = outcome["completed_runs"]
+    if mutation == "missing_run":
+        completed.pop()
+    elif mutation == "duplicate_run":
+        completed[1] = dict(completed[0])
+    elif mutation == "out_of_order":
+        completed[0], completed[1] = completed[1], completed[0]
+    elif mutation == "expected_jobs_mismatch":
+        completed[1]["expected_jobs"] = 3
+    elif mutation == "observed_jobs_mismatch":
+        completed[1]["observed_jobs"] = 1
+    elif mutation == "invalid_workflow_id":
+        completed[0]["workflow_id"] = "C:\\private\\workflow"
+    elif mutation == "duplicate_identity":
+        completed[2]["run_id"] = completed[0]["run_id"]
+    elif mutation == "result_mismatch":
+        completed[1]["result_matches"] = False
+    elif mutation == "graph_mismatch":
+        completed[2]["graph_matches"] = False
+
+    with pytest.raises(runner.RunnerAbort, match=runner._LIVE_SUCCESS_OUTCOME_ERROR):
+        runner._normalize_success_outcome_runs(outcome, ledger)
+
+
+def test_execute_live_saves_safe_failure_evidence_without_reusing_attempt_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    docs = repo_root / "docs"
+    docs.mkdir(parents=True)
+    writer = runner._write_live_evidence
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repo_root)
+
+    def fail_after_post(
+        cases: list[runner.RunCase], ledger: runner.AttemptLedger, _adapter: Any
+    ) -> dict[str, Any]:
+        case = cases[0]
+        request_id = runner.client_request_id_for(APPROVAL_ID, case)
+        ledger.before_post(case, request_id)
+        ledger.mark_accepted(case, request_id, "workflow-failure-a", "run-failure-a")
+        ledger.mark_terminal(case, "FAIL", "codex_job_event_trace_invalid")
+        raise runner.RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+
+    _context, _trace, _captured, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch, run_execution=fail_after_post
+    )
+    monkeypatch.setattr(runner, "_write_live_evidence", writer)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    evidence_path = docs / f"phase_c5_workflow_acceptance-{APPROVAL_ID}.json"
+    summary_path = docs / f"phase_c5_p2_live_acceptance-{APPROVAL_ID}.md"
+    assert result == 2
+    assert evidence_path.is_file()
+    assert summary_path.is_file()
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    runner.assert_safe_evidence(
+        evidence, secrets_to_reject=("fake-control-token", "fake-mcp-token")
+    )
+    assert evidence["status"] == "FAIL"
+    assert evidence["terminal_code"] == "codex_job_event_trace_invalid"
+    assert evidence["budget"]["observed_initial_workflow_posts"] == 1
+    assert evidence["runs"][0]["status"] == "FAIL"
+    assert evidence["runs"][0]["verified_completed_job_count"] == 0
+    assert evidence["runs"][1]["status"] == "NOT_RUN"
+    assert evidence["runs"][2]["status"] == "NOT_RUN"
+    assert ledger.marker_path.is_file()
+
+
+def test_execute_live_blocks_invalid_success_outcome_instead_of_claiming_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def invalid_success_outcome(
+        _cases: list[runner.RunCase], ledger: runner.AttemptLedger, _adapter: Any
+    ) -> dict[str, Any]:
+        outcome = _fake_successful_live_outcome(ledger)
+        outcome["completed_runs"][1]["graph_matches"] = False
+        return outcome
+
+    _context, _trace, evidence_rows, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch, run_execution=invalid_success_outcome
+    )
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    evidence = evidence_rows[0]
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["terminal_code"] == runner._LIVE_SUCCESS_OUTCOME_ERROR
+    assert evidence["gates"]["gate2"] == "BLOCKED"
+    assert evidence["gates"]["gate3"] == "BLOCKED"
+    assert all(row["status"] == "SUCCEEDED" for row in evidence["runs"])
+    assert all(row["result_matches"] is None for row in evidence["runs"])
+    assert all(row["graph_matches"] is None for row in evidence["runs"])
+    assert ledger.data["status"] == "BLOCKED"
+    assert ledger.data["terminal_code"] == runner._LIVE_SUCCESS_OUTCOME_ERROR
+
+
+@pytest.mark.parametrize(
+    ("writer_code", "expected_output_code"),
+    [
+        ("evidence_run_job_count_invalid", "evidence_run_job_count_invalid"),
+        ("unsafe-C:\\private\\detail", "live_evidence_write_failed"),
+    ],
+)
+def test_execute_live_prints_only_known_fixed_evidence_error_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    writer_code: str,
+    expected_output_code: str,
+) -> None:
+    _context, _trace, _captured, _ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch
+    )
+
+    def blocked_writer(*_args: Any, **_kwargs: Any) -> None:
+        raise runner.RunnerAbort("BLOCKED", writer_code)
+
+    monkeypatch.setattr(runner, "_write_live_evidence", blocked_writer)
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert f"live evidence could not be safely written ({expected_output_code})" in output
+    if writer_code != expected_output_code:
+        assert writer_code not in output
+    assert "fake-control-token" not in output
+    assert "fake-mcp-token" not in output
+
+
 def test_initialize_state_root_isolated_and_lazy_create_compatible(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

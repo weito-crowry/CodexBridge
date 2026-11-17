@@ -94,6 +94,27 @@ _GATE0_STAGE_VALUES = frozenset(
         "runs_completed",
     }
 )
+_SAFE_EVIDENCE_WRITE_ERROR_CODES = frozenset(
+    {
+        "evidence_not_json_safe",
+        "evidence_gate0_stage_invalid",
+        "evidence_process_ownership_invalid",
+        "evidence_ledger_job_count_invalid",
+        "evidence_verified_job_count_invalid",
+        "evidence_run_job_count_invalid",
+        "evidence_run_dto_invalid",
+        "evidence_contains_secret",
+        "evidence_contains_absolute_path",
+        "evidence_contains_raw_prompt_or_auth",
+        "evidence_contains_sensitive_field",
+        "execution_guards_invalid",
+        "live_evidence_output_already_exists",
+        "live_evidence_write_failed",
+        "live_summary_contains_absolute_path",
+        "live_summary_write_failed",
+    }
+)
+_LIVE_SUCCESS_OUTCOME_ERROR = "live_success_outcome_invalid"
 
 
 class RunnerAbort(RuntimeError):
@@ -2127,6 +2148,10 @@ def _create_evidence(approval_id: str, preflight: Mapping[str, Any]) -> dict[str
                 "status": "NOT_RUN",
                 "initial_post_count": 0,
                 "verified_completed_job_count": 0,
+                "workflow_id": None,
+                "run_id": None,
+                "result_matches": None,
+                "graph_matches": None,
             }
             for case in build_run_cases()
         ],
@@ -2141,46 +2166,154 @@ def _create_evidence(approval_id: str, preflight: Mapping[str, Any]) -> dict[str
     }
 
 
+def _valid_public_identifier(value: object) -> bool:
+    if not isinstance(value, str) or not _valid_identifier(value):
+        return False
+    return not WINDOWS_PATH_PATTERN.search(value) and not POSIX_PATH_PATTERN.search(value)
+
+
+def _normalize_success_outcome_runs(outcome: Any, ledger: AttemptLedger) -> list[dict[str, Any]]:
+    def invalid() -> RunnerAbort:
+        return RunnerAbort("BLOCKED", _LIVE_SUCCESS_OUTCOME_ERROR)
+
+    cases = build_run_cases()
+    restart = outcome.get("restart") if isinstance(outcome, Mapping) else None
+    if (
+        not isinstance(outcome, Mapping)
+        or outcome.get("gate2") != "PASS"
+        or outcome.get("gate3") != "PASS"
+        or outcome.get("gate1") != "NOT_RUN"
+        or not isinstance(restart, Mapping)
+        or restart.get("status") != "PASS"
+        or type(restart.get("new_post_count")) is not int
+        or restart.get("new_post_count") != 0
+        or type(restart.get("new_job_count")) is not int
+        or restart.get("new_job_count") != 0
+        or restart.get("snapshots_unchanged") is not True
+    ):
+        raise invalid()
+    completed = outcome.get("completed_runs")
+    ledger_runs = ledger.data.get("runs")
+    approval_id = ledger.data.get("approval_id")
+    if (
+        not isinstance(completed, list)
+        or len(completed) != len(cases)
+        or not isinstance(ledger_runs, Mapping)
+        or not isinstance(approval_id, str)
+        or APPROVAL_ID_PATTERN.fullmatch(approval_id) is None
+        or ledger.post_count != MAX_INITIAL_POSTS
+        or ledger.job_count != MAX_CODEX_JOBS
+    ):
+        raise invalid()
+
+    observed_ids: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for case, row in zip(cases, completed, strict=True):
+        if not isinstance(row, Mapping):
+            raise invalid()
+        workflow_id = row.get("workflow_id")
+        run_id = row.get("run_id")
+        ledger_row = ledger_runs.get(case.name)
+        expected_client_request_id = client_request_id_for(approval_id, case)
+        if (
+            row.get("name") != case.name
+            or type(row.get("expected_jobs")) is not int
+            or row.get("expected_jobs") != case.expected_jobs
+            or type(row.get("observed_jobs")) is not int
+            or row.get("observed_jobs") != case.expected_jobs
+            or not _valid_public_identifier(workflow_id)
+            or not _valid_public_identifier(run_id)
+            or workflow_id in observed_ids
+            or run_id in observed_ids
+            or row.get("result_matches") is not True
+            or row.get("graph_matches") is not True
+            or not isinstance(ledger_row, Mapping)
+            or type(ledger_row.get("expected_jobs")) is not int
+            or ledger_row.get("expected_jobs") != case.expected_jobs
+            or ledger_row.get("state") != "succeeded"
+            or ledger_row.get("client_request_id") != expected_client_request_id
+            or type(ledger_row.get("observed_jobs")) is not int
+            or ledger_row.get("observed_jobs") != case.expected_jobs
+            or ledger_row.get("workflow_id") != workflow_id
+            or ledger_row.get("run_id") != run_id
+        ):
+            raise invalid()
+        if not isinstance(workflow_id, str) or not isinstance(run_id, str):
+            raise invalid()
+        observed_ids.update((workflow_id, run_id))
+        normalized.append(
+            {
+                "name": case.name,
+                "status": "SUCCEEDED",
+                "initial_post_count": 1,
+                "expected_job_count": case.expected_jobs,
+                "verified_completed_job_count": case.expected_jobs,
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "result_matches": True,
+                "graph_matches": True,
+            }
+        )
+    if tuple(row["name"] for row in normalized) != ("A", "B", "C"):
+        raise invalid()
+    return normalized
+
+
 def _apply_failure_state(
     evidence: dict[str, Any], ledger: AttemptLedger, status: str, code: str
 ) -> None:
     evidence["status"] = status
     evidence["terminal_code"] = code
-    evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
-    evidence["budget"]["verified_completed_job_count"] = ledger.job_count
-    ledger_runs = ledger.data.get("runs", {})
-    evidence_runs = {row["name"]: row for row in evidence["runs"]}
-    for name, jobs, *_rest in _case_definitions():
-        record = ledger_runs.get(name, {}) if isinstance(ledger_runs, dict) else {}
-        row = evidence_runs[name]
-        run_state = str(record.get("state", "not_started"))
-        row["status"] = "NOT_RUN" if run_state == "not_started" else run_state.upper()
-        row["initial_post_count"] = int(record.get("client_request_id") is not None)
-        row["verified_completed_job_count"] = int(record.get("observed_jobs", 0))
-        row["expected_job_count"] = jobs
+    _apply_ledger_to_evidence(evidence, ledger)
     if ledger.post_count:
         gate_status = status if status in {"FAIL", "BLOCKED"} else "BLOCKED"
         all_runs_succeeded = all(
             ledger.run_states.get(name) == "succeeded" for name, *_rest in _case_definitions()
         )
-        evidence["gates"]["gate2"] = "PASS" if all_runs_succeeded else gate_status
-        if all_runs_succeeded:
+        if code == _LIVE_SUCCESS_OUTCOME_ERROR:
+            evidence["gates"]["gate2"] = "BLOCKED"
+            evidence["gates"]["gate3"] = "BLOCKED"
+        else:
+            evidence["gates"]["gate2"] = "PASS" if all_runs_succeeded else gate_status
+        if all_runs_succeeded and code != _LIVE_SUCCESS_OUTCOME_ERROR:
             evidence["gates"]["gate3"] = gate_status
 
 
 def _apply_ledger_to_evidence(evidence: dict[str, Any], ledger: AttemptLedger) -> None:
     evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
     evidence["budget"]["verified_completed_job_count"] = ledger.job_count
+    ledger_runs = ledger.data.get("runs", {})
+    expected_jobs = {case.name: case.expected_jobs for case in build_run_cases()}
+    state_labels = {
+        "not_started": "NOT_RUN",
+        "maybe_sent": "MAYBE_SENT",
+        "accepted": "ACCEPTED",
+        "succeeded": "SUCCEEDED",
+        "fail": "FAIL",
+        "blocked": "BLOCKED",
+        "unknown": "UNKNOWN",
+    }
     for row in evidence["runs"]:
-        state = ledger.run_states.get(row["name"], "not_started")
-        run_data = ledger.data.get("runs", {}).get(row["name"], {})
-        row["status"] = "NOT_RUN" if state == "not_started" else state.upper()
-        row["initial_post_count"] = int(state != "not_started")
-        row["verified_completed_job_count"] = int(run_data.get("observed_jobs", 0))
-        if isinstance(run_data.get("workflow_id"), str):
-            row["workflow_id"] = run_data["workflow_id"]
-        if isinstance(run_data.get("run_id"), str):
-            row["run_id"] = run_data["run_id"]
+        if not isinstance(row, dict) or row.get("name") not in expected_jobs:
+            raise RunnerAbort("BLOCKED", "evidence_run_dto_invalid")
+        name = str(row["name"])
+        state = ledger.run_states.get(name, "unknown")
+        run_data = ledger_runs.get(name, {}) if isinstance(ledger_runs, Mapping) else {}
+        if not isinstance(run_data, Mapping):
+            run_data = {}
+        verified_count = run_data.get("observed_jobs", 0)
+        if type(verified_count) is not int or not 0 <= verified_count <= expected_jobs[name]:
+            raise RunnerAbort("BLOCKED", "evidence_run_job_count_invalid")
+        row["status"] = state_labels.get(state, "UNKNOWN")
+        row["initial_post_count"] = int(run_data.get("client_request_id") is not None)
+        row["expected_job_count"] = expected_jobs[name]
+        row["verified_completed_job_count"] = verified_count
+        for identity_field in ("workflow_id", "run_id"):
+            value = run_data.get(identity_field)
+            row[identity_field] = value if _valid_public_identifier(value) else None
+        for result_field in ("result_matches", "graph_matches"):
+            if type(row.get(result_field)) is not bool:
+                row[result_field] = None
 
 
 def _write_live_evidence(
@@ -2334,7 +2467,7 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         evidence["gates"]["gate0"] = "PASS"
         evidence["gates"]["gate2"] = outcome["gate2"]
         evidence["gates"]["gate3"] = outcome["gate3"]
-        evidence["runs"] = outcome["completed_runs"]
+        evidence["runs"] = _normalize_success_outcome_runs(outcome, ledger)
         evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
         evidence["budget"]["verified_completed_job_count"] = ledger.job_count
         evidence["status"] = "LIVE_RUNS_PASS_GUI_NOT_RUN"
@@ -2351,7 +2484,9 @@ def execute_live(approved_head: str, approval_id: str) -> int:
             evidence["gates"]["gate0"] = "BLOCKED"
         if evidence is not None and ledger is not None and not ledger.post_count:
             evidence["gates"]["gate0"] = "BLOCKED"
-        if ledger is not None and ledger.data.get("status") == "started":
+        if ledger is not None and (
+            ledger.data.get("status") == "started" or error.code == _LIVE_SUCCESS_OUTCOME_ERROR
+        ):
             ledger.mark_terminal(None, error.status, error.code)
     except Exception:
         if evidence is not None and ledger is not None:
@@ -2424,13 +2559,18 @@ def execute_live(approved_head: str, approval_id: str) -> int:
             )
             try:
                 _write_live_evidence(evidence, approval_id, secrets_to_reject)
-            except RunnerAbort:
-                print("BLOCKED: live evidence could not be safely written")
+            except RunnerAbort as error:
+                code = (
+                    error.code
+                    if error.code in _SAFE_EVIDENCE_WRITE_ERROR_CODES
+                    else "live_evidence_write_failed"
+                )
+                print(f"BLOCKED: live evidence could not be safely written ({code})")
                 exit_code = 2
     if exit_code == 0:
         print("PASS: Gate 2 and Gate 3 complete; Gate 1 GUI visual check remains NOT_RUN")
     else:
-        print("BLOCKED: live acceptance stopped; inspect the fixed diagnostic code in evidence")
+        print("BLOCKED: live acceptance stopped; this approval ID must not be retried")
     return exit_code
 
 
