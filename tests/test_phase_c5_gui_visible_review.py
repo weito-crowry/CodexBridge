@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gc
 import socket
 import subprocess
+import weakref
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import Qt
@@ -19,6 +22,118 @@ def _app() -> QApplication:
 
 def _deny_external(*_args: object, **_kwargs: object) -> None:
     raise AssertionError("external process or network operation was attempted")
+
+
+def _assert_scenario_rendered(dialog: WorkflowManagementDialog, index: int) -> None:
+    scenario = review.build_scenarios()[index]
+    fixture = review.build_fixture(scenario)
+    assert dialog.selected_workflow_id == scenario.workflow_id
+    assert dialog.detail_labels["workflow_id"].text() == scenario.workflow_id
+    assert dialog.detail_labels["status"].text() != "Not available"
+    assert scenario.label in dialog.final_text_view.toPlainText()
+    assert dialog.graph_widget.snapshot_identity == (
+        scenario.workflow_id,
+        scenario.run_id,
+        fixture["snapshot"]["snapshot_version"],
+    )
+    assert dialog.graph_widget.event_list.count() == len(fixture["events"]["events"])
+    assert scenario.label in dialog.status_label.text()
+    assert not dialog.start_button.isEnabled()
+
+
+def test_show_keeps_harness_alive_during_selection_events_after_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app()
+    assert app.platformName().lower() == "offscreen"
+    monkeypatch.setattr(socket, "socket", _deny_external)
+    monkeypatch.setattr(socket, "create_connection", _deny_external)
+    monkeypatch.setattr(subprocess, "Popen", _deny_external)
+    monkeypatch.setattr(review.sys, "platform", "win32")
+    monkeypatch.setattr(review, "os", SimpleNamespace(environ={"QT_QPA_PLATFORM": ""}))
+
+    dialogs: list[WorkflowManagementDialog] = []
+    harness_refs: list[weakref.ReferenceType[review.VisibleReviewHarness]] = []
+    harness_factory = review.VisibleReviewHarness
+
+    class RecordingDialog(WorkflowManagementDialog):
+        def __init__(self) -> None:
+            super().__init__()
+            dialogs.append(self)
+
+    def create_harness(dialog: WorkflowManagementDialog, size: str) -> review.VisibleReviewHarness:
+        instance = harness_factory(dialog, size)
+        harness_refs.append(weakref.ref(instance))
+        return instance
+
+    class FakeApp:
+        @staticmethod
+        def instance() -> None:
+            return None
+
+        def __init__(self, _argv: list[str]) -> None:
+            pass
+
+        def setApplicationName(self, _name: str) -> None:
+            pass
+
+        def setQuitOnLastWindowClosed(self, _enabled: bool) -> None:
+            pass
+
+        def exec(self) -> int:
+            gc.collect()
+            assert harness_refs and harness_refs[0]() is not None
+            dialog = dialogs[-1]
+            _assert_scenario_rendered(dialog, 0)
+
+            # Selecting the already-current item must not clear the initial view.
+            dialog.workflow_list.setCurrentRow(0)
+            QApplication.instance().processEvents()
+            _assert_scenario_rendered(dialog, 0)
+
+            # Exercise the actual Qt selection signal after collecting garbage.
+            for index in (1, 2, 3, 0):
+                dialog.workflow_list.setCurrentRow(index)
+                QApplication.instance().processEvents()
+                _assert_scenario_rendered(dialog, index)
+
+            dialog.result_tabs.setCurrentIndex(1)
+            QApplication.instance().processEvents()
+            dialog.graph_widget.node_list.setCurrentRow(1)
+            QApplication.instance().processEvents()
+            assert dialog.graph_widget._selected_node_id == "/do/0/for-many"
+            dialog.result_tabs.setCurrentIndex(0)
+            QApplication.instance().processEvents()
+            return 0
+
+    monkeypatch.setattr(review, "VisibleReviewHarness", create_harness)
+    monkeypatch.setattr(review, "_load_ui_types", lambda: (FakeApp, RecordingDialog))
+    assert review._show("regular") == 0
+    assert len(dialogs) == 1
+    _assert_scenario_rendered(dialogs[0], 0)
+    dialogs[0].close()
+    app.processEvents()
+
+
+def test_same_selection_stays_rendered_and_returning_updates_graph_identity() -> None:
+    app = _app()
+    dialog = WorkflowManagementDialog()
+    harness = review.VisibleReviewHarness(dialog)
+    _assert_scenario_rendered(dialog, 0)
+
+    dialog.workflow_list.setCurrentRow(0)
+    app.processEvents()
+    _assert_scenario_rendered(dialog, 0)
+
+    dialog.workflow_list.setCurrentRow(2)
+    app.processEvents()
+    _assert_scenario_rendered(dialog, 2)
+    dialog.workflow_list.setCurrentRow(0)
+    app.processEvents()
+    _assert_scenario_rendered(dialog, 0)
+    dialog.close()
+    app.processEvents()
+    assert harness.dialog is dialog
 
 
 def test_fixed_fixtures_render_in_real_graph_widget() -> None:

@@ -531,9 +531,12 @@ def _show(size: str) -> int:
     application.setApplicationName("Phase C5 GUI visible review")
     application.setQuitOnLastWindowClosed(True)
     dialog = dialog_type()
-    VisibleReviewHarness(dialog, size)
+    harness = VisibleReviewHarness(dialog, size)
     dialog.show()
-    return application.exec()
+    try:
+        return application.exec()
+    finally:
+        del harness
 
 
 def _parser() -> argparse.ArgumentParser:
