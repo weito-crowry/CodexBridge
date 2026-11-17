@@ -1472,10 +1472,17 @@ def test_execute_live_success_normalizes_and_writes_safe_public_evidence(
 
     fake_adapters: list[Any] = []
 
+    class FakeWorkerObserver:
+        def __init__(self) -> None:
+            self.finish_count = 0
+
+        def finish(self) -> None:
+            self.finish_count += 1
+
     class FakeLiveAdapter:
         def __init__(self, context: Any, _ledger: runner.AttemptLedger) -> None:
             self.context = context
-            self._worker_observer = None
+            self._worker_observer = FakeWorkerObserver()
             self.rows: dict[str, tuple[runner.RunCase, str]] = {}
             self.start_count = 0
             self.restart_count = 0
@@ -1566,6 +1573,7 @@ def test_execute_live_success_normalizes_and_writes_safe_public_evidence(
     }
     assert evidence["budget"]["observed_initial_workflow_posts"] == 3
     assert evidence["budget"]["verified_completed_job_count"] == 6
+    assert fake_adapters[0]._worker_observer.finish_count == 1
     public_run_keys = {
         "name",
         "status",
@@ -1598,6 +1606,163 @@ def test_execute_live_success_normalizes_and_writes_safe_public_evidence(
     assert len(fake_adapters) == 1
     assert fake_adapters[0].start_count == 3
     assert fake_adapters[0].restart_count == 1
+
+
+def _install_synthetic_success_adapter(
+    monkeypatch: pytest.MonkeyPatch, *, observer_finish_error: bool = False
+) -> Any:
+    class FakeWorkerObserver:
+        def finish(self) -> None:
+            if observer_finish_error:
+                raise RuntimeError("fake observer finish failure")
+
+    observer = FakeWorkerObserver()
+
+    class FakeLiveAdapter:
+        def __init__(self, _context: Any, _ledger: runner.AttemptLedger) -> None:
+            self._worker_observer = observer
+
+    monkeypatch.setattr(runner, "LiveAdapter", FakeLiveAdapter)
+    monkeypatch.setattr(
+        runner,
+        "execute_runs",
+        lambda _cases, ledger, _adapter: _fake_successful_live_outcome(ledger),
+    )
+    return observer
+
+
+def test_execute_live_blocks_observer_finish_failure_after_six_fake_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = tmp_path / "repo"
+    docs = repo_root / "docs"
+    docs.mkdir(parents=True)
+    writer = runner._write_live_evidence
+    _install_fake_execute_live(tmp_path, monkeypatch)
+    _install_synthetic_success_adapter(monkeypatch, observer_finish_error=True)
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repo_root)
+    monkeypatch.setattr(runner, "_read_only_owned_job_ledger_rows", lambda *_args, **_kwargs: 6)
+    monkeypatch.setattr(runner, "_write_live_evidence", writer)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+    output = capsys.readouterr().out
+    evidence_path = docs / f"phase_c5_workflow_acceptance-{APPROVAL_ID}.json"
+
+    assert result == 2
+    assert "PASS:" not in output
+    assert evidence_path.is_file()
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["gates"]["gate3"] == "BLOCKED"
+    assert evidence["terminal_code"] == "worker_observer_finish_unconfirmed"
+    assert evidence["read_only_ledger_job_rows"] == 6
+
+
+def test_execute_live_preserves_run_failure_when_observer_finish_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_runs(
+        _cases: list[runner.RunCase], _ledger: runner.AttemptLedger, _adapter: Any
+    ) -> dict[str, Any]:
+        raise runner.RunnerAbort("FAIL", "existing_run_failure")
+
+    _context, _trace, evidence_rows, _ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch, run_execution=failed_runs
+    )
+
+    class FakeObserver:
+        def finish(self) -> None:
+            raise RuntimeError("fake observer finish failure")
+
+    class FakeLiveAdapter:
+        def __init__(self, _context: Any, _ledger: runner.AttemptLedger) -> None:
+            self._worker_observer = FakeObserver()
+
+    monkeypatch.setattr(runner, "LiveAdapter", FakeLiveAdapter)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    evidence = evidence_rows[0]
+    assert evidence["status"] == "FAIL"
+    assert evidence["terminal_code"] == "existing_run_failure"
+    assert evidence["gates"]["gate3"] == "BLOCKED"
+
+
+def test_execute_live_does_not_confirm_bridge_that_exited_before_final_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def runs_then_bridge_exits(
+        _cases: list[runner.RunCase], ledger: runner.AttemptLedger, _adapter: Any
+    ) -> dict[str, Any]:
+        outcome = _fake_successful_live_outcome(ledger)
+        process.exit_code = 0
+        return outcome
+
+    context, trace, evidence_rows, _ledger, process = _install_fake_execute_live(
+        tmp_path, monkeypatch, run_execution=runs_then_bridge_exits
+    )
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    assert context.process is process
+    assert "verify_owner" not in trace
+    assert "stop_owned" not in trace
+    evidence = evidence_rows[0]
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["gates"]["gate3"] == "BLOCKED"
+    assert evidence["owned_bridge_shutdown_confirmed"] is None
+    assert evidence["terminal_code"] == "owned_bridge_exited_before_final_stop"
+
+
+@pytest.mark.parametrize("observed_rows", [None, 5, True, -1, runner.MAX_CODEX_JOBS + 1])
+def test_execute_live_blocks_success_when_read_only_ledger_count_is_not_exact_six(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    observed_rows: int | bool | None,
+) -> None:
+    repo_root = tmp_path / "repo"
+    docs = repo_root / "docs"
+    docs.mkdir(parents=True)
+    writer = runner._write_live_evidence
+    _install_fake_execute_live(tmp_path, monkeypatch)
+    _install_synthetic_success_adapter(monkeypatch)
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", repo_root)
+    monkeypatch.setattr(
+        runner,
+        "_read_only_owned_job_ledger_rows",
+        lambda *_args, **_kwargs: observed_rows,
+    )
+    monkeypatch.setattr(runner, "_write_live_evidence", writer)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+    output = capsys.readouterr().out
+    evidence_path = docs / f"phase_c5_workflow_acceptance-{APPROVAL_ID}.json"
+    summary_path = docs / f"phase_c5_p2_live_acceptance-{APPROVAL_ID}.md"
+
+    assert result == 2
+    assert "PASS:" not in output
+    assert evidence_path.is_file()
+    assert summary_path.is_file()
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["gates"]["gate3"] == "BLOCKED"
+    assert evidence["terminal_code"] == "read_only_ledger_job_count_unconfirmed"
+    expected_evidence_value = (
+        observed_rows
+        if observed_rows is None
+        or (type(observed_rows) is int and 0 <= observed_rows <= runner.MAX_CODEX_JOBS)
+        else None
+    )
+    assert evidence["read_only_ledger_job_rows"] == expected_evidence_value
+    expected_summary_value = (
+        "UNKNOWN" if expected_evidence_value is None else str(expected_evidence_value)
+    )
+    assert expected_summary_value in summary_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(

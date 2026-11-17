@@ -2352,7 +2352,7 @@ def _write_live_evidence(
         f"- Verified completed jobs: {budget.get('verified_completed_job_count')}/"
         f"{MAX_CODEX_JOBS}\n"
         "- Read-only isolated ledger job rows: "
-        f"{ledger_job_rows if type(ledger_job_rows) is int else 'UNKNOWN'}\n\n"
+        f"{'UNKNOWN' if ledger_job_rows is None else ledger_job_rows}\n\n"
         "Gate 1 remains NOT_RUN until a person inspects the isolated visible GUI.\n"
     )
     if WINDOWS_PATH_PATTERN.search(summary) or POSIX_PATH_PATTERN.search(summary):
@@ -2500,6 +2500,7 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         if ledger is not None and ledger.data.get("status") == "started":
             ledger.mark_terminal(None, "BLOCKED", "live_runner_unexpected_failure")
     finally:
+        success_candidate = exit_code == 0
         worker_observer_finished = True
         if adapter is not None and adapter._worker_observer is not None:
             try:
@@ -2508,38 +2509,50 @@ def execute_live(approved_head: str, approval_id: str) -> int:
                 worker_observer_finished = False
                 if evidence is not None:
                     evidence["gates"]["gate3"] = "BLOCKED"
+                    if success_candidate:
+                        evidence["status"] = "BLOCKED"
+                        evidence["terminal_code"] = "worker_observer_finish_unconfirmed"
+                exit_code = 2
         bridge_started = evidence.get("owned_bridge_started") if evidence is not None else False
         if bridge_started is True:
             try:
                 if context is None or context.process is None or context.identity is None:
                     raise RunnerAbort("BLOCKED", "owned_bridge_identity_missing_for_cleanup")
-                if context.process.poll() is None:
-                    b5 = _b5()
-                    identity = context.identity
-                    stop_owned_process(
-                        context.process,
+                if context.process.poll() is not None:
+                    raise RunnerAbort("BLOCKED", "owned_bridge_exited_before_final_stop")
+                b5 = _b5()
+                identity = context.identity
+                stop_owned_process(
+                    context.process,
+                    identity,
+                    verify_owner=lambda owned, expected: b5.phase5f5._assert_bridge_identity(
+                        owned, expected
+                    ),
+                    stop_process=lambda owned: b5.stop_owned_bridge(
+                        owned,
                         identity,
-                        verify_owner=lambda owned, expected: b5.phase5f5._assert_bridge_identity(
-                            owned, expected
-                        ),
-                        stop_process=lambda owned: b5.stop_owned_bridge(
-                            owned,
-                            identity,
-                            ui_port=context.ports[1],
-                            control_token=context.control_token,
-                        ),
-                    )
+                        ui_port=context.ports[1],
+                        control_token=context.control_token,
+                    ),
+                )
                 if context.process.poll() is None:
                     raise RunnerAbort("BLOCKED", "owned_bridge_shutdown_not_confirmed")
                 if evidence is not None:
                     evidence["owned_bridge_shutdown_confirmed"] = True
-            except Exception:
+            except Exception as error:
                 if evidence is not None:
                     evidence["owned_bridge_shutdown_confirmed"] = None
                     evidence["gates"]["gate3"] = "BLOCKED"
                     evidence["status"] = "BLOCKED"
-                    evidence["terminal_code"] = "owned_shutdown_unconfirmed"
-                    exit_code = 2
+                    if not (success_candidate and "terminal_code" in evidence):
+                        evidence["terminal_code"] = (
+                            "owned_bridge_exited_before_final_stop"
+                            if success_candidate
+                            and isinstance(error, RunnerAbort)
+                            and error.code == "owned_bridge_exited_before_final_stop"
+                            else "owned_shutdown_unconfirmed"
+                        )
+                exit_code = 2
         elif bridge_started is None:
             if evidence is not None:
                 evidence["owned_bridge_shutdown_confirmed"] = None
@@ -2551,12 +2564,52 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         if ledger is not None:
             _apply_ledger_to_evidence(evidence, ledger)
         if evidence is not None:
-            evidence["read_only_ledger_job_rows"] = _read_only_owned_job_ledger_rows(
+            observed_ledger_rows = _read_only_owned_job_ledger_rows(
                 context,
                 bridge_started=bridge_started is True,
                 bridge_shutdown_confirmed=(evidence.get("owned_bridge_shutdown_confirmed") is True),
                 worker_observer_finished=worker_observer_finished,
             )
+            evidence["read_only_ledger_job_rows"] = (
+                observed_ledger_rows
+                if observed_ledger_rows is None
+                or (
+                    type(observed_ledger_rows) is int
+                    and 0 <= observed_ledger_rows <= MAX_CODEX_JOBS
+                )
+                else None
+            )
+            if success_candidate:
+                if type(observed_ledger_rows) is not int or observed_ledger_rows != MAX_CODEX_JOBS:
+                    evidence["gates"]["gate3"] = "BLOCKED"
+                    evidence["status"] = "BLOCKED"
+                    if "terminal_code" not in evidence:
+                        evidence["terminal_code"] = "read_only_ledger_job_count_unconfirmed"
+                    exit_code = 2
+                success_invariant = (
+                    evidence["status"] == "LIVE_RUNS_PASS_GUI_NOT_RUN"
+                    and evidence["gates"].get("gate0") == "PASS"
+                    and evidence["gates"].get("gate1") == "NOT_RUN"
+                    and evidence["gates"].get("gate2") == "PASS"
+                    and evidence["gates"].get("gate3") == "PASS"
+                    and evidence.get("owned_bridge_started") is True
+                    and evidence.get("owned_bridge_shutdown_confirmed") is True
+                    and worker_observer_finished is True
+                    and type(observed_ledger_rows) is int
+                    and observed_ledger_rows == MAX_CODEX_JOBS
+                    and type(evidence["budget"].get("observed_initial_workflow_posts")) is int
+                    and evidence["budget"]["observed_initial_workflow_posts"] == MAX_INITIAL_POSTS
+                    and type(evidence["budget"].get("verified_completed_job_count")) is int
+                    and evidence["budget"]["verified_completed_job_count"] == MAX_CODEX_JOBS
+                    and [row.get("status") for row in evidence.get("runs", [])]
+                    == ["SUCCEEDED"] * len(build_run_cases())
+                )
+                if not success_invariant:
+                    evidence["gates"]["gate3"] = "BLOCKED"
+                    evidence["status"] = "BLOCKED"
+                    if "terminal_code" not in evidence:
+                        evidence["terminal_code"] = "final_cleanup_success_unconfirmed"
+                    exit_code = 2
             try:
                 _write_live_evidence(evidence, approval_id, secrets_to_reject)
             except RunnerAbort as error:
@@ -2566,6 +2619,12 @@ def execute_live(approved_head: str, approval_id: str) -> int:
                     else "live_evidence_write_failed"
                 )
                 print(f"BLOCKED: live evidence could not be safely written ({code})")
+                exit_code = 2
+            except Exception:
+                print(
+                    "BLOCKED: live evidence could not be safely "
+                    "written (live_evidence_write_failed)"
+                )
                 exit_code = 2
     if exit_code == 0:
         print("PASS: Gate 2 and Gate 3 complete; Gate 1 GUI visual check remains NOT_RUN")
