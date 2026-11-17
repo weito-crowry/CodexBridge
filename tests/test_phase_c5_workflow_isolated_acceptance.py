@@ -85,6 +85,414 @@ def _cases() -> tuple[runner.RunCase, ...]:
     return runner.build_run_cases()
 
 
+class _FakeLiveAdapterHarness:
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.workspace = tmp_path / "fake-live-workspace"
+        self.state_root = tmp_path / "fake-live-state"
+        self.workspace.mkdir()
+        self.state_root.mkdir()
+        self.expected_ports = (19081, 19082)
+        self.expected_identity = {"pid": 7311, "create_time": 123.0}
+        process = SimpleNamespace(pid=self.expected_identity["pid"])
+        self.context = SimpleNamespace(
+            process=process,
+            identity=dict(self.expected_identity),
+            ports=self.expected_ports,
+            app_server_pid=8322,
+            control_token="fake-control-token",
+            codex_executable=tmp_path / "fake-codex.exe",
+            workspace=self.workspace,
+            state_root=self.state_root,
+        )
+        self.guard_calls: list[str] = []
+        self.posts: list[dict[str, Any]] = []
+        self.prepost_snapshots: list[dict[str, Any]] = []
+        self.workflow_runs: dict[str, str] = {}
+        self.worker_count = 0
+        self.preflight_appserver_pid = self.context.app_server_pid
+        self.missing_dependencies: list[str] = []
+        self.raise_on_post = False
+        self.ledger = runner.AttemptLedger.create(
+            tmp_path / "budget",
+            APPROVAL_ID,
+            HEAD,
+            SOURCE_HASH,
+        )
+        self.adapter = runner.LiveAdapter(self.context, self.ledger)
+        self.adapter.begin_run = lambda _case: None
+        self.adapter.get_status = self._get_status
+        self.adapter.get_result = lambda workflow_id: (
+            200,
+            {"workflow_id": workflow_id, "status": "succeeded"},
+        )
+        self.adapter.verify = self._verify
+        self.adapter.readonly_restart = lambda completed: {
+            "status": "PASS",
+            "new_post_count": 0,
+            "new_job_count": 0,
+            "snapshots_unchanged": True,
+        }
+        isolated = SimpleNamespace(
+            _owned_listener_pids=self._owned_listener_pids,
+            _preflight_bridge=self._preflight_bridge,
+            _worker_process_count=self._worker_process_count,
+        )
+        phase5f5 = SimpleNamespace(_assert_bridge_identity=self._assert_bridge_identity)
+        fake_b5 = SimpleNamespace(
+            phase5f5=phase5f5,
+            isolated=isolated,
+            missing_workflow_dependencies=self._missing_workflow_dependencies,
+            _read_sqlite=self._read_sqlite,
+        )
+        monkeypatch.setattr(runner, "_b5", lambda: fake_b5)
+        monkeypatch.setattr(runner, "initial_workflow_post", self._initial_post)
+
+    def _assert_bridge_identity(self, process: object, identity: dict[str, Any]) -> None:
+        self.guard_calls.append("identity")
+        if process is not self.context.process or identity != self.expected_identity:
+            raise runner.RunnerAbort("BLOCKED", "fake_owned_bridge_identity_mismatch")
+
+    def _owned_listener_pids(self, pid: int, ports: tuple[int, int]) -> None:
+        self.guard_calls.append("listeners")
+        if pid != self.context.process.pid or ports != self.expected_ports:
+            raise runner.RunnerAbort("BLOCKED", "fake_owned_listener_identity_mismatch")
+
+    def _preflight_bridge(
+        self,
+        process: object,
+        *,
+        mcp_port: int,
+        ui_port: int,
+        token: str,
+        expected_codex: Path,
+    ) -> dict[str, int]:
+        self.guard_calls.append("appserver")
+        if (
+            process is not self.context.process
+            or (mcp_port, ui_port) != self.expected_ports
+            or token != self.context.control_token
+            or expected_codex != self.context.codex_executable
+        ):
+            raise runner.RunnerAbort("BLOCKED", "fake_bridge_preflight_identity_mismatch")
+        return {"appserver_pid": self.preflight_appserver_pid}
+
+    def _worker_process_count(self, pid: int) -> int:
+        self.guard_calls.append("worker")
+        if pid != self.context.process.pid:
+            raise runner.RunnerAbort("BLOCKED", "fake_worker_parent_identity_mismatch")
+        return self.worker_count
+
+    def _missing_workflow_dependencies(self) -> list[str]:
+        self.guard_calls.append("dependencies")
+        return self.missing_dependencies
+
+    def _read_sqlite(
+        self, path: Path, query: str, parameters: tuple[Any, ...] = ()
+    ) -> list[dict[str, Any]]:
+        if not query.lstrip().casefold().startswith("select "):
+            raise AssertionError("pre-POST ledger reads must remain read-only")
+        with sqlite3.connect(path) as connection:
+            connection.row_factory = sqlite3.Row
+            return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+
+    def _request_rows(self) -> list[dict[str, Any]]:
+        path = self.state_root / "requests.sqlite"
+        if not path.exists():
+            return []
+        return self._read_sqlite(
+            path,
+            "SELECT client_request_id, workflow_id, run_id, state FROM workflow_requests",
+        )
+
+    def add_request(
+        self,
+        client_request_id: str,
+        workflow_id: str,
+        run_id: str,
+        state: str = "running",
+    ) -> None:
+        path = self.state_root / "requests.sqlite"
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_requests "
+                "(client_request_id TEXT, workflow_id TEXT, run_id TEXT, state TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO workflow_requests VALUES (?, ?, ?, ?)",
+                (client_request_id, workflow_id, run_id, state),
+            )
+
+    def _initial_post(self, context: Any, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        self.posts.append(dict(payload))
+        if context is not self.context:
+            raise AssertionError("live adapter must send through the isolated context")
+        post_number = self.adapter.initial_posts
+        expected_case = _cases()[post_number - 1]
+        expected_request_id = runner.client_request_id_for(APPROVAL_ID, expected_case)
+        if payload.get("client_request_id") != expected_request_id:
+            raise AssertionError("fake POST did not receive the fixed current run ID")
+        rows = self._request_rows()
+        if post_number != len(rows) + 1:
+            raise AssertionError("POST counter must increment only after preflight")
+        self.prepost_snapshots.append(
+            {
+                "initial_posts_before_current": post_number - 1,
+                "ledger_post_count": self.ledger.post_count,
+                "ledger_job_count": self.ledger.job_count,
+                "states": self.ledger.run_states.copy(),
+                "database_ids": tuple(row.get("client_request_id") for row in rows),
+                "current_id": payload["client_request_id"],
+            }
+        )
+        if self.raise_on_post:
+            raise TimeoutError("fake transport outcome unknown")
+        workflow_id = f"workflow-live-{post_number}"
+        run_id = f"run-live-{post_number}"
+        self.workflow_runs[workflow_id] = run_id
+        self.add_request(payload["client_request_id"], workflow_id, run_id)
+        return 202, {"workflow_id": workflow_id, "run_id": run_id, "status": "queued"}
+
+    def _get_status(self, workflow_id: str) -> tuple[int, dict[str, Any]]:
+        return 200, {
+            "workflow_id": workflow_id,
+            "run_id": self.workflow_runs[workflow_id],
+            "status": "succeeded",
+        }
+
+    @staticmethod
+    def _verify(
+        case: runner.RunCase,
+        accepted: dict[str, Any],
+        _detail: dict[str, Any],
+        _result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "job_count": case.expected_jobs,
+            "result_matches": True,
+            "graph_matches": True,
+            "workflow_id": accepted["workflow_id"],
+            "run_id": accepted["run_id"],
+        }
+
+
+def _seed_live_prepost_run(
+    harness: _FakeLiveAdapterHarness,
+    case_index: int,
+    *,
+    include_prior_rows: bool = True,
+) -> tuple[runner.RunCase, str]:
+    cases = _cases()
+    for prior_index, prior_case in enumerate(cases[:case_index], start=1):
+        prior_id = runner.client_request_id_for(APPROVAL_ID, prior_case)
+        harness.ledger.before_post(prior_case, prior_id)
+        workflow_id = f"workflow-prior-{prior_index}"
+        run_id = f"run-prior-{prior_index}"
+        harness.ledger.mark_accepted(prior_case, prior_id, workflow_id, run_id)
+        harness.ledger.record_observed_jobs(prior_case, prior_case.expected_jobs)
+        harness.ledger.mark_success(prior_case)
+        if include_prior_rows:
+            harness.add_request(prior_id, workflow_id, run_id)
+    case = cases[case_index]
+    client_request_id = runner.client_request_id_for(APPROVAL_ID, case)
+    harness.ledger.before_post(case, client_request_id)
+    harness.adapter.initial_posts = case_index
+    return case, client_request_id
+
+
+@pytest.mark.parametrize("case_index", [0, 1, 2])
+def test_live_adapter_start_allows_only_prior_succeeded_request_rows(
+    case_index: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+    case, client_request_id = _seed_live_prepost_run(harness, case_index)
+
+    status_code, accepted = harness.adapter.start(case, client_request_id)
+
+    prior_cases = _cases()[:case_index]
+    snapshot = harness.prepost_snapshots[0]
+    assert status_code == 202
+    assert accepted["workflow_id"] == f"workflow-live-{case_index + 1}"
+    assert len(harness.posts) == 1
+    assert harness.adapter.initial_posts == case_index + 1
+    assert snapshot["initial_posts_before_current"] == case_index
+    assert snapshot["ledger_post_count"] == case_index + 1
+    assert snapshot["ledger_job_count"] == sum(item.expected_jobs for item in prior_cases)
+    assert snapshot["database_ids"] == tuple(
+        runner.client_request_id_for(APPROVAL_ID, item) for item in prior_cases
+    )
+    assert snapshot["current_id"] == client_request_id
+    assert snapshot["states"] == {
+        "A": "succeeded" if case_index > 0 else "maybe_sent",
+        "B": "succeeded"
+        if case_index > 1
+        else ("maybe_sent" if case_index == 1 else "not_started"),
+        "C": "maybe_sent" if case_index == 2 else "not_started",
+    }
+
+
+def test_execute_runs_uses_live_adapter_for_ordered_a_b_c_prepost_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+
+    outcome = runner.execute_runs(_cases(), harness.ledger, harness.adapter)
+
+    assert [case.name for case in _cases()] == ["A", "B", "C"]
+    assert [post["client_request_id"] for post in harness.posts] == [
+        runner.client_request_id_for(APPROVAL_ID, case) for case in _cases()
+    ]
+    assert [len(row["database_ids"]) for row in harness.prepost_snapshots] == [0, 1, 2]
+    assert [row["initial_posts_before_current"] for row in harness.prepost_snapshots] == [0, 1, 2]
+    assert [row["ledger_post_count"] for row in harness.prepost_snapshots] == [1, 2, 3]
+    assert [row["ledger_job_count"] for row in harness.prepost_snapshots] == [0, 1, 3]
+    assert [row["states"] for row in harness.prepost_snapshots] == [
+        {"A": "maybe_sent", "B": "not_started", "C": "not_started"},
+        {"A": "succeeded", "B": "maybe_sent", "C": "not_started"},
+        {"A": "succeeded", "B": "succeeded", "C": "maybe_sent"},
+    ]
+    assert harness.ledger.post_count == 3
+    assert harness.ledger.job_count == 6
+    assert harness.ledger.run_states == {"A": "succeeded", "B": "succeeded", "C": "succeeded"}
+    assert harness.adapter.initial_posts == 3
+    assert len(harness.posts) == 3
+    assert harness.guard_calls.count("identity") == 3
+    assert harness.guard_calls.count("listeners") == 3
+    assert harness.guard_calls.count("appserver") == 3
+    assert harness.guard_calls.count("dependencies") == 3
+    assert harness.guard_calls.count("worker") == 3
+    assert outcome["gate2"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "case_index"),
+    [
+        ("foreign_row", 0),
+        ("current_id_present", 0),
+        ("missing_prior_row", 1),
+        ("duplicate_prior_row", 2),
+        ("invalid_db_id", 0),
+        ("invalid_current_id", 0),
+        ("invalid_prior_id", 1),
+        ("multiple_maybe_sent", 0),
+        ("prior_accepted", 1),
+        ("prior_unknown", 1),
+        ("prior_failed", 1),
+        ("future_id_occupied", 0),
+        ("initial_posts_mismatch", 1),
+        ("ledger_post_count_mismatch", 0),
+        ("duplicate_ledger_id", 1),
+        ("current_accepted", 1),
+    ],
+)
+def test_live_adapter_start_rejects_prepost_ledger_inconsistency_without_post(
+    scenario: str,
+    case_index: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+    case, client_request_id = _seed_live_prepost_run(
+        harness,
+        case_index,
+        include_prior_rows=scenario != "missing_prior_row",
+    )
+    prior_case = _cases()[0]
+    prior_id = runner.client_request_id_for(APPROVAL_ID, prior_case)
+    future_case = _cases()[2]
+
+    if scenario == "foreign_row":
+        harness.add_request("foreign-request-id", "workflow-foreign", "run-foreign")
+    elif scenario == "current_id_present":
+        harness.add_request(client_request_id, "workflow-current", "run-current")
+    elif scenario == "duplicate_prior_row":
+        harness.add_request(prior_id, "workflow-prior-duplicate", "run-prior-duplicate")
+    elif scenario == "invalid_db_id":
+        harness.add_request("invalid request ID", "workflow-invalid", "run-invalid")
+    elif scenario == "invalid_current_id":
+        harness.ledger.data["runs"][case.name]["client_request_id"] = "invalid request ID"
+    elif scenario == "invalid_prior_id":
+        harness.ledger.data["runs"][prior_case.name]["client_request_id"] = "invalid request ID"
+    elif scenario == "multiple_maybe_sent":
+        second_case = _cases()[1]
+        harness.ledger.data["runs"][second_case.name]["state"] = "maybe_sent"
+        harness.ledger.data["runs"][second_case.name]["client_request_id"] = (
+            runner.client_request_id_for(APPROVAL_ID, second_case)
+        )
+    elif scenario in {"prior_accepted", "prior_unknown", "prior_failed"}:
+        states = {"prior_accepted": "accepted", "prior_unknown": "unknown", "prior_failed": "fail"}
+        harness.ledger.data["runs"][prior_case.name]["state"] = states[scenario]
+    elif scenario == "future_id_occupied":
+        harness.ledger.data["runs"][future_case.name]["client_request_id"] = (
+            runner.client_request_id_for(APPROVAL_ID, future_case)
+        )
+    elif scenario == "initial_posts_mismatch":
+        harness.adapter.initial_posts = 0
+    elif scenario == "ledger_post_count_mismatch":
+        harness.ledger.data["post_count"] = 0
+    elif scenario == "duplicate_ledger_id":
+        harness.ledger.data["runs"][case.name]["client_request_id"] = prior_id
+    elif scenario == "current_accepted":
+        harness.ledger.mark_accepted(
+            case,
+            client_request_id,
+            "workflow-current",
+            "run-current",
+        )
+    harness.ledger._save("fixture_prepost_ledger_mutation")
+    before_initial_posts = harness.adapter.initial_posts
+
+    with pytest.raises(runner.RunnerAbort):
+        harness.adapter.start(case, client_request_id)
+
+    assert harness.posts == []
+    assert harness.adapter.initial_posts == before_initial_posts
+
+
+@pytest.mark.parametrize(
+    "guard", ["identity", "listener", "appserver", "worker", "dependencies", "workspace"]
+)
+def test_live_adapter_start_preserves_bridge_worker_and_workspace_guards(
+    guard: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+    case, client_request_id = _seed_live_prepost_run(harness, 0)
+    if guard == "identity":
+        harness.context.identity = {"pid": 9999, "create_time": 1.0}
+    elif guard == "listener":
+        harness.context.ports = (19091, 19092)
+    elif guard == "appserver":
+        harness.preflight_appserver_pid += 1
+    elif guard == "worker":
+        harness.worker_count = 1
+    elif guard == "dependencies":
+        harness.missing_dependencies = ["fake-workflow-dependency"]
+    else:
+        (harness.workspace / "unexpected.txt").write_text("occupied", encoding="utf-8")
+
+    with pytest.raises(runner.RunnerAbort):
+        harness.adapter.start(case, client_request_id)
+
+    assert harness.posts == []
+    assert harness.adapter.initial_posts == 0
+
+
+def test_live_adapter_transport_unknown_is_not_reposted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _FakeLiveAdapterHarness(tmp_path, monkeypatch)
+    harness.raise_on_post = True
+
+    with pytest.raises(runner.RunnerAbort, match="start_outcome_unknown"):
+        runner.execute_runs(_cases(), harness.ledger, harness.adapter)
+
+    assert len(harness.posts) == 1
+    assert harness.adapter.initial_posts == 1
+    assert harness.ledger.post_count == 1
+    assert harness.ledger.job_count == 0
+    assert harness.ledger.run_states["A"] == "maybe_sent"
+    assert not (harness.state_root / "requests.sqlite").exists()
+
+
 def test_fixed_workflows_validate_as_exact_one_two_three_job_cases() -> None:
     cases = _cases()
 

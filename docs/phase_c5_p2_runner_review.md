@@ -33,6 +33,12 @@ The new offline digest tests call the real `WorkflowService._prepare_request` wi
 
 The C5 final visible GUI inspection remains unperformed. Existing B5 `_qt_readback` covers list, detail, and result, but does not directly verify the C4 Execution graph GUI/API integration. This correction does not expand that integration; Gate 1 remains `NOT_RUN` until a separate human visual check.
 
+## Issue #157 pre-POST ledger correction
+
+`execute_runs` persists the current request as `maybe_sent` before calling `LiveAdapter.start`. The pre-POST readiness check now receives that fixed current case and ID, requires every earlier A/B run to be `succeeded`, the current run alone to be `maybe_sent`, and later runs to remain `not_started` without IDs. It compares only successful prior IDs with `requests.sqlite`, rejects a current-ID row, duplicates, missing or foreign rows, state and counter inconsistencies, and preserves the POST budget burn before transport. `LiveAdapter.start` still increments its in-memory POST count only after readiness passes. B5 identity, listener, app-server, worker, and workspace guards remain in place.
+
+Offline tests use the real `LiveAdapter.start`, `_assert_bridge_ready`, and `execute_runs` with a fake B5 preflight, fake owned process identity, temporary SQLite state, and fake HTTP start function. They verify pre-POST DB row counts of 0/1/2 for A/B/C, budget totals of three initial POSTs and six jobs, rejection cases with zero fake POSTs, and no resend after an unknown transport outcome. No Bridge, Worker, real HTTP POST, or Codex job was started for this correction.
+
 Related offline regression tests selected for the implementation turn:
 
 - `tests/test_phase_b5_workflow_isolated_smoke.py`

@@ -1299,7 +1299,7 @@ class LiveAdapter:
         self._worker_observer.start()
 
     def start(self, case: RunCase, client_request_id: str) -> tuple[int, Any]:
-        self._assert_bridge_ready()
+        self._assert_bridge_ready(case, client_request_id)
         payload = {
             "client_request_id": client_request_id,
             "workflow_yaml": case.workflow_yaml,
@@ -1497,7 +1497,7 @@ class LiveAdapter:
         }
         return _sha256(_canonical_json(summary).encode("utf-8"))
 
-    def _assert_bridge_ready(self) -> None:
+    def _assert_bridge_ready(self, case: RunCase, client_request_id: str) -> None:
         b5 = _b5()
         context = self.context
         if context.process is None or context.identity is None:
@@ -1527,15 +1527,99 @@ class LiveAdapter:
                 request_database,
                 "SELECT client_request_id, workflow_id, run_id, state FROM workflow_requests",
             )
-        expected_request_ids = {
-            str(run["client_request_id"])
-            for run in self.ledger.data.get("runs", {}).values()
-            if isinstance(run, dict) and isinstance(run.get("client_request_id"), str)
-        }
-        observed_request_ids = {
-            str(row.get("client_request_id")) for row in request_rows if isinstance(row, dict)
-        }
-        if len(request_rows) != self.initial_posts or observed_request_ids != expected_request_ids:
+
+        cases = build_run_cases()
+        case_names = tuple(item.name for item in cases)
+        current_index = next(
+            (index for index, item in enumerate(cases) if item.name == case.name), None
+        )
+        runs = self.ledger.data.get("runs")
+        approval_id = self.ledger.data.get("approval_id")
+        if (
+            current_index is None
+            or cases[current_index].expected_jobs != case.expected_jobs
+            or not isinstance(runs, dict)
+            or set(runs) != set(case_names)
+            or not isinstance(approval_id, str)
+            or not isinstance(self.initial_posts, int)
+            or isinstance(self.initial_posts, bool)
+            or self.initial_posts != current_index
+            or self.ledger.data.get("status") != "started"
+        ):
+            raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
+
+        current_expected_id = client_request_id_for(approval_id, case)
+        if client_request_id != current_expected_id:
+            raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
+        expected_prior_ids: set[str] = set()
+        expected_prior_jobs = 0
+        for index, expected_case in enumerate(cases):
+            record = runs.get(expected_case.name)
+            expected_id = client_request_id_for(approval_id, expected_case)
+            if (
+                not isinstance(record, dict)
+                or type(record.get("expected_jobs")) is not int
+                or record.get("expected_jobs") != expected_case.expected_jobs
+            ):
+                raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
+            if index < current_index:
+                if (
+                    record.get("state") != "succeeded"
+                    or record.get("client_request_id") != expected_id
+                    or not _valid_identifier(record.get("workflow_id"))
+                    or not _valid_identifier(record.get("run_id"))
+                    or type(record.get("observed_jobs")) is not int
+                    or record.get("observed_jobs") != expected_case.expected_jobs
+                ):
+                    raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
+                expected_prior_ids.add(expected_id)
+                expected_prior_jobs += expected_case.expected_jobs
+            elif index == current_index:
+                if (
+                    record.get("state") != "maybe_sent"
+                    or record.get("client_request_id") != current_expected_id
+                    or record.get("workflow_id") is not None
+                    or record.get("run_id") is not None
+                    or type(record.get("observed_jobs")) is not int
+                    or record.get("observed_jobs") != 0
+                ):
+                    raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
+            elif (
+                record.get("state") != "not_started"
+                or record.get("client_request_id") is not None
+                or record.get("workflow_id") is not None
+                or record.get("run_id") is not None
+                or type(record.get("observed_jobs")) is not int
+                or record.get("observed_jobs") != 0
+            ):
+                raise RunnerAbort("BLOCKED", "prepost_run_ledger_state_mismatch")
+
+        post_count = self.ledger.data.get("post_count")
+        job_count = self.ledger.data.get("job_count")
+        if (
+            len(expected_prior_ids) != self.initial_posts
+            or type(post_count) is not int
+            or post_count != self.initial_posts + 1
+            or post_count > MAX_INITIAL_POSTS
+            or type(job_count) is not int
+            or job_count != expected_prior_jobs
+            or job_count > MAX_CODEX_JOBS
+        ):
+            raise RunnerAbort("BLOCKED", "prepost_run_counter_mismatch")
+
+        request_ids: list[str] = []
+        for row in request_rows:
+            request_id = row.get("client_request_id") if isinstance(row, dict) else None
+            if not _valid_identifier(request_id):
+                raise RunnerAbort("BLOCKED", "unexpected_isolated_workflow_request_count")
+            request_ids.append(str(request_id))
+        observed_request_ids = set(request_ids)
+        if (
+            len(request_rows) != self.initial_posts
+            or observed_request_ids != expected_prior_ids
+            or len(observed_request_ids) != len(request_rows)
+            or current_expected_id in observed_request_ids
+        ):
             raise RunnerAbort("BLOCKED", "unexpected_isolated_workflow_request_count")
 
 
