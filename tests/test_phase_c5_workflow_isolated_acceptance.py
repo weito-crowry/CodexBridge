@@ -11,8 +11,13 @@ from typing import Any
 import pytest
 import yaml
 
+from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter
 from codex_bridge.workflows.definitions import WorkflowDefinitionRepository
-from codex_bridge.workflows.interpreter import Interpreter, compute_task_action
+from codex_bridge.workflows.interpreter import (
+    SAFE_CODEX_JOB_PROMPT,
+    Interpreter,
+    compute_task_action,
+)
 from codex_bridge.workflows.service import WorkflowService, _ensure_state_root
 from scripts import phase_c5_workflow_isolated_acceptance as runner
 
@@ -607,9 +612,64 @@ def test_runner_digest_matches_service_prepare_request_for_one_two_three_jobs(
         assert wrong_prepared.request_digest != runner_digest
 
 
+def _product_adapter_job_rows_and_events(
+    run_dir: Path,
+    workflow_id: str,
+    expected_texts: tuple[str, ...],
+    *,
+    include_running: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    adapter = CodexJobAdapter(run_dir / "codex_jobs.sqlite")
+    for index, final_text in enumerate(expected_texts, start=1):
+        task_identity = f"do[0].codexJob[{index}]"
+        job = adapter.prepare_job(
+            workflow_id,
+            task_identity,
+            SAFE_CODEX_JOB_PROMPT,
+            run_dir,
+            port=24017,
+            max_jobs_per_workflow=len(expected_texts),
+        )
+        job_id = str(job["job_id"])
+        assert adapter.claim_post(job_id)
+        adapter.mark_accepted(
+            job_id,
+            f"thread-c5-{index:08d}",
+            f"turn-c5-{index:08d}",
+            "in_progress",
+        )
+        if include_running:
+            adapter._mark_running(job_id, "in_progress")
+        adapter._mark_succeeded(job_id, final_text)
+
+    adapter_jobs = adapter.get_jobs_for_workflow(workflow_id, limit=max(1, len(expected_texts)))
+    adapter_jobs.sort(key=lambda job: str(job["task_identity"]))
+    jobs = [
+        {
+            "job_id": job["job_id"],
+            "request_key": f"{workflow_id}::{job['task_identity']}",
+            "workflow_id": workflow_id,
+            "task_identity": job["task_identity"],
+            "state": job["state"],
+            "remote_state": "completed",
+            "receipt_json": json.dumps(job["receipt"], ensure_ascii=False),
+        }
+        for job in adapter_jobs
+    ]
+    events = [
+        {key: event[key] for key in ("event_id", "job_id", "state")}
+        for event in adapter.read_events(after_id=0, limit=runner.MAX_CODEX_JOB_EVENT_ROWS)
+    ]
+    return jobs, events
+
+
 @pytest.mark.parametrize("case_index", [0, 1, 2])
+@pytest.mark.parametrize("include_running", [False, True], ids=["without-running", "with-running"])
 def test_verify_live_run_requires_matching_service_digest_in_ledger_and_manifest(
-    case_index: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    case_index: int,
+    include_running: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     case = _cases()[case_index]
     workspace = tmp_path / "c5-verify-workspace"
@@ -668,25 +728,12 @@ def test_verify_live_run_requires_matching_service_digest_in_ledger_and_manifest
             (client_request_id, workflow_id, run_id, prepared.request_digest, "succeeded"),
         )
 
-    jobs: list[dict[str, Any]] = []
-    job_events: list[dict[str, Any]] = []
-    for index, expected_text in enumerate(case.expected_texts, start=1):
-        job_id = f"job-{case.name}-{index}"
-        task_identity = f"task-{index}"
-        jobs.append(
-            {
-                "job_id": job_id,
-                "workflow_id": workflow_id,
-                "state": "SUCCEEDED",
-                "task_identity": task_identity,
-                "request_key": f"{workflow_id}::{task_identity}",
-                "remote_state": "completed",
-                "receipt_json": json.dumps({"result": {"final_text": expected_text}}),
-            }
-        )
-        job_events.extend(
-            {"job_id": job_id, "state": state} for state in ("MAYBE_SENT", "SUCCEEDED")
-        )
+    jobs, job_events = _product_adapter_job_rows_and_events(
+        run_dir,
+        workflow_id,
+        case.expected_texts,
+        include_running=include_running,
+    )
 
     nodes: list[dict[str, Any]] = []
     task_events: list[dict[str, Any]] = []
@@ -779,6 +826,105 @@ def test_verify_live_run_requires_matching_service_digest_in_ledger_and_manifest
     (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(runner.RunnerAbort, match="workflow_manifest_worker_or_dbos_mismatch"):
         runner._verify_live_run(context, case, accepted, detail, result)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "two_event_legacy_trace",
+        "missing_prepared",
+        "missing_maybe_sent",
+        "missing_accepted",
+        "missing_succeeded",
+        "duplicate_transition",
+        "success_before_accepted",
+        "foreign_job",
+        "reverse_event_ids",
+        "duplicate_event_id",
+        "zero_event_id",
+        "boolean_event_id",
+        "unknown_state",
+        "failed_state",
+        "reconciliation_state",
+        "too_many_events",
+        "duplicate_job_id",
+    ],
+)
+def test_codex_job_event_trace_rejects_invalid_adapter_histories(
+    tmp_path: Path, mutation: str
+) -> None:
+    run_dir = tmp_path / "invalid-job-event-run"
+    run_dir.mkdir()
+    jobs, original_events = _product_adapter_job_rows_and_events(
+        run_dir, "workflow-event-trace", ("4",), include_running=True
+    )
+    events = json.loads(json.dumps(original_events))
+    if mutation == "two_event_legacy_trace":
+        events = [event for event in events if event["state"] in {"MAYBE_SENT", "SUCCEEDED"}]
+    elif mutation.startswith("missing_"):
+        state = mutation.removeprefix("missing_").upper()
+        events = [event for event in events if event["state"] != state]
+    elif mutation == "duplicate_transition":
+        events[-1]["state"] = "RUNNING"
+    elif mutation == "success_before_accepted":
+        for event, state in zip(
+            events,
+            ("PREPARED", "MAYBE_SENT", "SUCCEEDED", "ACCEPTED", "RUNNING"),
+            strict=True,
+        ):
+            event["state"] = state
+    elif mutation == "foreign_job":
+        events[-1]["job_id"] = "foreign-job-1234"
+    elif mutation == "reverse_event_ids":
+        events.reverse()
+    elif mutation == "duplicate_event_id":
+        events[1]["event_id"] = events[0]["event_id"]
+    elif mutation == "zero_event_id":
+        events[0]["event_id"] = 0
+    elif mutation == "boolean_event_id":
+        events[0]["event_id"] = True
+    elif mutation == "unknown_state":
+        events[2]["state"] = "UNKNOWN"
+    elif mutation == "failed_state":
+        events[-1]["state"] = "FAILED"
+    elif mutation == "reconciliation_state":
+        events[-1]["state"] = "NEEDS_RECONCILIATION"
+    elif mutation == "too_many_events":
+        extra = dict(events[-1])
+        extra["event_id"] = events[-1]["event_id"] + 1
+        events.append(extra)
+    elif mutation == "duplicate_job_id":
+        jobs.append(dict(jobs[0]))
+
+    with pytest.raises(runner.RunnerAbort, match="codex_job_event_trace_invalid"):
+        runner.validate_codex_job_event_trace(jobs, events)
+
+
+def test_codex_job_event_trace_checks_each_interleaved_job_independently(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "interleaved-job-event-run"
+    run_dir.mkdir()
+    jobs, events = _product_adapter_job_rows_and_events(
+        run_dir,
+        "workflow-event-traces",
+        ("C5-B1", "C5-B2"),
+        include_running=True,
+    )
+    grouped = {
+        str(job["job_id"]): [event for event in events if event["job_id"] == job["job_id"]]
+        for job in jobs
+    }
+    interleaved = [
+        event
+        for event_index in range(5)
+        for job in jobs
+        for event in grouped[str(job["job_id"])][event_index : event_index + 1]
+    ]
+    for event_id, event in enumerate(interleaved, start=1):
+        event["event_id"] = event_id
+
+    assert runner.validate_codex_job_event_trace(jobs, interleaved)
 
 
 @pytest.mark.parametrize("mutation", ["extra_call", "input_count", "switch_path"])
@@ -1203,10 +1349,21 @@ def _install_fake_execute_live(
             raise runner.RunnerAbort("BLOCKED", "fake_stop_arguments_mismatch")
         owned_process.exit_code = 0
 
+    def read_sqlite(
+        path: Path, query: str, parameters: tuple[Any, ...] = ()
+    ) -> list[dict[str, Any]]:
+        with sqlite3.connect(
+            f"{path.resolve(strict=True).as_uri()}?mode=ro", uri=True
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+
     fake_b5 = SimpleNamespace(
         _make_isolated_context=create_context,
         phase5f5=SimpleNamespace(_assert_bridge_identity=assert_owner),
         stop_owned_bridge=stop_process,
+        _read_sqlite=read_sqlite,
     )
 
     def tracked_validate(
@@ -1526,6 +1683,7 @@ def test_execute_live_initializes_state_before_mock_bridge_and_records_cleanup(
         "execute_runs",
         "verify_owner",
         "stop_owned",
+        "strict_layout",
     ]
     assert context.state_root.is_dir()
     assert len(evidence_rows) == 1
@@ -1533,7 +1691,85 @@ def test_execute_live_initializes_state_before_mock_bridge_and_records_cleanup(
     assert evidence["gate0_stage"] == "starting_runs"
     assert evidence["owned_bridge_started"] is True
     assert evidence["owned_bridge_shutdown_confirmed"] is True
+    assert evidence["read_only_ledger_job_rows"] == 0
+    assert evidence["budget"]["verified_completed_job_count"] == 0
     assert evidence["terminal_code"] == "offline_test_stop_before_post"
+
+
+def test_execute_live_records_read_only_job_rows_when_post_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_after_job_was_recorded(
+        cases: tuple[runner.RunCase, ...],
+        ledger: runner.AttemptLedger,
+        _adapter: Any,
+    ) -> None:
+        case = cases[0]
+        request_id = runner.client_request_id_for(APPROVAL_ID, case)
+        ledger.before_post(case, request_id)
+        ledger.mark_accepted(case, request_id, "workflow-audit-1", "run-audit-1")
+        run_dir = context.state_root / "run-audit-1"
+        run_dir.mkdir()
+        with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+            connection.execute("CREATE TABLE jobs (job_id TEXT NOT NULL)")
+            connection.execute("INSERT INTO jobs VALUES (?)", ("job-audit-0001",))
+        raise runner.RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+
+    context, _trace, evidence_rows, ledger, _process = _install_fake_execute_live(
+        tmp_path,
+        monkeypatch,
+        run_execution=fail_after_job_was_recorded,
+    )
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    assert ledger.post_count == 1
+    assert ledger.job_count == 0
+    evidence = evidence_rows[0]
+    assert evidence["status"] == "FAIL"
+    assert evidence["budget"]["verified_completed_job_count"] == 0
+    assert evidence["runs"][0]["verified_completed_job_count"] == 0
+    assert evidence["read_only_ledger_job_rows"] == 1
+
+
+@pytest.mark.parametrize("fault", ["unsafe_layout", "ledger_unavailable"])
+def test_read_only_job_ledger_audit_records_unknown_instead_of_guessing_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    context, _localappdata, _codexbridge_root, state_root = _state_root_context(tmp_path)
+    monkeypatch.setattr(runner, "_same_owner_as_current_user", lambda _path: True)
+    runner._initialize_isolated_state_root(context)
+    context.process = SimpleNamespace(poll=lambda: 0)
+    context.identity = {"pid": 17, "create_time": 1.0}
+    original_validate = runner.validate_isolated_layout
+    count_calls = 0
+
+    def unavailable_layout(*_args: Any, **_kwargs: Any) -> None:
+        raise runner.RunnerAbort("UNKNOWN", "isolated_root_unavailable")
+
+    def unavailable_ledger(_state_root: Path) -> int:
+        nonlocal count_calls
+        count_calls += 1
+        raise runner.RunnerAbort("UNKNOWN", "isolated_run_ledger_unavailable")
+
+    monkeypatch.setattr(
+        runner,
+        "validate_isolated_layout",
+        unavailable_layout if fault == "unsafe_layout" else original_validate,
+    )
+    monkeypatch.setattr(runner, "count_isolated_codex_jobs", unavailable_ledger)
+
+    observed = runner._read_only_owned_job_ledger_rows(
+        context,
+        bridge_started=True,
+        bridge_shutdown_confirmed=True,
+        worker_observer_finished=True,
+    )
+
+    assert observed is None
+    assert count_calls == (0 if fault == "unsafe_layout" else 1)
+    assert state_root.is_dir()
 
 
 @pytest.mark.parametrize(
@@ -1598,6 +1834,7 @@ def test_execute_live_is_fail_closed_before_mock_bridge_for_state_setup_faults(
     assert evidence["gate0_stage"] == expected_stage
     assert evidence["owned_bridge_started"] is False
     assert evidence["owned_bridge_shutdown_confirmed"] is False
+    assert evidence["read_only_ledger_job_rows"] is None
 
 
 def test_execute_live_records_unknown_start_and_cleanup_without_stopping_unowned_process(
@@ -1619,6 +1856,7 @@ def test_execute_live_records_unknown_start_and_cleanup_without_stopping_unowned
     assert evidence_rows[0]["gate0_stage"] == "starting_bridge"
     assert evidence_rows[0]["owned_bridge_started"] is None
     assert evidence_rows[0]["owned_bridge_shutdown_confirmed"] is None
+    assert evidence_rows[0]["read_only_ledger_job_rows"] is None
     assert evidence_rows[0]["terminal_code"] == "owned_bridge_start_outcome_unknown"
     assert evidence_rows[0]["status"] == "UNKNOWN"
 
@@ -1640,6 +1878,7 @@ def test_execute_live_records_cleanup_failure_as_unknown_without_killing_unverif
     assert trace[-2:] == ["verify_owner", "stop_owned"]
     assert evidence_rows[0]["owned_bridge_started"] is True
     assert evidence_rows[0]["owned_bridge_shutdown_confirmed"] is None
+    assert evidence_rows[0]["read_only_ledger_job_rows"] is None
     assert evidence_rows[0]["terminal_code"] == "owned_shutdown_unconfirmed"
     assert evidence_rows[0]["status"] == "BLOCKED"
 
@@ -1777,6 +2016,42 @@ def test_evidence_sanitizer_requires_fixed_stage_and_process_ownership_values(
 ) -> None:
     with pytest.raises(runner.RunnerAbort):
         runner.assert_safe_evidence(unsafe)
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        {"read_only_ledger_job_rows": True},
+        {"read_only_ledger_job_rows": -1},
+        {"read_only_ledger_job_rows": runner.MAX_CODEX_JOBS + 1},
+        {"read_only_ledger_job_rows": 1.5},
+        {"budget": {"verified_completed_job_count": True}},
+        {"budget": {"verified_completed_job_count": runner.MAX_CODEX_JOBS + 1}},
+        {"runs": [{"expected_job_count": 1, "verified_completed_job_count": 2}]},
+    ],
+)
+def test_evidence_sanitizer_bounds_verified_and_read_only_job_counts(
+    unsafe: dict[str, Any],
+) -> None:
+    with pytest.raises(runner.RunnerAbort):
+        runner.assert_safe_evidence(unsafe)
+
+
+def test_evidence_sanitizer_accepts_unknown_and_budget_bounded_job_counts() -> None:
+    runner.assert_safe_evidence({"read_only_ledger_job_rows": None})
+    runner.assert_safe_evidence({"read_only_ledger_job_rows": 0})
+    runner.assert_safe_evidence({"read_only_ledger_job_rows": runner.MAX_CODEX_JOBS})
+    runner.assert_safe_evidence(
+        {
+            "budget": {"verified_completed_job_count": runner.MAX_CODEX_JOBS},
+            "runs": [
+                {
+                    "expected_job_count": 3,
+                    "verified_completed_job_count": 3,
+                }
+            ],
+        }
+    )
 
 
 def test_evidence_paths_are_unique_and_validate_external_approval_id(

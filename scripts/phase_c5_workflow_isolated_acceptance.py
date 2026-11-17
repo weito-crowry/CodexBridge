@@ -30,6 +30,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PARENT_HEAD = "93089459f8387ef0fa6ef25f8458144d9d1a25bf"
 MAX_INITIAL_POSTS = 3
 MAX_CODEX_JOBS = 6
+MAX_CODEX_JOB_EVENT_ROWS = MAX_CODEX_JOBS * 5
 MAX_WORKFLOW_WAIT_SECONDS = 600.0
 STATUS_POLL_SECONDS = 0.5
 BRIDGE_HOST = "127.0.0.1"
@@ -67,6 +68,12 @@ _WORKFLOW_STATUSES = frozenset(
         "succeeded",
         "failed",
         "failed_to_start",
+    }
+)
+_CODEX_JOB_EVENT_TRACES = frozenset(
+    {
+        ("PREPARED", "MAYBE_SENT", "ACCEPTED", "SUCCEEDED"),
+        ("PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED"),
     }
 )
 _GATE0_STAGE_VALUES = frozenset(
@@ -1019,6 +1026,30 @@ def assert_safe_evidence(
             or value[ownership_field] is None
         ):
             raise RunnerAbort("BLOCKED", "evidence_process_ownership_invalid")
+    if "read_only_ledger_job_rows" in value:
+        ledger_rows = value["read_only_ledger_job_rows"]
+        if ledger_rows is not None and (
+            type(ledger_rows) is not int or not 0 <= ledger_rows <= MAX_CODEX_JOBS
+        ):
+            raise RunnerAbort("BLOCKED", "evidence_ledger_job_count_invalid")
+    budget = value.get("budget")
+    if isinstance(budget, Mapping) and "verified_completed_job_count" in budget:
+        verified_count = budget["verified_completed_job_count"]
+        if type(verified_count) is not int or not 0 <= verified_count <= MAX_CODEX_JOBS:
+            raise RunnerAbort("BLOCKED", "evidence_verified_job_count_invalid")
+    runs = value.get("runs")
+    if isinstance(runs, list):
+        for row in runs:
+            if not isinstance(row, Mapping) or "verified_completed_job_count" not in row:
+                continue
+            verified_count = row["verified_completed_job_count"]
+            expected_count = row.get("expected_job_count")
+            if (
+                type(expected_count) is not int
+                or type(verified_count) is not int
+                or not 0 <= verified_count <= expected_count <= MAX_CODEX_JOBS
+            ):
+                raise RunnerAbort("BLOCKED", "evidence_run_job_count_invalid")
     for secret in secrets_to_reject:
         if secret and secret in encoded:
             raise RunnerAbort("BLOCKED", "evidence_contains_secret")
@@ -1842,6 +1873,37 @@ def count_isolated_codex_jobs(state_root: Path) -> int:
     return total
 
 
+def _read_only_owned_job_ledger_rows(
+    context: Any | None,
+    *,
+    bridge_started: bool,
+    bridge_shutdown_confirmed: bool,
+    worker_observer_finished: bool,
+) -> int | None:
+    if (
+        context is None
+        or bridge_started is not True
+        or bridge_shutdown_confirmed is not True
+        or worker_observer_finished is not True
+    ):
+        return None
+    try:
+        process = context.process
+        identity = context.identity
+        if process is None or not isinstance(identity, dict) or process.poll() is None:
+            return None
+        validate_isolated_layout(
+            context.temp_root,
+            context.state_root,
+            context.workspace,
+            context.ports,
+            require_state_root=True,
+        )
+        return count_isolated_codex_jobs(Path(context.state_root))
+    except Exception:
+        return None
+
+
 def _workflow_request_digest(
     case: RunCase, definition: Mapping[str, Any], workspace_root: str
 ) -> str:
@@ -1853,6 +1915,53 @@ def _workflow_request_digest(
     if case.expected_jobs in {2, 3}:
         digest_payload["max_live_codex_jobs"] = case.expected_jobs
     return _sha256(_canonical_json(digest_payload).encode("utf-8"))
+
+
+def validate_codex_job_event_trace(
+    jobs: Sequence[Mapping[str, Any]], events: Sequence[Mapping[str, Any]]
+) -> bool:
+    if (
+        not isinstance(jobs, list)
+        or not 1 <= len(jobs) <= MAX_CODEX_JOBS
+        or not isinstance(events, list)
+        or not 4 * len(jobs) <= len(events) <= 5 * len(jobs)
+    ):
+        raise RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+
+    job_ids: list[str] = []
+    for job in jobs:
+        job_id = job.get("job_id") if isinstance(job, Mapping) else None
+        if not _valid_identifier(job_id):
+            raise RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+        job_ids.append(str(job_id))
+    expected_job_ids = set(job_ids)
+    if len(expected_job_ids) != len(job_ids):
+        raise RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+
+    events_by_job: dict[str, list[str]] = {job_id: [] for job_id in job_ids}
+    previous_event_id = 0
+    for event in events:
+        if not isinstance(event, Mapping):
+            raise RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+        event_id = event.get("event_id")
+        job_id = event.get("job_id")
+        state = event.get("state")
+        if (
+            type(event_id) is not int
+            or event_id <= previous_event_id
+            or not isinstance(job_id, str)
+            or job_id not in expected_job_ids
+            or not isinstance(state, str)
+        ):
+            raise RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+        previous_event_id = event_id
+        events_by_job[job_id].append(state)
+
+    if set(events_by_job) != expected_job_ids or any(
+        tuple(events_by_job[job_id]) not in _CODEX_JOB_EVENT_TRACES for job_id in job_ids
+    ):
+        raise RunnerAbort("FAIL", "codex_job_event_trace_invalid")
+    return True
 
 
 def _verify_live_run(
@@ -1950,13 +2059,9 @@ def _verify_live_run(
             raise RunnerAbort("FAIL", "fixed_result_expectation_mismatch")
         observed_texts.append(receipt["result"]["final_text"])
     validate_expected_texts(case, observed_texts)
-    if (
-        len(job_events) != 2 * case.expected_jobs
-        or sum(event.get("state") == "MAYBE_SENT" for event in job_events) != case.expected_jobs
-        or sum(event.get("state") == "SUCCEEDED" for event in job_events) != case.expected_jobs
-        or any(event.get("job_id") not in job_ids for event in job_events)
-    ):
-        raise RunnerAbort("FAIL", "codex_job_start_marker_or_event_mismatch")
+    if len(job_ids) != case.expected_jobs:
+        raise RunnerAbort("FAIL", "codex_job_ledger_mismatch")
+    validate_codex_job_event_trace(jobs, job_events)
     tasks_http, events_http = _read_events_http(context, str(workflow_id))
     tasks_mcp, events_mcp = _read_events_mcp(context, str(workflow_id))
     validate_projection(
@@ -2001,12 +2106,13 @@ def _create_evidence(approval_id: str, preflight: Mapping[str, Any]) -> dict[str
         "gate0_stage": "not_started",
         "owned_bridge_started": False,
         "owned_bridge_shutdown_confirmed": False,
+        "read_only_ledger_job_rows": None,
         "budget": {
             "planned_runs": 3,
             "max_initial_workflow_posts": MAX_INITIAL_POSTS,
             "max_codex_jobs": MAX_CODEX_JOBS,
             "observed_initial_workflow_posts": 0,
-            "observed_codex_jobs": 0,
+            "verified_completed_job_count": 0,
         },
         "gates": {
             "gate0": "NOT_RUN",
@@ -2020,7 +2126,7 @@ def _create_evidence(approval_id: str, preflight: Mapping[str, Any]) -> dict[str
                 "expected_job_count": case.expected_jobs,
                 "status": "NOT_RUN",
                 "initial_post_count": 0,
-                "observed_job_count": 0,
+                "verified_completed_job_count": 0,
             }
             for case in build_run_cases()
         ],
@@ -2041,7 +2147,7 @@ def _apply_failure_state(
     evidence["status"] = status
     evidence["terminal_code"] = code
     evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
-    evidence["budget"]["observed_codex_jobs"] = ledger.job_count
+    evidence["budget"]["verified_completed_job_count"] = ledger.job_count
     ledger_runs = ledger.data.get("runs", {})
     evidence_runs = {row["name"]: row for row in evidence["runs"]}
     for name, jobs, *_rest in _case_definitions():
@@ -2050,7 +2156,7 @@ def _apply_failure_state(
         run_state = str(record.get("state", "not_started"))
         row["status"] = "NOT_RUN" if run_state == "not_started" else run_state.upper()
         row["initial_post_count"] = int(record.get("client_request_id") is not None)
-        row["observed_job_count"] = int(record.get("observed_jobs", 0))
+        row["verified_completed_job_count"] = int(record.get("observed_jobs", 0))
         row["expected_job_count"] = jobs
     if ledger.post_count:
         gate_status = status if status in {"FAIL", "BLOCKED"} else "BLOCKED"
@@ -2064,13 +2170,13 @@ def _apply_failure_state(
 
 def _apply_ledger_to_evidence(evidence: dict[str, Any], ledger: AttemptLedger) -> None:
     evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
-    evidence["budget"]["observed_codex_jobs"] = ledger.job_count
+    evidence["budget"]["verified_completed_job_count"] = ledger.job_count
     for row in evidence["runs"]:
         state = ledger.run_states.get(row["name"], "not_started")
         run_data = ledger.data.get("runs", {}).get(row["name"], {})
         row["status"] = "NOT_RUN" if state == "not_started" else state.upper()
         row["initial_post_count"] = int(state != "not_started")
-        row["observed_job_count"] = int(run_data.get("observed_jobs", 0))
+        row["verified_completed_job_count"] = int(run_data.get("observed_jobs", 0))
         if isinstance(run_data.get("workflow_id"), str):
             row["workflow_id"] = run_data["workflow_id"]
         if isinstance(run_data.get("run_id"), str):
@@ -2096,6 +2202,7 @@ def _write_live_evidence(
         raise RunnerAbort("BLOCKED", "live_evidence_write_failed") from None
     gates = evidence.get("gates", {})
     budget = evidence.get("budget", {})
+    ledger_job_rows = evidence.get("read_only_ledger_job_rows")
     summary = (
         "# Phase C5-P2 live acceptance\n\n"
         f"- Status: {evidence.get('status')}\n"
@@ -2109,7 +2216,10 @@ def _write_live_evidence(
         f"- Gate 2 1/2/3 jobs: {gates.get('gate2')}\n"
         f"- Gate 3 read-only restart: {gates.get('gate3')}\n"
         f"- Initial POSTs: {budget.get('observed_initial_workflow_posts')}/{MAX_INITIAL_POSTS}\n"
-        f"- Codex jobs: {budget.get('observed_codex_jobs')}/{MAX_CODEX_JOBS}\n\n"
+        f"- Verified completed jobs: {budget.get('verified_completed_job_count')}/"
+        f"{MAX_CODEX_JOBS}\n"
+        "- Read-only isolated ledger job rows: "
+        f"{ledger_job_rows if type(ledger_job_rows) is int else 'UNKNOWN'}\n\n"
         "Gate 1 remains NOT_RUN until a person inspects the isolated visible GUI.\n"
     )
     if WINDOWS_PATH_PATTERN.search(summary) or POSIX_PATH_PATTERN.search(summary):
@@ -2226,7 +2336,7 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         evidence["gates"]["gate3"] = outcome["gate3"]
         evidence["runs"] = outcome["completed_runs"]
         evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
-        evidence["budget"]["observed_codex_jobs"] = ledger.job_count
+        evidence["budget"]["verified_completed_job_count"] = ledger.job_count
         evidence["status"] = "LIVE_RUNS_PASS_GUI_NOT_RUN"
         evidence["gate0_stage"] = "runs_completed"
         ledger.data["status"] = "live_runs_pass_gui_not_run"
@@ -2255,10 +2365,12 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         if ledger is not None and ledger.data.get("status") == "started":
             ledger.mark_terminal(None, "BLOCKED", "live_runner_unexpected_failure")
     finally:
+        worker_observer_finished = True
         if adapter is not None and adapter._worker_observer is not None:
             try:
                 adapter._worker_observer.finish()
             except Exception:
+                worker_observer_finished = False
                 if evidence is not None:
                     evidence["gates"]["gate3"] = "BLOCKED"
         bridge_started = evidence.get("owned_bridge_started") if evidence is not None else False
@@ -2304,6 +2416,12 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         if ledger is not None:
             _apply_ledger_to_evidence(evidence, ledger)
         if evidence is not None:
+            evidence["read_only_ledger_job_rows"] = _read_only_owned_job_ledger_rows(
+                context,
+                bridge_started=bridge_started is True,
+                bridge_shutdown_confirmed=(evidence.get("owned_bridge_shutdown_confirmed") is True),
+                worker_observer_finished=worker_observer_finished,
+            )
             try:
                 _write_live_evidence(evidence, approval_id, secrets_to_reject)
             except RunnerAbort:
