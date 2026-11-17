@@ -64,3 +64,17 @@ python -m scripts.phase_c5_workflow_isolated_acceptance --execute --approved-hea
 ```
 
 After Gate 2 and Gate 3, the user still needs to inspect the visible isolated GUI and record that human decision separately. No PR, merge, rebase, force-push, tag, release, or production deployment is part of this runner task.
+
+## Issue #166 Gate 0 state initialization and diagnostics
+
+This section supersedes the Issue #158 pre-start statement above that C5 leaves the state hierarchy absent until Bridge startup.
+
+The earlier live attempt recorded `isolated_root_unavailable`, Gate 0 `BLOCKED`, zero initial POSTs, zero Codex jobs, and runs A/B/C `NOT_RUN`. That evidence did not record the failing stage, so it does not establish whether the strict state-root check failed before or after Bridge startup. The source flow and offline reproduction show that a fresh B5 context intentionally has no `localappdata/CodexBridge/workflows` directory, while C5 had required it immediately after startup. The precise stage of the earlier live failure remains an inference.
+
+C5 now validates the fresh isolated layout and canonical `LOCALAPPDATA`, then creates only the isolated `CodexBridge` and `workflows` directories with separate exclusive `mkdir` calls before starting its Bridge. Each parent and new directory is checked for reparse points, path containment, ownership, and access. Strict layout checks run before Bridge startup, after startup, and again before Workflow POST readiness. The product's lazy `mkdir(parents=True, exist_ok=True)` behavior remains compatible; an offline test exercises the existing service and definition repository helpers against the initialized temporary state root. B5 and product source are unchanged.
+
+Future evidence paths are unique per externally supplied approval ID: `phase_c5_workflow_acceptance-<approval-id>.json` and `phase_c5_p2_live_acceptance-<approval-id>.md`. The prior fixed summary and other approval IDs do not block a new ID; a collision at either target for the same ID blocks without overwrite. This change does not modify or reuse the already consumed attempt marker or the prior failed evidence.
+
+Evidence now records a fixed `gate0_stage` and tri-state `owned_bridge_started` / `owned_bridge_shutdown_confirmed` values. It records no exception text, absolute paths, process identifiers, ports, commands, tokens, or prompts. Ambiguous startup or cleanup remains `UNKNOWN`/`BLOCKED`; cleanup still requires the runner's verified owned-process identity.
+
+Offline verification for Issue #166: the C5 runner suite reported 109 passed and 1 skipped (Windows denied creation of the test symlink, WinError 1314). The selected GUI-offscreen, B5, C2, and C3 related suite reported 272 passed and 2 skipped (Windows denied two test symlink creations). Ruff check and format passed; `mypy src` passed for 132 source files; mypy passed for the runner with `--follow-imports=skip --disable-error-code=import-untyped`; compileall and `git diff --check` passed. This implementation turn made zero real Bridge/Worker starts, zero Workflow POSTs, zero Codex jobs, and zero visible GUI launches. The consumed approval ID was not retried and no new live attempt was authorized or run.

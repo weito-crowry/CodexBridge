@@ -11,8 +11,9 @@ from typing import Any
 import pytest
 import yaml
 
+from codex_bridge.workflows.definitions import WorkflowDefinitionRepository
 from codex_bridge.workflows.interpreter import Interpreter, compute_task_action
-from codex_bridge.workflows.service import WorkflowService
+from codex_bridge.workflows.service import WorkflowService, _ensure_state_root
 from scripts import phase_c5_workflow_isolated_acceptance as runner
 
 APPROVAL_ID = "a" * 32
@@ -1089,6 +1090,285 @@ def test_layout_requires_state_root_only_after_bridge_start(tmp_path: Path) -> N
     )
 
 
+def test_missing_state_after_mock_start_reproduces_previous_gate0_failure(
+    tmp_path: Path,
+) -> None:
+    temp_root, _localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+
+    runner.validate_isolated_layout(
+        temp_root, state_root, workspace, (24001, 24002), require_state_root=False
+    )
+    assert not codexbridge_root.exists()
+    with pytest.raises(runner.RunnerAbort, match="isolated_root_unavailable"):
+        runner.validate_isolated_layout(
+            temp_root, state_root, workspace, (24001, 24002), require_state_root=True
+        )
+
+
+def _state_root_context(tmp_path: Path) -> tuple[Any, Path, Path, Path]:
+    temp_root, localappdata, workspace, codexbridge_root, state_root = _fresh_isolated_roots(
+        tmp_path
+    )
+    appdata = temp_root / "appdata"
+    appdata.mkdir()
+    temp_dir = temp_root / "tmp"
+    temp_dir.mkdir()
+    context = SimpleNamespace(
+        temp_root=temp_root,
+        state_root=state_root,
+        workspace=workspace,
+        ports=(24001, 24002),
+        environment={
+            "LOCALAPPDATA": str(localappdata),
+            "APPDATA": str(appdata),
+            "TEMP": str(temp_dir),
+            "TMP": str(temp_dir),
+            "CODEX_HOME": str(temp_root / "codex_home"),
+        },
+    )
+    return context, localappdata, codexbridge_root, state_root
+
+
+def _install_fake_execute_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bridge_start: Any | None = None,
+    run_execution: Any | None = None,
+    bridge_stop: Any | None = None,
+) -> tuple[Any, list[str], list[dict[str, Any]], runner.AttemptLedger, Any]:
+    context, _localappdata, _codexbridge_root, _state_root = _state_root_context(tmp_path)
+    context.control_token = "fake-control-token"
+    context.mcp_token = "fake-mcp-token"
+    context.codex_executable = context.temp_root / "fake-codex.exe"
+    context.process = None
+    context.identity = None
+    trace: list[str] = []
+    captured_evidence: list[dict[str, Any]] = []
+    process = SimpleNamespace(exit_code=None)
+    process.poll = lambda: process.exit_code
+    identity = {"pid": 7311, "create_time": 123.0}
+    ledger = runner.AttemptLedger.create(tmp_path / "budget", APPROVAL_ID, HEAD, SOURCE_HASH)
+    original_validate = runner.validate_isolated_layout
+    original_initialize = runner._initialize_isolated_state_root
+
+    class TrackingEnvironment(dict[str, str]):
+        localappdata_checked = False
+
+        def get(self, key: str, default: Any = None) -> Any:
+            if key == "LOCALAPPDATA" and not self.localappdata_checked:
+                self.localappdata_checked = True
+                trace.append("environment_check")
+            return super().get(key, default)
+
+    context.environment = TrackingEnvironment(context.environment)
+
+    def fake_ledger_create(
+        cls: type[runner.AttemptLedger], *_args: Any, **_kwargs: Any
+    ) -> runner.AttemptLedger:
+        return ledger
+
+    def fake_preflight(*_args: Any) -> dict[str, Any]:
+        trace.append("preflight")
+        return {
+            "approved_head": HEAD,
+            "runner_source_sha256": SOURCE_HASH,
+            "codex_executable": context.codex_executable,
+            "source_home": context.temp_root / "source-home",
+        }
+
+    def create_context(*_args: Any) -> Any:
+        trace.append("context_created")
+        return context
+
+    def assert_owner(owned_process: object, owned_identity: dict[str, Any]) -> None:
+        trace.append("verify_owner")
+        if owned_process is not process or owned_identity != identity:
+            raise runner.RunnerAbort("BLOCKED", "fake_owner_mismatch")
+
+    def stop_process(
+        owned_process: Any,
+        _owned_identity: dict[str, Any],
+        *,
+        ui_port: int,
+        control_token: str,
+    ) -> None:
+        trace.append("stop_owned")
+        if bridge_stop is not None:
+            bridge_stop(owned_process)
+            return
+        if ui_port != context.ports[1] or control_token != context.control_token:
+            raise runner.RunnerAbort("BLOCKED", "fake_stop_arguments_mismatch")
+        owned_process.exit_code = 0
+
+    fake_b5 = SimpleNamespace(
+        _make_isolated_context=create_context,
+        phase5f5=SimpleNamespace(_assert_bridge_identity=assert_owner),
+        stop_owned_bridge=stop_process,
+    )
+
+    def tracked_validate(
+        temp_root: Path,
+        state_root: Path,
+        workspace: Path,
+        ports: tuple[int, int],
+        *,
+        require_state_root: bool,
+    ) -> None:
+        trace.append("strict_layout" if require_state_root else "prestart_layout")
+        original_validate(
+            temp_root,
+            state_root,
+            workspace,
+            ports,
+            require_state_root=require_state_root,
+        )
+
+    def tracked_initialize(_context: Any) -> None:
+        trace.append("initialize_state")
+        original_initialize(_context)
+
+    def fake_start(_context: Any, *, restart: bool = False) -> dict[str, Any]:
+        trace.append("bridge_start")
+        if restart:
+            raise AssertionError("initial acceptance must not use restart mode")
+        if bridge_start is not None:
+            return bridge_start(_context, process, identity)
+        _context.process = process
+        _context.identity = identity
+        return {}
+
+    def fake_runs(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        trace.append("execute_runs")
+        if run_execution is not None:
+            return run_execution(*_args, **_kwargs)
+        raise runner.RunnerAbort("BLOCKED", "offline_test_stop_before_post")
+
+    def capture_evidence(
+        evidence: dict[str, Any],
+        _approval_id: str,
+        secrets_to_reject: tuple[str, ...],
+    ) -> None:
+        runner.assert_safe_evidence(evidence, secrets_to_reject=secrets_to_reject)
+        captured_evidence.append(json.loads(json.dumps(evidence)))
+
+    monkeypatch.setattr(runner.AttemptLedger, "create", classmethod(fake_ledger_create))
+    monkeypatch.setattr(runner, "live_preflight", fake_preflight)
+    monkeypatch.setattr(runner, "_b5", lambda: fake_b5)
+    monkeypatch.setattr(runner, "_same_owner_as_current_user", lambda _path: True)
+    monkeypatch.setattr(runner, "validate_isolated_layout", tracked_validate)
+    monkeypatch.setattr(runner, "_initialize_isolated_state_root", tracked_initialize)
+    monkeypatch.setattr(runner, "start_isolated_bridge", fake_start)
+    monkeypatch.setattr(runner, "execute_runs", fake_runs)
+    monkeypatch.setattr(runner, "_write_live_evidence", capture_evidence)
+    return context, trace, captured_evidence, ledger, process
+
+
+def test_initialize_state_root_isolated_and_lazy_create_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context, localappdata, codexbridge_root, state_root = _state_root_context(tmp_path)
+    monkeypatch.setattr(runner, "_same_owner_as_current_user", lambda _path: True)
+
+    runner.validate_isolated_layout(
+        context.temp_root,
+        state_root,
+        context.workspace,
+        context.ports,
+        require_state_root=False,
+    )
+    runner._initialize_isolated_state_root(context)
+    runner.validate_isolated_layout(
+        context.temp_root,
+        state_root,
+        context.workspace,
+        context.ports,
+        require_state_root=True,
+    )
+
+    assert codexbridge_root.is_dir()
+    assert state_root.is_dir()
+    assert tuple(localappdata.iterdir()) == (codexbridge_root,)
+    assert _ensure_state_root(state_root, create=True) == state_root.resolve(strict=True)
+    assert WorkflowDefinitionRepository(state_root)._resolve_state_root(create=True) == (
+        state_root.resolve(strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "localappdata_mismatch",
+        "existing_codexbridge",
+        "owner_mismatch",
+        "permission_denied",
+        "bridge_mkdir_failure",
+        "workflows_mkdir_failure",
+        "original_state_overlap",
+        "reparse_parent",
+    ],
+)
+def test_initialize_state_root_fails_closed_without_leaving_isolated_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    context, localappdata, codexbridge_root, state_root = _state_root_context(tmp_path)
+    monkeypatch.setattr(runner, "_same_owner_as_current_user", lambda _path: True)
+    if fault == "localappdata_mismatch":
+        context.environment["LOCALAPPDATA"] = context.environment["APPDATA"]
+    elif fault == "existing_codexbridge":
+        codexbridge_root.mkdir()
+    elif fault == "owner_mismatch":
+        monkeypatch.setattr(
+            runner,
+            "_same_owner_as_current_user",
+            lambda path: Path(path) != localappdata,
+        )
+    elif fault == "permission_denied":
+        real_access = runner.os.access
+        monkeypatch.setattr(
+            runner.os,
+            "access",
+            lambda path, mode, *args, **kwargs: (
+                False if Path(path) == localappdata else real_access(path, mode, *args, **kwargs)
+            ),
+        )
+    elif fault in {"bridge_mkdir_failure", "workflows_mkdir_failure"}:
+        target = codexbridge_root if fault == "bridge_mkdir_failure" else state_root
+        real_mkdir = Path.mkdir
+
+        def fail_target_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            if path == target:
+                raise PermissionError("fake directory creation failure")
+            real_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fail_target_mkdir)
+    elif fault == "original_state_overlap":
+        monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
+    elif fault == "reparse_parent":
+        real_reparse = runner._is_reparse_point
+        monkeypatch.setattr(
+            runner,
+            "_is_reparse_point",
+            lambda path: Path(path) == localappdata or real_reparse(path),
+        )
+
+    with pytest.raises(runner.RunnerAbort):
+        runner._initialize_isolated_state_root(context)
+
+    if fault in {
+        "localappdata_mismatch",
+        "existing_codexbridge",
+        "owner_mismatch",
+        "permission_denied",
+        "bridge_mkdir_failure",
+        "original_state_overlap",
+        "reparse_parent",
+    }:
+        assert not state_root.exists()
+
+
 @pytest.mark.parametrize("precreated", ["codexbridge", "workflows"])
 def test_layout_rejects_precreated_state_hierarchy_before_bridge_start(
     tmp_path: Path, precreated: str
@@ -1223,109 +1503,145 @@ def test_layout_rejects_an_actual_symlinked_state_parent(tmp_path: Path) -> None
         )
 
 
-@pytest.mark.parametrize(
-    ("bridge_creates_state_root", "localappdata_matches"),
-    [(True, True), (False, True), (False, False)],
-)
-def test_execute_live_checks_state_root_after_mock_start_before_run_execution(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    bridge_creates_state_root: bool,
-    localappdata_matches: bool,
+def test_execute_live_initializes_state_before_mock_bridge_and_records_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    temp_root, localappdata, workspace, _codexbridge_root, state_root = _fresh_isolated_roots(
-        tmp_path
+    context, trace, evidence_rows, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch
     )
-    appdata = temp_root / "appdata"
-    appdata.mkdir()
-    temp_dir = temp_root / "tmp"
-    temp_dir.mkdir()
-    context = SimpleNamespace(
-        temp_root=temp_root,
-        state_root=state_root,
-        workspace=workspace,
-        ports=(24001, 24002),
-        environment={
-            "LOCALAPPDATA": str(localappdata if localappdata_matches else appdata),
-            "APPDATA": str(appdata),
-            "TEMP": str(temp_dir),
-            "TMP": str(temp_dir),
-            "CODEX_HOME": str(temp_root / "codex_home"),
-        },
-        control_token="fake-control-token",
-        mcp_token="fake-mcp-token",
-        codex_executable=temp_root / "fake-codex.exe",
-        process=None,
-        identity=None,
-    )
-    ledger = runner.AttemptLedger.create(tmp_path / "budget", APPROVAL_ID, HEAD, SOURCE_HASH)
-    trace: list[Any] = []
-    real_validate = runner.validate_isolated_layout
-
-    def fake_create_ledger(
-        cls: type[runner.AttemptLedger], *_args: Any, **_kwargs: Any
-    ) -> runner.AttemptLedger:
-        return ledger
-
-    def tracked_validate(
-        root: Path,
-        state: Path,
-        work: Path,
-        ports: tuple[int, int],
-        *,
-        require_state_root: bool,
-    ) -> None:
-        trace.append(("validate", require_state_root))
-        real_validate(root, state, work, ports, require_state_root=require_state_root)
-        if not require_state_root:
-            assert not state.exists()
-
-    def fake_start_bridge(_context: Any, *, restart: bool = False) -> None:
-        assert restart is False
-        trace.append("bridge_start")
-        if bridge_creates_state_root:
-            state_root.mkdir(parents=True)
-
-    def fake_execute_runs(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        trace.append("execute_runs")
-        raise runner.RunnerAbort("BLOCKED", "offline_test_stop_before_post")
-
-    monkeypatch.setattr(runner.AttemptLedger, "create", classmethod(fake_create_ledger))
-    monkeypatch.setattr(
-        runner,
-        "live_preflight",
-        lambda *_args: {
-            "approved_head": HEAD,
-            "runner_source_sha256": SOURCE_HASH,
-            "codex_executable": context.codex_executable,
-            "source_home": temp_root / "source-home",
-        },
-    )
-    monkeypatch.setattr(
-        runner,
-        "_b5",
-        lambda: SimpleNamespace(
-            _make_isolated_context=lambda *_args: trace.append("context_created") or context
-        ),
-    )
-    monkeypatch.setattr(runner, "validate_isolated_layout", tracked_validate)
-    monkeypatch.setattr(runner, "start_isolated_bridge", fake_start_bridge)
-    monkeypatch.setattr(runner, "execute_runs", fake_execute_runs)
-    monkeypatch.setattr(runner, "_write_live_evidence", lambda *_args, **_kwargs: None)
 
     result = runner.execute_live(HEAD, APPROVAL_ID)
 
     assert result == 2
     assert ledger.post_count == 0
-    expected = [
+    assert trace == [
+        "preflight",
         "context_created",
-        ("validate", False),
+        "prestart_layout",
+        "environment_check",
+        "initialize_state",
+        "strict_layout",
+        "bridge_start",
+        "strict_layout",
+        "execute_runs",
+        "verify_owner",
+        "stop_owned",
     ]
-    if localappdata_matches:
-        expected.extend(["bridge_start", ("validate", True)])
-        if bridge_creates_state_root:
-            expected.append("execute_runs")
-    assert trace == expected
+    assert context.state_root.is_dir()
+    assert len(evidence_rows) == 1
+    evidence = evidence_rows[0]
+    assert evidence["gate0_stage"] == "starting_runs"
+    assert evidence["owned_bridge_started"] is True
+    assert evidence["owned_bridge_shutdown_confirmed"] is True
+    assert evidence["terminal_code"] == "offline_test_stop_before_post"
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_stage"),
+    [
+        ("localappdata_mismatch", "prestart_layout_validated"),
+        ("preexisting_codexbridge", "context_created"),
+        ("owner_mismatch", "initializing_isolated_state"),
+        ("permission_denied", "initializing_isolated_state"),
+        ("mkdir_failure", "initializing_isolated_state"),
+    ],
+)
+def test_execute_live_is_fail_closed_before_mock_bridge_for_state_setup_faults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    expected_stage: str,
+) -> None:
+    context, trace, evidence_rows, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch
+    )
+    localappdata = Path(context.environment["LOCALAPPDATA"])
+    state_root = context.state_root
+    codexbridge_root = state_root.parent
+    if fault == "localappdata_mismatch":
+        context.environment["LOCALAPPDATA"] = context.environment["APPDATA"]
+    elif fault == "preexisting_codexbridge":
+        codexbridge_root.mkdir()
+    elif fault == "owner_mismatch":
+        monkeypatch.setattr(
+            runner,
+            "_same_owner_as_current_user",
+            lambda path: Path(path) != localappdata,
+        )
+    elif fault == "permission_denied":
+        real_access = runner.os.access
+        monkeypatch.setattr(
+            runner.os,
+            "access",
+            lambda path, mode, *args, **kwargs: (
+                False if Path(path) == localappdata else real_access(path, mode, *args, **kwargs)
+            ),
+        )
+    elif fault == "mkdir_failure":
+        real_mkdir = Path.mkdir
+
+        def fail_state_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            if path == state_root:
+                raise PermissionError("fake directory creation failure")
+            real_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fail_state_mkdir)
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    assert ledger.post_count == 0
+    assert "bridge_start" not in trace
+    assert "execute_runs" not in trace
+    assert len(evidence_rows) == 1
+    evidence = evidence_rows[0]
+    assert evidence["gate0_stage"] == expected_stage
+    assert evidence["owned_bridge_started"] is False
+    assert evidence["owned_bridge_shutdown_confirmed"] is False
+
+
+def test_execute_live_records_unknown_start_and_cleanup_without_stopping_unowned_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def ambiguous_start(_context: Any, _process: Any, _identity: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("fake start result unavailable")
+
+    context, trace, evidence_rows, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch, bridge_start=ambiguous_start
+    )
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    assert context.process is None
+    assert ledger.post_count == 0
+    assert "stop_owned" not in trace
+    assert evidence_rows[0]["gate0_stage"] == "starting_bridge"
+    assert evidence_rows[0]["owned_bridge_started"] is None
+    assert evidence_rows[0]["owned_bridge_shutdown_confirmed"] is None
+    assert evidence_rows[0]["terminal_code"] == "owned_bridge_start_outcome_unknown"
+    assert evidence_rows[0]["status"] == "UNKNOWN"
+
+
+def test_execute_live_records_cleanup_failure_as_unknown_without_killing_unverified_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_stop(_process: Any) -> None:
+        raise RuntimeError("fake stop result unavailable")
+
+    _context, trace, evidence_rows, ledger, _process = _install_fake_execute_live(
+        tmp_path, monkeypatch, bridge_stop=fail_stop
+    )
+
+    result = runner.execute_live(HEAD, APPROVAL_ID)
+
+    assert result == 2
+    assert ledger.post_count == 0
+    assert trace[-2:] == ["verify_owner", "stop_owned"]
+    assert evidence_rows[0]["owned_bridge_started"] is True
+    assert evidence_rows[0]["owned_bridge_shutdown_confirmed"] is None
+    assert evidence_rows[0]["terminal_code"] == "owned_shutdown_unconfirmed"
+    assert evidence_rows[0]["status"] == "BLOCKED"
 
 
 def test_auth_source_requires_owned_regular_bounded_file(tmp_path: Path) -> None:
@@ -1445,6 +1761,103 @@ def test_fixed_result_expectations_are_compared_without_persisting_text(
 def test_evidence_sanitizer_rejects_paths_secrets_and_raw_text(unsafe: dict[str, Any]) -> None:
     with pytest.raises(runner.RunnerAbort):
         runner.assert_safe_evidence(unsafe, secrets_to_reject=("very-secret-token",))
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        {"gate0_stage": "unexpected-stage"},
+        {"gate0_stage": ["starting_bridge"]},
+        {"owned_bridge_started": "yes"},
+        {"owned_bridge_shutdown_confirmed": 1},
+    ],
+)
+def test_evidence_sanitizer_requires_fixed_stage_and_process_ownership_values(
+    unsafe: dict[str, Any],
+) -> None:
+    with pytest.raises(runner.RunnerAbort):
+        runner.assert_safe_evidence(unsafe)
+
+
+def test_evidence_paths_are_unique_and_validate_external_approval_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", tmp_path)
+
+    evidence_path, summary_path = runner._live_evidence_paths(APPROVAL_ID)
+
+    assert evidence_path == tmp_path / "docs" / f"phase_c5_workflow_acceptance-{APPROVAL_ID}.json"
+    assert summary_path == tmp_path / "docs" / f"phase_c5_p2_live_acceptance-{APPROVAL_ID}.md"
+    with pytest.raises(runner.RunnerAbort):
+        runner._live_evidence_paths("../unsafe")
+
+
+def test_live_preflight_and_writer_ignore_older_fixed_summary_without_overwriting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    new_approval_id = "c" * 32
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    old_summary = docs / "phase_c5_p2_live_acceptance.md"
+    old_json = docs / f"phase_c5_workflow_acceptance-{APPROVAL_ID}.json"
+    old_summary.write_text("previous fixed summary", encoding="utf-8")
+    old_json.write_text('{"previous":"evidence"}', encoding="utf-8")
+    old_summary_bytes = old_summary.read_bytes()
+    old_json_bytes = old_json.read_bytes()
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(runner, "_git_preflight", lambda _head: (HEAD, SOURCE_HASH))
+    monkeypatch.setattr(
+        runner,
+        "_environment_preflight",
+        lambda: (tmp_path / "codex.exe", tmp_path / "source-home"),
+    )
+
+    preflight = runner.live_preflight(HEAD, new_approval_id)
+    evidence = runner._create_evidence(new_approval_id, preflight)
+    json_target, summary_target = runner._live_evidence_paths(new_approval_id)
+    runner._write_live_evidence(evidence, new_approval_id, ())
+
+    assert json_target.is_file()
+    assert summary_target.is_file()
+    runner.assert_safe_evidence(json.loads(json_target.read_text(encoding="utf-8")))
+    summary_text = summary_target.read_text(encoding="utf-8")
+    assert not runner.WINDOWS_PATH_PATTERN.search(summary_text)
+    assert not runner.POSIX_PATH_PATTERN.search(summary_text)
+    assert old_summary.read_bytes() == old_summary_bytes
+    assert old_json.read_bytes() == old_json_bytes
+
+
+@pytest.mark.parametrize("existing_target", ["json", "summary"])
+def test_live_preflight_rejects_only_existing_target_for_same_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing_target: str
+) -> None:
+    approval_id = "d" * 32
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    json_target, summary_target = (
+        tmp_path / "docs" / f"phase_c5_workflow_acceptance-{approval_id}.json",
+        tmp_path / "docs" / f"phase_c5_p2_live_acceptance-{approval_id}.md",
+    )
+    target = json_target if existing_target == "json" else summary_target
+    target.write_text("existing target", encoding="utf-8")
+    before = target.read_bytes()
+    monkeypatch.setattr(runner, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(runner, "_git_preflight", lambda _head: (HEAD, SOURCE_HASH))
+    monkeypatch.setattr(
+        runner,
+        "_environment_preflight",
+        lambda: (tmp_path / "codex.exe", tmp_path / "source-home"),
+    )
+
+    with pytest.raises(runner.RunnerAbort, match="live_evidence_output_already_exists"):
+        runner.live_preflight(HEAD, approval_id)
+    evidence = runner._create_evidence(
+        approval_id, {"approved_head": HEAD, "runner_source_sha256": SOURCE_HASH}
+    )
+    with pytest.raises(runner.RunnerAbort, match="live_evidence_output_already_exists"):
+        runner._write_live_evidence(evidence, approval_id, ())
+
+    assert target.read_bytes() == before
 
 
 def test_cli_default_and_prepare_never_enter_live_execution(

@@ -69,6 +69,24 @@ _WORKFLOW_STATUSES = frozenset(
         "failed_to_start",
     }
 )
+_GATE0_STAGE_VALUES = frozenset(
+    {
+        "not_started",
+        "preflight",
+        "preflight_ok",
+        "context_created",
+        "prestart_layout_validated",
+        "environment_validated",
+        "initializing_isolated_state",
+        "isolated_state_created",
+        "isolated_state_validated",
+        "starting_bridge",
+        "bridge_ready",
+        "poststart_layout_validated",
+        "starting_runs",
+        "runs_completed",
+    }
+)
 
 
 class RunnerAbort(RuntimeError):
@@ -785,6 +803,106 @@ def validate_isolated_layout(
         raise RunnerAbort("BLOCKED", "isolated_ports_unsafe")
 
 
+def _path_text_overlaps(first: Path, second: Path) -> bool:
+    first_text = os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(first))))
+    second_text = os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(second))))
+    separator = os.path.sep
+    return (
+        first_text == second_text
+        or first_text.startswith(second_text.rstrip(separator) + separator)
+        or second_text.startswith(first_text.rstrip(separator) + separator)
+    )
+
+
+def _initialize_isolated_state_root(context: Any) -> None:
+    """Create only the fresh per-run state directories inside the owned temp root."""
+    try:
+        temp_root = Path(context.temp_root)
+        root = temp_root.resolve(strict=True)
+        localappdata_path = root / "localappdata"
+        localappdata = localappdata_path.resolve(strict=True)
+        workspace = Path(context.workspace).resolve(strict=True)
+        state_root = Path(context.state_root)
+        codexbridge_root = localappdata / "CodexBridge"
+        expected_state = codexbridge_root / "workflows"
+        configured_localappdata = context.environment.get("LOCALAPPDATA")
+        configured_localappdata_path = (
+            Path(configured_localappdata).resolve(strict=True)
+            if isinstance(configured_localappdata, str)
+            else None
+        )
+        state_root_resolved = state_root.resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise RunnerAbort("BLOCKED", "isolated_state_root_preflight_failed") from None
+
+    original_localappdata = os.environ.get("LOCALAPPDATA")
+    if (
+        configured_localappdata_path != localappdata
+        or state_root_resolved != expected_state
+        or root != temp_root
+        or localappdata != localappdata_path
+        or not root.is_dir()
+        or not localappdata.is_dir()
+        or not workspace.is_dir()
+        or not workspace.is_relative_to(root)
+        or workspace == localappdata
+        or workspace.is_relative_to(localappdata)
+        or localappdata.is_relative_to(workspace)
+        or _path_text_overlaps(expected_state, workspace)
+        or (
+            original_localappdata is not None
+            and _path_text_overlaps(
+                expected_state,
+                Path(original_localappdata) / "CodexBridge" / "workflows",
+            )
+        )
+        or any(
+            _is_reparse_point(path)
+            for path in (
+                temp_root,
+                localappdata_path,
+                context.workspace,
+                codexbridge_root,
+                state_root,
+            )
+        )
+        or codexbridge_root.exists()
+        or state_root.exists()
+        or not os.access(localappdata, os.R_OK | os.W_OK | os.X_OK)
+        or not _same_owner_as_current_user(root)
+        or not _same_owner_as_current_user(localappdata)
+    ):
+        raise RunnerAbort("BLOCKED", "isolated_state_root_preflight_failed")
+
+    try:
+        codexbridge_root.mkdir(exist_ok=False)
+        if (
+            _is_reparse_point(localappdata)
+            or _is_reparse_point(codexbridge_root)
+            or codexbridge_root.resolve(strict=True) != codexbridge_root
+            or not codexbridge_root.is_dir()
+            or not codexbridge_root.is_relative_to(root)
+            or not _same_owner_as_current_user(codexbridge_root)
+        ):
+            raise RunnerAbort("BLOCKED", "isolated_state_root_creation_failed")
+        state_root.mkdir(exist_ok=False)
+        if (
+            _is_reparse_point(localappdata)
+            or _is_reparse_point(codexbridge_root)
+            or _is_reparse_point(state_root)
+            or state_root.resolve(strict=True) != expected_state
+            or not state_root.is_dir()
+            or not state_root.is_relative_to(root)
+            or not os.access(state_root, os.R_OK | os.W_OK | os.X_OK)
+            or not _same_owner_as_current_user(state_root)
+        ):
+            raise RunnerAbort("BLOCKED", "isolated_state_root_creation_failed")
+    except RunnerAbort:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise RunnerAbort("BLOCKED", "isolated_state_root_creation_failed") from None
+
+
 def stop_owned_process(
     process: object,
     identity: dict[str, Any],
@@ -891,6 +1009,16 @@ def assert_safe_evidence(
         encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True)
     except (TypeError, ValueError, UnicodeError, RecursionError):
         raise RunnerAbort("BLOCKED", "evidence_not_json_safe") from None
+    stage = value.get("gate0_stage")
+    if stage is not None and (not isinstance(stage, str) or stage not in _GATE0_STAGE_VALUES):
+        raise RunnerAbort("BLOCKED", "evidence_gate0_stage_invalid")
+    for ownership_field in ("owned_bridge_started", "owned_bridge_shutdown_confirmed"):
+        if ownership_field in value and not (
+            value[ownership_field] is True
+            or value[ownership_field] is False
+            or value[ownership_field] is None
+        ):
+            raise RunnerAbort("BLOCKED", "evidence_process_ownership_invalid")
     for secret in secrets_to_reject:
         if secret and secret in encoded:
             raise RunnerAbort("BLOCKED", "evidence_contains_secret")
@@ -921,6 +1049,16 @@ def assert_safe_evidence(
                 raise RunnerAbort("BLOCKED", "evidence_contains_absolute_path")
 
     visit(value)
+
+
+def _live_evidence_paths(approval_id: str) -> tuple[Path, Path]:
+    if APPROVAL_ID_PATTERN.fullmatch(approval_id) is None:
+        raise RunnerAbort("BLOCKED", "execution_guards_invalid")
+    docs = REPOSITORY_ROOT / "docs"
+    return (
+        docs / f"phase_c5_workflow_acceptance-{approval_id}.json",
+        docs / f"phase_c5_p2_live_acceptance-{approval_id}.md",
+    )
 
 
 def prepare_offline() -> dict[str, Any]:
@@ -1196,8 +1334,7 @@ def live_preflight(approved_head: str, approval_id: str) -> dict[str, Any]:
         raise RunnerAbort("BLOCKED", "execution_guards_invalid")
     current_head, source_hash = _git_preflight(approved_head)
     codex, source_home = _environment_preflight()
-    evidence_json = REPOSITORY_ROOT / "docs" / f"phase_c5_workflow_acceptance-{approval_id}.json"
-    summary_md = REPOSITORY_ROOT / "docs" / "phase_c5_p2_live_acceptance.md"
+    evidence_json, summary_md = _live_evidence_paths(approval_id)
     if evidence_json.exists() or summary_md.exists():
         raise RunnerAbort("BLOCKED", "live_evidence_output_already_exists")
     return {
@@ -1861,6 +1998,9 @@ def _create_evidence(approval_id: str, preflight: Mapping[str, Any]) -> dict[str
         "approved_source_head": preflight.get("approved_head"),
         "runner_source_sha256": preflight.get("runner_source_sha256"),
         "status": "RUNNING",
+        "gate0_stage": "not_started",
+        "owned_bridge_started": False,
+        "owned_bridge_shutdown_confirmed": False,
         "budget": {
             "planned_runs": 3,
             "max_initial_workflow_posts": MAX_INITIAL_POSTS,
@@ -1941,12 +2081,19 @@ def _write_live_evidence(
     evidence: dict[str, Any], approval_id: str, secrets_to_reject: Sequence[str]
 ) -> None:
     assert_safe_evidence(evidence, secrets_to_reject=secrets_to_reject)
-    docs = REPOSITORY_ROOT / "docs"
-    evidence_path = docs / f"phase_c5_workflow_acceptance-{approval_id}.json"
-    summary_path = docs / "phase_c5_p2_live_acceptance.md"
+    evidence_path, summary_path = _live_evidence_paths(approval_id)
     if evidence_path.exists() or summary_path.exists():
         raise RunnerAbort("BLOCKED", "live_evidence_output_already_exists")
-    _atomic_json(evidence_path, evidence)
+    payload = json.dumps(evidence, ensure_ascii=False, allow_nan=False, sort_keys=True) + "\n"
+    try:
+        with evidence_path.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        raise RunnerAbort("BLOCKED", "live_evidence_output_already_exists") from None
+    except OSError:
+        raise RunnerAbort("BLOCKED", "live_evidence_write_failed") from None
     gates = evidence.get("gates", {})
     budget = evidence.get("budget", {})
     summary = (
@@ -1955,6 +2102,9 @@ def _write_live_evidence(
         f"- Source HEAD: {evidence.get('approved_source_head')}\n"
         f"- Runner source SHA-256: {evidence.get('runner_source_sha256')}\n"
         f"- Gate 0: {gates.get('gate0')}\n"
+        f"- Gate 0 stage: {evidence.get('gate0_stage')}\n"
+        f"- Owned Bridge started: {evidence.get('owned_bridge_started')}\n"
+        f"- Owned Bridge shutdown confirmed: {evidence.get('owned_bridge_shutdown_confirmed')}\n"
         f"- Gate 1 human GUI: {gates.get('gate1')}\n"
         f"- Gate 2 1/2/3 jobs: {gates.get('gate2')}\n"
         f"- Gate 3 read-only restart: {gates.get('gate3')}\n"
@@ -1969,6 +2119,8 @@ def _write_live_evidence(
             stream.write(summary)
             stream.flush()
             os.fsync(stream.fileno())
+    except FileExistsError:
+        raise RunnerAbort("BLOCKED", "live_evidence_output_already_exists") from None
     except OSError:
         raise RunnerAbort("BLOCKED", "live_summary_write_failed") from None
 
@@ -1986,6 +2138,7 @@ def execute_live(approved_head: str, approval_id: str) -> int:
     }
     evidence = _create_evidence(approval_id, preflight)
     try:
+        evidence["gate0_stage"] = "preflight"
         ledger = AttemptLedger.create(
             REPOSITORY_ROOT / "docs" / ".phase_c5_attempt_budgets",
             approval_id,
@@ -1994,9 +2147,11 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         )
         preflight = live_preflight(approved_head, approval_id)
         evidence = _create_evidence(approval_id, preflight)
+        evidence["gate0_stage"] = "preflight_ok"
         evidence["gates"]["gate0"] = "PASS"
         b5 = _b5()
         context = b5._make_isolated_context(preflight["codex_executable"], preflight["source_home"])
+        evidence["gate0_stage"] = "context_created"
         secrets_to_reject = (context.control_token, context.mcp_token)
         validate_isolated_layout(
             context.temp_root,
@@ -2005,6 +2160,7 @@ def execute_live(approved_head: str, approval_id: str) -> int:
             context.ports,
             require_state_root=False,
         )
+        evidence["gate0_stage"] = "prestart_layout_validated"
         expected_localappdata = context.temp_root.resolve(strict=True) / "localappdata"
         localappdata_value = context.environment.get("LOCALAPPDATA")
         try:
@@ -2025,7 +2181,10 @@ def execute_live(approved_head: str, approval_id: str) -> int:
                 raise RunnerAbort("BLOCKED", "isolated_environment_root_mismatch")
         if context.control_token == context.mcp_token:
             raise RunnerAbort("BLOCKED", "isolated_tokens_not_distinct")
-        start_isolated_bridge(context)
+        evidence["gate0_stage"] = "environment_validated"
+        evidence["gate0_stage"] = "initializing_isolated_state"
+        _initialize_isolated_state_root(context)
+        evidence["gate0_stage"] = "isolated_state_created"
         validate_isolated_layout(
             context.temp_root,
             context.state_root,
@@ -2033,7 +2192,34 @@ def execute_live(approved_head: str, approval_id: str) -> int:
             context.ports,
             require_state_root=True,
         )
+        evidence["gate0_stage"] = "isolated_state_validated"
+        if context.process is not None or context.identity is not None:
+            raise RunnerAbort("BLOCKED", "isolated_bridge_context_not_fresh")
+        evidence["gate0_stage"] = "starting_bridge"
+        evidence["owned_bridge_started"] = None
+        evidence["owned_bridge_shutdown_confirmed"] = None
+        try:
+            start_isolated_bridge(context)
+        except Exception:
+            if context.process is not None and context.identity is not None:
+                evidence["owned_bridge_started"] = True
+                evidence["owned_bridge_shutdown_confirmed"] = False
+            raise RunnerAbort("UNKNOWN", "owned_bridge_start_outcome_unknown") from None
+        if context.process is None or context.identity is None:
+            raise RunnerAbort("UNKNOWN", "owned_bridge_start_outcome_unknown")
+        evidence["owned_bridge_started"] = True
+        evidence["owned_bridge_shutdown_confirmed"] = False
+        evidence["gate0_stage"] = "bridge_ready"
+        validate_isolated_layout(
+            context.temp_root,
+            context.state_root,
+            context.workspace,
+            context.ports,
+            require_state_root=True,
+        )
+        evidence["gate0_stage"] = "poststart_layout_validated"
         adapter = LiveAdapter(context, ledger)
+        evidence["gate0_stage"] = "starting_runs"
         outcome = execute_runs(build_run_cases(), ledger, adapter)
         evidence["gates"]["gate0"] = "PASS"
         evidence["gates"]["gate2"] = outcome["gate2"]
@@ -2042,6 +2228,7 @@ def execute_live(approved_head: str, approval_id: str) -> int:
         evidence["budget"]["observed_initial_workflow_posts"] = ledger.post_count
         evidence["budget"]["observed_codex_jobs"] = ledger.job_count
         evidence["status"] = "LIVE_RUNS_PASS_GUI_NOT_RUN"
+        evidence["gate0_stage"] = "runs_completed"
         ledger.data["status"] = "live_runs_pass_gui_not_run"
         ledger._save("live_runs_pass_gui_gate_not_run")
         exit_code = 0
@@ -2074,13 +2261,14 @@ def execute_live(approved_head: str, approval_id: str) -> int:
             except Exception:
                 if evidence is not None:
                     evidence["gates"]["gate3"] = "BLOCKED"
-        if context is not None and context.process is not None:
+        bridge_started = evidence.get("owned_bridge_started") if evidence is not None else False
+        if bridge_started is True:
             try:
+                if context is None or context.process is None or context.identity is None:
+                    raise RunnerAbort("BLOCKED", "owned_bridge_identity_missing_for_cleanup")
                 if context.process.poll() is None:
                     b5 = _b5()
                     identity = context.identity
-                    if identity is None:
-                        raise RunnerAbort("BLOCKED", "owned_bridge_identity_missing_for_cleanup")
                     stop_owned_process(
                         context.process,
                         identity,
@@ -2096,12 +2284,23 @@ def execute_live(approved_head: str, approval_id: str) -> int:
                     )
                 if context.process.poll() is None:
                     raise RunnerAbort("BLOCKED", "owned_bridge_shutdown_not_confirmed")
+                if evidence is not None:
+                    evidence["owned_bridge_shutdown_confirmed"] = True
             except Exception:
                 if evidence is not None:
+                    evidence["owned_bridge_shutdown_confirmed"] = None
                     evidence["gates"]["gate3"] = "BLOCKED"
                     evidence["status"] = "BLOCKED"
                     evidence["terminal_code"] = "owned_shutdown_unconfirmed"
                     exit_code = 2
+        elif bridge_started is None:
+            if evidence is not None:
+                evidence["owned_bridge_shutdown_confirmed"] = None
+                evidence["gates"]["gate3"] = "UNKNOWN"
+                if evidence.get("status") == "RUNNING":
+                    evidence["status"] = "UNKNOWN"
+                    evidence["terminal_code"] = "owned_bridge_start_outcome_unknown"
+                exit_code = 2
         if ledger is not None:
             _apply_ledger_to_evidence(evidence, ledger)
         if evidence is not None:
