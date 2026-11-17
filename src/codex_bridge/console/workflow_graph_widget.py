@@ -1064,8 +1064,17 @@ class WorkflowExecutionGraphWidget(QWidget):
         self.graph_status_label.setText(message)
 
     def clear_data(self) -> None:
+        self._selected_node_id = None
+        previous_signals_blocked = self.node_list.blockSignals(True)
+        try:
+            self.node_list.clear()
+        finally:
+            self.node_list.blockSignals(previous_signals_blocked)
+        self._node_items.clear()
+        self._edge_items.clear()
+        self._virtual_node_items.clear()
+        self._scope_labels.clear()
         self.graph_scene.clear()
-        self.node_list.clear()
         self.event_list.clear()
         self.detail_view.clear()
         self._workflow_id = None
@@ -1074,11 +1083,6 @@ class WorkflowExecutionGraphWidget(QWidget):
         self._snapshot = None
         self._structure = None
         self._node_records.clear()
-        self._node_items.clear()
-        self._edge_items.clear()
-        self._virtual_node_items.clear()
-        self._scope_labels.clear()
-        self._selected_node_id = None
         self._reset_events()
         self._omitted_graph_count = 0
         self._graph_truncated = False

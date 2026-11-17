@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, QSize, Qt
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QScrollArea
 
 from codex_bridge.console.i18n import tr
@@ -395,6 +395,213 @@ def test_graph_keeps_event_history_for_same_run_and_clears_new_identity() -> Non
     assert graph.set_snapshot("workflow-history-two", new_workflow)
     assert graph.event_cursor == 0 and graph.event_list.count() == 0
     assert "result survives graph updates" in dialog.final_text_view.toPlainText()
+    dialog.close()
+    app.processEvents()
+
+
+def _one_graph_event_page(workflow_id: str, run_id: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "events": [
+            {
+                "event_id": 1,
+                "event_type": "task_started",
+                "node_id": "/do/0/for-many",
+                "occurred_at": "2026-11-17T03:00:00Z",
+                "source": "interpreter",
+                "metadata": {},
+            }
+        ],
+        "next_after_id": 1,
+        "has_more": False,
+        "truncated": False,
+        "coverage": "partial",
+        "coverage_reason": "workflow_not_confirmed",
+        "latest_event_id": 1,
+    }
+
+
+def test_clear_data_blocks_selection_signal_before_destroying_scene_items() -> None:
+    app = _app()
+    dialog = WorkflowManagementDialog()
+    graph = dialog.graph_widget
+    workflow_id = "workflow-clear-selected"
+    run_id = "run-clear-selected"
+    snapshot = _scenario_snapshot(workflow_id, run_id, "e")
+    snapshot["coverage"] = "partial"
+    snapshot["coverage_reason"] = "workflow_not_confirmed"
+    snapshot["latest_event_id"] = 1
+    assert graph.set_snapshot(workflow_id, snapshot)
+    assert graph.set_events(_one_graph_event_page(workflow_id, run_id))
+
+    selection_spy = QSignalSpy(graph.node_list.currentItemChanged)
+    graph.node_list.setCurrentRow(1)
+    app.processEvents()
+    assert graph.selected_node_id == "/do/0/for-many"
+    assert selection_spy.count() == 1
+    before_clear_count = selection_spy.count()
+
+    graph.clear_data()
+    app.processEvents()
+
+    assert selection_spy.count() == before_clear_count
+    assert graph.selected_node_id is None
+    assert graph.snapshot_identity is None
+    assert graph.node_list.count() == 0
+    assert graph.graph_scene.items() == []
+    assert graph.node_items == {}
+    assert graph.edge_items == []
+    assert graph.virtual_node_items == {}
+    assert graph._scope_labels == []
+    assert graph.event_list.count() == 0
+    assert graph.event_cursor == 0
+    assert graph.detail_view.toPlainText() == ""
+    dialog.close()
+    app.processEvents()
+
+
+def test_clear_data_restores_previously_blocked_signals_and_allows_new_run() -> None:
+    app = _app()
+    dialog = WorkflowManagementDialog()
+    graph = dialog.graph_widget
+    first_id = "workflow-preblocked-first"
+    first_run = "run-preblocked-first"
+    first = _scenario_snapshot(first_id, first_run, "f")
+    first["coverage"] = "partial"
+    first["coverage_reason"] = "workflow_not_confirmed"
+    first["latest_event_id"] = 1
+    assert graph.set_snapshot(first_id, first)
+    assert graph.set_events(_one_graph_event_page(first_id, first_run))
+
+    graph.node_list.blockSignals(True)
+    graph.clear_data()
+    assert graph.node_list.signalsBlocked()
+    assert graph.selected_node_id is None
+    assert graph.node_items == {}
+    assert graph.graph_scene.items() == []
+
+    second_id = "workflow-preblocked-second"
+    second_run = "run-preblocked-second"
+    second = _scenario_snapshot(second_id, second_run, "a")
+    second["coverage"] = "partial"
+    second["coverage_reason"] = "workflow_not_confirmed"
+    second["latest_event_id"] = 1
+    assert graph.set_snapshot(second_id, second)
+    assert graph.set_events(_one_graph_event_page(second_id, second_run))
+    graph.select_node("/do/0/switch-one")
+    assert graph.selected_node_id == "/do/0/switch-one"
+    assert graph.node_list.signalsBlocked()
+    graph.clear_data()
+    assert graph.node_list.signalsBlocked()
+    graph.node_list.blockSignals(False)
+
+    third_id = "workflow-after-clear"
+    third_run = "run-after-clear"
+    third = _scenario_snapshot(third_id, third_run, "b")
+    third["coverage"] = "partial"
+    third["coverage_reason"] = "workflow_not_confirmed"
+    third["latest_event_id"] = 1
+    assert graph.set_snapshot(third_id, third)
+    assert graph.set_events(_one_graph_event_page(third_id, third_run))
+    graph.node_list.setCurrentRow(1)
+    app.processEvents()
+    assert graph.selected_node_id == "/do/0/for-many"
+    assert graph.event_cursor == 1
+    assert graph.event_list.count() == 1
+    dialog.close()
+    app.processEvents()
+
+
+def test_dialog_workflow_switch_stress_keeps_graph_and_detail_in_sync() -> None:
+    app = _app()
+    dialog = WorkflowManagementDialog()
+    graph = dialog.graph_widget
+    scenarios = (
+        ("workflow-a", "run-a", "A", "succeeded"),
+        ("workflow-b", "run-b", "B", "succeeded"),
+        ("workflow-c", "run-c", "C", "succeeded"),
+        ("workflow-unknown", "run-unknown", "Unknown", "unknown"),
+    )
+    rows: list[dict[str, object]] = []
+    payloads: dict[str, dict[str, object]] = {}
+    for index, (workflow_id, run_id, label, status) in enumerate(scenarios):
+        snapshot = _scenario_snapshot(workflow_id, run_id, chr(ord("a") + index))
+        snapshot["workflow_status"] = status
+        snapshot["coverage"] = "partial"
+        snapshot["coverage_reason"] = "workflow_not_confirmed"
+        snapshot["latest_event_id"] = 1
+        payloads[workflow_id] = {
+            "run_id": run_id,
+            "label": label,
+            "status": status,
+            "snapshot": snapshot,
+            "events": _one_graph_event_page(workflow_id, run_id),
+        }
+        rows.append({"workflow_id": workflow_id, "status": status})
+
+    applied: list[str] = []
+
+    def apply_workflow(workflow_id: str) -> None:
+        payload = payloads[workflow_id]
+        graph_payload = payload["snapshot"]
+        event_payload = payload["events"]
+        assert isinstance(graph_payload, dict)
+        assert isinstance(event_payload, dict)
+        detail = {
+            "workflow_id": workflow_id,
+            "status": payload["status"],
+            "created_at": "2026-11-17T03:00:00Z",
+            "updated_at": "2026-11-17T03:01:00Z",
+            "worker_state": "completed" if payload["status"] == "succeeded" else "unknown",
+            "max_live_codex_jobs": 1,
+        }
+        dialog.set_detail(detail)
+        dialog.set_result({"result": {"final_text": f"synthetic result {payload['label']}"}})
+        assert graph.set_snapshot(workflow_id, graph_payload)
+        assert graph.set_events(event_payload)
+        dialog.set_message(f"Synthetic scenario {payload['label']}")
+        applied.append(workflow_id)
+
+    dialog.workflow_selected.connect(apply_workflow)
+    dialog.set_bridge_ready(False)
+    dialog.set_start_enabled(False)
+    dialog.set_workflows(rows, selected_workflow_id=scenarios[0][0])
+    dialog.resize(900, 760)
+    dialog.show()
+    app.processEvents()
+    assert dialog.selected_workflow_id == scenarios[0][0]
+
+    graph_index = {
+        workflow_id: index for index, (workflow_id, _run, _label, _status) in enumerate(scenarios)
+    }
+    for cycle in range(50):
+        dialog.result_tabs.setCurrentIndex(1 if cycle < 25 else 0)
+        app.processEvents()
+        for target_index in (1, 2, 3, 0):
+            workflow_id, run_id, label, status = scenarios[target_index]
+            dialog.workflow_list.setCurrentRow(target_index)
+            app.processEvents()
+            assert dialog.selected_workflow_id == workflow_id
+            assert dialog.detail_labels["workflow_id"].text() == workflow_id
+            assert dialog.detail_labels["status"].text() != "Not available"
+            assert f"synthetic result {label}" in dialog.final_text_view.toPlainText()
+            assert label in dialog.status_label.text()
+            assert graph.snapshot_identity is not None
+            assert graph.snapshot_identity[:2] == (workflow_id, run_id)
+            assert graph.event_cursor == 1
+            assert graph.event_list.count() == 1
+            assert graph_index[workflow_id] == target_index
+            assert applied[-1] == workflow_id
+
+            graph.node_list.setCurrentRow(1)
+            app.processEvents()
+            assert graph.selected_node_id == "/do/0/for-many"
+            assert graph.event_cursor == 1
+            assert not dialog.start_button.isEnabled()
+
+    assert len(applied) == 201
     dialog.close()
     app.processEvents()
 
