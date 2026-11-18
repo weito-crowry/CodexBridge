@@ -19,6 +19,7 @@ I1の純粋な契約コンパイル、JSON正規化、Schema検証コアを追�
 - Proposed上限としてcontract 64 KiB、normalized input 96 KiB、output/variable initial 64 KiB、declarations 256、Schema depth 24 / nodes 512 / properties 512 / ref depth 16、JSON value depth 32 / object properties 1024 / array length 10000を適用します。
 
 返却されるcontract構造はコピーとして扱い、呼び出し元の変更でcompiled stateが変化しないようにしています。JSON Schemaの追加keyword、外部参照、循環参照は明示的に拒否します。
+`CompiledContract`のreprではcanonical contract本文を非表示にし、digestは表示します。テストでinput defaultとvariable initialのsentinel値がreprへ漏れず、canonical本文プロパティには保持されることを確認しています。
 
 ## 検証結果
 
@@ -26,7 +27,7 @@ I1の純粋な契約コンパイル、JSON正規化、Schema検証コアを追�
 
 | 検証 | 結果 |
 | --- | --- |
-| `uv run pytest -q -ra tests/test_workflow_d1_i1_contract_core.py` | PASS — 38 passed、0 failed |
+| `uv run pytest -q tests/test_workflow_d1_i1_contract_core.py` | PASS — 39 passed、0 failed |
 | `uv run pytest -q -ra tests/test_workflow_d1_i0_baseline.py` | PASS — 8 passed、0 failed |
 | `uv run pytest -q -ra tests/test_workflow_definitions.py tests/test_workflow_definition_api.py` | PASS — 31 passed、2 skipped、0 failed（73.90秒） |
 | `uv run ruff check src/codex_bridge/workflows/contracts.py tests/test_workflow_d1_i1_contract_core.py` | PASS |

@@ -562,7 +562,7 @@ class CompiledContract:
     """Immutable canonical snapshot; properties return newly parsed copies."""
 
     contract_sha256: str
-    contract_json_canonical: str
+    contract_json_canonical: str = field(repr=False)
     _input_schema_json: str = field(repr=False)
     _output_schema_json: str = field(repr=False)
     _variables_json: str = field(repr=False)

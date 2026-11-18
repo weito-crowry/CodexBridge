@@ -138,6 +138,22 @@ def test_compile_contract_is_immutable_and_uses_canonical_sha256() -> None:
     assert compiled.variables == []
 
 
+def test_compiled_contract_repr_hides_contract_values_but_keeps_digest() -> None:
+    sentinel = "private-contract-value-sentinel"
+    raw = _contract(
+        input_schema=_schema(properties={"defaulted": {"type": "string", "default": sentinel}}),
+        variables=[_variable("private", "private", initial=sentinel)],
+    )
+
+    compiled = compile_contract(raw)
+    rendered = repr(compiled)
+
+    assert sentinel not in rendered
+    assert compiled.contract_sha256 in rendered
+    assert compiled.contract_json_canonical == canonical_json(raw)
+    assert sentinel in compiled.contract_json_canonical
+
+
 @pytest.mark.parametrize(
     "replacement",
     [
