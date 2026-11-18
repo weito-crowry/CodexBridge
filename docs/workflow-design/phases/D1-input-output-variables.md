@@ -1,8 +1,8 @@
 # D1: Workflow共通入出力契約・変数・スコープ
 
 - **文書状態:** DRAFT / Proposed（レビュー待ち）
-- **基本仕様:** v0.2は合意済み。本書のProposed decisionsは第1回の詳細設計候補であり、設計承認・実装完了を意味しません。
-- **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)
+- **基本仕様:** v0.2は合意済み。本書のProposed decisionsは詳細設計候補であり、設計承認・実装完了を意味しません。
+- **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)
 
 ## 1. 背景と目的
 
@@ -92,6 +92,10 @@ binding_digestは同じcanonical JSON方式によるSHA-256とし、definition_i
 
 legacy revisionにはcontract rowを作らず、従来の検証とrequest identityを維持します。contractだけを同一revisionへ更新せず、contract変更は新revisionを作成します。strict ETagはcontractを含むversioned identityに拡張しますが、wire表現と既存ETag移行影響は後続設計に残します。
 
+**Proposed migration:** 現行definitions.sqliteはPRAGMA user_version=1で、現行schema checkerはテーブル名の完全一致を検査します。strict contract用テーブル追加には単一SQLite write transactionによるv1→v2 migrationを用い、既存revision row、primary key、YAML hash、legacy ETagの値を保持します。v2でworkflow_definition_contractsを追加し、PRAGMA user_version=2とv2 schemaを検査します。既存legacy revisionにcontract用NULL rowは作らず、行を欠落させます。既存workflow_definition_revisionsへcontract列を後付けしません。
+
+migration途中のクラッシュはtransaction rollbackか全完了のどちらかとし、中間schemaを受け入れません。起動時schema不一致はfail closedです。運用案はwriter停止、DB backup、upgrade、対応版restart、schema・既存revision・legacy ETag検証の順です。v2へupgradeしたDBと旧プロセスの同時運用はサポートしません。旧コードはuser_version v2を検出してfail closedする前提です。SQL本文、実際のmigration実行は本DRAFTの範囲外です。
+
 ### 4.3 create/updateとcontract指定
 
 - legacy create/updateでcontractが省略された場合は従来どおりlegacy revisionとして扱います。
@@ -142,7 +146,11 @@ strict runはstrict v2のversioned manifest/request-digest経路を使い、固�
     validate_output(revision_identity, output_value)
       -> valid output / contract violation
 
-既存のsaved Workflow startは選択revision、client request id、workspace、input_dataを使います。D1で別のmain/sub呼び出し口を作りません。現行のHTTP start request上限は128 KiB、OWS YAML上限は64 KiBです。strict runはversioned v2 manifest/request-digest経路にbinding_digestとnormalized input hashを加え、legacy v1 manifestの検証と既存request digestは再解釈しません。v1/v2の具体的な識別fieldと契約追加後の総量・保存・応答上限は後続設計に残します。
+既存のsaved Workflow startは選択revision、client request id、workspace、input_dataを使います。D1で別のmain/sub呼び出し口を作りません。現行のHTTP start request上限は128 KiB、OWS YAML上限は64 KiBです。strict runはmanifestのrun_format_version=2とrequests.sqliteのstrict binding rowを相互検証し、binding_digestとnormalized input hashを持つversioned request-digest経路を使います。run_format_versionがないmanifestはlegacy v1として扱い、legacy digestの計算と検証は変更しません。契約追加後の総量・保存・応答上限は後続設計に残します。
+
+strict v2 request_digestは名前空間付きcanonical JSON（codexbridge-workflow-request-v2）から一度だけ算出します。Workflow canonical content、workspace、max_live_codex_jobs、definition ID/revision、YAML source SHA、contract SHA、binding digest、normalized input SHA、および他の実行identityを含め、requests ledgerとmanifest検証で同一規則を使います。具体的なcanonical payload field namesは後続設計事項です。
+
+strict manifestの追加field案はrun_format_version=2、definition_id、definition_revision、contract_version=1、contract_sha256、binding_digest、normalized_input_sha256、variable_store.filename=variables.sqlite、variable_store.schema_version=1です。secret、variable value、promptはmanifestに保存しません。request binding rowの案はworkflow_request_contract_bindingsをtable名とし、run_idをkeyにworkflow_id、definition_id、definition_revision、run_format_version、contract_version、contract_sha256、binding_digest、normalized_input_sha256、request_digestを保持します。いずれも既存legacy manifest/request rowを遡及変更しません。
 
 Workflow呼び出し元はinput Schemaを使って一度だけ正規化・検証します。成功時にDBOS runへ渡すinput_dataは正規化済み値です。既存メインフローのinput_dataとJSON resultの形は維持し、Schemaが値の意味やwire shapeを勝手に変えません。
 
@@ -199,20 +207,24 @@ Workflow scopeはrun内で有効です。Issue値は該当Issue frame、Attempt�
 
 ## 8. 永続化とDBOS回復設計案
 
-### 8.1 概念的な永続モデル
+### 8.1 run-local変数DBと概念的な永続モデル
 
-DB table名・列名を確定する前の論理モデルです。
+**Proposed:** 各Workflow run directoryに独立したvariables.sqliteを新規作成します。配置例は $LOCALAPPDATA/CodexBridge/workflows/run-<runid>/variables.sqlite です。definitions.sqlite、requests.sqlite、run-localのdbos.sqlite、node-event DBの既存tableへ変数値を混在させません。variables.sqliteの専用schemaはVariableState、ScopeFrame、VariableMutation、RunBindingを持ちます。各tableの正確なDDL・index・CHECK制約はOpen question 9に残します。
+
+DBはPRAGMA user_version=1、想定journal_mode=WAL、synchronous=FULL、busy_timeout設定、foreign_keys=ON、write時BEGIN IMMEDIATEを候補とし、接続時にuser_versionとschemaを厳格に検査します。読取専用inspectionはreadonly接続とし、DBを新規作成・初期化しません。run_dirのcanonical path、run ID、workflow identityとRunBindingの所有関係を毎回照合し、symlink、junction、その他reparse pointを拒否します。Windowsでの安全なファイル作成とACL設定はOpen question 11に残します。明示的なDB容量上限も未決です。
+
+variables.sqlite transactionとDBOS step/checkpointは別transactionです。run directory上の新規DBに初期状態を準備し、requests.sqliteのrequest reservationとbinding rowを別のSQLite transactionで確定するため、両者をまたぐatomic commitはありません。
 
 | レコード | 必須の論理情報 |
 | --- | --- |
 | VariableState | run_id、scope_frame_id、variable_name、type、value、version、value_digest、機密区分 |
 | ScopeFrame | run_id、frame_id、parent_frame_id、stable_scope_path、iteration vector、call context、frame status |
 | VariableMutation | execution_key、payload_digest、before_digest、after_digest、before/after version、commit outcome |
-| RunContractBinding | run_id、definition_id/revision、YAML hash、contract hash、binding digest、normalized input digest |
+| RunBinding | run_id、workflow/definition identity、revision、contract version/hash、binding digest、normalized input digest、owner、store schema version、初期化状態 |
 
 ユーザーの未追跡ファイルやOWS汎用contextへvariable stateを混ぜません。strict v1ではsensitivity=secretの宣言を持つWorkflowと、secret値を含むと明示分類されたinputを受け付けず、明示拒否します。secret valueの保存方式は将来の別設計です。
 
-VariableState、ScopeFrame、VariableMutationは同じrunを所有する永続SQLite DBで管理し、各mutationのstate更新と台帳記録を同一transactionにします。DBの配置をrun-directory単位にするかstate-root shared DBにするかはOpen questionです。
+VariableState、ScopeFrame、VariableMutation、RunBindingはrun-local variables.sqliteで管理します。各mutationのstate更新と台帳記録は同一transactionにします。run directoryはrunごとに所有され、別run間で変数DBを共有しません。
 
 ### 8.2 mutation identity
 
@@ -234,11 +246,11 @@ execution_keyは、次のidentityを決定的に結合する案です。
 
 1. DBOS named stepがexecution_key、payload_digest、期待するbefore version/digest、operationと値を構成します。
 2. workerがSQLite write transactionを開始し、同じexecution_keyのledger行を探します。
-3. 既存行がありpayload_digestも同じなら、保存済みafter version/digest/valueを検証して記録済み結果を返します。mutationを再適用しません。
+3. 既存行がありpayload_digestも同じなら、そのledger行に記録済みのafter value/digest/versionを、そのmutationの結果として返します。ledger payload/hash/結果の自己整合、version chain、RunBinding、DBOS checkpointとの対応を検証します。後続mutationがcommit済みならVariableStateは歴史的after valueから先へ進んでいて正当なため、現在のlatest stateと過去mutationのafter digestが同一であることを要求しません。
 4. 既存行が同じkeyで別payloadなら、runをNEEDS_RECONCILIATION相当の状態にし、再適用せずconflictを返します。
-5. 初回ならbefore version/digestを現在値と照合し、operation、型、scope、Schemaを検証します。
+5. 初回mutationに限りbefore version/digestを現在値とCAS照合し、operation、型、scope、Schemaを検証します。
 6. 新しい値・version/digestとmutation ledgerを同じtransactionでcommitします。どちらかだけをcommitしません。
-7. DBOS stepのcheckpointにはexecution_keyとpayload/before/after digestを含めます。workflow側はcheckpointから復帰した後も対応ledgerとの一致を確認してから次のnodeへ進みます。
+7. DBOS stepのcheckpointにはexecution_keyとpayload/before/after digestを含めます。workflow側はcheckpointから復帰した後も対応ledgerとの一致を確認してから次のnodeへ進みます。過去mutationのreplayでlatest VariableStateを古いafter valueへ戻したり、更新を再加算・再appendしたりしません。
 
 ### 8.4 Crash/replay境界
 
@@ -249,9 +261,10 @@ DBOS checkpointと変数SQLite transactionを一つの物理transactionにでき
 | transaction開始前 | ledgerも値も未変更 | 同じstepが初回mutationとして実行 |
 | transaction中、commit前 | transaction rollbackでledger・値とも未変更 | 同じkeyで初回実行 |
 | SQLite commit後、DBOS checkpoint前 | ledgerと値はcommit済み、checkpointは未完了 | step再実行は同一key・payloadを読み、after stateを返して二重更新しない |
+| 後続mutationがcommit済みの後、過去stepを再生 | ledger chainとlatest stateは後続versionまで進行 | 過去ledgerに記録した結果を返し、latest stateとの同値を要求せず、巻戻し・再適用しない |
 | DBOS checkpoint後 | checkpointとledgerがある | checkpoint identity/digestとledgerを照合して続行 |
 | 同一keyでpayload違い | 既存ledgerと再生要求が不一致 | conflict、値を上書きせずneeds_reconciliationへ |
-| checkpointとledgerの片方欠落・digest不一致 | durable記録間に矛盾 | 自動修復や再計算をせずneeds_reconciliationへ |
+| checkpointとledgerの片方欠落・digest不一致、chain矛盾 | durable記録間に矛盾 | 自動修復や再計算をせずneeds_reconciliationへ |
 
 既存Codex MAYBE_SENTは外部送信の不確実性です。変数更新がcommit済みかの確認にMAYBE_SENTを流用しません。
 
@@ -264,12 +277,15 @@ strict contractの一回のsaved Workflow runは、次の順序を通る案で�
 3. Schema dialect、許可キーワード、内部参照、declaration一意性、default自身、scope宣言を検証する。
 4. raw inputに正規化を一度適用する。missing/nullを保ち、採用されたdefaultだけを追加する。
 5. normalized inputをinput Schemaで検証する。invalidならWorkflowを起動しない。
-6. 固定revision、contract binding、normalized input、既存request identityを含むrequest digestを作る。同じrequest idの同一digestは既存runへreplayし、異なるdigestはconflictにする。
-7. Workflow frameと変数宣言を初期化して永続化する。loop/nested frameはD5等が将来入る位置で親から分離して作る。
-8. 各mutationをDBOS named stepとSQLite mutation ledgerで実行する。
-9. Workflow終了時に明示return/exportのJSON候補を作り、output Schemaで検証する。
-10. validなら既存JSON result shapeに沿って結果を確定する。不正ならFAILEDとして扱い、親への戻り値を出さない。
-11. Graph/MCP/UI/通常ログは公開projectionを作り、入力・prompt・variable・outputの秘匿値を含めない。
+6. strict v2用request digestを作り、run directoryとimmutable YAML/input/manifest snapshotを準備します。manifestはrun_format_version=2とcontract/revision/binding/normalized input identityを持ち、input.jsonは正規化済みinputです。秘匿値はmanifestに記録しません。
+7. run-local variables.sqliteを作成し、schemaとownerを検査したうえでRunBindingのstatus=INITIALIZEDを記録します。
+8. requests.sqliteのrequest rowとworkflow_request_contract_bindings rowを同一request DB transactionで予約します。strict reservationが確定する前にworkerへ実行を渡しません。
+9. worker開始時およびrecover時にrequest binding、manifest、immutable YAML/input、contract revision/hash、variables.sqlite schema/owner/RunBinding、mutation ledgerとDBOS checkpointを照合してから再開します。
+10. 各mutationをDBOS named stepとSQLite mutation ledgerで実行します。
+11. Workflow終了時に明示return/exportのJSON候補を作り、output Schemaで検証します。validなら既存JSON result shapeに沿って結果を確定し、不正ならFAILEDとして扱い親へ戻しません。
+12. Graph/MCP/UI/通常ログは許可済みメタ情報だけの公開projectionを作り、入力・prompt・variable・outputの実値を含めません。
+
+run directory準備後、requests.sqlite予約前にcrashするとorphan directoryが残る可能性があります。orphanをWorkflowとして自動復活させず監査対象とします。cleanupはrequest reservationや他の実行が存在しないことを確認した後に限り候補とし、その確認前に自動削除しません。strict request予約後にvariables.sqliteが欠落・破損していればneeds_reconciliationで停止し、再作成・worker実行・外部job再送を行いません。request bindingがある場合はrecover経路でもv2を強制します。manifest/binding不一致、未知version、owner/schema/ledger不整合はUNKNOWNまたはNEEDS_RECONCILIATIONとして止め、成功・受入成功と返しません。DB間atomic commitは仮定しません。
 
 ## 10. 公開・内部API契約案
 
@@ -279,6 +295,8 @@ strict contractの一回のsaved Workflow runは、次の順序を通る案で�
 | --- | --- | --- | --- |
 | revision contract load | definition_id、revision | YAML/contract/binding identity | revision欠落はNOT_FOUND、hash不整合は保存不整合 |
 | input normalize/validate | 固定contract、raw JSON | normalized JSON、normalization digest | Schema不正・必須欠落・型不一致は実行前拒否 |
+| strict run reserve | request row、run_format_version=2、contract binding | reserved run identity | requests DB内で両rowを同一transactionにし、不整合はreconciliation |
+| strict run recover | request binding、manifest、definition/contract、variables store | 検証済み再開位置 | 欠落・破損・version/hash/owner不一致なら停止し、storeを再作成しない |
 | variable read | run/frame selector、declaration selector | typed JSON value、version/digest | missing/ambiguous/invalid scopeは明示エラー |
 | variable mutate | execution_key、payload、expected before identity | commit済みvalue/version/digest | stale before、同key異payloadはconflict |
 | child input boundary | fixed child revision、explicit argument JSON | child用normalized input | D6で実装。D1では契約のみ |
@@ -292,6 +310,7 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 
 - Draft 2020-12以外のdialectはstrict contractで受け付けません。
 - malformed Schema、未許可のvalidation keyword、required additionalPropertiesの欠落、remote/recursive $ref、digest mismatch、revision不一致を実行前に検出します。
+- definitions.sqlite v1→v2 migration後はuser_versionとschemaを厳格検査します。requests.sqliteのbinding rowとmanifest run_format_versionを相互確認し、片側の欠落・改変をlegacy v1として読み替えません。
 - contractとOWS YAMLは同じimmutable revisionとして照合します。
 - Schemaが使うJSON値にNaN/Infinity等のJSON外数値を認めません。
 - $refは同一Schema内の #/$defs/<name> への非循環参照だけを解決し、外部ネットワーク経由の参照解決を行いません。
@@ -315,6 +334,8 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 - declaration_idとframe_identityをread/writeごとに指定します。同名変数はscopeをまたいで許し、同scope内の重複と識別子重複は拒否します。
 - object_set/object_deleteはRFC 6901 pathを使い、更新後value_schemaに不適合ならmutation全体をrollbackします。
 - execution_keyには同一node内のmutation ordinalも含め、同key異payloadまたはdigest不一致をfail closedにします。
+- strict runは全read/recover経路でrequest binding・manifest v2・RunBinding・store schema/ownerを検証します。未対応readerはstrict runを作成・再開できません。
+- 過去execution_keyのreplayはそのledger記録の結果を返し、latest VariableStateとの同一性を要求しません。version chainやcheckpointとの矛盾はneeds_reconciliationにします。
 
 ## 12. 機密性、公開projection、リソース上限
 
@@ -323,6 +344,7 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 - 既存のCodexBridge tokenをWorkflow変数へ自動注入しません。
 - strict v1の初期実装では、sensitivity=secretの変数宣言とsecretを含むと明示された入力を受け付けず、明示的に拒否します。CodexBridge tokenを自動注入しません。secret保存・暗号鍵管理は将来の別設計です。
 - 公開projectionは入力実値、秘密値、prompt等をGraph/MCP/UI/通常ログや例外へ漏らさず、値をredactします。
+- Graph/MCPのv2 projectionは許可されたidentity・status・type・version等のメタ情報に限定し、変数の実値は公開しません。
 - 現行のHTTP Workflow requestは128 KiB、YAMLは64 KiBです。Schema、contract、input/output/valueの合計、depth/node数、HTTP/MCP応答などの具体上限は実装開始前に承認が必要です。
 - JSON Schema validatorで外部ネットワーク参照を行いません。
 
@@ -347,6 +369,9 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | stale before digest/version | VARIABLE_STATE_CONFLICT | retryで上書きせずconflict |
 | execution_key再利用でpayload違い | MUTATION_ID_CONFLICT | needs_reconciliation相当 |
 | checkpoint/ledger不一致 | MUTATION_RECONCILIATION_REQUIRED | 次nodeへ進まない |
+| v2 manifest/request binding不在・不一致・未知version | RUN_BINDING_RECONCILIATION_REQUIRED | UNKNOWN/NEEDS_RECONCILIATIONで停止し、実行・成功扱いしない |
+| 予約済みstrict runのvariables.sqlite欠落・破損・owner不一致 | VARIABLE_STORE_RECONCILIATION_REQUIRED | DBを再作成せずworkerを起動しない |
+| variables.sqliteが未知user_version/schemaまたはrun directoryがreparse point | VARIABLE_STORE_INVALID | 初期化せずfail closed |
 | output Schema違反 | OUTPUT_CONTRACT_VIOLATION | runをFAILED、親へ返さない |
 | strict v1でsecret変数またはsecret入力を宣言 | SECRET_VALUE_UNSUPPORTED | 明示拒否し、保存・実行しない |
 | 設定上限超過 | RESOURCE_LIMIT_EXCEEDED | 実行前または更新前に拒否 |
@@ -399,8 +424,32 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-39 | object_setの新規末尾key、欠けた親、required delete | 既存親だけ許し、Schema違反deleteはrollback |
 | D1-40 | 異なるexecution_keyで同じ値をappend | 同値追加を許し、unique-by/dedupを行わない |
 | D1-41 | strict sensitivity=secret宣言とsecret入力 | 明示拒否し、secret保管・実行へ進まない |
+| D1-42 | definitions.sqlite v1→v2 migration | 既存revision row、PK、hash、legacy ETagを維持し、user_versionとschemaをv2として検証 |
+| D1-43 | 定義migrationのwrite transaction中にcrash | 全rollbackまたは全commitとなり、中間table/schemaを残さない |
+| D1-44 | legacy revisionとstrict revisionのcontract row | legacyは行なし、strictのみ親revision FK付きworkflow_definition_contracts rowを持つ |
+| D1-45 | v2 definitions.sqliteを旧プロセスが開く | user_version/schema不一致を検出してfail closedし、既存データを変更しない |
+| D1-46 | strict request rowとworkflow_request_contract_bindings | requests.sqlite内の同一transactionで両方保存し、legacy requestにbinding rowを作らない |
+| D1-47 | strict manifest v2とinput snapshot | 必須identity fieldとvariables.sqlite filename/schema versionを持ち、秘匿実値を含めず、input.jsonはnormalized input |
+| D1-48 | binding row/manifestのversion削除・変更・片側欠落 | downgradeとしてlegacy解釈せずneeds_reconciliation、workerを開始しない |
+| D1-49 | strict v2 request digestの再計算 | namespaceと固定revision・binding・normalized input identityが一致し、legacy digestは不変 |
+| D1-50 | request予約前のrun directory orphan | Workflowとして自動復活させず監査対象にし、reservation未作成を確認するまで自動削除しない |
+| D1-51 | reservation済みstrict runでvariables.sqlite欠落・破損 | storeを再作成せずneeds_reconciliation、worker起動・Codex POSTなし |
+| D1-52 | variables.sqliteのunknown user_version/schema、readonly inspection | schema不一致はfail closedし、readonly inspectionはDB作成・初期化をしない |
+| D1-53 | run directoryがsymlink/junction/reparse point | identity/path検証で拒否し、外部pathを開かない |
+| D1-54 | variables.sqlite接続とRunBinding owner検査 | run/workflow identity、foreign key、想定pragma、store schemaを照合してからread/write |
+| D1-55 | SQLite mutation commit前・commit後checkpoint前のDBOS crash | rollback時は未反映、commit後はledger結果を返し、いずれも二重更新しない |
+| D1-56 | 後続mutation後に過去stepを再replay | 過去ledgerのafter value/digest/versionを返し、latest stateとの誤conflict・巻戻しを起こさない |
+| D1-57 | 同一execution_keyで異payload、version chain/ledger digest矛盾 | stateを上書きせずneeds_reconciliationにし、自己整合性を検出 |
+| D1-58 | replayされたappend/incrementとnode内複数mutation | mutation ordinalを含むkeyで結果を一度だけ反映し、append/加算を重複させない |
+| D1-59 | strict runのworker entry/start/recover/task projection/manager reader | 全readerがv2 bindingとmanifestを相互検証し、未対応readerはstrict runを扱わない |
+| D1-60 | legacy v1 request、manifest、digest、全reader | v1の既存照合と表示を維持し、strict v2へ再解釈しない |
+| D1-61 | variables.sqlite/RunBindingの不一致とread-only inspector | UNKNOWN/NEEDS_RECONCILIATIONとして停止し、状態再作成や成功投影を行わない |
+| D1-62 | Codex adapter MAYBE_SENTの既存回復 | 既存状態機械を維持し、v2 run reconciliationを理由に不確実なPOSTを再送しない |
+| D1-63 | definitions migrationの運用手順 | writer停止、backup、v1→v2 upgrade、対応版restart、schemaとlegacyデータ検証の順で確認 |
+| D1-64 | upgrade transaction中の失敗と事前backupからの復元 | migrationが全rollbackすることを確認し、退避backupを検証可能にする |
+| D1-65 | strict v2使用後のdowngrade/rollback判断 | v2データを保持したまま旧schemaへ戻せると仮定せず、backup retentionとrollback方針の確定前に運用移行を完了扱いにしない |
 
-D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。実装時に既存CI・適用可能なコマンドを再確認します。この文書のみの変更ではこれらを実行しません。
+D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。上記D1-42以降は追加migration・run lifecycle・回復受入項目です。実装時に既存CI・適用可能なコマンドを再確認します。この文書のみの変更ではこれらを実行しません。
 
 ## 15. D1出口条件
 
@@ -410,7 +459,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 
 ## 16. Proposed decisions（レビュー対象）
 
-以下はD1詳細設計第1回の確定候補です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。各項目は旧Open questions 1〜8、13への回答候補を具体化しています。
+以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-10は第1回の候補を維持し、PD-11以降は第2回で具体化した永続化・run binding・回復候補です。
 
 | ID | Proposed decision | 対応する論点 |
 | --- | --- | --- |
@@ -421,18 +470,25 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-05 | strict v1の全objectでadditionalPropertiesを必須明記し、暗黙trueをfalseへ改変しない。input properties defaultだけをdeep copyへ一度適用し、nested/existing-array objectを正規化する。output defaultとroot default補完は行わない。 | 旧Q4/Q5 |
 | PD-06 | 変数宣言はdeclaration_id、name、owner_scope、value_schema、optional initial、sensitivityを持つ。read/writeはdeclaration_idとframe_identityを明示し、同scope重複は拒否、別scope同名は許す。 | 旧Q7 |
 | PD-07 | initialize、assign、increment、decrement、append、object_set、object_delete、variable_deleteを論理操作として定義する。object pathはRFC 6901、schema違反deleteはrollback、同じ値の別key appendは許容しunique-byは対象外。 | 旧Q8 |
-| PD-08 | mutation execution_keyにはrun/revision binding、stable node path、全loop iteration vector、scope/frame、将来のsubflow call context、node内mutation ordinalを含める。SQLite mutation ledgerでDBOS checkpointとのreplay境界をつなぎ、MAYBE_SENTは流用しない。 | 旧Q8 |
+| PD-08 | mutation execution_keyにはrun/revision binding、stable node path、全loop iteration vector、scope/frame、将来のsubflow call context、node内mutation ordinalを含める。SQLite mutation ledgerでDBOS checkpointとのreplay境界をつなぎ、同じkeyの再実行は記録済みmutation結果を返す。過去mutationの結果とlatest VariableStateは一致しない場合があり、latest stateを巻き戻さない。MAYBE_SENTは流用しない。 | 旧Q8 |
 | PD-09 | strict入力は一度正規化してからvalidation・実行・idempotency digestに使用する。strict v2にbinding digestとnormalized input hashを加え、過去manifest/request digestとlegacy v1検証を再解釈しない。 | 旧Q13 |
 | PD-10 | strict v1初期実装はsecret変数とsecret入力を明示拒否する。token自動注入やplaintext secret保存を行わず、secret storage/key管理は別設計とする。 | 機密性候補 |
+| PD-11 | 変数状態はrun directory内の独立variables.sqliteに保存し、VariableState/ScopeFrame/VariableMutation/RunBinding専用schemaとuser_version=1を使う。DBOS/requests/definitions/node-event DBへ混在させず、run/workflow ownerとrun directoryを検証する。 | 旧Q9の配置判断 |
+| PD-12 | definitions.sqlite v1→v2を単一write transactionで移行し、既存revision/PK/hash/legacy ETagを保持してworkflow_definition_contractsを追加する。legacy revisionのcontract rowは欠落とし、user_version/schema検証後に対応版のみ運用する。 | 旧Q9のdefinition migration |
+| PD-13 | strict requestだけrequests.sqlite内のworkflow_request_contract_bindingsへrun_format_version=2、revision/contract/binding/normalized-input/request digestを保存し、request rowと同一transactionで確定する。legacy requestはbinding rowなし。 | 旧Q9のrequest binding |
+| PD-14 | strict manifestはrun_format_version=2とrevision/contract/binding/normalized-input/store identityを記録し、request binding rowと全readerで相互検証する。bindingとmanifestの欠落・downgrade・未知versionはfail closed。legacy v1 digest・reader挙動は不変。 | 旧Q9のmanifest識別 |
+| PD-15 | strict作成順はimmutable revision/contractとnormalized input検証、v2 digest、snapshot準備、run-local store初期化、request+binding予約、worker owner検証とする。別DB/Filesystem間atomicityを仮定せず、orphanは自動復活させず監査し、reservation不存在を確認するまで削除しない。予約後のstore欠落・破損は再作成せずreconciliationで停止する。 | 旧Q9のlifecycle |
+| PD-16 | 同一execution_keyのhistorical replayは台帳保存済みafter resultを返し、payload/hash/chain/RunBinding/checkpointを検証する。後続mutation後のlatest stateを過去after digestと一致要求せず、巻戻し・再適用をしない。 | 旧Q9のreplay詳細 |
+| PD-17 | v2の不確定なbinding/store/recovery状態を成功・受入成功にしない。read-only inspectorはstoreを作成せず、Graph/MCPは許可済みmetadataのみ公開する。Codex MAYBE_SENT状態機械とsecret拒否方針は変更しない。 | 旧Q9のreader・公開境界 |
 
 ## 17. Open questions
 
-次は未確定事項として残し、実装前に決定・承認します。項目番号は前版Open questionsの参照番号を維持しています。
+次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、definitions v1→v2のmigration案、request bindingとmanifest v2識別、run作成・recovery順序、historical mutation replayの意味はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
 
-9. variable stateのDB schema/migration、stateをrun-directory DBまたはstate-root shared DBのどちらへ置くか、SQLite transaction接続、DBOS checkpointからledgerを照合する具体API。既存manifest v1とstrict v2を識別する具体fieldもここで決めます。
-10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1拒否を公開するerror mapping。secret機能を初期実装へ含めません。
-11. Workflow/input/output/value合計、深度、Schema節点数、参照解決量、HTTP/MCP応答・eventの数値上限。現行128 KiB API request、64 KiB YAML等と整合させ、実装開始前に明示承認を得ます。
-12. HTTP/MCPの公開route、field、同一endpoint optional fieldか別APIか、strict ETagのwire表現と既存clientへの移行、Console投影、public error code。
-14. output違反の公開status/event名と、外部副作用発生後のレビュー・再実行手順。
+9. migrationの実際のDDL/SQL、index・column CHECK制約、schema validatorの具体形、およびrequests.sqlite既存schema版管理・FK互換確認・migration方法。definitions/request/variablesの各DB transactionを接続する実装APIと障害記録も詰めます。
+10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1での拒否を公開するerror mapping。secret機能を初期実装へ含めません。
+11. Workflow/input/output/value合計、DB容量、深度、Schema節点数、参照解決量、HTTP/MCP response/eventの数値上限と、Windowsでのvariables.sqlite安全な作成・physical ACL。現行128 KiB API request、64 KiB YAML等と整合させます。
+12. HTTP/MCPの公開route/field/status、同一endpoint optional fieldか別APIか、strict ETagのwire表現と既存client移行、Console投影、public error code、backup retentionおよびstrict v2利用後のrollback手順。
+14. output違反・reconciliationの公開status/event名と、外部副作用発生後の補償・レビュー・再実行手順。
 
 上記のOpen questionsはこのDRAFTと実装対象を区別するために残します。解決前に未決定の値やAPIを確定仕様として扱いません。

@@ -2,7 +2,7 @@
 
 ## 状態
 
-本書の「現行」は確認したソース上の実装を示します。「ターゲット」「案」は基本仕様 v0.2またはD1以降の設計方針で、未実装の内容を含みます。基本仕様は [requirements.md](requirements.md)、詳細案は [D1 DRAFT](phases/D1-input-output-variables.md)、ループ方針は [ADR 0001](decisions/0001-structured-loops.md) を参照してください。
+本書の「現行」は確認したソース上の実装を示します。「ターゲット」「案」は基本仕様 v0.2またはD1以降の設計方針で、未実装の内容を含みます。基本仕様は [requirements.md](requirements.md)、詳細案は [D1 DRAFT](phases/D1-input-output-variables.md)、ループ方針は [ADR 0001](decisions/0001-structured-loops.md)、contract保存は [ADR 0002](decisions/0002-contract-storage-and-normalization.md)、run-local変数DBとmanifest v2は [ADR 0003 Proposed](decisions/0003-run-local-variable-store-and-manifest-v2.md) を参照してください。
 
 ## 現行でできること
 
@@ -46,12 +46,16 @@ D1以降では、現行の入口・定義・worker境界を保ちながら、次
 
 呼び出し元（GUI / MCP / API / Workflow）<br>
 → 共通requestとrevision解決<br>
-→ YAML revision + 同一SQLite DBのrevision従属contract row（immutable、digest照合）<br>
-→ 入力正規化・input/output Schema検証<br>
+→ definitions.sqlite（immutable YAML revision + revision従属contract row）<br>
+→ 入力正規化・input/output Schema検証 + versioned request digest<br>
+→ run directory（immutable YAML/input/manifest v2 snapshot + 独立variables.sqlite + 既存dbos.sqlite）<br>
+→ requests.sqlite（request row + strict v2 contract bindingを同一transactionで予約）<br>
 → OWS interpreterと構造化scope frame<br>
-→ DBOS step/checkpoint + variable mutation ledger<br>
+→ DBOS step/checkpoint + variables.sqliteのmutation ledger<br>
 → 明示return/exportとoutput contract検証<br>
 → 既存JSON result形を維持したrun履歴・限定公開projection
+
+run directory/variables.sqliteとrequests.sqliteは別の永続transaction境界です。run binding、manifest、DB schema/owner、mutation ledgerとcheckpointを照合して回復し、跨DB atomic commitを仮定しません。
 
 Workflowをmain/subに分けず、同じ入口・contract検証を使います。別Workflow呼び出しは、呼び出し元と明示的な引数・戻り値境界の違いです。
 
@@ -59,6 +63,7 @@ Workflowをmain/subに分けず、同じ入口・contract検証を使います�
 
 - OWS v1.0.3の公式YAML Schemaを変更・拡張してCodexBridge固有contractを表すことはしません。
 - D1 ProposedではCodexBridge側のcontract JSONを新規revision従属テーブル workflow_definition_contracts に保存し、WorkflowDefinitionRepositoryと同一SQLite DBを使います。OWS YAML top-levelと公式Schemaは変更せず、別ファイルsidecarも使いません。
+- 現行definitions.sqliteはuser_version=1でtable名完全一致のschema検査を行うため、contract table追加にあたりv1→v2の単一transaction migrationを提案します。既存revision/hash/legacy ETagは保持し、legacy revisionにcontract rowを作りません。user_version=2を扱えない旧プロセスはfail closedする運用候補です。
 - contract rowは親revisionを参照し、revision・contract row・mutation ledgerを一つのSQLite write transactionでcommitする候補です。contractのcanonical hashと既存YAML source/canonical hashを保持し、binding digestを照合します。
 - contractだけを新revisionにすり替えたり、最新contractで古いrunを解釈し直したりしません。strict ETagはcontract identityを含む候補ですが、wire表現と移行影響は後続設計に残します。
 - JSON Schemaの外部参照を取得せず、検証中の外部ネットワークアクセスを禁止します。Schema資源はrevisionに含まれる値とローカル実装資源に限定します。
@@ -80,6 +85,7 @@ D2 AgentノードはD1の型付き参照を使い、prompt文字列の構文はD
 ## D1の互換境界と残る検討事項
 
 - メインフローのinput_dataとJSON result形は維持します。Contract適用で既存呼び出しwire formatを変更するかは別途明示します。
-- legacy definition mutation digest、legacy request id再送規則、service.pyの _verified_active_workspace を含むlegacy manifest v1検証を維持し、strict runだけbinding digestとnormalized input hashを含むversioned v2経路に分ける候補です。過去manifest/request digestを再解釈しません。
-- 現行APIのrequest body上限は128 KiB、OWS YAML上限は64 KiBです。contract rowのmigration番号、strict v2 discriminator、secret future storage、Schema/値/応答の総上限、公開API・error codesはD1 DRAFTのOpen questionsです。
+- legacy definition mutation digest、legacy request id再送規則、service.pyの _verified_active_workspace を含むlegacy manifest v1検証を維持し、strict runだけrequests.sqlite binding rowとmanifest run_format_version=2を相互検証する経路に分ける候補です。過去manifest/request digestを再解釈しません。strict v2へ未対応のworker/recover/manager readerが残る間はstrict runを生成しません。
+- strict runではnormalized input digestとcontract/revision bindingを名前空間付きv2 request digestに固定し、run directory内のvariables.sqliteでDBOS recoveryを行います。requests予約後に変数DBが欠落・破損すれば再作成せず停止します。run directory orphanをWorkflowとして自動復活させません。
+- 現行APIのrequest body上限は128 KiB、OWS YAML上限は64 KiBです。requests.sqlite migration詳細、DDL/制約、secret future storage、Schema/値/DB/応答の総上限、Windows ACL、公開API/error codes、v2利用後のbackup/rollbackはD1 DRAFTのOpen questionsです。
 - D1は既存Codex MAYBE_SENTの意味や再送禁止規則を変更しません。

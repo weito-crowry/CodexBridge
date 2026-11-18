@@ -17,6 +17,7 @@
 | [現行実装とターゲット構成](architecture.md) | 現状記録 / 将来構成案 | OWS、DBOS、保存定義、request ledger、MCP、Consoleの現状と拡張境界 |
 | [ADR 0001: 構造化ループ](decisions/0001-structured-loops.md) | Accepted（基本方針） | 新規修正ループに任意ジャンプを使わない方針と互換性 |
 | [ADR 0002: contractのrevision保存と正規化](decisions/0002-contract-storage-and-normalization.md) | Proposed（レビュー待ち） | contract revision保存、hash binding、strict input normalizationの設計候補 |
+| [ADR 0003: run-local変数DBとmanifest v2](decisions/0003-run-local-variable-store-and-manifest-v2.md) | Proposed（レビュー待ち） | run別変数DB、DB移行、request binding、strict v2回復・replayの設計候補 |
 | [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（レビュー待ち） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
 
 ## Phase一覧
@@ -47,4 +48,4 @@
 
 ## 依存関係
 
-基本仕様と現在の責務分担をそれぞれ [要件](requirements.md) と [アーキテクチャ](architecture.md) に記します。D1はこれらを前提にする詳細設計案であり、ループ方針は [ADR 0001](decisions/0001-structured-loops.md) を参照します。D2〜D8はD1のcontract・scope・return境界を利用する前提ですが、後続設計で詳細な依存関係を定めます。
+基本仕様と現在の責務分担をそれぞれ [要件](requirements.md) と [アーキテクチャ](architecture.md) に記します。D1はこれらを前提にする詳細設計案であり、ループ方針は [ADR 0001](decisions/0001-structured-loops.md)、contract保存・正規化は [ADR 0002](decisions/0002-contract-storage-and-normalization.md)、run-local変数DBとmanifest v2は [ADR 0003](decisions/0003-run-local-variable-store-and-manifest-v2.md) を参照します。D2〜D8はD1のcontract・scope・return境界を利用する前提ですが、後続設計で詳細な依存関係を定めます。
