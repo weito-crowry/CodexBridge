@@ -4,7 +4,7 @@
 - **目的:** 現行legacy動作を観測可能なテストとgolden allowlistに固定する。strict contract、変数runtime、schema migrationなどの新機能を実装した証跡ではありません。
 - **作業branch:** `codex/workflow-d1-i0-baseline`
 - **起点branch / base SHA:** `docs/workflow-design-d1` / `3a883334daf6480cb3ae2f7fdb6e8269928504dc`
-- **I0 commit SHA:** 証跡同期commitで記載予定
+- **I0 commit SHA:** `a88f346dc63fc76b0c17f9450f6a2717383196c9`（証跡・テスト・golden・plan）
 - **実行環境:** Windows native、Python 3.14 `.venv`、`uv`。
 
 ## 検証結果
