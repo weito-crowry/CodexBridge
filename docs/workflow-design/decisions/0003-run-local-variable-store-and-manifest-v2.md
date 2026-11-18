@@ -4,7 +4,7 @@
 - **対象:** Workflow D1詳細設計
 - **関連:** [D1詳細設計](../phases/D1-input-output-variables.md)、[アーキテクチャ](../architecture.md)、[ADR 0002: contractのrevision保存と正規化](0002-contract-storage-and-normalization.md)
 
-このADRはChatGPTが設計したD1第2回の確定候補を記録します。基本仕様 v0.2を変更せず、D1はDRAFTのままです。ユーザーレビュー前の提案であり、schema migration、DB/API変更、実装承認を意味しません。
+このADRはChatGPTが設計したD1第2回の候補を記録します。基本仕様 v0.2を変更せず、D1はDRAFTのままです。2026-11-19の合意に従い、D1必須条件はsingle-DB transaction、replay-safe ledger、既存互換と許可済みroot内のpath境界です。Global Mutex、明示NTFS DACL/owner SID、全ancestor/sidecar handle検査はDEFERRED / NON-BLOCKINGです。本ADRはProposedのままで、schema migration、DB/API変更、実装承認を意味しません。
 
 ## Context
 
@@ -22,9 +22,9 @@ definition DB、request DB、DBOS DB、node-event DBは別の責務を持ち、�
 
 各Workflow run directoryに新規・独立したvariables.sqliteを置きます。配置例は $LOCALAPPDATA/CodexBridge/workflows/run-<runid>/variables.sqlite です。definitions.sqlite、requests.sqlite、run-local dbos.sqlite、node-event DBの既存tableへ変数値を直接混在させません。
 
-変数DBはVariableState、ScopeFrame、VariableMutation、RunBinding専用schemaを持ち、提案user_versionは1です。想定設定はjournal_mode=WAL、synchronous=FULL、busy_timeout、foreign_keys=ON、write時のBEGIN IMMEDIATEです。接続時にuser_version/schemaを厳格検査し、read-only inspectorはreadonlyで開いてDBを作成・初期化しません。run directory path、run/workflow identity、RunBinding ownerを照合し、symlink/junction等のreparse pointを拒否します。
+変数DBはVariableState、ScopeFrame、VariableMutation、RunBinding専用schemaを持ち、提案user_versionは1です。必須のwrite境界はsingle-DB `BEGIN IMMEDIATE` transactionで、stateとmutation ledgerを同じtransactionでcommitします。unique execution key、CAS/version/digest、schema/user_version、`integrity_check`、`foreign_key_check`を整合検査します。journal_mode=WAL、synchronous=FULL、foreign_keys=ONを使い、busy_timeout値は未決です。read-only inspectorはreadonlyで開いてDBを作成・初期化しません。run directory pathが許可済みroot内にあることは既存のpath boundary defenseで確認し、run/workflow identityとRunBindingを照合します。新しい全ancestor/sidecar reparse、Win32 handle/file-ID、TOCTOU、NTFS DACL/owner SID検査は従来候補でありDEFERREDです。
 
-正確なDDL、index、CHECK制約、Windows上の安全なファイル作成とACL、DB容量上限はD1のOpen Questionsに残します。
+正確なDDL、index、CHECK制約と具体的なdata/resource budgetはD1のOpen Questionsに残します。Windows ACLや全祖先handle検査はD1必須条件ではありません。
 
 ### 2. definitions.sqlite v1→v2 migration
 
@@ -32,7 +32,7 @@ definition DB、request DB、DBOS DB、node-event DBは別の責務を持ち、�
 
 既存revision row、primary key、YAML hash、legacy ETagは保持します。legacy revisionにはcontract rowを作らず、workflow_definition_revisionsへcontract列を後付けしません。migrationのcommitでPRAGMA user_version=2とv2 schemaを整合させます。途中crashは全rollbackまたは全完了とし、中間schemaを許容しません。schema mismatchはfail closedです。
 
-運用順はwriter停止、backup、migration、対応版restart、schema/既存revision/legacy ETag検証を提案します。旧プロセスとv2 schemaは同時運用できず、旧コードはuser_version v2でfail closedする前提です。migration SQLと実番号は実装前に詰めます。
+I3では新しい隔離一時directory/test DBだけでmigration codeを実装・検証し、共有DBや本番DBを変更しません。`user_version`やSQLite writer lockは旧binaryが新schemaへアクセスすることを防がず、異なるDB間のatomicityも提供しません。旧binaryとの安全共存や自動upgradeは約束しません。将来共有DBを移行する場合は別途オペレーター承認を要し、既知writer/worker停止を確認し、SQLite online backupと検証、schema互換確認、成功後のlegacy identity検証を行います。停止を確認できなければ移行しません。旧Bridge本番起動時の自動migrationと旧schemaへの自動downgradeは禁止です。migration SQLと実番号は実装時に詰めます。
 
 ### 3. requests.sqlite strict binding
 
@@ -57,13 +57,13 @@ strict runの作成・回復順は次の通りです。
 1. immutable definition/contract revisionと全digestを検証します。
 2. inputを一度正規化し、strict v2 request digestを確定します。
 3. run directoryとimmutable YAML/input/manifest snapshotを準備します。
-4. variables.sqliteを初期化し、schema/owner検査後にRunBinding status=INITIALIZEDを保存します。
+4. variables.sqliteを初期化し、schemaとlogical run/workflow binding検査後にRunBinding status=INITIALIZEDを保存します。
 5. requests.sqliteのrequest rowとstrict binding rowを同一transactionで予約します。
-6. worker開始前およびrecover時にrequest binding、manifest、revision/contract、immutable input、variables.sqlite schema/owner/RunBinding、mutation ledgerとDBOS checkpointを照合します。
+6. worker開始前およびrecover時にrequest binding、manifest、revision/contract、immutable input、variables.sqlite schema/RunBinding、mutation ledgerとDBOS checkpointを照合します。
 
 run directory準備後、request reservation前にcrashした場合、orphan directoryが残ることがあります。orphanをWorkflowとして自動復活させず、監査対象とします。cleanupはrequest reservationや他の実行が存在しないことを確認した後に限り候補とし、その確認前に自動削除しません。strict reservation後にvariables.sqliteが欠落・破損した場合はneeds_reconciliationで停止し、DBを再作成せず、worker起動やCodex job再送を行いません。
 
-Filesystem、variables.sqlite、requests.sqliteをまたぐatomic commitは仮定しません。どの照合点でも不一致があればUNKNOWN/NEEDS_RECONCILIATIONで止め、成功・受入成功として返しません。Codex adapterの既存MAYBE_SENT state machineは変更せず、再送しません。
+Filesystem、variables.sqlite、requests.sqliteをまたぐatomic commitは仮定しません。同一SQLite内のwriter lockはそのDBのtransactionだけを調停し、旧binary/別controllerの新schemaアクセスや複数DB間整合性を保証しません。どの照合点でも不一致があればUNKNOWN/NEEDS_RECONCILIATIONで止め、成功・受入成功として返しません。Codex adapterの既存MAYBE_SENT state machineは変更せず、再送しません。
 
 ### 6. mutation replay
 
@@ -80,6 +80,7 @@ Filesystem、variables.sqlite、requests.sqliteをまたぐatomic commitは仮�
 - manifest v2を読む全readerの互換実装が済むまでstrict runを有効化できません。
 - 過去stepのreplayはhistorical mutation resultとlatest stateを区別します。後続versionが存在すること自体をconflictにしません。
 - migrationとv2利用後のbackup/rollback運用は別途確定が必要です。strict v2使用後に旧schemaへ安全にdowngradeできるとは仮定しません。
+- I3は隔離test DBだけでmigrationを検証し、共有/production DB変更には別途operator approvalと停止・backup・compatibility・legacy identity gatesが必要です。
 - strict v1 secret入力・secret variableは前回PD-10通り拒否します。Graph/MCPは許可済みmetadataだけを公開し、変数実値を返しません。
 
 ## Failure matrix
@@ -87,11 +88,11 @@ Filesystem、variables.sqlite、requests.sqliteをまたぐatomic commitは仮�
 | 条件 | 提案処理 |
 | --- | --- |
 | definitions migration中のcrash | SQLite transaction rollbackまたは全commit。部分schemaを起動時に許可しない |
-| 旧プロセスがdefinitions user_version=2を開く | schema mismatchでfail closed |
+| 旧binaryや別controllerが新schemaへアクセスする可能性 | `user_version`/SQLite lockだけで排除したと見なさない。I3は隔離DBのみ。共有DB移行は別途承認とwriter/worker停止が確認できなければ行わない |
 | request bindingとmanifest versionの片側欠落・不一致 | NEEDS_RECONCILIATION。legacy downgradeとして扱わない |
 | 予約前のrun directory orphan | 自動復活せず監査対象。reservation不存在を確認するまで削除しない |
 | reservation済みstrict runでvariables.sqlite欠落/破損 | DBを再生成せずworkerを起動しない。NEEDS_RECONCILIATION |
-| run directoryがsymlink/junction/reparse point | path/owner検証で拒否 |
+| 保存pathが許可済みroot外、path traversal、run binding不一致 | 既存path boundary defense/RunBinding照合で拒否 |
 | SQLite commit前のmutation crash | transaction rollback後に同じkeyを初回実行 |
 | mutation commit後・DBOS checkpoint前のcrash | ledgerの保存済み結果を返し、更新を再適用しない |
 | 後続mutation後に古いstepをreplay | historical resultを返す。latest VariableStateを巻き戻さない |
@@ -108,4 +109,4 @@ Filesystem、variables.sqlite、requests.sqliteをまたぐatomic commitは仮�
 
 ## 未決定事項
 
-ADR Proposed状態を解消する前に、D1のOpen Questions 9〜12、14に記載したDDL/制約、requests.sqlite migration、上限/ACL、公開field/status、backup/rollback、外部副作用処理を具体化します。これらを本ADRが確定済みとするものではありません。
+ADR Proposed状態を解消する前に、D1のOpen Questions 9〜12、14に記載したDDL/制約、requests.sqlite migration、resource budget、公開field/status、backup/rollback、外部副作用処理を具体化します。Global Mutex、Windows DACL/owner SID、全ancestor/sidecar handle/file-ID gateはDEFERRED / NON-BLOCKINGです。これらを本ADRが確定済みとするものではありません。

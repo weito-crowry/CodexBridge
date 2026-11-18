@@ -1,5 +1,7 @@
 # D1-I2 Windows Guard 実装証跡
 
+> **2026-11-19方針変更:** I2-AのGlobal Mutex primitiveは実装済み、現行moduleは未接続のまま保持します。I2-Bの追加実装は停止し、I2全体はNOT_ACCEPTEDです。I2はD1/I3/I8のblocking gateではなく、DEFERRED / NON-BLOCKINGです。以下の`IN_PROGRESS / BLOCKED_FULL_ACCEPTANCE`等の状態記述は、この証跡作成時点の歴史的状態を示します。既存の実装・テスト証跡と実測結果は変更していません。
+
 **状態:** `IN_PROGRESS / BLOCKED_FULL_ACCEPTANCE`（I2-Aの実装と記載済み隔離検証は完了、I2全体の受入gate未達）
 **基点:** `codex/workflow-d1-i1-contract-core` / `dc3b68687a83b189f3eb98fed5a1db0fee929cf7`
 **作業ブランチ:** `codex/workflow-d1-i2-windows-guard`

@@ -4,7 +4,9 @@
 - **対象:** Workflow D1詳細設計
 - **関連:** [D1詳細設計](../phases/D1-input-output-variables.md)、[アーキテクチャ](../architecture.md)、[ADR 0004: SQLite DDLとschema migration](0004-sqlite-ddl-and-schema-migration.md)
 
-このADRはD1第4回のcontroller起動排他、Windows ACL/path保護、strict v1 resource capを記録します。D1はDRAFTのままで、本ADRもレビュー前のProposedです。mutex、ACL、resource limitはいずれもコードや運用に実装済みではありません。
+このADRはD1第4回に提案されたcontroller起動排他、Windows ACL/path保護、strict v1 resource capを記録します。**2026-11-19方針変更:** D1ではWindows起動排他と追加ACL/handle gateを`DEFERRED / NON-BLOCKING`とし、以下の旧詳細は歴史的な候補で、現行の必須条件ではありません。`windows_guard.py`のI2-A Global Mutex primitiveとテストは実装済みですが現行controller等へ未接続です。I2-Bは停止し、I2全体はNOT_ACCEPTEDです。D1はDRAFT、本ADRはProposedのままです。resource数値予算は独立したProposed data budgetとして残し、必要に応じて再評価します。
+
+D1-93..107の元IDと旧期待結果は履歴として保持しますが、DEFERRED / NON-BLOCKINGに分類し、現行D1/I8 gateから除外します。D1本文の正式なD1-108以降にある現行製品上限、入力/output検証、privacy redaction、capacity error/transaction rollbackは維持します。新strict数値はProposedです。Windows DACL/ACE/SID、RDP/Global Mutex実証、handle/file-ID/TOCTOU、WAL/SHM hard physical byte保証はI3/I8必須gateではありません。
 
 ## 動機と確定済み事実
 
@@ -22,7 +24,9 @@ SQLite schema versionだけでは旧binaryとの同時writerを止められま�
 | active Workflow | 同時2件 |
 | Workflow task数 | 10,000 |
 
-manager.pyはrun directoryをmode=0700で作成しますが、os.chmodはWindowsで呼ばれません。service.pyのsnapshot作成も同様で、Windows ACLは明示されていません。node_events.pyとtask_projection.pyにはWindows FILE_ATTRIBUTE_REPARSE_POINT検査がありますが、variables.sqliteの全open経路を覆いません。コード内に既存のWindows named mutex、LockFileEx、portalockerによるstate_root writer排他はありません。
+この節の実装状況記述はADR作成時点のものです。I2-Aとして独立したGlobal Mutex primitiveは実装されましたが、controllerやDB open/migration経路へ接続していません。I2-BのACL/path guardは停止され、D1必須要件ではありません。
+
+manager.pyはrun directoryをmode=0700で作成しますが、os.chmodはWindowsで呼ばれません。service.pyのsnapshot作成も同様で、Windows ACLは明示されていません。node_events.pyとtask_projection.pyにはWindows FILE_ATTRIBUTE_REPARSE_POINT検査がありますが、variables.sqliteの全open経路を覆いません。ADR作成時には既存のWindows named mutex、LockFileEx、portalockerによるstate_root writer排他はありませんでした。
 
 ## 提案
 
@@ -44,7 +48,7 @@ Mutexはthread-ownedです。controllerの寿命中mutexを所有するthreadを
 
 Global namespaceの同一Mutexは、同じstate_root/SIDを使うRDP、fast user switching、serviceを含む別ログオンsessionから共有され、controllerを一つに制限する設計です。別session間での同時起動試験を実装時ゲートとします。異なるSIDが同じstate_rootを使う場合はowner/ACL不整合を検出してfail closedします。
 
-### 2. Windows ACLとpath security
+### 2. Windows ACLとpath security（歴史的候補・D1ではDEFERRED）
 
 strict D1で新規作成するrun directory、variables.sqlite、SQLiteの-WAL/-SHM sidecarはWindows NTFS上のprotected explicit DACLで保護します。作成時にsecurity descriptorを指定し、owner SIDとcanonical ACLを検証します。許可ACEは実行User SIDとLOCAL SYSTEMに限定し、Everyone、Users、Authenticated Users、別SIDからのgrantを認めません。DACLは安全でない親からの継承に依存せず、SQLite sidecarが新規作成されるときは保護済みrun directoryの適切な継承ACEを受けるようにします。
 
@@ -52,7 +56,7 @@ state_root自体の所有SIDとACLも検査します。既存state_rootやlegacy
 
 state_root、run directory、variables.sqlite、WAL/SHMおよび該当するancestor pathにsymlink/junction/reparse pointがあれば拒否します。lstatとFILE_ATTRIBUTE_REPARSE_POINT等の属性検査に加え、create-exclusiveとhandle-based owner/file-ID照合を使い、名前衝突やpath swapを検出します。SQLiteがsidecarを作成するため、sidecarのowner/DACL/path検査が完了するまでstrict workerを動かしません。NTFS以外、security descriptor/identity API不在、意図したSIDを得られない場合はstrictをfail closedにし、POSIX/WSL/Dockerへ暗黙に切り替えません。
 
-Windows file ACL/identity raceを完全に排除できるとは主張しません。handleベース検査と隔離Windows dogfoodでの検証を実装時gateにします。ACLは他ユーザーからの誤アクセスを防ぐ境界であり、同一userのrogue process、Administrators、backup privilegeからの保護を保証しません。strict v1のsecret input/variable拒否（PD-10）は維持します。
+この旧提案はWindows file ACL/identity raceを完全に排除できるとは主張せず、handleベース検査と隔離Windows dogfoodを実装時gateとしていました。現行D1ではこれらの追加検査をDEFERREDとし、I3/I8 gateにしません。ACLは他ユーザーからの誤アクセスを防ぐ境界であり、同一userのrogue process、Administrators、backup privilegeからの保護を保証しません。strict v1のsecret input/variable拒否（PD-10）は維持します。
 
 ### 3. strict v1 resource budget（Proposed初期値）
 
@@ -85,7 +89,7 @@ Duplicate JSON keys、NaN/Infinity、許可されないschema keyword、cyclic $
 
 mutationのaggregate/ledger/database capを超える場合はBEGIN IMMEDIATE内で変更前に検出し、変更なしrollbackとcapacity errorにします。既存値・ledgerを削除せず、Workflow成功・acceptance PASSとして扱いません。main DB 64 MiBはSQLite PRAGMA max_page_count等とlogical quotaを組み合わせる案です。WAL 16 MiBは高水位目標で、上限前checkpointとwriter抑制を行います。長時間readerがcheckpointを妨げる場合があるためcheckpoint/backpressureと単一writer前提を検証します。SHM/WALの別個のhard byte limit、競合時も64 MiB main DB capを保証する方法はOpen Question 11に残します。
 
-## 状態と判断マトリクス
+## 状態と判断マトリクス（歴史的Proposed案）
 
 | 状態 | 提案動作 |
 | --- | --- |
@@ -115,22 +119,24 @@ mutationのaggregate/ledger/database capを超える場合はBEGIN IMMEDIATE内�
 | Workflow resource | 大きなSchema/JSON、配列/変数大量化、長時間ledger/WAL増加 | stageごとのstrict cap、transaction前check、page/quota/checkpoint案。WAL/SHM物理保証は未解決 |
 | secret data | error/log/projectionへの値漏れ | PD-10 secret拒否、errorは値を含めず、MCP/Graphにvariable実値を出さない |
 
-## Test plan
+## Test plan（旧提案のtraceability）
 
-以下はD1実装時の受入計画です。新しいD1受入IDは93から120まで追加し、D1-01..92は保持します。
+D1-93..107は歴史的期待結果を保持するものの、現行gateから除外します。現在のpath受入では、保存pathが許可済みroot内にあることと、実装済みpath boundary defenseがpath traversal/run外アクセスを拒否することを確認します。全ancestor/sidecar Win32 handle/file-ID、DACL、RDP/Mutexの追加検証は要求しません。D1-108以降では現行製品上限とprivacy/rollback behaviorを維持し、表のstrict数値はProposed data budgetです。D1-115のmain DB/WAL/SHM物理byte保証はDEFERREDです。
+
+以下は旧D1提案のtraceabilityです。新しいD1受入IDは93から120まで追加し、D1-01..92は保持します。D1-93..107の元期待結果は履歴として残しますがDEFERRED / NON-BLOCKINGで、現行gateではありません。このADRの旧表はD1本文の正式なtraceabilityとD1-108付近で1件分ずれています。ADR-localのD1-108 threat-model rowは旧期待結果のまま履歴/DEFERREDとし、D1本文の現行D1-108 resource-cap rowを置き換えません。
 
 | D1 IDs | 受入対象 |
 | --- | --- |
-| D1-93..98 | 同root Mutex競合、同一state_root/SIDで別ログオンsessionのcontroller同時起動、RDP/fast user switching/service session間共有、有限待機、abandoned recovery、旧binary/autostart/未知writer gate、named object DACL |
-| D1-99..100 | client/controller/worker境界、controller認証済みrun起動、leftover workerがupgradeを止めること |
-| D1-101..107 | NTFS owner/protected ACL、広いACE拒否、legacy ACL不変、全path/sidecar reparse、exclusive create/file-ID、WAL/SHM DACL、ACL API/Filesystem不在 |
-| D1-108 | Administrators/backup privilegeと同一user rogue processの保護限界が記述どおりであること |
+| D1-93..98 | 同root Mutex競合、同一state_root/SIDで別ログオンsessionのcontroller同時起動、RDP/fast user switching/service session間共有、有限待機、abandoned recovery、旧binary/autostart/未知writer gate、named object DACL（旧期待結果保持、DEFERRED / NON-BLOCKING） |
+| D1-99..100 | client/controller/worker境界、controller認証済みrun起動、leftover workerがupgradeを止めること（旧期待結果保持、DEFERRED / NON-BLOCKING） |
+| D1-101..107 | NTFS owner/protected ACL、広いACE拒否、legacy ACL不変、全path/sidecar reparse、exclusive create/file-ID、WAL/SHM DACL、ACL API/Filesystem不在（旧期待結果保持、DEFERRED / NON-BLOCKING） |
+| D1-108 | Administrators/backup privilegeと同一user rogue processの保護限界が記述どおりであること（ADR-local旧採番の歴史的期待結果、DEFERRED / NON-BLOCKING。D1本文の正式なD1-108 resource cap rowとは別） |
 | D1-109..112 | 現行cap非回帰、body合算、raw/normalized input、output/value/mutation/aggregate/declaration/frame/ledger上限の境界 |
 | D1-113..114 | Schema depth/node/ref/property、JSON depth/property/array、duplicate key、NaN/Inf、cycle拒否 |
 | D1-115..117 | main DB/WAL/SHM、long reader checkpoint、各段階のlimit検査、mutation rollbackでstate/ledger保持 |
 | D1-118..120 | projection pagination/privacy、secret-safe error、既存prompt/time budget維持、外部Codex POSTなし |
 
-Windows ACL/pathの実装受入は隔離NTFS上で行い、handle-based identityとSQLite sidecarのDACLを検査します。docs-only taskではpytest、Ruff、mypy、compileall、実Codex job、MCP dogfoodを実行しません。今回のProposed capを永続設定や既存runへ適用しません。
+上表のD1-115..117元期待結果は履歴として保持します。D1-115に含むmain DB/WAL/SHMのhard physical byte保証はDEFERRED、D1-116/117の設定済みcap検査とmutation rollbackでstate/ledgerを維持するbehaviorは現行要件です。I8では隔離Windows上でWorkflow executionとSQLite DB整合性を確認します。DACL、RDP、Global Mutex、SID、全path handle/file-ID/TOCTOU、WAL/SHM hard byte保証はI8必須gateではありません。今回のdocs-only変更ではpytest、Ruff、mypy、compileall、実Codex job、MCP dogfoodをNOT_RUNとし、Proposed capを永続設定や既存runへ適用しません。
 
 ## Alternatives
 
@@ -145,9 +151,9 @@ Windows ACL/pathの実装受入は隔離NTFS上で行い、handle-based identity
 
 ## 未決定事項
 
-Open Question 9はGlobal mutex名のcanonicalization/hash input framing、CreateMutexExWを包むWin32 API、owner threadの寿命と同一threadによるrelease、RDP/fast user switching/serviceをまたぐ排他の実証、controllerの起動/停止統合、旧版起動経路の停止・自動再起動防止、worker起動identityと全writer quiescence証明です。Global作成・DACL/owner検証・取得に失敗した場合はLocalへfallbackせずstrict enableを止めます。Open Question 11はSECURITY_DESCRIPTOR/ACE継承/owner/file-IDの具体実装とdogfood、WAL/SHM個別上限・長時間reader時のcheckpoint、PRAGMA max_page_count/logical quotaでmain DB上限を保証する測定です。
+Open Question 9のGlobal Mutex名、CreateMutexExW、owner thread、RDP/session、DACL/owner、controller startup/quiescence gateの詳細は歴史的候補としてDEFERRED / NON-BLOCKINGであり、現行D1/I3/I8に要求しません。将来共有DBを移行する際は別途operator approval、known writers/workers停止確認、online backup/検証、schema互換、成功後legacy identity検証を行い、停止を確認できなければmigrationしません。Open Question 11のstrict数値は独立Proposed data budgetです。WAL/SHM hard physical byte guaranteeとNTFS SECURITY_DESCRIPTOR/ACE/owner/file-ID gateはDEFERREDであり、I3/I8必須条件ではありません。
 
-API/status/error/public projectionとresponse cap、backup retention/data loss、secret暗号化、外部副作用の扱いはD1 Open Questions 10、12、14に残します。すべての数値capはProposed初期値で、実装済みや承認済みと扱いません。
+API/status/error/public projectionとresponse cap、backup retention/data loss、secret暗号化、外部副作用の扱いはD1 Open Questions 10、12、14に残します。すべての追加strict数値capはProposed data budgetで、実装済みや承認済みと扱いません。現在の製品上限と既存pure-core checksは維持します。
 
 ## References
 

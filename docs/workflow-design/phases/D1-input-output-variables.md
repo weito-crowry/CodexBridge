@@ -1,14 +1,14 @@
 # D1: Workflow共通入出力契約・変数・スコープ
 
 - **文書状態:** DRAFT / Proposed（レビュー待ち）
-- **基本仕様:** v0.2は合意済み。本書のProposed decisionsは詳細設計候補であり、設計承認・実装完了を意味しません。
+- **基本仕様:** v0.2は合意済み。2026-11-19に合意したD1簡素化方針を本書へ反映しています。本書全体の最終承認、実装完了、本番有効化を意味しません。
 - **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)、[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)
 
 ## 1. 背景と目的
 
 現行WorkflowはOWSのYAML、input_data、jq式、単一context、task実行結果を使います。保存済みdefinition revisionと実行requestには既にdigest・revision bindingがありますが、Workflow共通のinput/output JSON Schema、型付き変数宣言、scope frame、再実行で二重適用しない変数mutation ledgerはありません。
 
-D1の目的は、呼び出し元がGUI、MCP、HTTP API、別Workflowのいずれでも、同じimmutable revisionに対し同一の検証・値の受渡し・変数更新を適用できる契約を定義することです。Workflowをmain/subという種類で分割しません。メインフローの既存input_dataとJSON resultの形、OWS v1.0.3の公式Schema、既存revisionの意味を維持します。
+D1の目的は、Workflow orchestrationに共通の入出力契約、型付き変数、構造化scope、DBOS replay-safe mutationを設け、HTTP/MCPとOWSへ統合することです。呼び出し元がGUI、MCP、HTTP API、別Workflowのいずれでも、同じimmutable revisionに対し同一の検証・値の受渡し・変数更新を適用します。Workflowをmain/subという種類で分割しません。メインフローの既存input_dataとJSON resultの形、OWS v1.0.3の公式Schema、既存revisionの意味を維持します。
 
 本書は将来の実装に使える設計案です。実装コード、DB migration、API変更はこの文書の対象外です。
 
@@ -24,6 +24,7 @@ D1の目的は、呼び出し元がGUI、MCP、HTTP API、別Workflowのいず�
 - Workflow run、scope frame、変数値、version/digest、mutation execution keyの永続モデル案
 - DBOS step/checkpointとmutation台帳の回復境界
 - 公開投影、redaction、エラー分類、D1受入条件
+- SQLite単一DB transactionの整合性、DBOS checkpoint境界をまたぐmutation ledgerによるreplay-safe更新、必要な保存先を許可済みroot内に保つ既存path境界防御
 
 ### D1が実装しない
 
@@ -33,6 +34,17 @@ D1の目的は、呼び出し元がGUI、MCP、HTTP API、別Workflowのいず�
 - 複数Issueの実運用・集計（D7）。Issue/Attemptは汎用runtimeのhard-coded概念にしません。
 - GUI編集画面（D8）
 - 既存OWS set/export、旧revision、Codex MAYBE_SENT台帳の変更
+
+Codexのコマンド・ファイル操作承認はCodex既存sandbox、OS一般権限はWindows、Workflow内部のDB・実行整合性はCodexBridge/SQLite/DBOSが担います。Codex sandboxはCodexBridge自身のファイルやDBを保護する境界ではありません。
+
+### D1の必須整合性境界
+
+- 各SQLite DB内の更新は`BEGIN IMMEDIATE`、unique key、CAS/version/digestを使ったsingle-DB transactionで確定し、schema、`user_version`、`integrity_check`、`foreign_key_check`を整合検査します。
+- 変数state更新とmutation ledger記録は同じvariables.sqlite transactionで確定します。DBOS checkpointとの非原子的境界はledger identityでつなぎ、同じmutationのreplayで二重適用しません。
+- 既存DB、definition revision、legacy ETag/manifest/request-idの互換性を維持し、input/outputを検証します。
+- 保存に必要なpathは許可済みroot内に収め、既存のpath境界防御を使ってpath traversalと意図しないrun外アクセスを拒否します。
+
+SQLite writer lockは同一DBへのtransactionを調停しますが、旧binaryや別controllerが新schemaへアクセスすること、definitions.sqliteとrequests.sqlite等の複数DBをまたぐ整合性を自動では防ぎません。Global Mutexや新しいWindows ACL/handle gateをその代替・必須条件とはしません。
 
 ## 3. 用語
 
@@ -92,9 +104,9 @@ binding_digestは同じcanonical JSON方式によるSHA-256とし、definition_i
 
 legacy revisionにはcontract rowを作らず、従来の検証とrequest identityを維持します。contractだけを同一revisionへ更新せず、contract変更は新revisionを作成します。strict ETagはcontractを含むversioned identityに拡張しますが、wire表現と既存ETag移行影響は後続設計に残します。
 
-**Proposed migration:** 現行definitions.sqliteはPRAGMA user_version=1で、現行schema checkerは既存3テーブルの完全一致を検査します。strict contract用table追加には単一SQLite write transactionによるv1→v2 migrationを用い、既存revision row、primary key、YAML hash、legacy ETagを保持します。v2でworkflow_definition_contractsを追加し、PRAGMA user_version=2とv2 schemaを検査します。既存legacy revisionにcontract用NULL rowは作らず、行を欠落させます。既存workflow_definition_revisionsへcontract列を後付けしません。新規definition DBはv2 schemaを一括作成します。
+**Proposed migration:** 現行definitions.sqliteはPRAGMA user_version=1で、現行schema checkerは既存3テーブルの完全一致を検査します。strict contract用table追加には単一SQLite write transactionによるv1→v2 migrationを用い、既存revision row、primary key、YAML hash、legacy ETagを保持します。v2でworkflow_definition_contractsを追加し、PRAGMA user_version=2とv2 schemaを検査します。既存legacy revisionにcontract用NULL rowは作らず、行を欠落させます。既存workflow_definition_revisionsへcontract列を後付けしません。新規definition DBはv2 schemaを一括作成します。I3のmigration実装・検証では新規の隔離一時directory/test DBのみを使い、共有DBを変更しません。
 
-migration途中のクラッシュはtransaction rollbackか全完了のどちらかとし、中間schemaを受け入れません。起動時schema不一致はfail closedです。運用案はwriter停止、SQLite online backupとその検証、upgrade、対応版restart、schema・既存revision・legacy ETag検証の順です。WAL使用時に主DBファイルだけをコピーする方法はbackupに使いません。v2へupgradeしたDBと旧プロセスの同時運用はサポートしません。SQL案、schema validator、upgrade/rollback gateは[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)に記載します。
+migration途中のクラッシュはtransaction rollbackか全完了のどちらかとし、中間schemaを受け入れません。起動時schema不一致はfail closedです。将来共有DBを移行する場合は別途オペレーター承認を要し、既知のwriter/worker停止、SQLite online backupと検証、schema互換確認、成功後のlegacy identity検証を行います。停止を確認できなければ移行しません。WAL使用時に主DBファイルだけをコピーする方法はbackupに使いません。旧Bridge本番起動時の自動migrationと旧schemaへの自動downgradeは禁止し、Global Mutexの有無にかかわらず旧binaryとの安全共存は約束しません。full strict enable、本番反映、releaseは別途承認です。SQL案とschema validatorは[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)に記載します。
 
 ### 4.3 create/updateとcontract指定
 
@@ -152,7 +164,7 @@ strict v2 request_digestは名前空間付きcanonical JSON（codexbridge-workfl
 
 strict manifestの追加field案はrun_format_version=2、definition_id、definition_revision、contract_version=1、contract_sha256、binding_digest、normalized_input_sha256、variable_store.filename=variables.sqlite、variable_store.schema_version=1です。secret、variable value、promptはmanifestに保存しません。request binding rowの案はworkflow_request_contract_bindingsをtable名とし、run_idをkeyにworkflow_id、definition_id、definition_revision、run_format_version、contract_version、contract_sha256、binding_digest、normalized_input_sha256、request_digestを保持します。いずれも既存legacy manifest/request rowを遡及変更しません。
 
-現行requests.sqliteにはPRAGMA user_versionによる版管理がありません。提案schema v1への移行ではuser_version=0の既存DBを、workflow_requests、workflow_request_sources、既存index、columns、foreign keys、row整合性について検査してから新binding tableを追加します。既存row/indexは維持し、legacy rowにはbindingを作りません。未知table/indexがあるuser_version=0 DBをblind migrationしません。旧binaryはrequests.sqliteのuser_versionを検査しないため、version値だけで旧writer混在を防げません。対応reader/worker/managerへの更新と旧process停止・起動排他の具体的なguardが必要です。詳細は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)のProposed案を参照します。
+現行requests.sqliteにはPRAGMA user_versionによる版管理がありません。提案schema v1への移行ではuser_version=0の既存DBを、workflow_requests、workflow_request_sources、既存index、columns、foreign keys、row整合性について検査してから新binding tableを追加します。既存row/indexは維持し、legacy rowにはbindingを作りません。未知table/indexがあるuser_version=0 DBをblind migrationしません。旧binaryはrequests.sqliteのuser_versionを検査しないため、version値やSQLite writer lockだけで旧writer混在を防げません。I3では隔離一時directory/test DBだけでmigrationを検証します。共有DBを将来移行する場合の停止・backup・検証gateは[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)に記し、自動upgradeは行いません。
 
 Workflow呼び出し元はinput Schemaを使って一度だけ正規化・検証します。成功時にDBOS runへ渡すinput_dataは正規化済み値です。既存メインフローのinput_dataとJSON resultの形は維持し、Schemaが値の意味やwire shapeを勝手に変えません。
 
@@ -213,9 +225,7 @@ Workflow scopeはrun内で有効です。Issue値は該当Issue frame、Attempt�
 
 **Proposed:** 各Workflow run directoryに独立したvariables.sqliteを新規作成します。配置例は $LOCALAPPDATA/CodexBridge/workflows/run-<runid>/variables.sqlite です。definitions.sqlite、requests.sqlite、run-localのdbos.sqlite、node-event DBの既存tableへ変数値を混在させません。variables.sqliteの専用schemaはVariableState、ScopeFrame、VariableMutation、RunBindingを持ちます。物理table名はrun_binding、scope_frames、variable_states、variable_mutationsで、前掲の大文字名は論理model名です。完全なDDL例とindexは[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)に記載します。
 
-DBはPRAGMA user_version=1、想定journal_mode=WAL、synchronous=FULL、busy_timeout設定、foreign_keys=ON、write時BEGIN IMMEDIATEを候補とし、接続時に4 table・index・columns・primary/foreign keys・user_versionを厳格に検査します。PRAGMA integrity_checkとforeign_key_checkを起動時検査案に含めます。JSON canonicalization/hash/schema検証はapplicationで行い、SQLite JSON1に依存しません。読取専用inspectionはmode=ro接続とし、DBを新規作成・初期化しません。run_dirのcanonical path、run ID、workflow identityとRunBindingの所有関係を毎回照合し、symlink、junction、その他reparse pointを拒否します。Windowsでの安全なファイル作成とACL設定はOpen question 11に残します。明示的なDB容量上限も未決です。
-
-Windows native strict runの新規run directory、variables.sqliteとSQLite WAL/SHM sidecarにはprotected explicit NTFS DACL、owner SID、ACL検証を提案します。既存state_root/legacy runのACLを自動変更せず、不適切なACLや保護を検証できない環境ではstrict runを開始しません。mode=0o700/os.chmodのみをWindows ACL保護とは見なしません。詳細と制約は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)に記します。
+DBはPRAGMA user_version=1、journal_mode=WAL、synchronous=FULL、foreign_keys=ON、write時BEGIN IMMEDIATEを使います。busy_timeout値は未決です。接続時に4 table・index・columns・primary/foreign keys・user_versionを検査し、PRAGMA integrity_checkとforeign_key_checkを整合確認します。JSON canonicalization/hash/schema検証はapplicationで行い、SQLite JSON1に依存しません。読取専用inspectionはmode=ro接続とし、DBを新規作成・初期化しません。run_dirと必要な保存pathが許可済みroot内にあることは既存のpath境界防御で検証し、run ID、workflow identityとRunBindingの論理所有関係を照合します。全祖先・sidecarのWin32 handle/file-ID/TOCTOU検査、明示NTFS DACL/owner SIDは従来提案としてDEFERRED / NON-BLOCKINGであり、D1必須条件ではありません。
 
 variables.sqlite transactionとDBOS step/checkpointは別transactionです。run directory上の新規DBに初期状態を準備し、requests.sqliteのrequest reservationとbinding rowを別のSQLite transactionで確定するため、両者をまたぐatomic commitはありません。
 
@@ -224,11 +234,11 @@ variables.sqlite transactionとDBOS step/checkpointは別transactionです。run
 | VariableState | run_id、scope_frame_id、variable_name、type、value、version、value_digest、機密区分 |
 | ScopeFrame | run_id、frame_id、parent_frame_id、stable_scope_path、iteration vector、call context、frame status |
 | VariableMutation | execution_key、payload_digest、before_digest、after_digest、before/after version、commit outcome |
-| RunBinding | run_id、workflow/definition identity、revision、contract version/hash、binding digest、normalized input digest、owner、store schema version、初期化状態 |
+| RunBinding | run_id、workflow/definition identity、revision、contract version/hash、binding digest、normalized input digest、logical run owner、store schema version、初期化状態 |
 
 ユーザーの未追跡ファイルやOWS汎用contextへvariable stateを混ぜません。strict v1ではsensitivity=secretの宣言を持つWorkflowと、secret値を含むと明示分類されたinputを受け付けず、明示拒否します。secret valueの保存方式は将来の別設計です。
 
-VariableState、ScopeFrame、VariableMutation、RunBindingはrun-local variables.sqliteで管理します。各mutationのstate更新と台帳記録は同一transactionにします。run directoryはrunごとに所有され、別run間で変数DBを共有しません。DDL、SQLite CHECK/UNIQUE/FK/indexとapplication validatorの境界はADR 0004のProposed案に従います。
+VariableState、ScopeFrame、VariableMutation、RunBindingはrun-local variables.sqliteで管理します。各mutationのstate更新と台帳記録は同じ`BEGIN IMMEDIATE` transactionで確定し、unique execution keyとCAS/version/digestを検査します。run directoryはrunごとに所有され、別run間で変数DBを共有しません。DDL、SQLite CHECK/UNIQUE/FK/index、schema/user_version/integrity/foreign-key検査とapplication validatorの境界はADR 0004に従います。
 
 ### 8.2 mutation identity
 
@@ -282,14 +292,14 @@ strict contractの一回のsaved Workflow runは、次の順序を通る案で�
 4. raw inputに正規化を一度適用する。missing/nullを保ち、採用されたdefaultだけを追加する。
 5. normalized inputをinput Schemaで検証する。invalidならWorkflowを起動しない。
 6. strict v2用request digestを作り、run directoryとimmutable YAML/input/manifest snapshotを準備します。manifestはrun_format_version=2とcontract/revision/binding/normalized input identityを持ち、input.jsonは正規化済みinputです。秘匿値はmanifestに記録しません。
-7. run-local variables.sqliteを作成し、schemaとownerを検査したうえでRunBindingのstatus=INITIALIZEDを記録します。
+7. run-local variables.sqliteを作成し、許可済みroot内のpath、schema、run/workflow bindingを検査したうえでRunBindingのstatus=INITIALIZEDを記録します。
 8. requests.sqliteのrequest rowとworkflow_request_contract_bindings rowを同一request DB transactionで予約します。strict reservationが確定する前にworkerへ実行を渡しません。
-9. worker開始時およびrecover時にrequest binding、manifest、immutable YAML/input、contract revision/hash、variables.sqlite schema/owner/RunBinding、mutation ledgerとDBOS checkpointを照合してから再開します。
+9. worker開始時およびrecover時にrequest binding、manifest、immutable YAML/input、contract revision/hash、variables.sqlite schema/RunBinding、mutation ledgerとDBOS checkpointを照合してから再開します。
 10. 各mutationをDBOS named stepとSQLite mutation ledgerで実行します。
 11. Workflow終了時に明示return/exportのJSON候補を作り、output Schemaで検証します。validなら既存JSON result shapeに沿って結果を確定し、不正ならFAILEDとして扱い親へ戻しません。
 12. Graph/MCP/UI/通常ログは許可済みメタ情報だけの公開projectionを作り、入力・prompt・variable・outputの実値を含めません。
 
-run directory準備後、requests.sqlite予約前にcrashするとorphan directoryが残る可能性があります。orphanをWorkflowとして自動復活させず監査対象とします。cleanupはrequest reservationや他の実行が存在しないことを確認した後に限り候補とし、その確認前に自動削除しません。strict request予約後にvariables.sqliteが欠落・破損していればneeds_reconciliationで停止し、再作成・worker実行・外部job再送を行いません。request bindingがある場合はrecover経路でもv2を強制します。manifest/binding不一致、未知version、owner/schema/ledger不整合はUNKNOWNまたはNEEDS_RECONCILIATIONとして止め、成功・受入成功と返しません。DB間atomic commitは仮定しません。
+run directory準備後、requests.sqlite予約前にcrashするとorphan directoryが残る可能性があります。orphanをWorkflowとして自動復活させず監査対象とします。cleanupはrequest reservationや他の実行が存在しないことを確認した後に限り候補とし、その確認前に自動削除しません。strict request予約後にvariables.sqliteが欠落・破損していればneeds_reconciliationで停止し、再作成・worker実行・外部job再送を行いません。request bindingがある場合はrecover経路でもv2を強制します。manifest/binding不一致、未知version、RunBinding/schema/ledger不整合はUNKNOWNまたはNEEDS_RECONCILIATIONとして止め、成功・受入成功と返しません。DB間atomic commitは仮定しません。
 
 ## 10. 公開・内部API契約案
 
@@ -300,7 +310,7 @@ run directory準備後、requests.sqlite予約前にcrashするとorphan directo
 | revision contract load | definition_id、revision | YAML/contract/binding identity | revision欠落はNOT_FOUND、hash不整合は保存不整合 |
 | input normalize/validate | 固定contract、raw JSON | normalized JSON、normalization digest | Schema不正・必須欠落・型不一致は実行前拒否 |
 | strict run reserve | request row、run_format_version=2、contract binding | reserved run identity | requests DB内で両rowを同一transactionにし、不整合はreconciliation |
-| strict run recover | request binding、manifest、definition/contract、variables store | 検証済み再開位置 | 欠落・破損・version/hash/owner不一致なら停止し、storeを再作成しない |
+| strict run recover | request binding、manifest、definition/contract、variables store | 検証済み再開位置 | 欠落・破損・version/hash/RunBinding不一致なら停止し、storeを再作成しない |
 | variable read | run/frame selector、declaration selector | typed JSON value、version/digest | missing/ambiguous/invalid scopeは明示エラー |
 | variable mutate | execution_key、payload、expected before identity | commit済みvalue/version/digest | stale before、同key異payloadはconflict |
 | child input boundary | fixed child revision、explicit argument JSON | child用normalized input | D6で実装。D1では契約のみ |
@@ -314,7 +324,7 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 
 - Draft 2020-12以外のdialectはstrict contractで受け付けません。
 - malformed Schema、未許可のvalidation keyword、required additionalPropertiesの欠落、remote/recursive $ref、digest mismatch、revision不一致を実行前に検出します。
-- definitions.sqlite v1→v2 migration後はuser_versionとschemaを厳格検査します。requests.sqliteのbinding rowとmanifest run_format_versionを相互確認し、片側の欠落・改変をlegacy v1として読み替えません。
+- definitions.sqlite v1→v2 migration後はuser_versionとschemaを厳格検査します。requests.sqliteのbinding rowとmanifest run_format_versionを相互確認し、片側の欠落・改変をlegacy v1として読み替えません。I3のmigration対象は隔離一時directory/test DBに限ります。
 - contractとOWS YAMLは同じimmutable revisionとして照合します。
 - Schemaが使うJSON値にNaN/Infinity等のJSON外数値を認めません。
 - $refは同一Schema内の #/$defs/<name> への非循環参照だけを解決し、外部ネットワーク経由の参照解決を行いません。
@@ -338,7 +348,7 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 - declaration_idとframe_identityをread/writeごとに指定します。同名変数はscopeをまたいで許し、同scope内の重複と識別子重複は拒否します。
 - object_set/object_deleteはRFC 6901 pathを使い、更新後value_schemaに不適合ならmutation全体をrollbackします。
 - execution_keyには同一node内のmutation ordinalも含め、同key異payloadまたはdigest不一致をfail closedにします。
-- strict runは全read/recover経路でrequest binding・manifest v2・RunBinding・store schema/ownerを検証します。未対応readerはstrict runを作成・再開できません。
+- strict runは全read/recover経路でrequest binding・manifest v2・RunBinding・store schemaを検証します。未対応readerはstrict runを作成・再開できません。
 - 過去execution_keyのreplayはそのledger記録の結果を返し、latest VariableStateとの同一性を要求しません。version chainやcheckpointとの矛盾はneeds_reconciliationにします。
 
 ## 12. 機密性、公開projection、リソース上限
@@ -384,7 +394,7 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 
 Workflow API body全体はcontract fieldを含めて既存128 KiB以内にします。YAMLやcontract等を個別上限内に収めても、body全体の上限は別に確認します。normalized inputはraw body/inputの大きさにかかわらずdefault適用後にも96 KiBで検査します。既存2 MiB input file制限、64 KiB result、64 KiB YAML等は引き続き適用され、該当するstrict capと小さい方を採ります。prompt 16 KiB、active Workflow 2件、task 10,000の現行制限を広げません。
 
-JSON byte capはUTF-8 canonical encoding（ensure_ascii=false、sort_keys=true、separators=(',', ':'), NaN不許可）を基準にします。duplicate JSON keys、NaN/Infinity、許可外Schema keyword、cyclic refを拒否します。Schema/resource capsはdefinition compile、input raw bodyとnormalized valueはrun admission、variable値/payload/合計/ledger/databaseはmutation transaction内、outputは成功確定前に検査します。WAL 16 MiBは高水位目標で、上限前checkpointとwriter抑制を行います。長時間reader等によりcheckpoint不能な場合のSHM/WAL物理上限と最終保証は未確定です。logical quota、SQLite max_page_count、checkpoint/backpressureの組合せは実装時に検証します。
+JSON byte capはUTF-8 canonical encoding（ensure_ascii=false、sort_keys=true、separators=(',', ':'), NaN不許可）を基準にします。duplicate JSON keys、NaN/Infinity、許可外Schema keyword、cyclic refを拒否します。Schema/resource capsはdefinition compile、input raw bodyとnormalized valueはrun admission、variable値/payload/合計/ledger/databaseはmutation transaction内、outputは成功確定前に検査します。WAL 16 MiBはProposed high-water data budgetです。予算を採用する場合のlogical quota、SQLite max_page_count、checkpoint/backpressureは実装時に検証します。長時間reader等によりcheckpoint不能な場合のSHM/WAL hard physical byte保証はD1/I3/I8 gateではありません。
 
 mutationが上限超過する場合はBEGIN IMMEDIATE内で適用前に検出し、変更なしrollbackとcapacity errorにします。既存state/ledgerを消さず、Workflowを正常完了・受入PASSにしません。read-only inspectorは全履歴を一括返却せずpagination/response capを用います。MCP/HTTP応答の具体数値はOpen question 12に残します。
 
@@ -413,8 +423,8 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | execution_key再利用でpayload違い | MUTATION_ID_CONFLICT | needs_reconciliation相当 |
 | checkpoint/ledger不一致 | MUTATION_RECONCILIATION_REQUIRED | 次nodeへ進まない |
 | v2 manifest/request binding不在・不一致・未知version | RUN_BINDING_RECONCILIATION_REQUIRED | UNKNOWN/NEEDS_RECONCILIATIONで停止し、実行・成功扱いしない |
-| 予約済みstrict runのvariables.sqlite欠落・破損・owner不一致 | VARIABLE_STORE_RECONCILIATION_REQUIRED | DBを再作成せずworkerを起動しない |
-| variables.sqliteが未知user_version/schemaまたはrun directoryがreparse point | VARIABLE_STORE_INVALID | 初期化せずfail closed |
+| 予約済みstrict runのvariables.sqlite欠落・破損・RunBinding不一致 | VARIABLE_STORE_RECONCILIATION_REQUIRED | DBを再作成せずworkerを起動しない |
+| variables.sqliteが未知user_version/schema、または必要pathが許可済みroot外 | VARIABLE_STORE_INVALID | 初期化せずfail closed |
 | output Schema違反 | OUTPUT_CONTRACT_VIOLATION | runをFAILED、親へ返さない |
 | strict v1でsecret変数またはsecret入力を宣言 | SECRET_VALUE_UNSUPPORTED | 明示拒否し、保存・実行しない |
 | 設定上限超過 | RESOURCE_LIMIT_EXCEEDED | 実行前または更新前に拒否 |
@@ -423,6 +433,8 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 ## 14. D1受入テストマトリクス
 
 以下はD1を将来実装するときに必要な具体受入項目です。現在の設計文書作成ターンでのコードテスト実行を意味しません。
+
+2026-11-19の分類では、D1-63..65の旧backup/restore・migration/downgrade期待結果を保持します。隔離test DBでのbackup/rollback behavior検証は現行対象ですが、共有DBの運用移行・downgrade判断は将来のoperator gateとして`DEFERRED / NON-BLOCKING`です。D1-93..107の元IDと旧期待結果は履歴として保持しますが、`DEFERRED / NON-BLOCKING`とし、現行D1/I8 gateから除外します。D1-45とD1-77の旧binary fail-closed/自動instance-startup exclusion期待も履歴として保持し、現行実装gateにはしません。将来共有DBを移行する場合のwriter/worker停止は別途オペレーター承認を伴う手順です。D1-53/D1-86の旧reparse-specific期待も履歴として保持し、現行gateは許可済みroot内のpath、path traversal/run外アクセス拒否とrun bindingの既存境界防御を確認します。新しい全ancestor/sidecar Win32 handle、file-ID、TOCTOU、DACL検査は追加gateにしません。D1-108以降は既存製品上限、入力/出力検証、容量超過時の未変更rollback、secret拒否と値非露出を維持します。strict追加数値はProposed data budgetとして扱い、D1-115のhard WAL/SHM物理byte保証はDEFERREDです。
 
 | ID | ケース | 期待結果 |
 | --- | --- | --- |
@@ -470,7 +482,7 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-42 | definitions.sqlite v1→v2 migration | 既存revision row、PK、hash、legacy ETagを維持し、user_versionとschemaをv2として検証 |
 | D1-43 | 定義migrationのwrite transaction中にcrash | 全rollbackまたは全commitとなり、中間table/schemaを残さない |
 | D1-44 | legacy revisionとstrict revisionのcontract row | legacyは行なし、strictのみ親revision FK付きworkflow_definition_contracts rowを持つ |
-| D1-45 | v2 definitions.sqliteを旧プロセスが開く | user_version/schema不一致を検出してfail closedし、既存データを変更しない |
+| D1-45 | v2 definitions.sqliteを旧プロセスが開く（旧binary fail-closed期待はDEFERRED / NON-BLOCKING） | user_version/schema不一致を検出してfail closedし、既存データを変更しない |
 | D1-46 | strict request rowとworkflow_request_contract_bindings | requests.sqlite内の同一transactionで両方保存し、legacy requestにbinding rowを作らない |
 | D1-47 | strict manifest v2とinput snapshot | 必須identity fieldとvariables.sqlite filename/schema versionを持ち、秘匿実値を含めず、input.jsonはnormalized input |
 | D1-48 | binding row/manifestのversion削除・変更・片側欠落 | downgradeとしてlegacy解釈せずneeds_reconciliation、workerを開始しない |
@@ -478,8 +490,8 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-50 | request予約前のrun directory orphan | Workflowとして自動復活させず監査対象にし、reservation未作成を確認するまで自動削除しない |
 | D1-51 | reservation済みstrict runでvariables.sqlite欠落・破損 | storeを再作成せずneeds_reconciliation、worker起動・Codex POSTなし |
 | D1-52 | variables.sqliteのunknown user_version/schema、readonly inspection | schema不一致はfail closedし、readonly inspectionはDB作成・初期化をしない |
-| D1-53 | run directoryがsymlink/junction/reparse point | identity/path検証で拒否し、外部pathを開かない |
-| D1-54 | variables.sqlite接続とRunBinding owner検査 | run/workflow identity、foreign key、想定pragma、store schemaを照合してからread/write |
+| D1-53 | run directoryがsymlink/junction/reparse point（旧reparse-specific期待はDEFERRED / NON-BLOCKING） | identity/path検証で拒否し、外部pathを開かない |
+| D1-54 | variables.sqlite接続とRunBinding logical owner検査 | run/workflow identity、foreign key、想定pragma、store schemaを照合してからread/write |
 | D1-55 | SQLite mutation commit前・commit後checkpoint前のDBOS crash | rollback時は未反映、commit後はledger結果を返し、いずれも二重更新しない |
 | D1-56 | 後続mutation後に過去stepを再replay | 過去ledgerのafter value/digest/versionを返し、latest stateとの誤conflict・巻戻しを起こさない |
 | D1-57 | 同一execution_keyで異payload、version chain/ledger digest矛盾 | stateを上書きせずneeds_reconciliationにし、自己整合性を検出 |
@@ -488,11 +500,11 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-60 | legacy v1 request、manifest、digest、全reader | v1の既存照合と表示を維持し、strict v2へ再解釈しない |
 | D1-61 | variables.sqlite/RunBindingの不一致とread-only inspector | UNKNOWN/NEEDS_RECONCILIATIONとして停止し、状態再作成や成功投影を行わない |
 | D1-62 | Codex adapter MAYBE_SENTの既存回復 | 既存状態機械を維持し、v2 run reconciliationを理由に不確実なPOSTを再送しない |
-| D1-63 | definitions migrationの運用手順 | writer停止、backup、v1→v2 upgrade、対応版restart、schemaとlegacyデータ検証の順で確認 |
-| D1-64 | upgrade transaction中の失敗と事前backupからの復元 | migrationが全rollbackすることを確認し、退避backupを検証可能にする |
-| D1-65 | strict v2使用後のdowngrade/rollback判断 | v2データを保持したまま旧schemaへ戻せると仮定せず、backup retentionとrollback方針の確定前に運用移行を完了扱いにしない |
+| D1-63 | definitions migrationの運用手順（共有DB運用gateは将来手順） | writer停止、backup、v1→v2 upgrade、対応版restart、schemaとlegacyデータ検証の順で確認 |
+| D1-64 | upgrade transaction中の失敗と事前backupからの復元（隔離test DBのみ現行対象） | migrationが全rollbackすることを確認し、退避backupを検証可能にする |
+| D1-65 | strict v2使用後のdowngrade/rollback判断（共有DB運用判断はDEFERRED / NON-BLOCKING） | v2データを保持したまま旧schemaへ戻せると仮定せず、backup retentionとrollback方針の確定前に運用移行を完了扱いにしない |
 | D1-66 | WAL中のdefinitions/requests backup | SQLite online backup APIで整合snapshotを取得・検証し、主DBファイル単純コピーを使わない |
-| D1-67 | definitions v1事前schema/data gate | user_version=1、既存3 table/columns/index/FK/hash/revisionを厳格検査し、不明object・writer混在を拒否 |
+| D1-67 | definitions v1事前schema/data gate（共有DBのwriter停止確認は将来operator gate） | user_version=1、既存3 table/columns/index/FK/hash/revisionを厳格検査し、不明object・writer混在を拒否 |
 | D1-68 | definitions v1→v2 DDLとversion更新 | 新contract table、columns/PK/FK/index、integrity/FK checkを検証しuser_version=2でcommit |
 | D1-69 | definitions migrationの各中断点 | CREATE後・user_version更新後・commit前のcrashはいずれも全rollbackし中間状態を残さない |
 | D1-70 | definitions既存revision/hash/legacy ETag保全 | migration前後のrowと既存identityを一致させ、legacy contract rowを作らない |
@@ -502,7 +514,7 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-74 | user_version=0 requests DBの未知table/index/shape | blind migrationせずfail closedして調査可能にする |
 | D1-75 | 新規requests DBの初期化 | 対応版で全table/indexを一括作成してuser_version=1にし、IF NOT EXISTSのみの初期化にしない |
 | D1-76 | request/source/bindingのstrict reservation | 三rowをrequests.sqliteの同一transactionで確定し、失敗時は全rollback |
-| D1-77 | 旧binaryとrequests schema v1の混在 | user_versionだけに依存せず、instance/startup gateが旧writer混在を防ぐことを検証 |
+| D1-77 | 旧binaryとrequests schema v1の混在（startup exclusion期待はDEFERRED / NON-BLOCKING） | user_versionだけに依存せず、instance/startup gateが旧writer混在を防ぐことを検証 |
 | D1-78 | binding FKとrequest row/application identity | run_id FK、workflow/request digest/definition revision/source SHAを照合し、orphanやtamperを拒否 |
 | D1-79 | variables.sqlite v1のphysical schema validator | 4 table、columns/PK/FK/index、user_version、integrity_checkとforeign_key_checkを検査 |
 | D1-80 | scope_frames root/parent lifecycle | runごとのrootをpartial unique indexで一つに制限し、composite parent FKを確認。acyclic/path/status規則はapplicationで検査 |
@@ -511,28 +523,28 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-83 | mutation CASと原子commit | 新keyは現state identityをCASし、variable_states更新とledger insertを同transactionでcommit/rollback |
 | D1-84 | 後続mutation後の古いkey replay | 保存済みhistorical after resultを返し、latest stateを要求・上書き・巻戻ししない |
 | D1-85 | JSON canonicalization/schema/digest検証 | application validatorで行い、SQLite JSON1が無効でもDDL・store読書きが成立 |
-| D1-86 | readonly inspectionとstore path | mode=roでDBを作成せず、symlink/junction/reparse pointを拒否 |
+| D1-86 | readonly inspectionとstore path（旧reparse-specific期待はDEFERRED / NON-BLOCKING） | mode=roでDBを作成せず、symlink/junction/reparse pointを拒否 |
 | D1-87 | unknown user_version/schema/object | variables/definitions/requestsそれぞれschema mismatchでfail closedし、既存dataを変更しない |
 | D1-88 | definitions/requests複数DB backup consistency | 全writer停止後に各SQLite online backupとrun metadata snapshotを取り、個別・組合せの復元確認を記録 |
 | D1-89 | rollout時のstrict writer有効化 | 全reader version-aware、旧process停止、両DB migrationとlegacy identity検査後に限りstrict runを許可 |
 | D1-90 | definitions成功後requests migration失敗 | strict runを止め、strict runが存在しないことを確認せず自動rollbackしない。安全なrestore条件を検査 |
 | D1-91 | strict run開始後のrollback要求 | 旧binary/schemaへの自動downgradeを禁止し、forward repairまたは承認済みoffline restore/data-loss扱いへ分岐 |
 | D1-92 | DDL smokeと外部副作用境界 | SQLite :memory:でDDL/制約/FKを確認し、docs taskでは実Codex POSTやpersistent user DB変更を行わない |
-| D1-93 | 同一state_root/SIDの新対応controllerを別ログオンsessionから同時起動 | Global Mutexを共有し一方だけが所有し、他方は有限待機またはfail-closed。RDP/fast user switching等を含め、既存processはkillしない |
-| D1-94 | Mutex取得の有限待機・timeout・abandoned状態 | WAIT_ABANDONED等は成功扱いせず、request/manifest/DB/worker状態を照合してから進行 |
-| D1-95 | migration前/新process起動後の旧Bridgeと自動再起動 | GUI/autostart/service/scheduled/manual経路と未終了workerの不存在を確認するまでmigration/strict enable不可 |
-| D1-96 | Mutexを無視する旧binary・未知writer・quiescence不明 | Mutex単体で排除したと見なさず、状態を証明できなければfail closed |
-| D1-97 | state_root/user SID別のGlobal lock identity・named object squatting | 同root/SIDならsessionをまたいで同じGlobal Mutex、別root/SIDなら別identityを確認し、owner/DACL/object不一致時はstrict enableを拒否。Local fallbackなし |
-| D1-98 | 通常GUI/API/MCP clientの複数接続 | client自身はMutexを取らず、単一controllerを共有して要求を処理 |
-| D1-99 | controllerが起動したrun固有worker | workerはcontroller Mutexを取得せず、認証済みrun/worker identityを検証。live workerが残ればupgradeを拒否 |
-| D1-100 | Windows NTFS run directory/variables.sqlite ACL | protected DACLのowner、現User SIDとLOCAL SYSTEMのみのACE、canonical ACLを検査 |
-| D1-101 | Everyone/Users/Authenticated Users/別SIDへの広いgrant | strict start前に拒否し、値や秘密をerror/logへ出さない |
-| D1-102 | 既存state_root/legacy runのACL不備 | 既存ACLを自動変更せずstrict runを停止。明示的管理者修復の範囲を案内 |
-| D1-103 | state_root/ancestor/run/database/WAL/SHMのreparse point | どの対象pathでも検出したらSQLiteを開かず拒否 |
-| D1-104 | run/database file name collisionとTOCTOU | create-exclusiveとhandle-based owner/file-ID照合で置換・path swapを拒否 |
-| D1-105 | SQLiteが作るWAL/SHMのDACL/owner | 保護directoryから正しいACLを継承し、生成後に検証が完了するまでworkerを開始しない |
-| D1-106 | NTFS以外、security descriptor/identity API不在・失敗 | POSIX/WSL/Dockerへ暗黙切替せずstrictをfail closed |
-| D1-107 | Administrators/backup privilegeや同一user rogue process | 保護対象として遮断できると主張せず、Threat modelの限界と一致 |
+| D1-93 | 同一state_root/SIDの新対応controllerを別ログオンsessionから同時起動（DEFERRED / NON-BLOCKING、旧期待結果保持） | Global Mutexを共有し一方だけが所有し、他方は有限待機またはfail-closed。RDP/fast user switching等を含め、既存processはkillしない |
+| D1-94 | Mutex取得の有限待機・timeout・abandoned状態（DEFERRED / NON-BLOCKING、旧期待結果保持） | WAIT_ABANDONED等は成功扱いせず、request/manifest/DB/worker状態を照合してから進行 |
+| D1-95 | migration前/新process起動後の旧Bridgeと自動再起動（DEFERRED / NON-BLOCKING、旧期待結果保持） | GUI/autostart/service/scheduled/manual経路と未終了workerの不存在を確認するまでmigration/strict enable不可 |
+| D1-96 | Mutexを無視する旧binary・未知writer・quiescence不明（DEFERRED / NON-BLOCKING、旧期待結果保持） | Mutex単体で排除したと見なさず、状態を証明できなければfail closed |
+| D1-97 | state_root/user SID別のGlobal lock identity・named object squatting（DEFERRED / NON-BLOCKING、旧期待結果保持） | 同root/SIDならsessionをまたいで同じGlobal Mutex、別root/SIDなら別identityを確認し、owner/DACL/object不一致時はstrict enableを拒否。Local fallbackなし |
+| D1-98 | 通常GUI/API/MCP clientの複数接続（DEFERRED / NON-BLOCKING、旧期待結果保持） | client自身はMutexを取らず、単一controllerを共有して要求を処理 |
+| D1-99 | controllerが起動したrun固有worker（DEFERRED / NON-BLOCKING、旧期待結果保持） | workerはcontroller Mutexを取得せず、認証済みrun/worker identityを検証。live workerが残ればupgradeを拒否 |
+| D1-100 | Windows NTFS run directory/variables.sqlite ACL（DEFERRED / NON-BLOCKING、旧期待結果保持） | protected DACLのowner、現User SIDとLOCAL SYSTEMのみのACE、canonical ACLを検査 |
+| D1-101 | Everyone/Users/Authenticated Users/別SIDへの広いgrant（DEFERRED / NON-BLOCKING、旧期待結果保持） | strict start前に拒否し、値や秘密をerror/logへ出さない |
+| D1-102 | 既存state_root/legacy runのACL不備（DEFERRED / NON-BLOCKING、旧期待結果保持） | 既存ACLを自動変更せずstrict runを停止。明示的管理者修復の範囲を案内 |
+| D1-103 | state_root/ancestor/run/database/WAL/SHMのreparse point（DEFERRED / NON-BLOCKING、旧期待結果保持） | どの対象pathでも検出したらSQLiteを開かず拒否 |
+| D1-104 | run/database file name collisionとTOCTOU（DEFERRED / NON-BLOCKING、旧期待結果保持） | create-exclusiveとhandle-based owner/file-ID照合で置換・path swapを拒否 |
+| D1-105 | SQLiteが作るWAL/SHMのDACL/owner（DEFERRED / NON-BLOCKING、旧期待結果保持） | 保護directoryから正しいACLを継承し、生成後に検証が完了するまでworkerを開始しない |
+| D1-106 | NTFS以外、security descriptor/identity API不在・失敗（DEFERRED / NON-BLOCKING、旧期待結果保持） | POSIX/WSL/Dockerへ暗黙切替せずstrictをfail closed |
+| D1-107 | Administrators/backup privilegeや同一user rogue process（DEFERRED / NON-BLOCKING、旧期待結果保持） | 保護対象として遮断できると主張せず、Threat modelの限界と一致 |
 | D1-108 | 現行API/YAML/prompt/result/file/concurrency/task上限の回帰 | 128/64/16/64 KiB、2 MiB、同時2件、10,000 taskを変更せずstrict側は追加制約を適用 |
 | D1-109 | contract/YAML/API全body境界 | contract 64 KiB、YAML 64 KiBを個別検査し、合計API body 128 KiBも独立検査 |
 | D1-110 | raw requestとdefault適用後normalized input | API body 128 KiBに加えnormalized JSON/input.json 96 KiBを両方検査 |
@@ -583,17 +595,21 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-155 | DBOS call replay/historical after | stable node path、mutation ordinal 0、binding/root frame keyで一度だけ反映し、後続stateを巻き戻さない |
 | D1-156 | invalid call mutation rollback/redaction | schema/value/ledger failureでstate変更なし、safe reason/eventから変数値・prompt・inputを漏らさない |
 
-D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。D1-42以降はmigration・run lifecycle・回復・security・resource・公開HTTP/MCP契約の受入項目です。この文書のみの変更ではコードテストを実行しません。
+D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows executionを含めます。D1-42以降はmigration・run lifecycle・回復・path boundary・resource/privacy・公開HTTP/MCP契約の受入項目です。2026-11-19 docs-only変更ではpytest、Ruff、mypy、compileallをNOT_RUNとし、コードテストを実行していません。
 
 ## 15. D1出口条件
 
 D1実装の出口では、一つの保存済みWorkflowについて、revision固定contract検証、入力正規化、変数初期化・代入・数値/配列/object変更・削除、output validation、明示exportがDBOS回復下でも再現できる必要があります。same execution_key replayでmutationを二重適用せず、競合時は上書きせず状態を照合可能にします。
 
+D1出口では、SQLiteのsingle-DB `BEGIN IMMEDIATE` transaction、unique key、CAS/version/digest、schema/`user_version`/integrity/foreign-key整合検査を確認します。変数stateとmutation ledgerは同じDB transactionで確定し、DBOS checkpointとの非原子的境界を越えてreplay-safeであること、既存DB/revision/legacy ETag/manifest/request-id互換、input/output検証、保存pathの許可済みroot containmentと既存path traversal/run外アクセス拒否を確認します。SQLite writer lockだけで旧binaryや複数DB間の整合性を保証したとは扱いません。
+
+I2は`DEFERRED / NON-BLOCKING`で、Global Mutex、RDP/session、explicit NTFS DACL/ACE/SID、全ancestor/sidecar file-ID/TOCTOU証跡はD1出口条件ではありません。隔離Windows実行とDB整合性はI8で確認します。D1のschema migrationはI3の隔離一時directory/test DBが対象で、共有DB migration、本番反映、full strict enable、releaseは別途承認事項です。
+
 この出口条件はD2の汎用Agent nodeや動的prompt、D5のRepeat-Until実装、D6の実subflow起動、D7の複数Issue運用、D8のGUI編集をD1へ持ち込みません。既存OWS動作・旧revision・Codex MAYBE_SENT再送規則は維持します。
 
 ## 16. Proposed decisions（レビュー対象）
 
-以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-23は従来候補を維持し、PD-24..PD-29は第4回のsingle-controller排他、Windows ACL/path、strict resource cap、PD-30以降は第5回の公開HTTP/MCP契約・ETag v2・error/status互換案です。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、起動/ACL/cap設計は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)、公開契約は[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)にあります。
+以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、D1全体はDRAFTのままです。PD-01..PD-23とPD-30以降のcontract/ledger/API案を維持します。PD-24..PD-27およびPD-29に含まれるWindows排他・DACL・handle/TOCTOU gateは従来候補として`DEFERRED / NON-BLOCKING`です。PD-28のstrict resource数値は独立したProposed data budgetです。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、従来の排他/ACL/cap候補は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)、公開契約は[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)にあります。
 
 | ID | Proposed decision | 対応する論点 |
 | --- | --- | --- |
@@ -607,25 +623,25 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-08 | mutation execution_keyにはrun/revision binding、stable node path、全loop iteration vector、scope/frame、将来のsubflow call context、node内mutation ordinalを含める。SQLite mutation ledgerでDBOS checkpointとのreplay境界をつなぎ、同じkeyの再実行は記録済みmutation結果を返す。過去mutationの結果とlatest VariableStateは一致しない場合があり、latest stateを巻き戻さない。MAYBE_SENTは流用しない。 | 旧Q8 |
 | PD-09 | strict入力は一度正規化してからvalidation・実行・idempotency digestに使用する。strict v2にbinding digestとnormalized input hashを加え、過去manifest/request digestとlegacy v1検証を再解釈しない。 | 旧Q13 |
 | PD-10 | strict v1初期実装はsecret変数とsecret入力を明示拒否する。token自動注入やplaintext secret保存を行わず、secret storage/key管理は別設計とする。 | 機密性候補 |
-| PD-11 | 変数状態はrun directory内の独立variables.sqliteに保存し、VariableState/ScopeFrame/VariableMutation/RunBinding専用schemaとuser_version=1を使う。DBOS/requests/definitions/node-event DBへ混在させず、run/workflow ownerとrun directoryを検証する。 | 旧Q9の配置判断 |
+| PD-11 | 変数状態はrun directory内の独立variables.sqliteに保存し、VariableState/ScopeFrame/VariableMutation/RunBinding専用schemaとuser_version=1を使う。DBOS/requests/definitions/node-event DBへ混在させず、run/workflow logical identityと許可済みroot内のpathを検証する。 | 旧Q9の配置判断 |
 | PD-12 | definitions.sqlite v1→v2を単一write transactionで移行し、既存revision/PK/hash/legacy ETagを保持してworkflow_definition_contractsを追加する。legacy revisionのcontract rowは欠落とし、user_version/schema検証後に対応版のみ運用する。 | 旧Q9のdefinition migration |
 | PD-13 | strict requestだけrequests.sqlite内のworkflow_request_contract_bindingsへrun_format_version=2、revision/contract/binding/normalized-input/request digestを保存し、request rowと同一transactionで確定する。legacy requestはbinding rowなし。 | 旧Q9のrequest binding |
 | PD-14 | strict manifestはrun_format_version=2とrevision/contract/binding/normalized-input/store identityを記録し、request binding rowと全readerで相互検証する。bindingとmanifestの欠落・downgrade・未知versionはfail closed。legacy v1 digest・reader挙動は不変。 | 旧Q9のmanifest識別 |
-| PD-15 | strict作成順はimmutable revision/contractとnormalized input検証、v2 digest、snapshot準備、run-local store初期化、request+binding予約、worker owner検証とする。別DB/Filesystem間atomicityを仮定せず、orphanは自動復活させず監査し、reservation不存在を確認するまで削除しない。予約後のstore欠落・破損は再作成せずreconciliationで停止する。 | 旧Q9のlifecycle |
+| PD-15 | strict作成順はimmutable revision/contractとnormalized input検証、v2 digest、snapshot準備、run-local store初期化、request+binding予約、worker RunBinding検証とする。別DB/Filesystem間atomicityを仮定せず、orphanは自動復活させず監査し、reservation不存在を確認するまで削除しない。予約後のstore欠落・破損は再作成せずreconciliationで停止する。 | 旧Q9のlifecycle |
 | PD-16 | 同一execution_keyのhistorical replayは台帳保存済みafter resultを返し、payload/hash/chain/RunBinding/checkpointを検証する。後続mutation後のlatest stateを過去after digestと一致要求せず、巻戻し・再適用をしない。 | 旧Q9のreplay詳細 |
 | PD-17 | v2の不確定なbinding/store/recovery状態を成功・受入成功にしない。read-only inspectorはstoreを作成せず、Graph/MCPは許可済みmetadataのみ公開する。Codex MAYBE_SENT状態機械とsecret拒否方針は変更しない。 | 旧Q9のreader・公開境界 |
-| PD-18 | definitions.sqlite v1→v2はwriter停止、online backup/検証、v1 exact-schema/data gate後に単一transactionでworkflow_definition_contractsを追加し、version/schema/rowsを照合してcommitする。WAL主DBファイル単純copyはbackupに使わない。 | 旧Q9 migration具体化 |
-| PD-19 | requests.sqliteの既存user_version=0は既知legacy schema/objects/rowsを厳格検査してから単一transactionでbinding tableを追加しuser_version=1にする。未知objectsは拒否し、version-aware readerと旧binary排他gateはversion fieldだけに依存しない。 | 旧Q9 request migration |
+| PD-18 | I3は隔離一時directory/test DBでdefinitions.sqlite v1→v2を単一transactionで実装・検証し、exact schema/data、version/rows/legacy identityを照合する。将来共有DBへ適用する場合はPD-23のoperator gateを使い、WAL主DBファイル単純copyはbackupに使わない。 | 旧Q9 migration具体化 |
+| PD-19 | I3は隔離一時directory/test DBでrequests.sqliteの既知user_version=0 schema/objects/rowsを検査後、単一transactionでbinding tableを追加しuser_version=1にする。未知objectsは拒否する。version metadataだけで旧binary/別controllerを排除できるとは扱わず、共有DB移行はPD-23のoperator gateに限る。 | 旧Q9 request migration |
 | PD-20 | run-local variables.sqlite physical schemaはrun_binding、scope_frames、variable_states、variable_mutationsの4 tableとADR0004のCHECK/FK/partial-unique/unique/history indexesを使う。JSON値のcanonical/hash/schema検査はapplication側で行いJSON1に依存しない。 | 旧Q9 variable DDL |
 | PD-21 | variable stateはmissing row、JSON null文字列、present=0 tombstoneを区別する。mutation ledgerはhistorical after valueを保持し、CAS、線形version chain、state更新とledger insertを一transactionで行う。 | 旧Q9 ledger DDL |
 | PD-22 | 各DBはuser_version・object/table/column/index/PK/FK・integrity/FK checkを厳格検査する。起動時のschema mismatch/未知objectはfail closedし、readonly inspectionでDB作成しない。 | 旧Q9 schema validator |
-| PD-23 | migration/rollbackは全writer停止、SQLite online backup、version-aware binary展開、各DB migration、legacy identity検証、reader対応後のstrict enableの順とする。strict run開始後は旧binary/schemaへの自動rollbackを行わずforward repairまたは承認済みoffline restoreを使う。 | 旧Q9 operational gate |
-| PD-24 | 新対応controllerはDB open/migration前にstate_rootのcanonical absolute pathと現user SIDのSHA-256 identifierに結び付く Global 名前付きMutexを取得し、controller寿命中保持する。CreateMutexExWには明示DACL付きSECURITY_ATTRIBUTESを渡しdwFlags=0とする。mutexはthread-ownedのため取得owner threadを保持し、同じthreadだけがreleaseする。DACL/owner検証または取得失敗、Global作成不可ならstrict enableを止め、Localへfallbackしない。abandoned時は状態照合を必須とする。 | 旧Q9 controller exclusion |
-| PD-25 | Mutexは旧binaryを止めない。全legacy起動経路とworkerの停止を確認し、互換owner/旧writer不存在が証明できない場合migration/strict enableしない。Mutexだけで旧binary混在を防ぐと主張しない。 | 旧Q9 old-version gate |
-| PD-26 | workerはcontroller Mutexを取得しない。controller認証済みrun/worker起動identityとbindingを検査し、live workerが残る間はupgradeしない。通常GUI/API/MCP clientは共有controllerを使い、Mutexを個別取得しない。 | 旧Q9 worker lifecycle |
-| PD-27 | strict D1の新規run directory/variables.sqlite/WAL/SHMはNTFS protected DACL、owner SID、canonical ACLを検査し、state_root・ancestor・run/database/sidecarのreparse pointを拒否する。create-exclusive/handle-based file-ID照合を行い、既存ACLを自動変更しない。 | 旧Q11 Windows boundary |
+| PD-23 | 将来共有DBを移行する場合は別途オペレーター承認を得て、既知writer/worker停止、SQLite online backupと検証、schema互換、DB migration、成功後のlegacy identity検証を行う。停止を確認できなければ移行しない。strict run開始後は旧binary/schemaへの自動rollbackを行わない。 | 旧Q9 operational gate |
+| PD-24 | **DEFERRED / NON-BLOCKING（従来候補）:** 新対応controllerがDB open/migration前にstate_root/SID由来Global named Mutexを取得し、controller寿命中保持する案。明示DACL、owner thread、abandoned recovery、Local fallbackなしを含むが、D1の必須依存・I8 gateではない。 | 旧Q9 controller exclusion |
+| PD-25 | **DEFERRED / NON-BLOCKING（従来候補）:** Mutexは旧binaryを止めず、全legacy起動経路とworker停止を確認する案。SQLite user_versionやwriter lockだけで旧binaryの安全共存を約束しない。共有DB移行時の別途承認・停止確認はPD-23に従う。 | 旧Q9 old-version gate |
+| PD-26 | **DEFERRED / NON-BLOCKING（従来候補）:** worker/controllerのmutex lifecycle、別client排他に関する運用案。D1で必要なrequest/run bindingとDBOS recovery identity検証は別のcontract/ledger要件として維持する。 | 旧Q9 worker lifecycle |
+| PD-27 | **DEFERRED / NON-BLOCKING（従来候補）:** Windows NTFS protected DACL、owner SID、WAL/SHM ACE、全ancestor reparse/handle/file-ID/TOCTOU検査案。既存の許可root containmentとpath traversal拒否は維持するが、これら追加Windows機構はD1 gateにしない。 | 旧Q11 Windows boundary |
 | PD-28 | 本節のresource tableをstrict v1のProposed初期値とし、既存limitを変えず重複制約にはmin(existing_limit, strict_limit)を適用する。API body、normalized input、schema/value/aggregate/store capsをそれぞれ明示検査する。 | 旧Q11 numerical limits |
-| PD-29 | cap超過は変更前に検出し安全なcapacity errorで止め、既存state/ledgerを保持して成功/acceptanceとしない。WAL/SHMを含む物理上限保証とWindows ACL raceは実装dogfoodで検証する未決ゲート。 | 旧Q11 enforcement |
+| PD-29 | 設定済みcap超過は変更前に検出し、安全なcapacity errorで止め、既存state/ledgerを保持して成功/acceptanceとしない。strict数値はPD-28のProposed data budgetとして再評価する。WAL/SHM hard physical byte guaranteeとWindows ACL raceはDEFERREDで、I3/I8 gateではない。 | 旧Q11 enforcement |
 | PD-30 | 既存HTTP definition create/validate/updateとMCP definition create/validate/updateへoptional top-level contract objectを追加する。contract_version=1、input_schema、output_schema、variablesのみを受け、JSON null/unknown key/unsupported versionとstrict v1のsecretを拒否する。 | 第5回contract wire |
 | PD-31 | contract absentのlegacy mutationは従来どおり。legacyからstrictは明示contract付き新revision、strict updateはcontract必須、missing/nullでworkflow_contract_required、strict-to-legacy downgrade禁止。同じcontractのupdateも新immutable revisionとする。Strict mutation digestはsource/profile/contract payload、共通expected_revision、definition mode/binding identityで計算し、raw If-Match/transport名を含めない。Legacy digestは1 bitも変更しない。 | 第5回CRUD互換 |
 | PD-32 | HTTP POST validate/MCP workflow_definition_validateはoptional contractを受ける。legacy response key setを維持し、strict成功時はcontract_version/contract_sha256を追加するがrevision未確定のbinding_digest previewは返さない。Invalid Schema/contractは安全errorでwriteしない。 | 第5回validate |
@@ -638,18 +654,18 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-39 | 公式OWS task type/schemaを変更せず、strict contract revisionのみCallFunction target codexbridge-variableをallowlistする。with operation/declaration_id/scope=workflowとoperation別引数を厳格検証し、現行set literal/jq評価規則を再利用する。Read-only $cbvarsはstrict root frameのpresent値だけを示し、legacy call/contextを変えない。DBOS ledger execution keyで一度だけ反映し、Loop/Issue/Attempt/Subflow/Dynamic promptは後工程へ残す。 | ADR 0007 Proposed |
 ## 17. Open questions
 
-次は未確定事項として残し、実装前に決定・承認します。run-local DB、DDL/schema version、binding、作成・回復順序、historical replay、migration/rollback、controller排他、resource capはPD-01..29へ、公開route/tool、contract wire delta、ETag v2、run/result/error projectionの提案はPD-30..38へ移しました。以下には実装詳細または別途レビューが必要な部分だけを残し、項目番号は前版Open questionsの参照番号を維持します。
+次はD1 DRAFTの未確定事項です。run-local DB、DDL/schema version、binding、作成・回復順序、historical replay、migration/rollback、resource budgetはPD-01..29へ、公開route/tool、contract wire delta、ETag v2、run/result/error projectionの提案はPD-30..38へ移しました。Windows排他/ACL関連は歴史的候補としてDEFERRED / NON-BLOCKINGに分類します。項目番号は前版Open questionsの参照番号を維持します。
 
-9. Global Mutex名のcanonicalization/hash input framingとWin32 API wrapper、owner threadの寿命・同一thread release、RDP/fast user switching/serviceをまたぐ排他の実証、controller起動/終了への組込み、旧GUI/autostart/service/scheduled/manual再起動経路を封じるinstance guard、live workerとcontroller認証済みrun起動identityの具体mechanism。Global作成/DACL/owner検証/取得に失敗した場合はstrict enableせずLocalへfallbackしません。requests.sqliteは現行でuser_version管理がなく、旧binaryは新Mutexを知らないため、version/Mutexだけでは旧writer排除になりません。quiescenceを証明できない場合はstrict enableしません。
+9. Global Mutex名、Win32 wrapper、owner thread、RDP/fast user switching/service session検証、DACL/owner検査、controller起動排他は従来I2候補として`DEFERRED / NON-BLOCKING`です。現行D1/I3/I8のgateではありません。将来の共有DB migration時はGlobal Mutexの有無に依存せず、別途承認、既知writer/worker停止、backup/検証、schema互換、legacy identity検証を行い、停止を確認できなければ移行しません。旧binaryの安全共存や自動upgradeは約束しません。
 10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1での拒否を公開するerror mapping。secret機能を初期実装へ含めません。
-11. 表12のresource capはProposed初期値です。WAL/SHM高水位と長時間reader時のcheckpoint/backpressure、PRAGMA max_page_count/論理quotaとの組合せで64 MiB main DBを超えない保証、NTFS SECURITY_DESCRIPTOR/DACL/ACE継承/owner確認とhandle-based file-ID検証の実装・Windows dogfood測定は未決定です。ACL/API/identity検査不能時のstrict fail-closed境界を実装前に確認します。
+11. 表12のstrict追加resource capはProposed data budgetであり、必要に応じてデータ予算として再評価します。予算を採用する場合のlong-reader checkpoint/backpressureとlogical quotaは実装時のresource設計事項です。WAL/SHMのhard physical byte guarantee、NTFS SECURITY_DESCRIPTOR/DACL/ACE継承/owner確認、handle-based file-ID検証は`DEFERRED / NON-BLOCKING`であり、I3/I8必須gateではありません。現行製品上限とI1 pure coreの既存checksは維持します。
 12. 既存route/toolへのoptional contract追加、legacy responseの厳密維持、strict ETag v2、error/status対応、D8へ渡すprojection方針はPD-30..38に記録しました。shared DTO serializer、厳密なfield allowlist fixture、strict-only metadata追加時のresponse cap/paging実装、strict v2利用後のbackup retention/offline restore手順は未確定です。
 14. Output violation=failed/output_contract_violation、実行・ledger不確実=needs_reconciliation/safe reason_codeという公開意味はPD-36..37に記録しました。内部causeから全reason_code/eventへの細かな写像、外部副作用発生後の補償・人手レビュー・再実行方針は未確定です。
 
-上記のOpen questionsはこのDRAFTと実装対象を区別するために残します。解決前に未決定の値やAPIを確定仕様として扱いません。
+上記のOpen questionsはこのDRAFTと実装対象を区別するために残します。DEFERRED項目を現行gateへ戻す場合は別の設計決定が必要です。解決前に未決定の値やAPIを確定仕様として扱いません。
 
 ## 18. D1実装計画とOWS call adapterの現状
 
-I0〜I8の分割、依存関係、受入gate、rollback案、D1-01〜D1-156 traceabilityは[D1実装スライス計画](D1-implementation-plan.md)に記録します。これはPLANNING / DRAFTであり、全sliceはNOT_STARTEDです。
+I0〜I8の履歴、依存関係、受入gate、rollback案、D1-01〜D1-156 traceabilityは[D1実装スライス計画](D1-implementation-plan.md)に記録します。I0/I1は条件付き受入済み、I2はDEFERRED / NON-BLOCKING、I3〜I8はNOT_STARTEDです。D1全体はDRAFTです。
 
 公式OWS CallFunction schemaはnamed task item内のfunction nameとwith objectを受け入れますが、現行interpreterのcall allowlistはmock-job/codex-jobのみです。call: codexbridge-variable、strict root variable adapter、$cbvarsは未実装です。OWS公式Schema、legacy call validation、OWS set/contextの既存意味は変更しません。候補契約の詳細は[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)を参照してください。
