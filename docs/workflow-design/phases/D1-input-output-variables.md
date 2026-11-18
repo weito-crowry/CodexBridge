@@ -546,8 +546,34 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-118 | read-only inspectorの履歴/HTTP-MCP projection | pagination/response capを使い、一括全履歴と変数実値を返さない |
 | D1-119 | strict cap errorとsecret扱い | valueをerror/logへ埋め込まずPD-10のsecret拒否を維持 |
 | D1-120 | limit導入後の既存設定・外部job境界 | 既存prompt/time budgetを変更せず、このdocs taskでCodex POST/MCP dogfoodを行わない |
+| D1-121 | contract wire object/version/field allowlist | contract_version=1とinput/output/variablesを検証し、null・unknown field・secretを拒否 |
+| D1-122 | contractなしのlegacy create/update response | 旧HTTP/MCP body、header、v1 ETag、request mutation identityにstrict fieldを追加しない |
+| D1-123 | strict validate success/error | contract_version/hashを返しbinding previewは返さず、不正contractは保存・revision追加なし |
+| D1-124 | legacy revisionからstrict update | 明示contractが新immutable revisionとstrict v2 ETagへ結び付き、旧revisionは不変 |
+| D1-125 | strict updateでcontract省略/null | HTTP/MCP workflow_contract_required、downgradeなし、repository mutationなし |
+| D1-126 | mutation request id/digestでcontractが異なる | contract presence/canonical hash/revision/validatorを識別し、旧legacy request replayを再解釈しない |
+| D1-127 | strict ETag v2 digest | domain、definition/revision、YAML、max-jobs、contract/binding fieldsからstrong lowercase SHA-256を再計算 |
+| D1-128 | HTTP If-Match / MCP expected_revision CAS | stale/cross-modeは既存precondition error、HTTP missing=428/malformed=400、MCPはexpected_revisionを維持 |
+| D1-129 | legacy GET/list/graph/revision metadata | exact body/ETag/cursorをbaselineと比較し、contract-null key等を追加しない |
+| D1-130 | strict detail/list/graph projection | detailのみcontract本体、summaryはcontract hash/binding metadataのみを含みcap内に収まる |
+| D1-131 | ETag header/body consistency | strict detailのHTTP header/bodyが同じv2値、legacy v1の既存一致を維持 |
+| D1-132 | HTTPとMCPのlegacy error compatibility | 既存transport固有error names/string/envelope/statusを相互renameしない |
+| D1-133 | strict run modeとrevision binding | pinned revisionからserverがmode決定し、client指定contract/run_format_versionを拒否 |
+| D1-134 | strict run input omission/null/default | omissionはobject defaultsを一度適用、explicit nullはinvalid、same normalized valueはsame digest |
+| D1-135 | strict input invalid/異なるnormalized request | invalidはreservation前で停止し、同じclient_request_idの異normalized inputはrequest_id_conflict |
+| D1-136 | strict/legacy run-start response | strict専用binding metadataだけ追加し、legacy fixed fields/body/statusをexact維持 |
+| D1-137 | output contract違反と業務REJECTED | invalid outputはfailed/no result、Schema valid REJECTEDはsucceeded/result内に残す |
+| D1-138 | uncertain send/commit/ledger回復 | needs_reconciliationとsafe reason_codeを返し、Workflow retry/Codex再POSTを行わない |
+| D1-139 | strict HTTP error table | HTTP status/code/run_id/state/retry mappingとreservation前後境界を対応表どおりにする |
+| D1-140 | strict MCP error envelope | 同じstrict codeをstructured {error,reason_code,workflow_id,run_id,status} allowlistで返しHTTP statusを混ぜない |
+| D1-141 | strict reason_code/event redaction | input/prompt/variable/secret/tracebackを含めず、legacy event bodyを変えない |
+| D1-142 | run/result/task public projection | bounded allowlist metadataのみを出しvariable valuesと全ledger historyを公開しない |
+| D1-143 | MCP read/write/execute permission regression | definition read、mutation write、run start executeの既存区分を保ち権限昇格しない |
+| D1-144 | HTTP/MCP request/response size caps | 128 KiB/1 MiB/256 KiBとstrict contract/input/output capsをcombined payload込みで検査 |
+| D1-145 | legacy clientとstrict clientの併存 | unknown request fields拒否を維持し、旧clientのexact response/ETag/replayとstrict clientの追加fieldを両立 |
+| D1-146 | 同時strict update race | 同じexpected revisionからの並行mutationは一つだけcommitし、他方は既存CAS conflictとなる |
 
-D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。上記D1-42以降は追加migration・run lifecycle・回復・security・resource受入項目です。この文書のみの変更ではコードテストを実行しません。
+D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。D1-42以降はmigration・run lifecycle・回復・security・resource・公開HTTP/MCP契約の受入項目です。この文書のみの変更ではコードテストを実行しません。
 
 ## 15. D1出口条件
 
@@ -557,7 +583,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 
 ## 16. Proposed decisions（レビュー対象）
 
-以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-23は従来候補を維持し、PD-24以降は第4回のsingle-controller排他、Windows ACL/path、strict resource cap候補です。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、起動/ACL/cap設計は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)にあります。
+以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-23は従来候補を維持し、PD-24..PD-29は第4回のsingle-controller排他、Windows ACL/path、strict resource cap、PD-30以降は第5回の公開HTTP/MCP契約・ETag v2・error/status互換案です。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、起動/ACL/cap設計は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)、公開契約は[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)にあります。
 
 | ID | Proposed decision | 対応する論点 |
 | --- | --- | --- |
@@ -590,14 +616,23 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-27 | strict D1の新規run directory/variables.sqlite/WAL/SHMはNTFS protected DACL、owner SID、canonical ACLを検査し、state_root・ancestor・run/database/sidecarのreparse pointを拒否する。create-exclusive/handle-based file-ID照合を行い、既存ACLを自動変更しない。 | 旧Q11 Windows boundary |
 | PD-28 | 本節のresource tableをstrict v1のProposed初期値とし、既存limitを変えず重複制約にはmin(existing_limit, strict_limit)を適用する。API body、normalized input、schema/value/aggregate/store capsをそれぞれ明示検査する。 | 旧Q11 numerical limits |
 | PD-29 | cap超過は変更前に検出し安全なcapacity errorで止め、既存state/ledgerを保持して成功/acceptanceとしない。WAL/SHMを含む物理上限保証とWindows ACL raceは実装dogfoodで検証する未決ゲート。 | 旧Q11 enforcement |
+| PD-30 | 既存HTTP definition create/validate/updateとMCP definition create/validate/updateへoptional top-level contract objectを追加する。contract_version=1、input_schema、output_schema、variablesのみを受け、JSON null/unknown key/unsupported versionとstrict v1のsecretを拒否する。 | 第5回contract wire |
+| PD-31 | contract absentのlegacy mutationは従来どおり。legacyからstrictは明示contract付き新revision、strict updateはcontract必須、missing/nullでworkflow_contract_required、strict-to-legacy downgrade禁止。同じcontractのupdateも新immutable revisionとする。 | 第5回CRUD互換 |
+| PD-32 | HTTP POST validate/MCP workflow_definition_validateはoptional contractを受ける。legacy response key setを維持し、strict成功時はcontract_version/contract_sha256を追加するがrevision未確定のbinding_digest previewは返さない。Invalid Schema/contractは安全errorでwriteしない。 | 第5回validate |
+| PD-33 | Legacy GET/list/graph responseとETagを変更せず、strict detailだけcontract本体とbinding hashを含める。strict list/graphはcontract_version/hash/binding_digest summaryだけを追加し、契約未指定時はnull keyを追加しない。 | 第5回read projection |
+| PD-34 | Strict definitionはstrong ETag v2を使い、domain-separated canonical JSONにdefinition/revision/YAML/max-jobs/contract/binding identityを含める。Legacy v1 ETag/digestは不変。HTTP If-Matchはv1/v2をmode照合しCASし、MCP expected_revisionはauthoritative CASのままとする。ETag v2とrun_format_version=2は異なるversion domain。 | 第5回ETag |
+| PD-35 | HTTP saved-run start/MCP workflow_run_startは既存required argsとoptional inputを保ち、pinned revisionからserverがlegacy/strictを選ぶ。callerはcontract/run_format_versionを選べない。strict inputはobject/null invalid、default後normalized inputをdigestし、同normalized default値は同じidempotency identity、異値は既存conflictとする。 | 第5回run start |
+| PD-36 | Strict成功runは既存response fieldsにrun_format_version、contract_version/hash、binding_digestを追加し、legacy responseは不変。Output Schema検証前にsucceeded/resultを公開せず、invalid outputはfailed/output_contract_violation、業務REJECTEDはvalid result内に置く。 | 第5回result |
+| PD-37 | Runtime status enumを維持し、strict-only safe reason_codeをstatus/detail/eventへ追加可能にする。UNKNOWNや外部効果/ledger不確定時はneeds_reconciliationを用い自動retry/POSTしない。error codeはtransport固有のlegacy namesを保ち、表のstrict additionsだけを追加する。 | 第5回status/error |
+| PD-38 | D1 public projectionはvariable value/prompt/input/secret/tracebackを返さず、必要時もallowlist metadata/countだけとする。MCP read/write/execute permissionとHTTP/MCP response capsを維持し、variable inspector/editorとGUI詳細はD8へ残す。 | 第5回projection/auth |
 ## 17. Open questions
 
-次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、DDL候補、schema version、request/manifest binding、run作成・recovery順序、historical mutation replay、migration/rollback方針、single-controller排他案、strict resource capのProposed初期値はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
+次は未確定事項として残し、実装前に決定・承認します。run-local DB、DDL/schema version、binding、作成・回復順序、historical replay、migration/rollback、controller排他、resource capはPD-01..29へ、公開route/tool、contract wire delta、ETag v2、run/result/error projectionの提案はPD-30..38へ移しました。以下には実装詳細または別途レビューが必要な部分だけを残し、項目番号は前版Open questionsの参照番号を維持します。
 
 9. Global Mutex名のcanonicalization/hash input framingとWin32 API wrapper、owner threadの寿命・同一thread release、RDP/fast user switching/serviceをまたぐ排他の実証、controller起動/終了への組込み、旧GUI/autostart/service/scheduled/manual再起動経路を封じるinstance guard、live workerとcontroller認証済みrun起動identityの具体mechanism。Global作成/DACL/owner検証/取得に失敗した場合はstrict enableせずLocalへfallbackしません。requests.sqliteは現行でuser_version管理がなく、旧binaryは新Mutexを知らないため、version/Mutexだけでは旧writer排除になりません。quiescenceを証明できない場合はstrict enableしません。
 10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1での拒否を公開するerror mapping。secret機能を初期実装へ含めません。
 11. 表12のresource capはProposed初期値です。WAL/SHM高水位と長時間reader時のcheckpoint/backpressure、PRAGMA max_page_count/論理quotaとの組合せで64 MiB main DBを超えない保証、NTFS SECURITY_DESCRIPTOR/DACL/ACE継承/owner確認とhandle-based file-ID検証の実装・Windows dogfood測定は未決定です。ACL/API/identity検査不能時のstrict fail-closed境界を実装前に確認します。
-12. HTTP/MCPの公開route/field/status、同一endpoint optional fieldか別APIか、strict ETagのwire表現と既存client移行、Console投影、public error code、backup retentionおよびstrict v2利用後のrollback手順。
-14. output違反・reconciliationの公開status/event名と、外部副作用発生後の補償・レビュー・再実行手順。
+12. 既存route/toolへのoptional contract追加、legacy responseの厳密維持、strict ETag v2、error/status対応、D8へ渡すprojection方針はPD-30..38に記録しました。shared DTO serializer、厳密なfield allowlist fixture、strict-only metadata追加時のresponse cap/paging実装、strict v2利用後のbackup retention/offline restore手順は未確定です。
+14. Output violation=failed/output_contract_violation、実行・ledger不確実=needs_reconciliation/safe reason_codeという公開意味はPD-36..37に記録しました。内部causeから全reason_code/eventへの細かな写像、外部副作用発生後の補償・人手レビュー・再実行方針は未確定です。
 
 上記のOpen questionsはこのDRAFTと実装対象を区別するために残します。解決前に未決定の値やAPIを確定仕様として扱いません。

@@ -20,6 +20,7 @@
 | [ADR 0003: run-local変数DBとmanifest v2](decisions/0003-run-local-variable-store-and-manifest-v2.md) | Proposed（レビュー待ち） | run別変数DB、DB移行、request binding、strict v2回復・replayの設計候補 |
 | [ADR 0004: SQLite DDLとschema migration](decisions/0004-sqlite-ddl-and-schema-migration.md) | Proposed（レビュー待ち） | definitions/request/variable DBのDDL案、validator、upgrade/rollback gate |
 | [ADR 0005: 起動排他・resource cap・Windows ACL](decisions/0005-startup-exclusion-resource-limits-windows-acl.md) | Proposed（レビュー待ち） | controller排他、旧版upgrade gate、NTFS ACL/path保護、strict v1上限案 |
+| [ADR 0006: 公開HTTP/MCP契約・ETag v2・エラー互換](decisions/0006-public-api-mcp-etag-error-contract.md) | Proposed（レビュー待ち） | optional contract、legacy/v2 ETag、strict run responseとエラー/status互換の設計案 |
 | [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（レビュー待ち） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
 
 ## Phase一覧
@@ -50,4 +51,4 @@
 
 ## 依存関係
 
-基本仕様と現在の責務分担をそれぞれ [要件](requirements.md) と [アーキテクチャ](architecture.md) に記します。D1はこれらを前提にする詳細設計案であり、ループ方針は [ADR 0001](decisions/0001-structured-loops.md)、contract保存・正規化は [ADR 0002](decisions/0002-contract-storage-and-normalization.md)、run-local変数DBとmanifest v2は [ADR 0003](decisions/0003-run-local-variable-store-and-manifest-v2.md)、SQLite DDLとmigrationは [ADR 0004](decisions/0004-sqlite-ddl-and-schema-migration.md)、起動排他・ACL・strict上限は [ADR 0005](decisions/0005-startup-exclusion-resource-limits-windows-acl.md) を参照します。D2〜D8はD1のcontract・scope・return境界を利用する前提ですが、後続設計で詳細な依存関係を定めます。
+基本仕様と現在の責務分担をそれぞれ [要件](requirements.md) と [アーキテクチャ](architecture.md) に記します。D1はこれらを前提にする詳細設計案であり、ループ方針は [ADR 0001](decisions/0001-structured-loops.md)、contract保存・正規化は [ADR 0002](decisions/0002-contract-storage-and-normalization.md)、run-local変数DBとmanifest v2は [ADR 0003](decisions/0003-run-local-variable-store-and-manifest-v2.md)、SQLite DDLとmigrationは [ADR 0004](decisions/0004-sqlite-ddl-and-schema-migration.md)、起動排他・ACL・strict上限は [ADR 0005](decisions/0005-startup-exclusion-resource-limits-windows-acl.md)、公開HTTP/MCP契約・ETag・error互換は [ADR 0006](decisions/0006-public-api-mcp-etag-error-contract.md) を参照します。D2〜D8はD1のcontract・scope・return境界を利用する前提ですが、後続設計で詳細な依存関係を定めます。
