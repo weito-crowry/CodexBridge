@@ -1,7 +1,7 @@
 # D1-I0 Baseline / 受入証跡
 
-- **受入候補:** I0 acceptance candidate: PASS, ChatGPT review pending
-- **計画状態:** REVIEW_PENDING（回帰検証PASS、ChatGPTレビュー待ち）
+- **受入状態:** ACCEPTED (ChatGPT GitHub review PASS)
+- **計画状態:** ACCEPTED (with documented caveats)
 - **目的:** 現行legacy動作を観測可能なテストとgolden allowlistに固定する。strict contract、変数runtime、schema migrationなどの新機能を実装した証跡ではありません。
 - **作業branch:** `codex/workflow-d1-i0-baseline`
 - **起点branch / base SHA:** `docs/workflow-design-d1` / `3a883334daf6480cb3ae2f7fdb6e8269928504dc`
@@ -77,5 +77,5 @@
 
 1. 8対象ファイルは完了した対象限定runでカバーされました。saved executionとgraphは29件の2ファイル合算です。以前の一括suiteはhistorical NOT_COMPLETEのままです。definitionsのwrapper exit codeは未採取なのでpytest summaryのPASSとして注記し、2件のWindows symlink SKIP理由も保持します。
 2. I0 traceabilityはlegacy互換の一部をテスト関数へ結び付けた段階です。残りのD1 IDは将来slice用に保持し、今回の基準テストを全156件PASSとみなしません。
-3. I1〜I8はNOT_STARTEDです。strict v1、schema migration、Global mutex/Windows ACL、strict request binding、variables.sqlite、API v2、adapter runtime、Windows isolated acceptanceは未実装です。
-4. ChatGPT GitHub review待ちです。I0は回帰検証済みの受入候補ですがREVIEW_PENDINGであり、D1実装開始・D1承認・本番strict enableを意味しません。
+3. I1〜I8はNOT_STARTEDです。I2とI8でWindows symlink権限によりskipした2件を再確認し、Windows ACL/RDPの必要な実機検証も行います。strict v1、schema migration、Global mutex/Windows ACL、strict request binding、variables.sqlite、API v2、adapter runtime、Windows isolated acceptanceは未実装です。
+4. I0はChatGPT GitHub reviewで条件付き受入PASSとなり、I0を受入済みとします。これはD1全体の承認、機能実装開始、本番strict enableを意味せず、D1全体はユーザー最終承認前のDRAFTです。

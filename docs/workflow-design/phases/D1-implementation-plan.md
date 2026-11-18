@@ -3,7 +3,7 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0はREVIEW_PENDING（回帰検証PASS、ChatGPTレビュー待ち）、I1〜I8はNOT_STARTED。D1の機能コード実装は開始していません。
+- **実装状態:** I0はACCEPTED (with documented caveats)、I1〜I8はNOT_STARTED。D1全体はユーザー最終承認前のDRAFTで、機能コード実装は開始していません。
 
 ## 1. 目的と適用境界
 
@@ -19,7 +19,7 @@ I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)を参照�
 
 | Slice | 状態 | 依存 |
 | --- | --- | --- |
-| D1-I0 Baseline/traceability | REVIEW_PENDING（検証PASS、ChatGPTレビュー待ち） | なし |
+| D1-I0 Baseline/traceability | ACCEPTED (with documented caveats) | なし |
 | D1-I1 Pure contract core | NOT_STARTED | I0 |
 | D1-I2 Windows protection/controller primitives | NOT_STARTED | I0。I1への技術依存はないが、単一Codexの実作業順ではI1の後 |
 | D1-I3 Definition contract storage/migration | NOT_STARTED | I0, I1, I2 |
@@ -47,7 +47,7 @@ I6はI3とI5の両方を満たしてから始めます。I8は全ての実装・
 - **変更面候補:** 既存workflow test suiteのfixture/test領域、必要最小限のdocs traceability。definitions.py/service.py/interpreter.py/API/MCPのruntime変更なし。fixture配置は既存suiteを確認後に決めます。
 - **検証:** 現行pytest、Ruff、mypy、compileallをbaselineとして実行し、isolated Windows baselineではlegacy definition/run/API/MCP/result/graphを採取します。既存workspace未追跡証跡は列挙名以外参照しません。
 - **受入gate:** legacy ETag/response/request replay/graph期待値が再現可能で、元となるtestとtraceability IDが各fixtureへ結び付き、変更前の環境・DB記録が読み取り専用で保存されること。
-- **今回の状態:** [I0基準証跡](D1-I0-baseline-evidence.md)に対象8ファイルをカバーする新規8件と既存回帰のPASS/既知SKIPを記録しました。saved executionとgraphは29件の2ファイル合算です。歴史的一括suiteはNOT_COMPLETEのまま維持し、一括suiteをPASSとは表現しません。状態はREVIEW_PENDING（ChatGPTレビュー待ち）です。
+- **今回の状態:** I0は条件付き受入PASSとして受入済みです。[I0基準証跡](D1-I0-baseline-evidence.md)に対象8ファイルをカバーする新規8件と既存回帰のPASS/既知SKIPを記録しました。saved executionとgraphは29件の2ファイル合算です。歴史的一括suiteはNOT_COMPLETEのまま維持し、一括suiteをPASSとは表現しません。I2/I8でsymlink権限由来の2件とWindows ACL/RDPの必要実機検証を再確認します。D1全体はDRAFT、I1〜I8はNOT_STARTEDです。
 - **rollback:** persistent DBや共有state rootを変更しません。fixtureが既存期待を誤って固定した場合はbaselineをpass扱いせず、そのsliceのfixture変更だけを修正・再レビューします。
 
 ### D1-I1 — Pure contract core
