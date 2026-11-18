@@ -16,6 +16,7 @@
 | [基本仕様 v0.2](requirements.md) | 合意済み | Workflowの構造、修正反復、判定、変数、契約、実行履歴、操作面 |
 | [現行実装とターゲット構成](architecture.md) | 現状記録 / 将来構成案 | OWS、DBOS、保存定義、request ledger、MCP、Consoleの現状と拡張境界 |
 | [ADR 0001: 構造化ループ](decisions/0001-structured-loops.md) | Accepted（基本方針） | 新規修正ループに任意ジャンプを使わない方針と互換性 |
+| [ADR 0002: contractのrevision保存と正規化](decisions/0002-contract-storage-and-normalization.md) | Proposed（レビュー待ち） | contract revision保存、hash binding、strict input normalizationの設計候補 |
 | [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（レビュー待ち） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
 
 ## Phase一覧
@@ -38,6 +39,7 @@
 - **合意済み**: 基本仕様 v0.2 に記された製品方針。個々の実装詳細まで確定したことを示しません。
 - **Accepted**: ADRが記録する基本方針。ADR 0001は構造化ループを採る方針を示し、既存機能に新しいLoop機能が実装済みであることを意味しません。
 - **DRAFT**: 詳細設計案。レビュー・変更の対象であり、最終承認前です。
+- **Proposed**: ADRに記録した設計候補。レビュー待ちであり、Acceptedではありません。
 - **PLANNED**: 概要のみの予定。詳細設計・実装・受入は未完了です。
 - **Legacy mode**: 共通contractが結び付いていない既存Workflow定義を、保存済み内容の従来検証・実行挙動のまま扱う互換モード案です。
 - **Strict contract**: revisionに明示的に結び付けた入力Schema、出力Schema、変数宣言を使うopt-in方式の案です。

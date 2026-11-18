@@ -38,7 +38,7 @@
 → OWS task / Codex job adapter（Codex送信台帳・status・reconciliation）<br>
 → run result・status・graph/event projection
 
-この図は現行の概略です。Workflow contract sidecar、型付き変数store、構造化ループはまだ加わっていません。
+この図は現行の概略です。revision従属contract row、型付き変数store、構造化ループはまだ加わっていません。
 
 ## ターゲットの責務案
 
@@ -46,7 +46,7 @@ D1以降では、現行の入口・定義・worker境界を保ちながら、次
 
 呼び出し元（GUI / MCP / API / Workflow）<br>
 → 共通requestとrevision解決<br>
-→ YAML revision + CodexBridge contract sidecar/envelope（同一revisionでimmutable、digest照合）<br>
+→ YAML revision + 同一SQLite DBのrevision従属contract row（immutable、digest照合）<br>
 → 入力正規化・input/output Schema検証<br>
 → OWS interpreterと構造化scope frame<br>
 → DBOS step/checkpoint + variable mutation ledger<br>
@@ -58,10 +58,11 @@ Workflowをmain/subに分けず、同じ入口・contract検証を使います�
 ## D1のOWS互換設計方針
 
 - OWS v1.0.3の公式YAML Schemaを変更・拡張してCodexBridge固有contractを表すことはしません。
-- D1ではCodexBridge側のversioned contract sidecar/envelopeを保存済みYAML revisionと一体でimmutableにする案を採ります。どのテーブル・列・ファイルに置くか、どの公開キーにするか、DB migration番号、schema URL、serialisation keyはD1のOpen questionsとして残します。
-- revision参照時はYAML側digest、contract digest、両者のrevision bindingを照合します。contractだけを新revisionにすり替えたり、最新contractで古いrunを解釈し直したりしません。
+- D1 ProposedではCodexBridge側のcontract JSONを新規revision従属テーブル workflow_definition_contracts に保存し、WorkflowDefinitionRepositoryと同一SQLite DBを使います。OWS YAML top-levelと公式Schemaは変更せず、別ファイルsidecarも使いません。
+- contract rowは親revisionを参照し、revision・contract row・mutation ledgerを一つのSQLite write transactionでcommitする候補です。contractのcanonical hashと既存YAML source/canonical hashを保持し、binding digestを照合します。
+- contractだけを新revisionにすり替えたり、最新contractで古いrunを解釈し直したりしません。strict ETagはcontract identityを含む候補ですが、wire表現と移行影響は後続設計に残します。
 - JSON Schemaの外部参照を取得せず、検証中の外部ネットワークアクセスを禁止します。Schema資源はrevisionに含まれる値とローカル実装資源に限定します。
-- contract未指定のrevisionはlegacy modeで従来のYAML検証・実行を続けます。新規strict contractは明示opt-inにし、既存revisionの一括再解釈をしません。
+- contract未指定のrevisionはlegacy modeで従来のYAML検証・実行を続けます。legacyからstrictへはcontractを明示した新revisionを作り、strict updateでもcontractを省略できない候補です。既存revisionの一括再解釈をしません。
 - D1変更はOWS set / input / output / exportや既存ジャンプ表現を上書きしません。新しい変数機能とは別名・別契約のまま共存させます。
 
 ## D1依存図
@@ -79,7 +80,6 @@ D2 AgentノードはD1の型付き参照を使い、prompt文字列の構文はD
 ## D1の互換境界と残る検討事項
 
 - メインフローのinput_dataとJSON result形は維持します。Contract適用で既存呼び出しwire formatを変更するかは別途明示します。
-- definition revisionとrequest ledgerの既存sha/idempotency意味を維持し、contract identityを加える方法はD1実装前に決めます。
-- 現行APIのrequest body上限は128 KiB、OWS YAML上限は64 KiBです。sidecar、Schema、値の深さ・複雑度を含む総上限は未決定です。
-- variable storeのDB schema/migration、sidecarの直列化キー、contractの公開MCP/HTTP投影、additionalProperties未指定時の厳密contract規則、default処理詳細、secret保管、schema complexity上限はD1 DRAFTのOpen questionsです。
+- legacy definition mutation digest、legacy request id再送規則、service.pyの _verified_active_workspace を含むlegacy manifest v1検証を維持し、strict runだけbinding digestとnormalized input hashを含むversioned v2経路に分ける候補です。過去manifest/request digestを再解釈しません。
+- 現行APIのrequest body上限は128 KiB、OWS YAML上限は64 KiBです。contract rowのmigration番号、strict v2 discriminator、secret future storage、Schema/値/応答の総上限、公開API・error codesはD1 DRAFTのOpen questionsです。
 - D1は既存Codex MAYBE_SENTの意味や再送禁止規則を変更しません。
