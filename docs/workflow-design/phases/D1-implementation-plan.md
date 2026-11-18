@@ -13,7 +13,7 @@
 
 通常のslice完了時は、そのsliceの変更・テスト結果・未達gate・rollback状態を記録し、指定branchへdocs/implementation commitをpushしてChatGPTのGitHub reviewを受けます。review前にdevへmergeしません。DB migrationはisolated preproductionに限定し、production/shared state rootでは明示的な後続承認なしに実行しません。pytest等の結果だけでWindows ACL、旧binary quiescence、backup/restore gateがpassしたことにはしません。
 
-I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)を参照してください。I1〜I8は未実装であり、実Codex job、production DB migration等は未実施です。
+I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)を参照してください。I1の実績は[D1-I1-contract-core-evidence.md](D1-I1-contract-core-evidence.md)を参照してください。I2〜I8は未実装であり、実Codex job、production DB migration等は未実施です。
 
 ## 2. 状態と依存関係
 
