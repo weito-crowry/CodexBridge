@@ -25,13 +25,13 @@
 | Phase | 概要 | 状態 |
 | --- | --- | --- |
 | D1 | Workflow共通入出力契約、変数宣言、Workflow・Issue・Attempt相当のスコープ | **DRAFT** |
-| D2 | Agentノード、埋め込みプロンプト、変数参照と差し込み | **PLANNED** |
-| D3 | Git変更、ブランチ、差分などのGit操作ノード | **PLANNED** |
-| D4 | テスト実行、機械判定、レビュー証跡の収集 | **PLANNED** |
-| D5 | For / While / Repeat-Until、Break / Continue、条件付き反復と停止結果 | **PLANNED** |
-| D6 | 親Workflowから子Workflowを呼ぶ引数・戻り値の実行連携 | **PLANNED** |
-| D7 | Issue入力、Issue単位の処理、レビュー、結果集計 | **PLANNED** |
-| D8 | GUIでのWorkflow編集、実行グラフ、MCP操作の統合 | **PLANNED** |
+| D2 | 汎用エージェント呼び出し・埋め込みプロンプト | **PLANNED** |
+| D3 | 機械判定・エージェント判定・レビュー | **PLANNED** |
+| D4 | 1 Issue・1回修正・受入の縦断実証（必要なテスト・検証を含む） | **PLANNED** |
+| D5 | While / Repeat-Until / Break / Continue、有界反復 | **PLANNED** |
+| D6 | サブWorkflow呼び出し・親子永続化・引数戻り値 | **PLANNED** |
+| D7 | 複数Issue For・Git連携・結果集計 | **PLANNED** |
+| D8 | GUI編集・実行表示・MCP管理拡充 | **PLANNED** |
 
 ## 用語と状態
 

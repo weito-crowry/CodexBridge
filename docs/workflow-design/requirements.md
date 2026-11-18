@@ -10,13 +10,13 @@ D1の具体設計は [D1詳細設計DRAFT](phases/D1-input-output-variables.md)�
 
 Workflowは、Issue修正、Git操作、テスト、レビュー、判定、結果集計を、再開可能な構造化フローとして記述・実行できるようにします。
 
-Issue修正Workflowの入口では、次の三つがそろっている必要があります。
+Issue修正Workflowの入口では、対象Issue配列と、配列内の各Issueに対応付く修正設計書および受入条件がそろっている必要があります。
 
 1. 処理対象Issueの配列
-2. 作業の設計書
-3. 受入条件
+2. 各Issueに対応付く修正設計書
+3. 各Issueに対応付く受入条件
 
-これらをどのJSON形状・変数名で表すかは共通入力contractで定義します。値の欠落と明示的なJSON nullは区別し、入口で不足を黙って作りません。
+Issueと設計書・受入条件の対応関係を保ったまま共通入力contractに渡します。具体的なJSON形状・変数名はcontractで定義します。値の欠落と明示的なJSON nullは区別し、入口で不足を黙って作りません。
 
 ## 制御構造
 
@@ -81,15 +81,15 @@ Issue修正Workflowの入口では、次の三つがそろっている必要が�
 ## 操作面、ノード群、段階計画
 
 - 将来の操作面として、GUIでのWorkflow編集、実行グラフ、MCPによる管理・実行操作を扱います。
-- 計画するノード群には、Git操作、テスト、Agent、レビュー、入力、判定、結果集計を含めます。
-- D1は共通入出力契約・変数・スコープを定めます。Agentノードとプロンプトの詳細はD2、条件付き反復はD5、実サブWorkflow呼び出しはD6、複数Issueの実運用と集計はD7、GUI編集はD8に分けます。
+- 計画するノード群には、汎用Agent呼び出し、機械判定、Agent判定、レビュー、テスト・検証、Git連携、入力、結果集計を含めます。
+- 各Phaseは[README](README.md)の対応表に従います。D3は機械判定・エージェント判定・レビュー、D4は1 Issue・1回修正・受入の縦断実証（必要なテスト・検証を含む）、D7は複数Issue For・Git連携・結果集計を担います。
 - Phase一覧と状態は[README](README.md)を参照してください。PLANNEDの項目は実装済みではありません。
 
 ## 合意事項と後工程の詳細決定
 
 ### 合意済み基本方針
 
-入口にIssue配列・設計書・受入条件をそろえること、外側Forと内側Repeat-Untilを使うこと、OK/NG/UNKNOWNの扱い、反復上限時のREJECTED、構造化ループだけで新しい修正反復を表すこと、型付き変数とWorkflow/Issue/Attemptの論理scope、全Workflow共通の入出力contract、immutable revision、明示的な親子引数戻り値、DBOS/OWS活用、GUI・グラフ・MCPとノード群を段階的に扱うことは合意済みです。
+入口にIssue配列と各Issueに対応付く修正設計書・受入条件をそろえること、外側Forと内側Repeat-Untilを使うこと、OK/NG/UNKNOWNの扱い、反復上限時のREJECTED、構造化ループだけで新しい修正反復を表すこと、型付き変数とWorkflow/Issue/Attemptの論理scope、全Workflow共通の入出力contract、immutable revision、明示的な親子引数戻り値、DBOS/OWS活用、GUI・グラフ・MCPとノード群を段階的に扱うことは合意済みです。
 
 ### 未確定の詳細
 
