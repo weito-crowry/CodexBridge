@@ -2,7 +2,7 @@
 
 - **文書状態:** DRAFT / Proposed（レビュー待ち）
 - **基本仕様:** v0.2は合意済み。本書のProposed decisionsは詳細設計候補であり、設計承認・実装完了を意味しません。
-- **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)
+- **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)、[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)
 
 ## 1. 背景と目的
 
@@ -92,9 +92,9 @@ binding_digestは同じcanonical JSON方式によるSHA-256とし、definition_i
 
 legacy revisionにはcontract rowを作らず、従来の検証とrequest identityを維持します。contractだけを同一revisionへ更新せず、contract変更は新revisionを作成します。strict ETagはcontractを含むversioned identityに拡張しますが、wire表現と既存ETag移行影響は後続設計に残します。
 
-**Proposed migration:** 現行definitions.sqliteはPRAGMA user_version=1で、現行schema checkerはテーブル名の完全一致を検査します。strict contract用テーブル追加には単一SQLite write transactionによるv1→v2 migrationを用い、既存revision row、primary key、YAML hash、legacy ETagの値を保持します。v2でworkflow_definition_contractsを追加し、PRAGMA user_version=2とv2 schemaを検査します。既存legacy revisionにcontract用NULL rowは作らず、行を欠落させます。既存workflow_definition_revisionsへcontract列を後付けしません。
+**Proposed migration:** 現行definitions.sqliteはPRAGMA user_version=1で、現行schema checkerは既存3テーブルの完全一致を検査します。strict contract用table追加には単一SQLite write transactionによるv1→v2 migrationを用い、既存revision row、primary key、YAML hash、legacy ETagを保持します。v2でworkflow_definition_contractsを追加し、PRAGMA user_version=2とv2 schemaを検査します。既存legacy revisionにcontract用NULL rowは作らず、行を欠落させます。既存workflow_definition_revisionsへcontract列を後付けしません。新規definition DBはv2 schemaを一括作成します。
 
-migration途中のクラッシュはtransaction rollbackか全完了のどちらかとし、中間schemaを受け入れません。起動時schema不一致はfail closedです。運用案はwriter停止、DB backup、upgrade、対応版restart、schema・既存revision・legacy ETag検証の順です。v2へupgradeしたDBと旧プロセスの同時運用はサポートしません。旧コードはuser_version v2を検出してfail closedする前提です。SQL本文、実際のmigration実行は本DRAFTの範囲外です。
+migration途中のクラッシュはtransaction rollbackか全完了のどちらかとし、中間schemaを受け入れません。起動時schema不一致はfail closedです。運用案はwriter停止、SQLite online backupとその検証、upgrade、対応版restart、schema・既存revision・legacy ETag検証の順です。WAL使用時に主DBファイルだけをコピーする方法はbackupに使いません。v2へupgradeしたDBと旧プロセスの同時運用はサポートしません。SQL案、schema validator、upgrade/rollback gateは[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)に記載します。
 
 ### 4.3 create/updateとcontract指定
 
@@ -151,6 +151,8 @@ strict runはstrict v2のversioned manifest/request-digest経路を使い、固�
 strict v2 request_digestは名前空間付きcanonical JSON（codexbridge-workflow-request-v2）から一度だけ算出します。Workflow canonical content、workspace、max_live_codex_jobs、definition ID/revision、YAML source SHA、contract SHA、binding digest、normalized input SHA、および他の実行identityを含め、requests ledgerとmanifest検証で同一規則を使います。具体的なcanonical payload field namesは後続設計事項です。
 
 strict manifestの追加field案はrun_format_version=2、definition_id、definition_revision、contract_version=1、contract_sha256、binding_digest、normalized_input_sha256、variable_store.filename=variables.sqlite、variable_store.schema_version=1です。secret、variable value、promptはmanifestに保存しません。request binding rowの案はworkflow_request_contract_bindingsをtable名とし、run_idをkeyにworkflow_id、definition_id、definition_revision、run_format_version、contract_version、contract_sha256、binding_digest、normalized_input_sha256、request_digestを保持します。いずれも既存legacy manifest/request rowを遡及変更しません。
+
+現行requests.sqliteにはPRAGMA user_versionによる版管理がありません。提案schema v1への移行ではuser_version=0の既存DBを、workflow_requests、workflow_request_sources、既存index、columns、foreign keys、row整合性について検査してから新binding tableを追加します。既存row/indexは維持し、legacy rowにはbindingを作りません。未知table/indexがあるuser_version=0 DBをblind migrationしません。旧binaryはrequests.sqliteのuser_versionを検査しないため、version値だけで旧writer混在を防げません。対応reader/worker/managerへの更新と旧process停止・起動排他の具体的なguardが必要です。詳細は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)のProposed案を参照します。
 
 Workflow呼び出し元はinput Schemaを使って一度だけ正規化・検証します。成功時にDBOS runへ渡すinput_dataは正規化済み値です。既存メインフローのinput_dataとJSON resultの形は維持し、Schemaが値の意味やwire shapeを勝手に変えません。
 
@@ -209,9 +211,9 @@ Workflow scopeはrun内で有効です。Issue値は該当Issue frame、Attempt�
 
 ### 8.1 run-local変数DBと概念的な永続モデル
 
-**Proposed:** 各Workflow run directoryに独立したvariables.sqliteを新規作成します。配置例は $LOCALAPPDATA/CodexBridge/workflows/run-<runid>/variables.sqlite です。definitions.sqlite、requests.sqlite、run-localのdbos.sqlite、node-event DBの既存tableへ変数値を混在させません。variables.sqliteの専用schemaはVariableState、ScopeFrame、VariableMutation、RunBindingを持ちます。各tableの正確なDDL・index・CHECK制約はOpen question 9に残します。
+**Proposed:** 各Workflow run directoryに独立したvariables.sqliteを新規作成します。配置例は $LOCALAPPDATA/CodexBridge/workflows/run-<runid>/variables.sqlite です。definitions.sqlite、requests.sqlite、run-localのdbos.sqlite、node-event DBの既存tableへ変数値を混在させません。variables.sqliteの専用schemaはVariableState、ScopeFrame、VariableMutation、RunBindingを持ちます。物理table名はrun_binding、scope_frames、variable_states、variable_mutationsで、前掲の大文字名は論理model名です。完全なDDL例とindexは[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)に記載します。
 
-DBはPRAGMA user_version=1、想定journal_mode=WAL、synchronous=FULL、busy_timeout設定、foreign_keys=ON、write時BEGIN IMMEDIATEを候補とし、接続時にuser_versionとschemaを厳格に検査します。読取専用inspectionはreadonly接続とし、DBを新規作成・初期化しません。run_dirのcanonical path、run ID、workflow identityとRunBindingの所有関係を毎回照合し、symlink、junction、その他reparse pointを拒否します。Windowsでの安全なファイル作成とACL設定はOpen question 11に残します。明示的なDB容量上限も未決です。
+DBはPRAGMA user_version=1、想定journal_mode=WAL、synchronous=FULL、busy_timeout設定、foreign_keys=ON、write時BEGIN IMMEDIATEを候補とし、接続時に4 table・index・columns・primary/foreign keys・user_versionを厳格に検査します。PRAGMA integrity_checkとforeign_key_checkを起動時検査案に含めます。JSON canonicalization/hash/schema検証はapplicationで行い、SQLite JSON1に依存しません。読取専用inspectionはmode=ro接続とし、DBを新規作成・初期化しません。run_dirのcanonical path、run ID、workflow identityとRunBindingの所有関係を毎回照合し、symlink、junction、その他reparse pointを拒否します。Windowsでの安全なファイル作成とACL設定はOpen question 11に残します。明示的なDB容量上限も未決です。
 
 variables.sqlite transactionとDBOS step/checkpointは別transactionです。run directory上の新規DBに初期状態を準備し、requests.sqliteのrequest reservationとbinding rowを別のSQLite transactionで確定するため、両者をまたぐatomic commitはありません。
 
@@ -224,7 +226,7 @@ variables.sqlite transactionとDBOS step/checkpointは別transactionです。run
 
 ユーザーの未追跡ファイルやOWS汎用contextへvariable stateを混ぜません。strict v1ではsensitivity=secretの宣言を持つWorkflowと、secret値を含むと明示分類されたinputを受け付けず、明示拒否します。secret valueの保存方式は将来の別設計です。
 
-VariableState、ScopeFrame、VariableMutation、RunBindingはrun-local variables.sqliteで管理します。各mutationのstate更新と台帳記録は同一transactionにします。run directoryはrunごとに所有され、別run間で変数DBを共有しません。
+VariableState、ScopeFrame、VariableMutation、RunBindingはrun-local variables.sqliteで管理します。各mutationのstate更新と台帳記録は同一transactionにします。run directoryはrunごとに所有され、別run間で変数DBを共有しません。DDL、SQLite CHECK/UNIQUE/FK/indexとapplication validatorの境界はADR 0004のProposed案に従います。
 
 ### 8.2 mutation identity
 
@@ -448,8 +450,35 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-63 | definitions migrationの運用手順 | writer停止、backup、v1→v2 upgrade、対応版restart、schemaとlegacyデータ検証の順で確認 |
 | D1-64 | upgrade transaction中の失敗と事前backupからの復元 | migrationが全rollbackすることを確認し、退避backupを検証可能にする |
 | D1-65 | strict v2使用後のdowngrade/rollback判断 | v2データを保持したまま旧schemaへ戻せると仮定せず、backup retentionとrollback方針の確定前に運用移行を完了扱いにしない |
+| D1-66 | WAL中のdefinitions/requests backup | SQLite online backup APIで整合snapshotを取得・検証し、主DBファイル単純コピーを使わない |
+| D1-67 | definitions v1事前schema/data gate | user_version=1、既存3 table/columns/index/FK/hash/revisionを厳格検査し、不明object・writer混在を拒否 |
+| D1-68 | definitions v1→v2 DDLとversion更新 | 新contract table、columns/PK/FK/index、integrity/FK checkを検証しuser_version=2でcommit |
+| D1-69 | definitions migrationの各中断点 | CREATE後・user_version更新後・commit前のcrashはいずれも全rollbackし中間状態を残さない |
+| D1-70 | definitions既存revision/hash/legacy ETag保全 | migration前後のrowと既存identityを一致させ、legacy contract rowを作らない |
+| D1-71 | contract rowとrevision/mutation ledger書込み | strict revision、contract row、mutation ledgerを同一definitions write transactionでcommit/rollback |
+| D1-72 | strict ETag v2と既存legacy ETag | strict側だけcontract identityを含め、既存v1値と照合規則を維持 |
+| D1-73 | requests user_version=0の既知旧schema migration | 既存workflow_requests/sources、既存index/rowを保持しbinding tableだけ追加してversion 1へ移行 |
+| D1-74 | user_version=0 requests DBの未知table/index/shape | blind migrationせずfail closedして調査可能にする |
+| D1-75 | 新規requests DBの初期化 | 対応版で全table/indexを一括作成してuser_version=1にし、IF NOT EXISTSのみの初期化にしない |
+| D1-76 | request/source/bindingのstrict reservation | 三rowをrequests.sqliteの同一transactionで確定し、失敗時は全rollback |
+| D1-77 | 旧binaryとrequests schema v1の混在 | user_versionだけに依存せず、instance/startup gateが旧writer混在を防ぐことを検証 |
+| D1-78 | binding FKとrequest row/application identity | run_id FK、workflow/request digest/definition revision/source SHAを照合し、orphanやtamperを拒否 |
+| D1-79 | variables.sqlite v1のphysical schema validator | 4 table、columns/PK/FK/index、user_version、integrity_checkとforeign_key_checkを検査 |
+| D1-80 | scope_frames root/parent lifecycle | runごとのrootをpartial unique indexで一つに制限し、composite parent FKを確認。acyclic/path/status規則はapplicationで検査 |
+| D1-81 | variable state missing/null/tombstone | initial missing row、JSON null string、present=0 tombstoneを区別し、CHECKとdigest validatorを検証 |
+| D1-82 | variable mutation version chain | before/after unique key、before version 0のdigest NULL規則、tombstone after JSON NULL、同version競合を検証 |
+| D1-83 | mutation CASと原子commit | 新keyは現state identityをCASし、variable_states更新とledger insertを同transactionでcommit/rollback |
+| D1-84 | 後続mutation後の古いkey replay | 保存済みhistorical after resultを返し、latest stateを要求・上書き・巻戻ししない |
+| D1-85 | JSON canonicalization/schema/digest検証 | application validatorで行い、SQLite JSON1が無効でもDDL・store読書きが成立 |
+| D1-86 | readonly inspectionとstore path | mode=roでDBを作成せず、symlink/junction/reparse pointを拒否 |
+| D1-87 | unknown user_version/schema/object | variables/definitions/requestsそれぞれschema mismatchでfail closedし、既存dataを変更しない |
+| D1-88 | definitions/requests複数DB backup consistency | 全writer停止後に各SQLite online backupとrun metadata snapshotを取り、個別・組合せの復元確認を記録 |
+| D1-89 | rollout時のstrict writer有効化 | 全reader version-aware、旧process停止、両DB migrationとlegacy identity検査後に限りstrict runを許可 |
+| D1-90 | definitions成功後requests migration失敗 | strict runを止め、strict runが存在しないことを確認せず自動rollbackしない。安全なrestore条件を検査 |
+| D1-91 | strict run開始後のrollback要求 | 旧binary/schemaへの自動downgradeを禁止し、forward repairまたは承認済みoffline restore/data-loss扱いへ分岐 |
+| D1-92 | DDL smokeと外部副作用境界 | SQLite :memory:でDDL/制約/FKを確認し、docs taskでは実Codex POSTやpersistent user DB変更を行わない |
 
-D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。上記D1-42以降は追加migration・run lifecycle・回復受入項目です。実装時に既存CI・適用可能なコマンドを再確認します。この文書のみの変更ではこれらを実行しません。
+D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。上記D1-42以降は追加migration・run lifecycle・回復受入項目です。今回のDDL構文確認は一時SQLite :memory:に限り、プロジェクトコードやpersistent user DBの実装テストとは区別します。
 
 ## 15. D1出口条件
 
@@ -459,7 +488,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 
 ## 16. Proposed decisions（レビュー対象）
 
-以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-10は第1回の候補を維持し、PD-11以降は第2回で具体化した永続化・run binding・回復候補です。
+以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-10は第1回の候補を維持し、PD-11以降は第2・3回で具体化した永続化・run binding・SQLite DDL/migration候補です。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)にあります。
 
 | ID | Proposed decision | 対応する論点 |
 | --- | --- | --- |
@@ -480,12 +509,18 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-15 | strict作成順はimmutable revision/contractとnormalized input検証、v2 digest、snapshot準備、run-local store初期化、request+binding予約、worker owner検証とする。別DB/Filesystem間atomicityを仮定せず、orphanは自動復活させず監査し、reservation不存在を確認するまで削除しない。予約後のstore欠落・破損は再作成せずreconciliationで停止する。 | 旧Q9のlifecycle |
 | PD-16 | 同一execution_keyのhistorical replayは台帳保存済みafter resultを返し、payload/hash/chain/RunBinding/checkpointを検証する。後続mutation後のlatest stateを過去after digestと一致要求せず、巻戻し・再適用をしない。 | 旧Q9のreplay詳細 |
 | PD-17 | v2の不確定なbinding/store/recovery状態を成功・受入成功にしない。read-only inspectorはstoreを作成せず、Graph/MCPは許可済みmetadataのみ公開する。Codex MAYBE_SENT状態機械とsecret拒否方針は変更しない。 | 旧Q9のreader・公開境界 |
+| PD-18 | definitions.sqlite v1→v2はwriter停止、online backup/検証、v1 exact-schema/data gate後に単一transactionでworkflow_definition_contractsを追加し、version/schema/rowsを照合してcommitする。WAL主DBファイル単純copyはbackupに使わない。 | 旧Q9 migration具体化 |
+| PD-19 | requests.sqliteの既存user_version=0は既知legacy schema/objects/rowsを厳格検査してから単一transactionでbinding tableを追加しuser_version=1にする。未知objectsは拒否し、version-aware readerと旧binary排他gateはversion fieldだけに依存しない。 | 旧Q9 request migration |
+| PD-20 | run-local variables.sqlite physical schemaはrun_binding、scope_frames、variable_states、variable_mutationsの4 tableとADR0004のCHECK/FK/partial-unique/unique/history indexesを使う。JSON値のcanonical/hash/schema検査はapplication側で行いJSON1に依存しない。 | 旧Q9 variable DDL |
+| PD-21 | variable stateはmissing row、JSON null文字列、present=0 tombstoneを区別する。mutation ledgerはhistorical after valueを保持し、CAS、線形version chain、state更新とledger insertを一transactionで行う。 | 旧Q9 ledger DDL |
+| PD-22 | 各DBはuser_version・object/table/column/index/PK/FK・integrity/FK checkを厳格検査する。起動時のschema mismatch/未知objectはfail closedし、readonly inspectionでDB作成しない。 | 旧Q9 schema validator |
+| PD-23 | migration/rollbackは全writer停止、SQLite online backup、version-aware binary展開、各DB migration、legacy identity検証、reader対応後のstrict enableの順とする。strict run開始後は旧binary/schemaへの自動rollbackを行わずforward repairまたは承認済みoffline restoreを使う。 | 旧Q9 operational gate |
 
 ## 17. Open questions
 
-次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、definitions v1→v2のmigration案、request bindingとmanifest v2識別、run作成・recovery順序、historical mutation replayの意味はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
+次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、DDL候補、schema version、request/manifest binding、run作成・recovery順序、historical mutation replay、migration/rollback方針はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
 
-9. migrationの実際のDDL/SQL、index・column CHECK制約、schema validatorの具体形、およびrequests.sqlite既存schema版管理・FK互換確認・migration方法。definitions/request/variablesの各DB transactionを接続する実装APIと障害記録も詰めます。
+9. DDL案を実装へ接続するschema validatorの具体的な比較方式、既存v1 DBのcolumn/index/FK inventory固定、複数DB transactionをつなぐruntime API、およびrequests.sqliteで旧binaryの同時writerを防ぐ起動・instance guardの機構。requests.sqliteは現行でuser_version管理がないためversion fieldだけでは旧writer排除になりません。
 10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1での拒否を公開するerror mapping。secret機能を初期実装へ含めません。
 11. Workflow/input/output/value合計、DB容量、深度、Schema節点数、参照解決量、HTTP/MCP response/eventの数値上限と、Windowsでのvariables.sqlite安全な作成・physical ACL。現行128 KiB API request、64 KiB YAML等と整合させます。
 12. HTTP/MCPの公開route/field/status、同一endpoint optional fieldか別APIか、strict ETagのwire表現と既存client移行、Console投影、public error code、backup retentionおよびstrict v2利用後のrollback手順。
