@@ -28,21 +28,21 @@ manager.pyはrun directoryをmode=0700で作成しますが、os.chmodはWindows
 
 ### 1. 新対応controllerのstate_root排他
 
-新対応Bridgeはstate_rootのDBを最初にopenしたりmigrationしたりする前に、state_rootごとのOS process連動型排他を取得します。第一候補はWindows Local namespaceのnamed Mutexです。mutex identityはcanonical absolute state_root pathと現在のuser SIDから安定したSHA-256 identifierを作ります。例となる名前は次の形です。
+新対応Bridgeはstate_rootのDBを最初にopenしたりmigrationしたりする前に、state_rootごとのOS process連動型排他を取得します。primary mutexはWindows Global namespaceのnamed Mutexです。Local namespaceはログオンsessionごとに分離され、同じstate_root/SIDでもRDP、fast user switching、service sessionをまたぐcontrollerを排他できないため採用しません。mutex identityはcanonical absolute state_root pathと現在のuser SIDから安定したSHA-256 identifierを作ります。例となる名前は次の形です。
 
 ~~~text
-Local\CodexBridge.Workflow.Writer.v1.<sha256-of-state-root-and-user-sid>
+Global\CodexBridge.Workflow.Writer.v1.<sha256-of-state-root-and-user-sid>
 ~~~
 
-Mutex objectのsecurity descriptorには現在のUser SIDとLOCAL SYSTEMだけを明示許可するDACLを設定します。既存objectを開く場合はobject type、owner、DACLが意図したものか検証し、不一致やnamed object squattingが疑われる場合は取得扱いにしません。canonicalization、hash input framing、Windows API wrapperはOpen Question 9に残します。
+CreateMutexExWにSECURITY_ATTRIBUTESと明示security descriptor/DACLを渡し、dwFlags=0とします。CREATE_MUTEX_INITIAL_OWNERは指定しません。同名Mutexが既にある場合に初期ownerが曖昧になるため、作成時にownerを設定せず、CreateMutexExWの結果とGetLastErrorを確認してからWaitForSingleObject系functionで有限時間待ちます。Mutex objectのDACLは現在のUser SIDとLOCAL SYSTEMだけを許可します。ERROR_ALREADY_EXISTSの場合もobject type、security descriptorのowner SID、DACLを検証し、named object squattingを疑う不一致は拒否します。Global Mutexを作成できない、DACL/owner検証に失敗する、または有限waitで所有権を取得・確認できない場合はstrict enableを止めます。Local namespaceへのfallbackは禁止します。canonicalization、hash input framing、Windows API wrapperはOpen Question 9に残します。
 
-mutexを取得するのはstate_rootを所有するcontrollerだけです。controllerはDB open/migration前に取得し、requests.sqlite/definitions.sqliteにアクセスするcontrollerの寿命中保持し、停止処理とlive worker確認が完了した後に解放します。第二の新対応controllerは有限時間待つかfail closedし、既存processを強制終了しません。process crashではWindowsがmutexを解放しますが、WAIT_ABANDONEDなどの結果は単なるlock取得成功と扱わず、request/manifest/DB/workerの状態照合を完了してから再開します。
+Mutexはthread-ownedです。controllerの寿命中mutexを所有するthreadを存続させ、停止処理とlive worker確認後にその同じthreadからReleaseMutexを呼びます。他threadからreleaseしてはなりません。第二の新対応controllerは有限時間待つかfail closedし、既存processを強制終了しません。owner threadの終了（process終了を含む）でmutexはabandonedになり得るため、WAIT_ABANDONEDなどの結果は単なるlock取得成功と扱わず、request/manifest/DB/workerの状態照合を完了してから再開します。
 
 このmutexは新対応controller同士の競合を防ぐものです。旧binaryはmutexを知らず、後から旧binaryが起動することも止められません。upgrade gateでは旧BridgeのGUI、autostart、service、scheduled task、manual起動経路を停止・無効化し、旧processと未終了workerがいないことを確認します。互換buildのsingle ownerを認証し、requests.sqliteなどに他writerがいないと証明できる場合にだけmigrationまたはstrict v1を有効化します。未知writerや起動元を照合できない状態はfail closedです。mutex単独で旧binaryを遮断できるとは主張しません。
 
 通常GUI/API/MCP clientは共有controllerへ接続し、clientごとにmutexを取りません。controllerがspawnするrun固有workerもcontroller mutexは取得しません。workerはcontrollerから許可されたrun/worker起動identity、request binding、manifestとrun ownerを照合します。operatorや旧processがcontrollerの起動契約を迂回してrecovery workerを作れないguardを設けます。controllerを停止するupgrade時にlive workerが残っている場合はupgradeしません。既存processを強制killする運用を通常の設計に入れません。
 
-Local namespaceが同じstate_rootを使う複数sessionから共有できるか、起動経路・worker identity・排他解除点をどう結び付けるかは実装前に確認します。異なるSIDが同じstate_rootを使う場合はowner/ACL不整合を検出してfail closedします。
+Global namespaceの同一Mutexは、同じstate_root/SIDを使うRDP、fast user switching、serviceを含む別ログオンsessionから共有され、controllerを一つに制限する設計です。別session間での同時起動試験を実装時ゲートとします。異なるSIDが同じstate_rootを使う場合はowner/ACL不整合を検出してfail closedします。
 
 ### 2. Windows ACLとpath security
 
@@ -89,6 +89,7 @@ mutationのaggregate/ledger/database capを超える場合はBEGIN IMMEDIATE内�
 
 | 状態 | 提案動作 |
 | --- | --- |
+| Global Mutexの作成不可、DACL/owner検証失敗、有限waitまたは取得owner確認失敗 | strict enableを止める。Local namespaceへfallbackしない |
 | 新対応controllerがmutexを取得 | DB open/migrationへ進める。controller停止とlive worker終了までlock保持 |
 | 第二の新対応controllerが起動 | 有限待機またはfail closed。既存ownerをkillしない |
 | mutexがabandoned/WAIT_ABANDONED | request/manifest/definition/store/worker状態を照合するまで再開しない |
@@ -120,7 +121,7 @@ mutationのaggregate/ledger/database capを超える場合はBEGIN IMMEDIATE内�
 
 | D1 IDs | 受入対象 |
 | --- | --- |
-| D1-93..98 | 同root Mutex競合、有限待機、abandoned recovery、旧binary/autostart/未知writer gate、state_root+SID identity、named object DACL |
+| D1-93..98 | 同root Mutex競合、同一state_root/SIDで別ログオンsessionのcontroller同時起動、RDP/fast user switching/service session間共有、有限待機、abandoned recovery、旧binary/autostart/未知writer gate、named object DACL |
 | D1-99..100 | client/controller/worker境界、controller認証済みrun起動、leftover workerがupgradeを止めること |
 | D1-101..107 | NTFS owner/protected ACL、広いACE拒否、legacy ACL不変、全path/sidecar reparse、exclusive create/file-ID、WAL/SHM DACL、ACL API/Filesystem不在 |
 | D1-108 | Administrators/backup privilegeと同一user rogue processの保護限界が記述どおりであること |
@@ -144,6 +145,11 @@ Windows ACL/pathの実装受入は隔離NTFS上で行い、handle-based identity
 
 ## 未決定事項
 
-Open Question 9はmutex API wrapper、Local namespaceのsession範囲、controllerの起動/停止統合、旧版起動経路の停止・自動再起動防止、worker起動identityと全writer quiescence証明です。Open Question 11はSECURITY_DESCRIPTOR/ACE継承/owner/file-IDの具体実装とdogfood、WAL/SHM個別上限・長時間reader時のcheckpoint、PRAGMA max_page_count/logical quotaでmain DB上限を保証する測定です。
+Open Question 9はGlobal mutex名のcanonicalization/hash input framing、CreateMutexExWを包むWin32 API、owner threadの寿命と同一threadによるrelease、RDP/fast user switching/serviceをまたぐ排他の実証、controllerの起動/停止統合、旧版起動経路の停止・自動再起動防止、worker起動identityと全writer quiescence証明です。Global作成・DACL/owner検証・取得に失敗した場合はLocalへfallbackせずstrict enableを止めます。Open Question 11はSECURITY_DESCRIPTOR/ACE継承/owner/file-IDの具体実装とdogfood、WAL/SHM個別上限・長時間reader時のcheckpoint、PRAGMA max_page_count/logical quotaでmain DB上限を保証する測定です。
 
 API/status/error/public projectionとresponse cap、backup retention/data loss、secret暗号化、外部副作用の扱いはD1 Open Questions 10、12、14に残します。すべての数値capはProposed初期値で、実装済みや承認済みと扱いません。
+
+## References
+
+- [Kernel object namespaces - Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/termserv/kernel-object-namespaces)
+- [CreateMutexExW function - Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexexw)

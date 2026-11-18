@@ -518,11 +518,11 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-90 | definitions成功後requests migration失敗 | strict runを止め、strict runが存在しないことを確認せず自動rollbackしない。安全なrestore条件を検査 |
 | D1-91 | strict run開始後のrollback要求 | 旧binary/schemaへの自動downgradeを禁止し、forward repairまたは承認済みoffline restore/data-loss扱いへ分岐 |
 | D1-92 | DDL smokeと外部副作用境界 | SQLite :memory:でDDL/制約/FKを確認し、docs taskでは実Codex POSTやpersistent user DB変更を行わない |
-| D1-93 | 新対応controllerを同一state_rootで同時起動 | 一方だけがMutexを取得し、他方は有限待機またはfail-closed。既存processをkillしない |
+| D1-93 | 同一state_root/SIDの新対応controllerを別ログオンsessionから同時起動 | Global Mutexを共有し一方だけが所有し、他方は有限待機またはfail-closed。RDP/fast user switching等を含め、既存processはkillしない |
 | D1-94 | Mutex取得の有限待機・timeout・abandoned状態 | WAIT_ABANDONED等は成功扱いせず、request/manifest/DB/worker状態を照合してから進行 |
 | D1-95 | migration前/新process起動後の旧Bridgeと自動再起動 | GUI/autostart/service/scheduled/manual経路と未終了workerの不存在を確認するまでmigration/strict enable不可 |
 | D1-96 | Mutexを無視する旧binary・未知writer・quiescence不明 | Mutex単体で排除したと見なさず、状態を証明できなければfail closed |
-| D1-97 | state_root/user SID別のlock identity・named object squatting | 同root/SIDでは同じMutex、別root/SIDでは別identityを確認し、共有rootのowner不一致や予期しないowner/DACL/objectを拒否 |
+| D1-97 | state_root/user SID別のGlobal lock identity・named object squatting | 同root/SIDならsessionをまたいで同じGlobal Mutex、別root/SIDなら別identityを確認し、owner/DACL/object不一致時はstrict enableを拒否。Local fallbackなし |
 | D1-98 | 通常GUI/API/MCP clientの複数接続 | client自身はMutexを取らず、単一controllerを共有して要求を処理 |
 | D1-99 | controllerが起動したrun固有worker | workerはcontroller Mutexを取得せず、認証済みrun/worker identityを検証。live workerが残ればupgradeを拒否 |
 | D1-100 | Windows NTFS run directory/variables.sqlite ACL | protected DACLのowner、現User SIDとLOCAL SYSTEMのみのACE、canonical ACLを検査 |
@@ -584,7 +584,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-21 | variable stateはmissing row、JSON null文字列、present=0 tombstoneを区別する。mutation ledgerはhistorical after valueを保持し、CAS、線形version chain、state更新とledger insertを一transactionで行う。 | 旧Q9 ledger DDL |
 | PD-22 | 各DBはuser_version・object/table/column/index/PK/FK・integrity/FK checkを厳格検査する。起動時のschema mismatch/未知objectはfail closedし、readonly inspectionでDB作成しない。 | 旧Q9 schema validator |
 | PD-23 | migration/rollbackは全writer停止、SQLite online backup、version-aware binary展開、各DB migration、legacy identity検証、reader対応後のstrict enableの順とする。strict run開始後は旧binary/schemaへの自動rollbackを行わずforward repairまたは承認済みoffline restoreを使う。 | 旧Q9 operational gate |
-| PD-24 | 新対応controllerはDB open/migration前にstate_rootのcanonical absolute pathと現user SIDのSHA-256 identifierに結び付くWindows Local名前付きMutexを取得し、controller寿命中保持する。Mutex DACLは現User SIDとLOCAL SYSTEMに限り、abandoned/予期しない既存objectは状態照合してから扱う。 | 旧Q9 controller exclusion |
+| PD-24 | 新対応controllerはDB open/migration前にstate_rootのcanonical absolute pathと現user SIDのSHA-256 identifierに結び付く Global 名前付きMutexを取得し、controller寿命中保持する。CreateMutexExWには明示DACL付きSECURITY_ATTRIBUTESを渡しdwFlags=0とする。mutexはthread-ownedのため取得owner threadを保持し、同じthreadだけがreleaseする。DACL/owner検証または取得失敗、Global作成不可ならstrict enableを止め、Localへfallbackしない。abandoned時は状態照合を必須とする。 | 旧Q9 controller exclusion |
 | PD-25 | Mutexは旧binaryを止めない。全legacy起動経路とworkerの停止を確認し、互換owner/旧writer不存在が証明できない場合migration/strict enableしない。Mutexだけで旧binary混在を防ぐと主張しない。 | 旧Q9 old-version gate |
 | PD-26 | workerはcontroller Mutexを取得しない。controller認証済みrun/worker起動identityとbindingを検査し、live workerが残る間はupgradeしない。通常GUI/API/MCP clientは共有controllerを使い、Mutexを個別取得しない。 | 旧Q9 worker lifecycle |
 | PD-27 | strict D1の新規run directory/variables.sqlite/WAL/SHMはNTFS protected DACL、owner SID、canonical ACLを検査し、state_root・ancestor・run/database/sidecarのreparse pointを拒否する。create-exclusive/handle-based file-ID照合を行い、既存ACLを自動変更しない。 | 旧Q11 Windows boundary |
@@ -594,7 +594,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 
 次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、DDL候補、schema version、request/manifest binding、run作成・recovery順序、historical mutation replay、migration/rollback方針、single-controller排他案、strict resource capのProposed初期値はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
 
-9. Local namespaceが同じstate_rootを使う全session/processを排他できるかを含むnamed MutexのWin32 API wrapper、controller起動/終了への組込み、旧GUI/autostart/service/scheduled/manual再起動経路を封じるinstance guard、live workerとcontroller認証済みrun起動identityの具体mechanism。requests.sqliteは現行でuser_version管理がなく、旧binaryは新Mutexを知らないため、version/Mutexだけでは旧writer排除になりません。quiescenceを証明できない場合はstrict enableしません。
+9. Global Mutex名のcanonicalization/hash input framingとWin32 API wrapper、owner threadの寿命・同一thread release、RDP/fast user switching/serviceをまたぐ排他の実証、controller起動/終了への組込み、旧GUI/autostart/service/scheduled/manual再起動経路を封じるinstance guard、live workerとcontroller認証済みrun起動identityの具体mechanism。Global作成/DACL/owner検証/取得に失敗した場合はstrict enableせずLocalへfallbackしません。requests.sqliteは現行でuser_version管理がなく、旧binaryは新Mutexを知らないため、version/Mutexだけでは旧writer排除になりません。quiescenceを証明できない場合はstrict enableしません。
 10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1での拒否を公開するerror mapping。secret機能を初期実装へ含めません。
 11. 表12のresource capはProposed初期値です。WAL/SHM高水位と長時間reader時のcheckpoint/backpressure、PRAGMA max_page_count/論理quotaとの組合せで64 MiB main DBを超えない保証、NTFS SECURITY_DESCRIPTOR/DACL/ACE継承/owner確認とhandle-based file-ID検証の実装・Windows dogfood測定は未決定です。ACL/API/identity検査不能時のstrict fail-closed境界を実装前に確認します。
 12. HTTP/MCPの公開route/field/status、同一endpoint optional fieldか別APIか、strict ETagのwire表現と既存client移行、Console投影、public error code、backup retentionおよびstrict v2利用後のrollback手順。
