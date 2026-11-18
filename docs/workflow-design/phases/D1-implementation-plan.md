@@ -3,17 +3,17 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0はACCEPTED (with documented caveats)、I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I3はIN_PROGRESS（I3-A/I3-B ACCEPTED (with documented caveats)、I3-C横断統合が次）、I4〜I8はNOT_STARTEDです。D1全体はDRAFTで、strict runはOFFです。
+- **実装状態:** I0はACCEPTED (with documented caveats)、I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I3はIN_PROGRESS（I3-A/I3-B ACCEPTED (with documented caveats)、I3-C IMPLEMENTED / PENDING_CHATGPT_REVIEW）、I4〜I8はNOT_STARTEDです。D1全体はDRAFTで、strict runはOFFです。
 
 ## 1. 目的と適用境界
 
-この計画は、D1の設計・受入ケースを、将来のレビュー可能な実装指示へ分割する案です。I番号はWorkflow Phase D1内の実装slice番号で、製品Phase D1〜D8とは別の識別子です。2026-11-19時点でI3-B requests.sqlite migrationはACCEPTED (with documented caveats)、I3-C横断統合が次の実装sliceです。本書と関連ADRはD1全体の最終承認やproduction enableを意味せず、D1自体はDRAFTです。strict runはOFFです。
+この計画は、D1の設計・受入ケースを、将来のレビュー可能な実装指示へ分割する案です。I番号はWorkflow Phase D1内の実装slice番号で、製品Phase D1〜D8とは別の識別子です。2026-11-19時点でI3-A/I3-BはACCEPTED (with documented caveats)、I3-C cross-DB binding verifierは実装済みでChatGPT review待ちです。本書と関連ADRはD1全体の最終承認やproduction enableを意味せず、D1自体はDRAFTです。strict runはOFFです。
 
 各sliceは、提示された依存関係・成果物・変更面・テスト・受入条件を一つのbounded taskとして扱います。ここに記す将来のパスやモジュールは領域または候補であり、新規module名・配置を確定しません。実装時に既存の責務境界を確認し、候補を採用する場合もそのsliceのレビューで確定します。
 
 通常のslice完了時は、そのsliceの変更・テスト結果・未達gate・rollback状態を記録し、指定branchへdocs/implementation commitをpushしてChatGPTのGitHub reviewを受けます。review前にdevへmergeしません。I3 migrationは新規隔離一時directory/test DBだけで検証し、共有DB移行には別途オペレーター承認と停止・backup・互換・legacy identity確認が必要です。pytestだけでbackup/restore behaviorを証明したり、将来のoperator stop gateを代替したりはできません。Windows ACL/RDP/Global Mutexは現行D1 gateではありません。
 
-I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)、I1の実績は[D1-I1-contract-core-evidence.md](D1-I1-contract-core-evidence.md)、I2-Aの過去実績と当時の未達gateは[D1-I2-windows-guard-evidence.md](D1-I2-windows-guard-evidence.md)、I3-Aの受入証跡は[D1-I3A-contract-storage-evidence.md](D1-I3A-contract-storage-evidence.md)、I3-Bの受入証跡は[D1-I3B-request-storage-evidence.md](D1-I3B-request-storage-evidence.md)を参照してください。I3-A/I3-BはACCEPTED (with documented caveats)、I3-C横断統合が次です。実Codex job、共有/production DB migration等は未実施です。I3-B APIは明示opt-inのまま本番runtimeに未接続です。
+I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)、I1の実績は[D1-I1-contract-core-evidence.md](D1-I1-contract-core-evidence.md)、I2-Aの過去実績と当時の未達gateは[D1-I2-windows-guard-evidence.md](D1-I2-windows-guard-evidence.md)、I3-Aの受入証跡は[D1-I3A-contract-storage-evidence.md](D1-I3A-contract-storage-evidence.md)、I3-Bの受入証跡は[D1-I3B-request-storage-evidence.md](D1-I3B-request-storage-evidence.md)、I3-Cの実装証跡は[D1-I3C-crossdb-binding-evidence.md](D1-I3C-crossdb-binding-evidence.md)を参照してください。I3-CがacceptedとなるまでI3全体はIN_PROGRESSです。実Codex job、共有/production DB migration等は未実施です。I3-C verifierは明示opt-inのままruntimeに未接続です。
 
 ## 2. 状態と依存関係
 
@@ -22,9 +22,9 @@ I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)、I1の�
 | D1-I0 Baseline/traceability | ACCEPTED (with documented caveats) | なし |
 | D1-I1 Pure contract core | ACCEPTED (with documented caveats) | I0 |
 | D1-I2 Windows protection/controller primitives | DEFERRED / NON-BLOCKING（I2-A historical implemented、I2全体NOT_ACCEPTED、I2-B停止） | 独立。I3以後の依存ではない |
-| D1-I3 Definition contract storage/migration | IN_PROGRESS（I3-A/I3-B ACCEPTED with documented caveats、I3-C横断統合が次） | I0, I1 |
-| D1-I4 Variable store/ledger | NOT_STARTED | I1, I3 |
-| D1-I5 Request binding/manifest/readers | NOT_STARTED | I3, I4 |
+| D1-I3 Definition contract storage/migration | IN_PROGRESS（I3-A/I3-B ACCEPTED with documented caveats、I3-C IMPLEMENTED / PENDING_CHATGPT_REVIEW） | I0, I1 |
+| D1-I4 Variable store/ledger | NOT_STARTED（次候補） | I1, I3 |
+| D1-I5 Request binding/manifest/readers | NOT_STARTED（将来slice） | I3, I4 |
 | D1-I6 HTTP/MCP contract surface | NOT_STARTED | I3, I5 |
 | D1-I7 Strict root runtime/OWS call adapter | NOT_STARTED | I4, I5, I6 |
 | D1-I8 Isolated acceptance/go-no-go | NOT_STARTED | I0, I1, I3〜I7 |
@@ -79,6 +79,7 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 - **rollback:** isolated test DBのみでtransaction rollbackまたは検証済み一時backup restoreを行います。共有DBのrestore/downgradeはこのsliceの範囲外です。
 - **I3-A進捗 (2026-11-19):** 隔離definitions.sqlite v1→v2 migration、明示的v2初期化、revision-bound contract保存/read検証、strict/legacy CRUD coreを実装しました。ChatGPT GitHub reviewでACCEPTED (with documented caveats)です。[I3-A証跡](D1-I3A-contract-storage-evidence.md)。I3-Bは受入済み、I3-C横断統合が次です。strict saved-run admissionはOFFです。
 - **I3-B進捗 (2026-11-19):** 隔離requests.sqlite v0→v1 migration、online backup/restore、opt-in strict request reservation/read verifierを実装し、ChatGPT GitHub reviewでACCEPTED (with documented caveats)です。[I3-B証跡](D1-I3B-request-storage-evidence.md)。I3-Cのcross-DB binding照合・manifest/reader/transport接続は未着手です。strict saved-run admissionはOFFです。
+- **I3-C進捗 (2026-11-19):** 既存opt-in storeを使ったread-only cross-DB binding照合、exact pinned revision lookup、input normalizationと明示snapshot照合を実装しました。[I3-C証跡](D1-I3C-crossdb-binding-evidence.md)。状態はIMPLEMENTED / PENDING_CHATGPT_REVIEWで、I3全体はIN_PROGRESSのままです。複数DB間atomicity、manifest/input snapshotの出所、request digest完全性は検証せず、strict runは開始できません。I4 variable storeが次候補です。I5 manifest/reader対応はI4後の将来sliceで未実装です。
 
 ### D1-I4 — Variable store / mutation ledger
 
@@ -159,4 +160,4 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 
 ## 5. Slice運用上の最終状態
 
-I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I3はIN_PROGRESS（I3-A/I3-B ACCEPTED with documented caveats、I3-C横断統合が次）、I4〜I8はNOT_STARTEDです。I3-Aの受入証跡は[D1-I3-A contract storage evidence](D1-I3A-contract-storage-evidence.md)、I3-Bの受入証跡は[D1-I3-B request storage evidence](D1-I3B-request-storage-evidence.md)に記録します。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。strict runはOFFで、実Codex job、共有/production DB migration、full strict enableは行っていません。
+I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I3はIN_PROGRESS（I3-A/I3-B ACCEPTED with documented caveats、I3-C IMPLEMENTED / PENDING_CHATGPT_REVIEW）、I4〜I8はNOT_STARTEDです。I3-A、I3-B、I3-Cの証跡は各phase evidence文書に記録します。I4 variable storeが次候補で、I5 manifest/readerはI4後の未実装sliceです。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。strict runはOFFで、実Codex job、共有/production DB migration、full strict enableは行っていません。
