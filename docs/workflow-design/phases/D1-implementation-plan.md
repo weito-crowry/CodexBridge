@@ -3,7 +3,7 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0はACCEPTED (with documented caveats)、I1〜I8はNOT_STARTED。D1全体はユーザー最終承認前のDRAFTで、機能コード実装は開始していません。
+- **実装状態:** I0はACCEPTED (with documented caveats)、I1はREVIEW_PENDING、I2〜I8はNOT_STARTED。D1全体はユーザー最終承認前のDRAFTです。
 
 ## 1. 目的と適用境界
 
@@ -20,7 +20,7 @@ I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)を参照�
 | Slice | 状態 | 依存 |
 | --- | --- | --- |
 | D1-I0 Baseline/traceability | ACCEPTED (with documented caveats) | なし |
-| D1-I1 Pure contract core | NOT_STARTED | I0 |
+| D1-I1 Pure contract core | REVIEW_PENDING | I0 |
 | D1-I2 Windows protection/controller primitives | NOT_STARTED | I0。I1への技術依存はないが、単一Codexの実作業順ではI1の後 |
 | D1-I3 Definition contract storage/migration | NOT_STARTED | I0, I1, I2 |
 | D1-I4 Variable store/ledger | NOT_STARTED | I1, I2, I3 |
@@ -54,10 +54,11 @@ I6はI3とI5の両方を満たしてから始めます。I8は全ての実装・
 
 - **依存:** I0。
 - **目的/成果物:** JSON Schema Draft 2020-12のallowlist/compile、strict contract key/type検証、canonical hash、input default normalization、missing/null区別、secret拒否、resource cap判定のpure coreを実装します。OWS schema、SQLite、HTTP/MCP、global runtime stateへ接続しません。
-- **変更面候補:** workflow package内の純粋なcontract/normalization領域（module/file名は未確定）と対応unit test領域。既存definitions validatorとの接続はI3/I6で扱います。
+- **変更面:** `src/codex_bridge/workflows/contracts.py` と `tests/test_workflow_d1_i1_contract_core.py`。既存definitions validatorとの接続はI3/I6で扱います。
 - **検証:** schema allowlist、external/cyclic ref拒否、depth/node/byte cap、nested defaultの一回適用、default再適用の冪等性、missing対null、secret入力拒否、legacy serialization/hash golden比較。
 - **受入gate:** malformed/unsupported Schemaをsilent ignoreせず拒否し、正規化結果/hashが同一fixture上で決定的で、legacy経路のdigest calculationが変化していないこと。
 - **rollback:** DB migrationを含めません。pure coreが旧validator/正規化と干渉した場合、strict呼出しを無効にしたままI1だけを修正し、legacy fixturesを維持します。
+- **今回の状態:** 純粋contract coreと単体テストを追加し、記録したI1検証はPASSです。ChatGPTのGitHubレビュー待ちとしてREVIEW_PENDINGです。[I1実装証跡](D1-I1-contract-core-evidence.md)。I0はACCEPTED、I2〜I8はNOT_STARTEDです。strict runtimeや既存呼出し元には接続していません。
 
 ### D1-I2 — Windows protection / controller primitives
 
