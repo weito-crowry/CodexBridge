@@ -3,7 +3,7 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0はACCEPTED (with documented caveats)、I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I3はIN_PROGRESS（I3-A ACCEPTED (with documented caveats)、I3-B requests.sqlite migrationが次、I3-C横断統合は後続）、I4〜I8はNOT_STARTEDです。D1全体はDRAFTで、最終承認・production enableを意味しません。
+- **実装状態:** I0はACCEPTED (with documented caveats)、I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I3はIN_PROGRESS（I3-A ACCEPTED (with documented caveats)、I3-B IMPLEMENTED / PENDING_CHATGPT_REVIEW、I3-C未着手）、I4〜I8はNOT_STARTEDです。D1全体はDRAFTで、最終承認・production enableを意味しません。
 
 ## 1. 目的と適用境界
 
@@ -78,6 +78,7 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 - **将来の共有DB移行:** 別途オペレーター承認、known writers/workers停止、停止状態の確認、SQLite online backupと検証、schema互換確認、成功後のlegacy identity検証が必要です。停止を確認できなければmigrationしません。SQLite writer lockやuser_version単独で旧binary/別controllerを排除できるとは扱わず、旧binaryとの安全共存・自動upgradeを約束しません。旧Bridge本番起動中の自動migration、旧schemaへの自動downgradeは禁止です。
 - **rollback:** isolated test DBのみでtransaction rollbackまたは検証済み一時backup restoreを行います。共有DBのrestore/downgradeはこのsliceの範囲外です。
 - **I3-A進捗 (2026-11-19):** 隔離definitions.sqlite v1→v2 migration、明示的v2初期化、revision-bound contract保存/read検証、strict/legacy CRUD coreを実装しました。ChatGPT GitHub reviewでACCEPTED (with documented caveats)です。[I3-A証跡](D1-I3A-contract-storage-evidence.md)。I3-B requests.sqlite migrationが次の実装slice、I3-C横断統合は後続で、いずれも未実装です。strict saved-run admissionはOFFです。
+- **I3-B進捗 (2026-11-19):** 隔離requests.sqlite v0→v1 migration、online backup/restore、opt-in strict request reservation/read verifierを実装しました。I3-BはIMPLEMENTED / PENDING_CHATGPT_REVIEWで、受入はレビュー待ちです。[I3-B証跡](D1-I3B-request-storage-evidence.md)。I3-C横断照合・manifest/reader/transport接続は未着手で、strict saved-run admissionはOFFです。
 
 ### D1-I4 — Variable store / mutation ledger
 
@@ -158,4 +159,4 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 
 ## 5. Slice運用上の最終状態
 
-I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I3はIN_PROGRESS（I3-A ACCEPTED with documented caveats、I3-B requests.sqlite migrationが次、I3-C横断統合が後続）、I4〜I8はNOT_STARTEDです。I3-Aの受入証跡は[D1-I3-A contract storage evidence](D1-I3A-contract-storage-evidence.md)に記録します。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。実Codex job、共有/production DB migration、full strict enableは行っていません。
+I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I3はIN_PROGRESS（I3-A ACCEPTED with documented caveats、I3-B IMPLEMENTED / PENDING_CHATGPT_REVIEW、I3-C未着手）、I4〜I8はNOT_STARTEDです。I3-Aの受入証跡は[D1-I3-A contract storage evidence](D1-I3A-contract-storage-evidence.md)、I3-Bの実装証跡は[D1-I3-B request storage evidence](D1-I3B-request-storage-evidence.md)に記録します。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。実Codex job、共有/production DB migration、full strict enableは行っていません。
