@@ -1,8 +1,9 @@
 # D1-I1 Pure Contract Core 実装証跡
 
-**状態:** `REVIEW_PENDING`（実装・記載済み検証は完了、ChatGPTのGitHubレビュー待ち）
+**状態:** `ACCEPTED (ChatGPT GitHub review PASS; documented caveats)`
 **基点:** `codex/workflow-d1-i0-baseline` / `ff30f856e9ec29c512acd279756963c001e4bf75`
 **作業ブランチ:** `codex/workflow-d1-i1-contract-core`
+**レビュー済み実装commit:** [5705da238db8a6e5281d1b3f79a014ff5c5a5cab](https://github.com/weito-crowry/CodexBridge/commit/5705da238db8a6e5281d1b3f79a014ff5c5a5cab)
 
 ## 範囲
 
@@ -40,6 +41,6 @@ Definitions/APIの2件のskipは、Windows環境でsymlinkを作成する特権�
 
 ## 状態と後続作業
 
-I0は `ACCEPTED (with documented caveats)` のままです。I1は記載済みの検証を通過し、レビュー待ちの `REVIEW_PENDING` です。D1全体は最終承認前のDRAFTであり、I2〜I8はすべて `NOT_STARTED` です。
+I0は `ACCEPTED (with documented caveats)` のままです。I1は記載済みの検証を通過し、ChatGPTのGitHubレビューで `ACCEPTED (with documented caveats)` と承認されました。Windows symlink権限由来のskip、全体pytest未実施、実API/DB/OWS未接続の留保は維持されます。必要なWindows ACL/RDP実機受入はI8で確認します。D1全体は最終承認前のDRAFTであり、I2〜I8はすべて `NOT_STARTED` です。
 
 定義DBへのcontract保存とmigrationはI3、変数永続化とmutation ledgerはI4、run binding/manifest/reader対応はI5、公開HTTP/MCP契約はI6、OWS runtime adapterやstrict実行接続はI7、隔離Windows受入はI8の対象です。これらは本作業で実装・検証していません。全体pytest、production DB migration、API/MCP実行、GUI、OWS変更、Codex外部jobも未実施です。
