@@ -21,7 +21,9 @@
 | [ADR 0004: SQLite DDLとschema migration](decisions/0004-sqlite-ddl-and-schema-migration.md) | Proposed（レビュー待ち） | definitions/request/variable DBのDDL案、validator、upgrade/rollback gate |
 | [ADR 0005: 起動排他・resource cap・Windows ACL](decisions/0005-startup-exclusion-resource-limits-windows-acl.md) | Proposed（レビュー待ち） | controller排他、旧版upgrade gate、NTFS ACL/path保護、strict v1上限案 |
 | [ADR 0006: 公開HTTP/MCP契約・ETag v2・エラー互換](decisions/0006-public-api-mcp-etag-error-contract.md) | Proposed（レビュー待ち） | optional contract、legacy/v2 ETag、strict run responseとエラー/status互換の設計案 |
+| [ADR 0007: OWS call adapterによるstrict変数操作](decisions/0007-variable-call-adapter.md) | Proposed（レビュー待ち） | OWS Schemaを変更せずstrict revision内のcodexbridge-variable callを許可する案 |
 | [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（レビュー待ち） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
+| [D1実装スライス計画](phases/D1-implementation-plan.md) | PLANNING / DRAFT（I0〜I8: NOT_STARTED） | 実装手順、gate、rollback、D1受入traceabilityの提案。実装済みを意味しない |
 
 ## Phase一覧
 

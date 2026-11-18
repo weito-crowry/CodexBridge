@@ -572,6 +572,16 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-144 | HTTP/MCP request/response size caps | 128 KiB/1 MiB/256 KiBとstrict contract/input/output capsをcombined payload込みで検査 |
 | D1-145 | legacy clientとstrict clientの併存 | unknown request fields拒否を維持し、旧clientのexact response/ETag/replayとstrict clientの追加fieldを両立 |
 | D1-146 | 同時strict update race | 同じexpected revisionからの並行mutationは一つだけcommitし、他方は既存CAS conflictとなる |
+| D1-147 | OWS Schema-valid call task itemと現行subset | task name key配下のcall: codexbridge-variable/withをOWS schemaが受理し、現行interpreterはstrict adapter未実装として拒否 |
+| D1-148 | strict/legacy call allowlistと既存job call | strict revisionだけvariable adapterを許可し、legacy拒否とmock-job/codex-jobの既存動作を維持 |
+| D1-149 | operation別with key allowlist | 8 operationのrequired/optional argsを検査し、unknown/extra keyとcaller run/frame identityを拒否 |
+| D1-150 | declaration_idとworkflow root scope binding | strict宣言だけ解決し、実行run bindingのroot frameを使う。Issue/Attempt/Loop/Subflowは拒否 |
+| D1-151 | increment/decrement by | default 1、有限かつ非負numberのみ、bool/負/NaN/Inf拒否、decrementは絶対量を減らす |
+| D1-152 | with.value評価規則 | JSON literal/許可済みjq式は既存set規則を再利用し、独自template/未許可式を追加しない |
+| D1-153 | object pointerとoperation payload | RFC 6901 path、append array型、object parent/required/delete、value必須/禁止条件を検査 |
+| D1-154 | strict jq $cbvars projection | present root valueのみread-onlyで解決し、missing/tombstoneはnull化せず、legacy/contextへ漏らさない |
+| D1-155 | DBOS call replay/historical after | stable node path、mutation ordinal 0、binding/root frame keyで一度だけ反映し、後続stateを巻き戻さない |
+| D1-156 | invalid call mutation rollback/redaction | schema/value/ledger failureでstate変更なし、safe reason/eventから変数値・prompt・inputを漏らさない |
 
 D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。D1-42以降はmigration・run lifecycle・回復・security・resource・公開HTTP/MCP契約の受入項目です。この文書のみの変更ではコードテストを実行しません。
 
@@ -625,6 +635,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-36 | Strict成功runは既存response fieldsにrun_format_version、contract_version/hash、binding_digestを追加し、legacy responseは不変。Output Schema検証前にsucceeded/resultを公開せず、invalid outputはfailed/output_contract_violation、業務REJECTEDはvalid result内に置く。 | 第5回result |
 | PD-37 | Runtime status enumを維持し、strict-only safe reason_codeをstatus/detail/eventへ追加可能にする。UNKNOWNや外部効果/ledger不確定時はneeds_reconciliationを用い自動retry/POSTしない。error codeはtransport固有のlegacy namesを保ち、表のstrict additionsだけを追加する。 | 第5回status/error |
 | PD-38 | D1 public projectionはvariable value/prompt/input/secret/tracebackを返さず、必要時もallowlist metadata/countだけとする。MCP read/write/execute permissionとHTTP/MCP response capsを維持し、variable inspector/editorとGUI詳細はD8へ残す。 | 第5回projection/auth |
+| PD-39 | 公式OWS task type/schemaを変更せず、strict contract revisionのみCallFunction target codexbridge-variableをallowlistする。with operation/declaration_id/scope=workflowとoperation別引数を厳格検証し、現行set literal/jq評価規則を再利用する。Read-only $cbvarsはstrict root frameのpresent値だけを示し、legacy call/contextを変えない。DBOS ledger execution keyで一度だけ反映し、Loop/Issue/Attempt/Subflow/Dynamic promptは後工程へ残す。 | ADR 0007 Proposed |
 ## 17. Open questions
 
 次は未確定事項として残し、実装前に決定・承認します。run-local DB、DDL/schema version、binding、作成・回復順序、historical replay、migration/rollback、controller排他、resource capはPD-01..29へ、公開route/tool、contract wire delta、ETag v2、run/result/error projectionの提案はPD-30..38へ移しました。以下には実装詳細または別途レビューが必要な部分だけを残し、項目番号は前版Open questionsの参照番号を維持します。
@@ -636,3 +647,9 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 14. Output violation=failed/output_contract_violation、実行・ledger不確実=needs_reconciliation/safe reason_codeという公開意味はPD-36..37に記録しました。内部causeから全reason_code/eventへの細かな写像、外部副作用発生後の補償・人手レビュー・再実行方針は未確定です。
 
 上記のOpen questionsはこのDRAFTと実装対象を区別するために残します。解決前に未決定の値やAPIを確定仕様として扱いません。
+
+## 18. D1実装計画とOWS call adapterの現状
+
+I0〜I8の分割、依存関係、受入gate、rollback案、D1-01〜D1-156 traceabilityは[D1実装スライス計画](D1-implementation-plan.md)に記録します。これはPLANNING / DRAFTであり、全sliceはNOT_STARTEDです。
+
+公式OWS CallFunction schemaはnamed task item内のfunction nameとwith objectを受け入れますが、現行interpreterのcall allowlistはmock-job/codex-jobのみです。call: codexbridge-variable、strict root variable adapter、$cbvarsは未実装です。OWS公式Schema、legacy call validation、OWS set/contextの既存意味は変更しません。候補契約の詳細は[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)を参照してください。
