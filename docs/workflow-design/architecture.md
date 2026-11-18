@@ -2,7 +2,7 @@
 
 ## 状態
 
-本書の「現行」は確認したソース上の実装を示します。「ターゲット」「案」は基本仕様 v0.2またはD1以降の設計方針で、未実装の内容を含みます。基本仕様は [requirements.md](requirements.md)、詳細案は [D1 DRAFT](phases/D1-input-output-variables.md)、ループ方針は [ADR 0001](decisions/0001-structured-loops.md)、contract保存は [ADR 0002](decisions/0002-contract-storage-and-normalization.md)、run-local変数DBとmanifest v2は [ADR 0003 Proposed](decisions/0003-run-local-variable-store-and-manifest-v2.md)、DDLとschema migrationは [ADR 0004 Proposed](decisions/0004-sqlite-ddl-and-schema-migration.md) を参照してください。
+本書の「現行」は確認したソース上の実装を示します。「ターゲット」「案」は基本仕様 v0.2またはD1以降の設計方針で、未実装の内容を含みます。基本仕様は [requirements.md](requirements.md)、詳細案は [D1 DRAFT](phases/D1-input-output-variables.md)、ループ方針は [ADR 0001](decisions/0001-structured-loops.md)、contract保存は [ADR 0002](decisions/0002-contract-storage-and-normalization.md)、run-local変数DBとmanifest v2は [ADR 0003 Proposed](decisions/0003-run-local-variable-store-and-manifest-v2.md)、DDLとschema migrationは [ADR 0004 Proposed](decisions/0004-sqlite-ddl-and-schema-migration.md)、起動排他・resource cap・Windows ACLは [ADR 0005 Proposed](decisions/0005-startup-exclusion-resource-limits-windows-acl.md) を参照してください。
 
 ## 現行でできること
 
@@ -86,9 +86,13 @@ D2 AgentノードはD1の型付き参照を使い、prompt文字列の構文はD
 
 ## D1の互換境界と残る検討事項
 
+- 現行manager.py/service.pyのrun pathはmode=0700を指定しますが、Windowsでos.chmodによるACL設定は行われていません。node_events.py/task_projection.pyのreparse-point検査は対象経路が限定され、すべてのstrict variable DB openを守る実装ではありません。現行にstate_root単位のnamed Mutex排他もありません。
 - メインフローのinput_dataとJSON result形は維持します。Contract適用で既存呼び出しwire formatを変更するかは別途明示します。
 - legacy definition mutation digest、legacy request id再送規則、service.pyの _verified_active_workspace を含むlegacy manifest v1検証を維持し、strict runだけrequests.sqlite binding rowとmanifest run_format_version=2を相互検証する経路に分ける候補です。過去manifest/request digestを再解釈しません。strict v2へ未対応のworker/recover/manager readerが残る間はstrict runを生成しません。
 - strict runではnormalized input digestとcontract/revision bindingを名前空間付きv2 request digestに固定し、run directory内のvariables.sqliteでDBOS recoveryを行います。requests予約後に変数DBが欠落・破損すれば再作成せず停止します。run directory orphanをWorkflowとして自動復活させません。
 - 現行APIのrequest body上限は128 KiB、OWS YAML上限は64 KiBです。requests.sqlite migration詳細、DDL/制約、secret future storage、Schema/値/DB/応答の総上限、Windows ACL、公開API/error codes、v2利用後のbackup/rollbackはD1 DRAFTのOpen questionsです。
 - migration運用案は全writer停止、SQLite online backup/検証、version-aware binary展開、各DB migration、legacy identity確認後にstrict writerを有効化する順です。strict run開始後の旧binary/schemaへの自動rollbackはしません。backup/restoreの一致範囲とoffline restore時のdata loss承認など、詳細gateはADR 0004 Proposedを参照してください。
 - D1は既存Codex MAYBE_SENTの意味や再送禁止規則を変更しません。
+- 新対応版のstrict writerはDB open前にstate_root単位のcontroller排他を取る案ですが、Mutexは旧binaryを止めません。旧版の自動起動経路・process・workerを停止し、互換ownerとquiescenceを証明できない場合はmigration/strict enableしません。通常clientとcontroller管理下のrun workerは同じMutexを個別に取得しません。
+- Windowsの新規strict run directory/variables.sqlite/sidecarはNTFS protected DACL・owner/path検証を行う案です。現行mode=0700やPOSIX chmod相当だけをWindows ACL保護と見なさず、既存state_root/legacy ACLを自動変更しません。同一userのrogue processやAdministrators/backup privilegeを防ぐ保証はありません。
+- strict v1 resource capは追加Proposed初期値で、既存128 KiB API body、64 KiB YAML/result、16 KiB prompt、2 MiB input file、同時2 Workflow、10,000 taskを変更しません。重なる上限にはmin(existing, strict)を使い、提案数値一覧と検査段階はD1 section 12 / ADR 0005に記載します。

@@ -2,7 +2,7 @@
 
 - **文書状態:** DRAFT / Proposed（レビュー待ち）
 - **基本仕様:** v0.2は合意済み。本書のProposed decisionsは詳細設計候補であり、設計承認・実装完了を意味しません。
-- **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)、[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)
+- **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)、[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)
 
 ## 1. 背景と目的
 
@@ -215,6 +215,8 @@ Workflow scopeはrun内で有効です。Issue値は該当Issue frame、Attempt�
 
 DBはPRAGMA user_version=1、想定journal_mode=WAL、synchronous=FULL、busy_timeout設定、foreign_keys=ON、write時BEGIN IMMEDIATEを候補とし、接続時に4 table・index・columns・primary/foreign keys・user_versionを厳格に検査します。PRAGMA integrity_checkとforeign_key_checkを起動時検査案に含めます。JSON canonicalization/hash/schema検証はapplicationで行い、SQLite JSON1に依存しません。読取専用inspectionはmode=ro接続とし、DBを新規作成・初期化しません。run_dirのcanonical path、run ID、workflow identityとRunBindingの所有関係を毎回照合し、symlink、junction、その他reparse pointを拒否します。Windowsでの安全なファイル作成とACL設定はOpen question 11に残します。明示的なDB容量上限も未決です。
 
+Windows native strict runの新規run directory、variables.sqliteとSQLite WAL/SHM sidecarにはprotected explicit NTFS DACL、owner SID、ACL検証を提案します。既存state_root/legacy runのACLを自動変更せず、不適切なACLや保護を検証できない環境ではstrict runを開始しません。mode=0o700/os.chmodのみをWindows ACL保護とは見なしません。詳細と制約は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)に記します。
+
 variables.sqlite transactionとDBOS step/checkpointは別transactionです。run directory上の新規DBに初期状態を準備し、requests.sqliteのrequest reservationとbinding rowを別のSQLite transactionで確定するため、両者をまたぐatomic commitはありません。
 
 | レコード | 必須の論理情報 |
@@ -347,7 +349,46 @@ Graph、MCP、Consoleの公開値はrun status、frame/node identity、宣言さ
 - strict v1の初期実装では、sensitivity=secretの変数宣言とsecretを含むと明示された入力を受け付けず、明示的に拒否します。CodexBridge tokenを自動注入しません。secret保存・暗号鍵管理は将来の別設計です。
 - 公開projectionは入力実値、秘密値、prompt等をGraph/MCP/UI/通常ログや例外へ漏らさず、値をredactします。
 - Graph/MCPのv2 projectionは許可されたidentity・status・type・version等のメタ情報に限定し、変数の実値は公開しません。
-- 現行のHTTP Workflow requestは128 KiB、YAMLは64 KiBです。Schema、contract、input/output/valueの合計、depth/node数、HTTP/MCP応答などの具体上限は実装開始前に承認が必要です。
+- 既存実装のlimitは変更しません。strict v1には以下の追加Proposed初期値を設け、重なる境界にはmin(existing_limit, strict_limit)を適用します。すべてレビュー前の提案値で、基本仕様の確定値ではありません。
+
+| 対象 | 現行上限（維持） |
+| --- | ---: |
+| HTTP API request body全体 | 128 KiB |
+| Workflow YAML/source | 64 KiB |
+| Codex job prompt | 16 KiB UTF-8 |
+| Workflow result | 64 KiB |
+| run input file | 2 MiB |
+| active Workflow | 同時2件 |
+| Workflow task数 | 10,000 |
+
+| strict v1 resource | Proposed初期上限 | 検査時点 |
+| --- | ---: | --- |
+| canonical contract JSON | 64 KiB UTF-8 | definition compile/save前 |
+| normalized input JSON / input.json | 96 KiB | default適用・正規化後、run admission |
+| output JSON | 64 KiB | result確定前 |
+| 単一variable value / mutation after value | 64 KiB UTF-8 | initialize/各mutation前後 |
+| 単一mutation payload | 64 KiB UTF-8 | mutation admission |
+| run内の現存variable値合計 | 2 MiB UTF-8 | BEGIN IMMEDIATE内、mutation前後 |
+| variable declarations | 256 / run | contract compile |
+| scope frames | 1,024 / run | frame作成前 |
+| mutation ledger rows | 10,000 / run | 新規ledger insert前 |
+| variables.sqlite main DB | 64 MiB | write admission/checkpoint管理 |
+| variables.sqlite WAL | 16 MiB high-water目標 | checkpoint監視・writer抑制 |
+| JSON Schema nesting depth | 24 | contract compile |
+| Schema nodes合計 | 512 | contract compile |
+| local $ref展開深度 | 16 | contract compile |
+| Schema object property数合計 | 512 | contract compile |
+| input/output/variable JSON depth | 32 | admission・mutation・output |
+| JSON object property数 | 1,024 / object | admission・mutation・output |
+| JSON array length | 10,000 / array | admission・mutation・output |
+
+Workflow API body全体はcontract fieldを含めて既存128 KiB以内にします。YAMLやcontract等を個別上限内に収めても、body全体の上限は別に確認します。normalized inputはraw body/inputの大きさにかかわらずdefault適用後にも96 KiBで検査します。既存2 MiB input file制限、64 KiB result、64 KiB YAML等は引き続き適用され、該当するstrict capと小さい方を採ります。prompt 16 KiB、active Workflow 2件、task 10,000の現行制限を広げません。
+
+JSON byte capはUTF-8 canonical encoding（ensure_ascii=false、sort_keys=true、separators=(',', ':'), NaN不許可）を基準にします。duplicate JSON keys、NaN/Infinity、許可外Schema keyword、cyclic refを拒否します。Schema/resource capsはdefinition compile、input raw bodyとnormalized valueはrun admission、variable値/payload/合計/ledger/databaseはmutation transaction内、outputは成功確定前に検査します。WAL 16 MiBは高水位目標で、上限前checkpointとwriter抑制を行います。長時間reader等によりcheckpoint不能な場合のSHM/WAL物理上限と最終保証は未確定です。logical quota、SQLite max_page_count、checkpoint/backpressureの組合せは実装時に検証します。
+
+mutationが上限超過する場合はBEGIN IMMEDIATE内で適用前に検出し、変更なしrollbackとcapacity errorにします。既存state/ledgerを消さず、Workflowを正常完了・受入PASSにしません。read-only inspectorは全履歴を一括返却せずpagination/response capを用います。MCP/HTTP応答の具体数値はOpen question 12に残します。
+
+- 数値はstrict v1のProposed初期値であり、レビュー後は後続revisionで変更可能です。これらはD2/D5のCodex job時間予算と別のdata/resource budgetです。
 - JSON Schema validatorで外部ネットワーク参照を行いません。
 
 ## 13. エラー分類案
@@ -477,8 +518,36 @@ HTTP/MCP status codeと公開error stringは未確定です。以下は内部分
 | D1-90 | definitions成功後requests migration失敗 | strict runを止め、strict runが存在しないことを確認せず自動rollbackしない。安全なrestore条件を検査 |
 | D1-91 | strict run開始後のrollback要求 | 旧binary/schemaへの自動downgradeを禁止し、forward repairまたは承認済みoffline restore/data-loss扱いへ分岐 |
 | D1-92 | DDL smokeと外部副作用境界 | SQLite :memory:でDDL/制約/FKを確認し、docs taskでは実Codex POSTやpersistent user DB変更を行わない |
+| D1-93 | 新対応controllerを同一state_rootで同時起動 | 一方だけがMutexを取得し、他方は有限待機またはfail-closed。既存processをkillしない |
+| D1-94 | Mutex取得の有限待機・timeout・abandoned状態 | WAIT_ABANDONED等は成功扱いせず、request/manifest/DB/worker状態を照合してから進行 |
+| D1-95 | migration前/新process起動後の旧Bridgeと自動再起動 | GUI/autostart/service/scheduled/manual経路と未終了workerの不存在を確認するまでmigration/strict enable不可 |
+| D1-96 | Mutexを無視する旧binary・未知writer・quiescence不明 | Mutex単体で排除したと見なさず、状態を証明できなければfail closed |
+| D1-97 | state_root/user SID別のlock identity・named object squatting | 同root/SIDでは同じMutex、別root/SIDでは別identityを確認し、共有rootのowner不一致や予期しないowner/DACL/objectを拒否 |
+| D1-98 | 通常GUI/API/MCP clientの複数接続 | client自身はMutexを取らず、単一controllerを共有して要求を処理 |
+| D1-99 | controllerが起動したrun固有worker | workerはcontroller Mutexを取得せず、認証済みrun/worker identityを検証。live workerが残ればupgradeを拒否 |
+| D1-100 | Windows NTFS run directory/variables.sqlite ACL | protected DACLのowner、現User SIDとLOCAL SYSTEMのみのACE、canonical ACLを検査 |
+| D1-101 | Everyone/Users/Authenticated Users/別SIDへの広いgrant | strict start前に拒否し、値や秘密をerror/logへ出さない |
+| D1-102 | 既存state_root/legacy runのACL不備 | 既存ACLを自動変更せずstrict runを停止。明示的管理者修復の範囲を案内 |
+| D1-103 | state_root/ancestor/run/database/WAL/SHMのreparse point | どの対象pathでも検出したらSQLiteを開かず拒否 |
+| D1-104 | run/database file name collisionとTOCTOU | create-exclusiveとhandle-based owner/file-ID照合で置換・path swapを拒否 |
+| D1-105 | SQLiteが作るWAL/SHMのDACL/owner | 保護directoryから正しいACLを継承し、生成後に検証が完了するまでworkerを開始しない |
+| D1-106 | NTFS以外、security descriptor/identity API不在・失敗 | POSIX/WSL/Dockerへ暗黙切替せずstrictをfail closed |
+| D1-107 | Administrators/backup privilegeや同一user rogue process | 保護対象として遮断できると主張せず、Threat modelの限界と一致 |
+| D1-108 | 現行API/YAML/prompt/result/file/concurrency/task上限の回帰 | 128/64/16/64 KiB、2 MiB、同時2件、10,000 taskを変更せずstrict側は追加制約を適用 |
+| D1-109 | contract/YAML/API全body境界 | contract 64 KiB、YAML 64 KiBを個別検査し、合計API body 128 KiBも独立検査 |
+| D1-110 | raw requestとdefault適用後normalized input | API body 128 KiBに加えnormalized JSON/input.json 96 KiBを両方検査 |
+| D1-111 | output、単一variable value、mutation after value/payload | 各64 KiB境界の直前/一致/超過を検査し、既存result capも維持 |
+| D1-112 | run aggregate/current value、declaration、frame、ledger count | 2 MiB、256、1,024、10,000の境界で挿入前検査 |
+| D1-113 | Schema depth/node/ref/property caps | 24、512、16、512の境界でcompile時に拒否・許可を判定 |
+| D1-114 | JSON depth/object property/array capsと不正JSON | 32、1,024/object、10,000/arrayの境界、duplicate key、NaN/Inf、cyclic refを検査 |
+| D1-115 | variables.sqlite main DB/WAL/SHM物理サイズ | 64 MiB main、16 MiB WAL high-water、長時間reader/checkpoint不能とSHM上限の未確定を含め最終容量保証を検証 |
+| D1-116 | definition/start/mutation/output/projection各段階のcap検査 | canonical UTF-8 byte数で検査し、normalization後や更新後の増加を見落とさない |
+| D1-117 | mutation中のaggregate/DB/ledger上限超過 | BEGIN IMMEDIATE内で変更前にrollbackし、state/ledger保持、成功/acceptance扱いにしない |
+| D1-118 | read-only inspectorの履歴/HTTP-MCP projection | pagination/response capを使い、一括全履歴と変数実値を返さない |
+| D1-119 | strict cap errorとsecret扱い | valueをerror/logへ埋め込まずPD-10のsecret拒否を維持 |
+| D1-120 | limit導入後の既存設定・外部job境界 | 既存prompt/time budgetを変更せず、このdocs taskでCodex POST/MCP dogfoodを行わない |
 
-D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。上記D1-42以降は追加migration・run lifecycle・回復受入項目です。今回のDDL構文確認は一時SQLite :memory:に限り、プロジェクトコードやpersistent user DBの実装テストとは区別します。
+D1実装時の検証計画にはpytest、Ruff、mypy、compileall、および隔離したWindows smokeを含めます。上記D1-42以降は追加migration・run lifecycle・回復・security・resource受入項目です。この文書のみの変更ではコードテストを実行しません。
 
 ## 15. D1出口条件
 
@@ -488,7 +557,7 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 
 ## 16. Proposed decisions（レビュー対象）
 
-以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-10は第1回の候補を維持し、PD-11以降は第2・3回で具体化した永続化・run binding・SQLite DDL/migration候補です。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)にあります。
+以下はD1詳細設計の提案（レビュー対象）です。基本仕様 v0.2を変更せず、ユーザーの設計レビュー後に確定します。PD-01..PD-23は従来候補を維持し、PD-24以降は第4回のsingle-controller排他、Windows ACL/path、strict resource cap候補です。DDL例は[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、起動/ACL/cap設計は[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)にあります。
 
 | ID | Proposed decision | 対応する論点 |
 | --- | --- | --- |
@@ -515,14 +584,19 @@ D1実装の出口では、一つの保存済みWorkflowについて、revision�
 | PD-21 | variable stateはmissing row、JSON null文字列、present=0 tombstoneを区別する。mutation ledgerはhistorical after valueを保持し、CAS、線形version chain、state更新とledger insertを一transactionで行う。 | 旧Q9 ledger DDL |
 | PD-22 | 各DBはuser_version・object/table/column/index/PK/FK・integrity/FK checkを厳格検査する。起動時のschema mismatch/未知objectはfail closedし、readonly inspectionでDB作成しない。 | 旧Q9 schema validator |
 | PD-23 | migration/rollbackは全writer停止、SQLite online backup、version-aware binary展開、各DB migration、legacy identity検証、reader対応後のstrict enableの順とする。strict run開始後は旧binary/schemaへの自動rollbackを行わずforward repairまたは承認済みoffline restoreを使う。 | 旧Q9 operational gate |
-
+| PD-24 | 新対応controllerはDB open/migration前にstate_rootのcanonical absolute pathと現user SIDのSHA-256 identifierに結び付くWindows Local名前付きMutexを取得し、controller寿命中保持する。Mutex DACLは現User SIDとLOCAL SYSTEMに限り、abandoned/予期しない既存objectは状態照合してから扱う。 | 旧Q9 controller exclusion |
+| PD-25 | Mutexは旧binaryを止めない。全legacy起動経路とworkerの停止を確認し、互換owner/旧writer不存在が証明できない場合migration/strict enableしない。Mutexだけで旧binary混在を防ぐと主張しない。 | 旧Q9 old-version gate |
+| PD-26 | workerはcontroller Mutexを取得しない。controller認証済みrun/worker起動identityとbindingを検査し、live workerが残る間はupgradeしない。通常GUI/API/MCP clientは共有controllerを使い、Mutexを個別取得しない。 | 旧Q9 worker lifecycle |
+| PD-27 | strict D1の新規run directory/variables.sqlite/WAL/SHMはNTFS protected DACL、owner SID、canonical ACLを検査し、state_root・ancestor・run/database/sidecarのreparse pointを拒否する。create-exclusive/handle-based file-ID照合を行い、既存ACLを自動変更しない。 | 旧Q11 Windows boundary |
+| PD-28 | 本節のresource tableをstrict v1のProposed初期値とし、既存limitを変えず重複制約にはmin(existing_limit, strict_limit)を適用する。API body、normalized input、schema/value/aggregate/store capsをそれぞれ明示検査する。 | 旧Q11 numerical limits |
+| PD-29 | cap超過は変更前に検出し安全なcapacity errorで止め、既存state/ledgerを保持して成功/acceptanceとしない。WAL/SHMを含む物理上限保証とWindows ACL raceは実装dogfoodで検証する未決ゲート。 | 旧Q11 enforcement |
 ## 17. Open questions
 
-次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、DDL候補、schema version、request/manifest binding、run作成・recovery順序、historical mutation replay、migration/rollback方針はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
+次は未確定事項として残し、実装前に決定・承認します。run-local DB配置、DDL候補、schema version、request/manifest binding、run作成・recovery順序、historical mutation replay、migration/rollback方針、single-controller排他案、strict resource capのProposed初期値はProposed decisionsへ移し、以下には未確定の実装詳細だけを残します。項目番号は前版Open questionsの参照番号を維持しています。
 
-9. DDL案を実装へ接続するschema validatorの具体的な比較方式、既存v1 DBのcolumn/index/FK inventory固定、複数DB transactionをつなぐruntime API、およびrequests.sqliteで旧binaryの同時writerを防ぐ起動・instance guardの機構。requests.sqliteは現行でuser_version管理がないためversion fieldだけでは旧writer排除になりません。
+9. Local namespaceが同じstate_rootを使う全session/processを排他できるかを含むnamed MutexのWin32 API wrapper、controller起動/終了への組込み、旧GUI/autostart/service/scheduled/manual再起動経路を封じるinstance guard、live workerとcontroller認証済みrun起動identityの具体mechanism。requests.sqliteは現行でuser_version管理がなく、旧binaryは新Mutexを知らないため、version/Mutexだけでは旧writer排除になりません。quiescenceを証明できない場合はstrict enableしません。
 10. 将来secretを扱う場合の暗号化、key ownership/rotation、およびstrict v1での拒否を公開するerror mapping。secret機能を初期実装へ含めません。
-11. Workflow/input/output/value合計、DB容量、深度、Schema節点数、参照解決量、HTTP/MCP response/eventの数値上限と、Windowsでのvariables.sqlite安全な作成・physical ACL。現行128 KiB API request、64 KiB YAML等と整合させます。
+11. 表12のresource capはProposed初期値です。WAL/SHM高水位と長時間reader時のcheckpoint/backpressure、PRAGMA max_page_count/論理quotaとの組合せで64 MiB main DBを超えない保証、NTFS SECURITY_DESCRIPTOR/DACL/ACE継承/owner確認とhandle-based file-ID検証の実装・Windows dogfood測定は未決定です。ACL/API/identity検査不能時のstrict fail-closed境界を実装前に確認します。
 12. HTTP/MCPの公開route/field/status、同一endpoint optional fieldか別APIか、strict ETagのwire表現と既存client移行、Console投影、public error code、backup retentionおよびstrict v2利用後のrollback手順。
 14. output違反・reconciliationの公開status/event名と、外部副作用発生後の補償・レビュー・再実行手順。
 
