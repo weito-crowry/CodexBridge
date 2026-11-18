@@ -108,7 +108,7 @@ Strict create/validate/updateでは同じrequest objectにcontract objectを加�
 | Legacy revision update | 従来どおりlegacy更新 | strictへの明示的移行として新revisionを作る | HTTP/MCP 400 |
 | Strict revision update | HTTP/MCP 400 workflow_contract_required。strictからlegacyへのdowngradeを許さない | contractを再検証し必ず新immutable revisionを作る。同一contractでも上書きしない | HTTP/MCP 400 workflow_contract_required |
 
-Contract変更、定義内容変更、ETag/CAS更新は既存revision追加とmutation ledgerの原子性に従います。mutation digestにはcontractのpresence、canonical value/hash、revisionと期待ETagまたはexpected_revisionを含めます。既存legacy request idとmutation replayのdigest/retry規則を再解釈しません。HTTPとMCPは共通のstrict意味を持ちますが、それぞれの既存transport envelopeを保ちます。
+Contract変更、定義内容変更、ETag/CAS更新は既存revision追加とmutation ledgerの原子性に従います。Strict mutation digestは、source/profile/contractのcanonical mutation payloadに加え、共通表現へ正規化したexpected_revisionと、そのrevisionのdefinition mode/binding identityを使います。HTTP If-Matchはimmutable revisionへ解決し、validator、contract hash、bindingを完全照合してから同revision番号へ正規化します。MCP expected_revisionも同じ整数revision表現へ正規化します。生のIf-Match header値やHTTP/MCP等のtransport名はdigestへ含めません。同一mutation_request_id・同一source/profile/contract・同一期待revision/bindingなら両transportで同一digestとなりreplayし、revisionまたはcontract/bindingが異なればconflictです。Legacy mutation digestは1 bitも変更せず、既存legacy request idとmutation replayのdigest/retry規則を再解釈しません。HTTPとMCPは共通のstrict意味を持ちますが、それぞれの既存transport envelopeを保ちます。
 
 ### 2. Validationと定義read response
 
@@ -188,9 +188,9 @@ etag = quote("workflow-definition-v2-" + etag_hash)
 
 canonical_jsonはD1で定めた決定的UTF-8 JSON（sort_keys、NaN/Infinity禁止）です。v2 ETagはETag header/bodyおよびdefinition mutation ledgerに同じidentityで記録します。ETag v2のv2はdefinition contract bindingの版で、run_format_version=2とは独立です。
 
-HTTP If-Match parserは既存v1とstrict v2のstrong ETagを受け付けます。serverはimmutable revisionのmode、contract row/hash、binding、current latest revisionを解決してCASします。Strict revisionにlegacy v1 ETag、legacy revisionにstrict v2 ETag、stale revision/hash/bindingを提示した場合は412 precondition_failedです。If-Match欠落は既存428、malformed valueは既存400です。新しいwire statusやweak ETagは追加しません。
+HTTP If-Match parserは既存v1とstrict v2のstrong ETagを受け付けます。serverはheader値からimmutable revisionを特定し、ETagと当該revisionのmode、strict contract row/hash、bindingを完全照合してからCAS対象のexpected_revisionへ正規化します。生header値はmutation digestへ渡しません。Strict revisionにlegacy v1 ETag、legacy revisionにstrict v2 ETag、stale revision/hash/bindingを提示した場合は従来どおり412 precondition_failedです。If-Match欠落は既存428、malformed valueは既存400です。新しいwire statusやweak ETagは追加しません。
 
-MCP workflow_definition_updateは現在のexpected_revisionをauthoritative CASとして維持し、必須If-Matchを新設しません。Strict updateはexpected_revisionに加えてcontractを要求し、staleなら既存MCP workflow_definition_precondition_failedを返します。ETag値はGET responseに表示しますが、MCP mutationをHTTP headerへ依存させません。
+MCP workflow_definition_updateは現在のexpected_revisionをauthoritative CASとして維持し、必須If-Matchを新設しません。Strict updateはexpected_revisionに加えてcontractを要求し、HTTP側と同じ共通revision表現へ正規化した上でmutation digestを計算します。staleなら既存MCP workflow_definition_precondition_failedを返します。ETag値はGET responseに表示しますが、MCP mutationをHTTP headerへ依存させません。HTTP stale ETagは従来の412、stale MCP expected_revisionは従来のMCP precondition errorを維持します。
 
 ### 4. Saved-run startとstrict v2 binding
 
