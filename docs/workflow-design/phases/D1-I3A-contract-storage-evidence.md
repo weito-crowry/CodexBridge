@@ -1,6 +1,6 @@
 # D1-I3-A Isolated Contract Storage Evidence
 
-**Status:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
+**Status:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19
 **Date:** 2026-11-19
 **Branch base:** d1f80d0f7de88016e14ec531c3f426300fc2a2ae
 **Scope:** definitions.sqlite v1→v2 migration, opt-in v2 initialization, revision-bound contract storage/read validation, and internal strict/legacy CRUD core.
@@ -24,6 +24,10 @@ The v1-to-v2 migration checks exact SQLite object inventory, table definitions, 
 
 The existing definitions.py and contracts.py behavior was not changed. WorkflowDefinitionRepository continues to require schema v1 and does not initialize or migrate v2. Strict run admission remains OFF. I3-B requests.sqlite migration and I3-C cross-database integration were not implemented.
 
+## Review caveat
+
+The isolated strict_definitions.py module is approximately 1,500 lines. When connecting I3-B and I3-C, reuse its schema, validation, and transaction responsibilities to avoid unnecessary duplicate logic. This is a maintainability caveat for follow-up work; this docs-only review record makes no refactoring or implementation changes.
+
 ## Isolated validation
 
 All test databases were created under pytest tmp_path. No production database, shared state root, running Bridge/Worker, or real Codex job was used.
@@ -46,4 +50,6 @@ The two skipped legacy definition tests require Windows symlink creation and wer
 
 ## State and review boundary
 
-D1-I3-A is IMPLEMENTED / PENDING_CHATGPT_REVIEW. I3 remains IN_PROGRESS because I3-B requests.sqlite migration and I3-C cross-database integration remain unimplemented. I0/I1 remain ACCEPTED, I2 remains DEFERRED / NON-BLOCKING, and D1 remains DRAFT. This evidence records implementation and isolated checks only; it does not mark final ChatGPT acceptance.
+D1-I3-A is ACCEPTED (with documented caveats) following ChatGPT GitHub review on 2026-11-19. I3 remains IN_PROGRESS: I3-B requests.sqlite migration is next, and I3-C cross-database integration follows. I0/I1 remain ACCEPTED, I2 remains DEFERRED / NON-BLOCKING, and D1 remains DRAFT. Production routes remain unconnected and no production/shared database was changed.
+
+This review-record update was docs-only. Pytest, Ruff, mypy, and compileall were NOT_RUN in this turn; the isolated implementation results above are retained unchanged.
