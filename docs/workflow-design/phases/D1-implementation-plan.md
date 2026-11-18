@@ -3,7 +3,7 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0はACCEPTED (with documented caveats)、I1はACCEPTED (with documented caveats)、I2〜I8はNOT_STARTED。D1全体はユーザー最終承認前のDRAFTです。
+- **実装状態:** I0はACCEPTED (with documented caveats)、I1はACCEPTED (with documented caveats)、I2はIN_PROGRESS / BLOCKED_FULL_ACCEPTANCE、I3〜I8はNOT_STARTED。D1全体はユーザー最終承認前のDRAFTです。
 
 ## 1. 目的と適用境界
 
@@ -13,7 +13,7 @@
 
 通常のslice完了時は、そのsliceの変更・テスト結果・未達gate・rollback状態を記録し、指定branchへdocs/implementation commitをpushしてChatGPTのGitHub reviewを受けます。review前にdevへmergeしません。DB migrationはisolated preproductionに限定し、production/shared state rootでは明示的な後続承認なしに実行しません。pytest等の結果だけでWindows ACL、旧binary quiescence、backup/restore gateがpassしたことにはしません。
 
-I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)を参照してください。I1の実績は[D1-I1-contract-core-evidence.md](D1-I1-contract-core-evidence.md)を参照してください。I2〜I8は未実装であり、実Codex job、production DB migration等は未実施です。
+I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)、I1の実績は[D1-I1-contract-core-evidence.md](D1-I1-contract-core-evidence.md)、I2の実績と未達gateは[D1-I2-windows-guard-evidence.md](D1-I2-windows-guard-evidence.md)を参照してください。I3〜I8は未実装であり、実Codex job、production DB migration等は未実施です。
 
 ## 2. 状態と依存関係
 
@@ -21,7 +21,7 @@ I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)を参照�
 | --- | --- | --- |
 | D1-I0 Baseline/traceability | ACCEPTED (with documented caveats) | なし |
 | D1-I1 Pure contract core | ACCEPTED (with documented caveats) | I0 |
-| D1-I2 Windows protection/controller primitives | NOT_STARTED | I0。I1への技術依存はないが、単一Codexの実作業順ではI1の後 |
+| D1-I2 Windows protection/controller primitives | IN_PROGRESS / BLOCKED_FULL_ACCEPTANCE | I0。I1への技術依存はないが、単一Codexの実作業順ではI1の後 |
 | D1-I3 Definition contract storage/migration | NOT_STARTED | I0, I1, I2 |
 | D1-I4 Variable store/ledger | NOT_STARTED | I1, I2, I3 |
 | D1-I5 Request binding/manifest/readers | NOT_STARTED | I3, I4 |
@@ -47,7 +47,7 @@ I6はI3とI5の両方を満たしてから始めます。I8は全ての実装・
 - **変更面候補:** 既存workflow test suiteのfixture/test領域、必要最小限のdocs traceability。definitions.py/service.py/interpreter.py/API/MCPのruntime変更なし。fixture配置は既存suiteを確認後に決めます。
 - **検証:** 現行pytest、Ruff、mypy、compileallをbaselineとして実行し、isolated Windows baselineではlegacy definition/run/API/MCP/result/graphを採取します。既存workspace未追跡証跡は列挙名以外参照しません。
 - **受入gate:** legacy ETag/response/request replay/graph期待値が再現可能で、元となるtestとtraceability IDが各fixtureへ結び付き、変更前の環境・DB記録が読み取り専用で保存されること。
-- **今回の状態:** I0は条件付き受入PASSとして受入済みです。[I0基準証跡](D1-I0-baseline-evidence.md)に対象8ファイルをカバーする新規8件と既存回帰のPASS/既知SKIPを記録しました。saved executionとgraphは29件の2ファイル合算です。歴史的一括suiteはNOT_COMPLETEのまま維持し、一括suiteをPASSとは表現しません。I2/I8でsymlink権限由来の2件とWindows ACL/RDPの必要実機検証を再確認します。D1全体はDRAFT、I1はACCEPTED (with documented caveats)、I2〜I8はNOT_STARTEDです。
+- **今回の状態:** I0は条件付き受入PASSとして受入済みです。[I0基準証跡](D1-I0-baseline-evidence.md)に対象8ファイルをカバーする新規8件と既存回帰のPASS/既知SKIPを記録しました。saved executionとgraphは29件の2ファイル合算です。歴史的一括suiteはNOT_COMPLETEのまま維持し、一括suiteをPASSとは表現しません。I2/I8でsymlink権限由来の2件とWindows ACL/RDPの必要実機検証を再確認します。D1全体はDRAFT、I1はACCEPTED (with documented caveats)、I2はIN_PROGRESS / BLOCKED_FULL_ACCEPTANCE、I3〜I8はNOT_STARTEDです。
 - **rollback:** persistent DBや共有state rootを変更しません。fixtureが既存期待を誤って固定した場合はbaselineをpass扱いせず、そのsliceのfixture変更だけを修正・再レビューします。
 
 ### D1-I1 — Pure contract core
@@ -58,7 +58,7 @@ I6はI3とI5の両方を満たしてから始めます。I8は全ての実装・
 - **検証:** schema allowlist、external/cyclic ref拒否、depth/node/byte cap、nested defaultの一回適用、default再適用の冪等性、missing対null、secret入力拒否、legacy serialization/hash golden比較。
 - **受入gate:** malformed/unsupported Schemaをsilent ignoreせず拒否し、正規化結果/hashが同一fixture上で決定的で、legacy経路のdigest calculationが変化していないこと。
 - **rollback:** DB migrationを含めません。pure coreが旧validator/正規化と干渉した場合、strict呼出しを無効にしたままI1だけを修正し、legacy fixturesを維持します。
-- **今回の状態:** 純粋contract coreと単体テストを追加し、記録したI1検証はPASSです。ChatGPTのGitHubレビューを受け、ACCEPTED (with documented caveats)です。[I1実装証跡](D1-I1-contract-core-evidence.md)。I0はACCEPTED、I2〜I8はNOT_STARTEDです。strict runtimeや既存呼出し元には接続していません。
+- **今回の状態:** 純粋contract coreと単体テストを追加し、記録したI1検証はPASSです。ChatGPTのGitHubレビューを受け、ACCEPTED (with documented caveats)です。[I1実装証跡](D1-I1-contract-core-evidence.md)。I0はACCEPTED、I2はIN_PROGRESS / BLOCKED_FULL_ACCEPTANCE、I3〜I8はNOT_STARTEDです。strict runtimeや既存呼出し元には接続していません。
 
 ### D1-I2 — Windows protection / controller primitives
 
@@ -68,6 +68,7 @@ I6はI3とI5の両方を満たしてから始めます。I8は全ての実装・
 - **検証:** 同一state_root/SIDの同一session・異なるRDP/fast-user-switching/service session、Global mutex作成/取得競合、WAIT_ABANDONED照合、DACL/SID mismatch、reparse/TOCTOU、旧binary/autostart/leftover worker gateをisolated Windows environmentで確認します。共有production rootを使いません。
 - **受入gate:** 全関連sessionを検査できない、Global Mutex/ACL/ownerを確認できない、または旧writer/worker quiescenceを証明できない場合はstrict enable不可とし、未実施をPASSに読み替えません。
 - **rollback:** isolated test resourceだけを対象にし、shared state rootや既存ACLを変更しません。Windows primitiveに不一致があればstrict startupを無効のまま修正し、旧controllerを強制終了しません。
+- **今回の状態:** I2-Aの独立Global Mutex primitiveと隔離テストを追加しました。Mutex owner/protected DACL readback、同一session競合・有限wait、same-thread cleanupは検証済みです。I2-BのNTFS directory/file ACL、reparse/file-ID検査、SQLite WAL/SHM、RDP/別sessionの実証、旧writer/worker quiescence gateは未実装または未検証のため、I2全体は`IN_PROGRESS / BLOCKED_FULL_ACCEPTANCE`です。[I2証跡](D1-I2-windows-guard-evidence.md)。I0/I1はACCEPTED、I3〜I8はNOT_STARTEDです。
 
 ### D1-I3 — Definition contract storage / schema migration / CRUD core
 
