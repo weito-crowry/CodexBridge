@@ -1,8 +1,9 @@
 # D1-I3-B request storage evidence
 
-- **状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
-- **I3-B受入:** PENDING_CHATGPT_REVIEW
-- **I3全体:** IN_PROGRESS。I3-Cは未着手。
+- **状態:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19
+- **I3-B受入:** ACCEPTED (with documented caveats)。
+- **実装commit:** [8f7f10928d565c2592af2b2771b2487704c484ba](https://github.com/weito-crowry/CodexBridge/commit/8f7f10928d565c2592af2b2771b2487704c484ba)。ChatGPT GitHubレビュー済み (2026-11-19)。
+- **I3全体:** IN_PROGRESS。I3-C横断統合が次で、未着手。
 - **既存状態:** I0/I1/I3-Aは受入済み、I2はDEFERRED、D1はDRAFT。
 - **実装日:** 2026-11-19
 
@@ -16,11 +17,13 @@ v0/v1検査は `user_version`、user schema object inventory、table_info、name
 
 strict reservationは、事前正規化済みのID・digest・definition/source/contract/input hash・version・日時を受け、`BEGIN IMMEDIATE` 内でrequest/source/bindingの3行を一度に予約します。衝突・異payload retryは変更なしで拒否し、同一内容retryは保存済みreservationをreplayします。成功時もrun directory、manifest、worker、Codex jobは作成しません。legacy rowにはbindingを追加しません。bindingを伴わない既存rowをstrict read対象として指定した場合はfail closedです。
 
-変更は指定された4ファイルのみです。`service.py`、既存runtime、共有/production DBは変更していません。definitions.sqliteとのcross-DB真正性検証、manifest v2、worker/reader/GUI/HTTP/MCP接続はI3-C以降です。複数DB atomicityや旧binaryとの共存は保証しません。
+変更は実装commitで指定された4ファイルのみです。`service.py`、既存runtime、共有/production DBは変更していません。APIは明示opt-inで本番runtimeには接続しておらず、共有DB移行には別途承認が必要です。definitions.sqliteとのcross-DB binding照合、manifest v2、worker/reader/GUI/HTTP/MCP接続はI3-C以降の未実装事項です。strict reservation/readの全件整合性・integrity走査コストは、I3-Cの接続性能検査事項です。複数DB atomicityや旧binaryとの共存は保証しません。
 
 ## テストと品質ゲート
 
 新規fixtureは実際の `service._initialize_write_connection` でtmp_path内にlegacy v0 DBを作成し、service/worker runtimeは起動しません。WALにcommit済みdataがある状態でonline backup/restore、複数legacy row/source有無/state、index保持、migration後のrowid/data/digest/UUID保持を確認しました。
+
+以下は実装commitに対する実装時実測です。今回のdocs-only受入記録では再実行していません。
 
 | 検証 | 結果 |
 | --- | --- |
@@ -49,4 +52,4 @@ pytest全fixtureは `tmp_path` を使います。静的検査コマンドは `uv
 
 ## 受入状態
 
-実装とfocused verificationは完了しました。I3-B受入はChatGPT GitHub review待ちであり、Codex実装完了はreview完了を意味しません。I3全体はIN_PROGRESS、I3-Cは未着手、strict saved-run admissionはOFFです。共有DB移行時には別途運用判断が必要で、この実装では共有/production DBを開いていません。
+今回の変更は2つのMarkdownだけです。`git diff --check` と変更対象パス、追加したMarkdown相対リンクを確認しました。pytest、Ruff、mypy、compileallはNOT_RUNです。I3-BはChatGPT GitHub reviewによりACCEPTED (with documented caveats)、I3全体はIN_PROGRESS、I3-C横断統合が次で未着手、strict saved-run admissionはOFFです。共有/production DB migration、実環境MCP dogfood、外部Codex jobはNOT_RUNです。
