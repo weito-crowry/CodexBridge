@@ -1,0 +1,53 @@
+{
+  "create": [
+    "canonical_sha256",
+    "created_at",
+    "definition_id",
+    "etag",
+    "max_live_codex_jobs",
+    "revision",
+    "source_sha256"
+  ],
+  "update": [
+    "canonical_sha256",
+    "created_at",
+    "definition_id",
+    "etag",
+    "max_live_codex_jobs",
+    "revision",
+    "source_sha256"
+  ],
+  "validate": [
+    "canonical_sha256",
+    "max_live_codex_jobs",
+    "source_sha256",
+    "valid"
+  ],
+  "list_envelope": [
+    "definitions",
+    "limit",
+    "next_cursor"
+  ],
+  "list_item": [
+    "canonical_sha256",
+    "created_at",
+    "definition_id",
+    "document_name",
+    "etag",
+    "latest_revision",
+    "max_live_codex_jobs",
+    "source_sha256",
+    "updated_at"
+  ],
+  "detail": [
+    "canonical_sha256",
+    "created_at",
+    "definition_id",
+    "document_name",
+    "etag",
+    "max_live_codex_jobs",
+    "revision",
+    "source_sha256",
+    "source_yaml"
+  ]
+}
