@@ -47,7 +47,7 @@ I6はI3とI5の両方を満たしてから始めます。I8は全ての実装・
 - **変更面候補:** 既存workflow test suiteのfixture/test領域、必要最小限のdocs traceability。definitions.py/service.py/interpreter.py/API/MCPのruntime変更なし。fixture配置は既存suiteを確認後に決めます。
 - **検証:** 現行pytest、Ruff、mypy、compileallをbaselineとして実行し、isolated Windows baselineではlegacy definition/run/API/MCP/result/graphを採取します。既存workspace未追跡証跡は列挙名以外参照しません。
 - **受入gate:** legacy ETag/response/request replay/graph期待値が再現可能で、元となるtestとtraceability IDが各fixtureへ結び付き、変更前の環境・DB記録が読み取り専用で保存されること。
-- **今回の状態:** I0は条件付き受入PASSとして受入済みです。[I0基準証跡](D1-I0-baseline-evidence.md)に対象8ファイルをカバーする新規8件と既存回帰のPASS/既知SKIPを記録しました。saved executionとgraphは29件の2ファイル合算です。歴史的一括suiteはNOT_COMPLETEのまま維持し、一括suiteをPASSとは表現しません。I2/I8でsymlink権限由来の2件とWindows ACL/RDPの必要実機検証を再確認します。D1全体はDRAFT、I1〜I8はNOT_STARTEDです。
+- **今回の状態:** I0は条件付き受入PASSとして受入済みです。[I0基準証跡](D1-I0-baseline-evidence.md)に対象8ファイルをカバーする新規8件と既存回帰のPASS/既知SKIPを記録しました。saved executionとgraphは29件の2ファイル合算です。歴史的一括suiteはNOT_COMPLETEのまま維持し、一括suiteをPASSとは表現しません。I2/I8でsymlink権限由来の2件とWindows ACL/RDPの必要実機検証を再確認します。D1全体はDRAFT、I1はREVIEW_PENDING、I2〜I8はNOT_STARTEDです。
 - **rollback:** persistent DBや共有state rootを変更しません。fixtureが既存期待を誤って固定した場合はbaselineをpass扱いせず、そのsliceのfixture変更だけを修正・再レビューします。
 
 ### D1-I1 — Pure contract core
