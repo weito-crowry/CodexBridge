@@ -1,11 +1,12 @@
 # D1-I5-B1 common run format discriminator / service reader evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
+- **実装状態:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-20
 - **I5-A:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19
-- **I5-B1:** PENDING_CHATGPT_REVIEW。service reader entry gateのみを対象とします。
+- **I5-B1:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-20。service reader entry gateのみを対象とします。
 - **I5-B2 / I5-B3:** NOT_STARTED。
 - **I5全体:** IN_PROGRESS。**D1全体:** DRAFT。**strict run admission:** OFF。
 - **B1実装日:** 2026-11-20。
+- **B1実装commit:** `475d30e838d5f1e56b805ceef2d9288517177215`。
 - **対象branch:** `codex/workflow-d1-i5-manifest-readers`
 
 ## 対象と実装
@@ -50,10 +51,11 @@ Ruff、format、mypy、compileallとdiff checkは記録したB1コード上でPA
 
 ## 制約と後続作業
 
-- B1はserviceの2 reader入口だけです。manager、worker、worker entry/start/recover、task projection、graph/status/recovery readerの全数監査は未完了で、全reader coverage gateは未達です。I5-B2/B3を実装してから全reader互換を判定します。
+- ChatGPTはGitHub上でcommit `475d30e838d5f1e56b805ceef2d9288517177215` を独立レビューし、文書化した留保付きでI5-B1を受入れました（2026-11-20）。
+- B1はserviceの `_verified_active_workspace(...)` と `_inspect_run(...)` の2 reader入口だけです。manager、worker、worker entry/start/recover、task projection、graph/status/recovery readerの全数監査は未完了で、全reader coverage gateは未達です。I5-B2/B3を実装してから全reader互換を判定します。
 - strict v2はserviceから保守的にreconciliationへ送られます。`StrictWorkflowSnapshotVerifier.verify_reserved()`、I4 variable ledgerとDBOS checkpointの完全照合、strict v2の正常status/result投影は未接続です。
 - SQLite read-only接続でもWAL sidecar metadataが変化する可能性があります。主DB file/rowの不変比較は通りましたが、sidecar bytes不変性は主張しません。manifest filesと複数DB間のatomicityもありません。
-- I5全体はIN_PROGRESS、I5-B2/B3はNOT_STARTEDです。D1はDRAFT、strict run admissionはOFFです。
+- I5-AとI5-B1はACCEPTED (with documented caveats)、I5-B2/B3はNOT_STARTED、I5全体はIN_PROGRESSです。D1はDRAFT、strict run admissionはOFFです。
 
 ## Stage / rollback
 
