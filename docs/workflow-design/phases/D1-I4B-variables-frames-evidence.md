@@ -1,7 +1,8 @@
 # D1-I4-B: Typed variable candidates and scope frames evidence
 
-- **Status:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
+- **Status:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19
 - **Date:** 2026-11-19
+- **Implementation commit:** `4f01a8ff3fdb17d84eb4df739466c53cddfda458` — reviewed on GitHub.
 - **Slice state:** I4-B only; I4 overall remains IN_PROGRESS.
 - **D1 state:** DRAFT; strict run admission remains OFF.
 
@@ -25,6 +26,11 @@
   schema migration, or production state root was used.
 
 ## Verification results
+
+The PASS/SKIP results below are from implementation commit
+`4f01a8ff3fdb17d84eb4df739466c53cddfda458`. This docs-only review-record
+commit does not rerun Python tests or code checks; those checks are NOT_RUN for
+this commit.
 
 | Check | Result |
 | --- | --- |
@@ -58,13 +64,25 @@ The final focused regression completed in 179.20 seconds.
 - Scope paths are validated as explicit parent/child metadata. Their mapping
   to future I7 OWS nodes remains to be confirmed at that adapter boundary.
 - This slice does not write variable state or mutation ledger rows and does not
-  implement execution keys, CAS/version checks, or historical replay. Those
-  are I4-C work.
+  provide a persistent state/ledger update API. I4-C must implement and verify
+  CAS/version/digest checks, execution_key identity and replay, and
+  `variable_states` plus `variable_mutations` updates in the same transaction.
+- I4-C must also implement and verify DBOS historical replay against the
+  committed mutation ledger. I4-B frame enter/close/inspect fail closed while
+  either state or ledger table is nonempty.
 - No atomicity across variables.sqlite, requests.sqlite, dbos.sqlite, or DBOS
-  checkpoints is claimed.
+  checkpoints is claimed. No production run has been enabled.
+
+## This docs-only record validation
+
+- Markdown relative links: PASS.
+- Current I4 status agrees across the plan heading, table, I4 section, and final
+  summary: PASS.
+- `git diff --check`: PASS.
+- Pytest, Ruff, mypy, and compileall for this docs-only commit: NOT_RUN.
 
 ## Current phase state
 
-I4-A is ACCEPTED (with documented caveats); I4-B is IMPLEMENTED /
-PENDING_CHATGPT_REVIEW; I4-C is NOT_STARTED. I4 overall is IN_PROGRESS. I5-I8
-remain NOT_STARTED. D1 remains DRAFT and strict run admission remains OFF.
+I4-A and I4-B are ACCEPTED (with documented caveats); I4-C is NOT_STARTED and
+is the next implementation slice. I4 overall is IN_PROGRESS. I5-I8 remain
+NOT_STARTED. D1 remains DRAFT and strict run admission remains OFF.
