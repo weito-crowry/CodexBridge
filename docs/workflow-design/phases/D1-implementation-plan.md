@@ -3,7 +3,7 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0/I1/I3はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I4-A/I4-B/I4-CおよびI4全体はACCEPTED (with documented caveats)、I5はIN_PROGRESS（I5-A ACCEPTED with documented caveats、I5-B未着手・次工程I5-B1）、I6〜I8はNOT_STARTEDです。D1全体はDRAFTで、strict run admissionはOFFです。
+- **実装状態:** I0/I1/I3はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I4-A/I4-B/I4-CおよびI4全体はACCEPTED (with documented caveats)、I5はIN_PROGRESS（I5-A ACCEPTED with documented caveats、I5-B1 IMPLEMENTED / PENDING_CHATGPT_REVIEW、I5-B2/B3 NOT_STARTED）、I6〜I8はNOT_STARTEDです。D1全体はDRAFTで、strict run admissionはOFFです。
 
 ## 1. 目的と適用境界
 
@@ -24,7 +24,7 @@ I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)、I1の�
 | D1-I2 Windows protection/controller primitives | DEFERRED / NON-BLOCKING（I2-A historical implemented、I2全体NOT_ACCEPTED、I2-B停止） | 独立。I3以後の依存ではない |
 | D1-I3 Definition contract storage/migration | ACCEPTED (with documented caveats)（I3-A/I3-B/I3-C） | I0, I1 |
 | D1-I4 Variable Store/Mutation Ledger | ACCEPTED (with documented caveats)（I4-A/I4-B/I4-CおよびI4全体） | I1, I3 |
-| D1-I5 Manifest v2 / reader integration | IN_PROGRESS（I5-A ACCEPTED with documented caveats、I5-B未着手・次工程I5-B1） | I3, I4 |
+| D1-I5 Manifest v2 / reader integration | IN_PROGRESS（I5-A ACCEPTED with documented caveats、I5-B1 IMPLEMENTED / PENDING_CHATGPT_REVIEW、I5-B2/B3 NOT_STARTED） | I3, I4 |
 | D1-I6 HTTP/MCP contract surface | NOT_STARTED | I3, I5 |
 | D1-I7 Strict root runtime/OWS call adapter | NOT_STARTED | I4, I5, I6 |
 | D1-I8 Isolated acceptance/go-no-go | NOT_STARTED | I0, I1, I3〜I7 |
@@ -102,6 +102,7 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 - **受入gate:** どのreaderにもstrict v2未対応経路が残らず、legacy runをstrictとして再解釈しません。strict admission feature flagはI8 gateまでOFFです。
 - **rollback:** binding/manifestが一致しないrunはneeds_reconciliationで停止し、statusを成功へ投影しません。旧runを新方式で再計算・変換せず、strict runの自動削除や自動降格をしません。
 - **I5-A進捗 (2026-11-19):** opt-in strict v2 request digest/canonical manifest codec、exclusive snapshot writer、pre-reservation/reserved read verifierを実装し、ChatGPT GitHub reviewでACCEPTED (with documented caveats)となりました。[I5-A証跡](D1-I5A-manifest-evidence.md)。実装commitは `982b461ba47bdfa0a62bf6da4d648c47a6545e9c`、レビュー修正commitは `2fda398abbce7299c5f1e3ae0a565aebd04ab6e9` です。I3 pinned definition/request APIsとI4-A/I4-C read APIsを再利用し、DB reservationや既存reader接続は行いません。I5はIN_PROGRESS、I5-AはACCEPTED (with documented caveats)、I5-Bは未着手で次工程はI5-B1です。D1はDRAFT、strict run admissionはOFFです。
+- **I5-B1進捗 (2026-11-20):** common run format discriminatorとserviceの `_verified_active_workspace` / `_inspect_run` reader entry gateを実装しました。[I5-B1証跡](D1-I5B1-service-reader-evidence.md)。legacy v0/v1 no-bindingは従来readerへ進み、strict v2と不整合はserviceで `needs_reconciliation` / workspace conflictに保守的に収束します。B1は全readerを接続せず、I5-B2（manager/task projection/graph/status/recovery reader）とI5-B3（worker/worker_entry/start/recover readerおよび全reader audit）はNOT_STARTEDです。I5-B1はIMPLEMENTED / PENDING_CHATGPT_REVIEW、I5全体はIN_PROGRESS、strict run admissionはOFFです。
 
 ### D1-I6 — HTTP/MCP contract surface
 
@@ -164,4 +165,4 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 
 ## 5. Slice運用上の最終状態
 
-I0/I1/I3はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I4-A/I4-B/I4-CおよびI4全体はACCEPTED (with documented caveats)です。I5はIN_PROGRESS（I5-A ACCEPTED with documented caveats、I5-B未着手・次工程I5-B1）、I6〜I8はNOT_STARTEDです。I3-A/B/C、I4-A/B/C、I5-Aの証跡は各phase evidence文書に記録します。次工程I5-B1はcommon run format discriminatorとservice reader entry gateに限定し、B2/B3で残りのreaderを接続・監査します。I5-B1完了を全reader version-aware対応とは扱いません。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。D1全体はDRAFT、strict run admissionはOFFで、実Codex job、共有/production DB migration、production反映は行っていません。
+I0/I1/I3はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I4-A/I4-B/I4-CおよびI4全体はACCEPTED (with documented caveats)です。I5はIN_PROGRESS（I5-A ACCEPTED with documented caveats、I5-B1 IMPLEMENTED / PENDING_CHATGPT_REVIEW、I5-B2/B3 NOT_STARTED）、I6〜I8はNOT_STARTEDです。I3-A/B/C、I4-A/B/C、I5-A、I5-B1の証跡は各phase evidence文書に記録します。I5-B1はcommon run format discriminatorとservice reader entry gateに限定し、B2/B3で残りのreaderを接続・監査します。I5-B1完了を全reader version-aware対応とは扱いません。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。D1全体はDRAFT、strict run admissionはOFFで、実Codex job、共有/production DB migration、production反映は行っていません。
