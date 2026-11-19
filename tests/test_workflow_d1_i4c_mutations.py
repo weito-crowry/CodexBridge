@@ -843,11 +843,20 @@ def test_ledger_aware_frame_lifecycle_preserves_state_and_legacy_frame_store_sta
                 owner_scope="/do/1",
                 initial=2,
             ),
+            _variable(
+                "child-uninitialized",
+                "child-uninitialized",
+                _schema("integer"),
+                owner_scope="/do/1",
+            ),
         ]
     )
     run_directory = tmp_path / "run-frame-ledger"
     _, binding, store = _initialize(run_directory, contract)
+    initially_missing = store.read_current("workflow-root", "root-value")
+    assert initially_missing.exists is False and initially_missing.version == 0
     root_result = _apply(store, "root-value", "initialize", node="/init/root")
+    assert store.read_current("workflow-root", "root-value").value == 1
     monkeypatch.setattr(frame_module, "_MAX_FRAMES", 4)
     child_zero = store.enter_frame("workflow-root", "/do/1", [0], _CREATED_AT)
     assert store.enter_frame("workflow-root", "/do/1", [0], _LATER) == child_zero
@@ -858,6 +867,18 @@ def test_ledger_aware_frame_lifecycle_preserves_state_and_legacy_frame_store_sta
         node="/do/1/init",
         frame=child_zero.frame_id,
         vector=[0],
+    )
+    child_latest = _apply(
+        store,
+        "child-value",
+        "assign",
+        node="/do/1/update",
+        ordinal=1,
+        frame=child_zero.frame_id,
+        vector=[0],
+        before_version=1,
+        before_digest=child_value.after_digest,
+        value=3,
     )
     child_one = store.enter_frame("workflow-root", "/do/1", [1], _LATER)
     assert child_one.frame_id != child_zero.frame_id
@@ -871,7 +892,54 @@ def test_ledger_aware_frame_lifecycle_preserves_state_and_legacy_frame_store_sta
     closed = store.close_frame(child_zero.frame_id, _LATER)
     assert closed.status == "CLOSED"
     assert store.close_frame(child_zero.frame_id, _LATER) == closed
-    assert store.read_current(child_zero.frame_id, "child-value").value == 2
+    historical = store.get_mutation(child_value.execution_key)
+    assert historical is not None
+    assert historical.after_value == 2 and historical.after_version == 1
+    assert historical.replayed is False
+    ledger = store.inspect_ledger()
+    assert child_value.execution_key in {item.execution_key for item in ledger.mutations}
+    latest_before_replay: tuple[object, ...]
+    with _connect(run_directory) as connection:
+        latest_before_replay = connection.execute(
+            "SELECT version, value_json, value_digest FROM variable_states "
+            "WHERE run_id=? AND frame_id=? AND declaration_id=?",
+            (_RUN_ID, child_zero.frame_id, "child-value"),
+        ).fetchone()
+    replay = _apply(
+        store,
+        "child-value",
+        "initialize",
+        node="/do/1/init",
+        frame=child_zero.frame_id,
+        vector=[0],
+        before_version=0,
+        before_digest=None,
+    )
+    assert replay.replayed is True
+    assert replay.after_value == 2 and replay.after_version == 1
+    assert replay.execution_key == child_value.execution_key
+    with _connect(run_directory) as connection:
+        latest_after_replay = connection.execute(
+            "SELECT version, value_json, value_digest FROM variable_states "
+            "WHERE run_id=? AND frame_id=? AND declaration_id=?",
+            (_RUN_ID, child_zero.frame_id, "child-value"),
+        ).fetchone()
+    assert (
+        latest_before_replay
+        == latest_after_replay
+        == (
+            2,
+            "3",
+            child_latest.after_digest,
+        )
+    )
+    with pytest.raises(StrictWorkflowVariableConflict) as existing_read_error:
+        store.read_current(child_zero.frame_id, "child-value")
+    assert "3" not in str(existing_read_error.value)
+    with pytest.raises(StrictWorkflowVariableConflict):
+        store.read_current(child_zero.frame_id, "child-uninitialized")
+    active_child_missing = store.read_current(child_one.frame_id, "child-uninitialized")
+    assert active_child_missing.exists is False and active_child_missing.version == 0
     with pytest.raises(StrictWorkflowVariableConflict):
         _apply(
             store,
@@ -880,9 +948,10 @@ def test_ledger_aware_frame_lifecycle_preserves_state_and_legacy_frame_store_sta
             node="/do/1/after-close",
             frame=child_zero.frame_id,
             vector=[0],
-            before_version=1,
-            before_digest=child_value.after_digest,
-            value=3,
+            ordinal=2,
+            before_version=2,
+            before_digest=child_latest.after_digest,
+            value=4,
         )
     with pytest.raises(StrictWorkflowVariableConflict):
         store.enter_frame("workflow-root", "/do/1", [0], _LATER)

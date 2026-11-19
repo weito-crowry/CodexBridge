@@ -437,6 +437,8 @@ class StrictWorkflowVariableMutationStore:
             frame = frames.get(frame_id)
             if frame is None:
                 raise StrictWorkflowVariableConflict()
+            if frame["status"] != "ACTIVE":
+                raise StrictWorkflowVariableConflict()
             declaration = resolve_variable_declaration(
                 self._compiled_contract, declaration_id, frame["scope_path"]
             )

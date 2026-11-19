@@ -32,8 +32,9 @@
 
 | 検証 | 結果 |
 | --- | --- |
-| 新I4-C mutation/fault/replay/frame/concurrency/resource-limit tests | PASS — 23 passed |
-| I4-C + I4-A/I4-B + I3-A/B/C + I1/I0 + focused legacy regression（対象16 test filesを1回のpytest runで実行） | PASS — 343 passed、FAIL 0。SKIP — 4（Windows symlink作成権限: I4-A 2、legacy definitions 2）。271.78秒 |
+| 新I4-C mutation/fault/replay/frame/concurrency/resource-limit tests（CLOSED read guard修正後の今回run） | PASS — 23 passed、FAIL 0。11.14秒 |
+| I4-A/I4-B/I1/I3-C focused regression（今回のread guard修正run） | PASS — 154 passed、FAIL 0。SKIP — 2（I4-AのWindows symlink作成権限）。47.04秒 |
+| I4-C + I4-A/I4-B + I3-A/B/C + I1/I0 + focused legacy regression（対象16 test files） | PASS — 343 passed、FAIL 0。SKIP — 4（Windows symlink作成権限: I4-A 2、legacy definitions 2）。271.78秒。この結果は前commit `f8a904c4caad458bfb0d1058ab86c488178d904f` の過去runであり、今回の修正検証件数には合算していません |
 | 2つのthreadによるsame-key replay / different-key stale CAS | PASS |
 | `after_state_write` / `after_ledger_write` / `before_commit` rollback、再起動後historical replay | PASS |
 | ledger chain/state corruption、binding/schema/user_version、read-only missing DB、SQLite integrity/FK、value-free repr/error | PASS |
@@ -44,6 +45,13 @@
 | `uv run --no-sync ruff format --check` on touched Python files | PASS |
 | `git diff --check` | PASS |
 | Full pytest suite | NOT_RUN |
+| 今回のI3-A/I3-B、D1-I0、focused legacy suites | NOT_RUN — CLOSED read guardに直接関係するI4-A/B、I1、I3-Cだけを実行 |
 | DBOS real checkpoint / strict runtime / manifest-reader-API integration / production migration / external Codex job | NOT_RUN — I5以降または別境界 |
+
+## ChatGPTレビュー修正 — CLOSED frame read guard (2026-11-19)
+
+ChatGPT review対象commit `f8a904c4caad458bfb0d1058ab86c488178d904f` で、`read_current(frame_id, declaration_id)` がframeの存在だけを確認し、CLOSED frame上の既存stateとmissing stateを返す欠陥が指摘されました。設計 [D1 §11.3](D1-input-output-variables.md) に従い、対象frameを特定した直後に`status != ACTIVE`を確認し、既存のvalue-free `StrictWorkflowVariableConflict` で拒否します。declaration解決/history read前の局所guardであり、frame状態やread-only監査経路は変更していません。
+
+修正後のI4-C testはactive rootでのmissing/current read、CLOSED child上の既存stateと同scope未初期化宣言のread拒否を確認します。同じCLOSED childで`get_mutation`と`inspect_ledger()`が履歴を検証でき、既存execution keyの`apply()` replayはversion 1の保存結果を返し、version 2のlatest stateを保持することも確認します。CLOSED childへの新規mutationは拒否され、別のACTIVE childとrootのreadは成功します。I4-CはIMPLEMENTED / PENDING_CHATGPT_REVIEWのままで、ChatGPTの再レビュー前に受入済みとはしません。
 
 既存I4-B FrameStoreはvariable state/ledger非空時のenter/close/inspect拒否を維持し、新I4-C ledger-aware frame APIだけが全chain監査を通じてlifecycleを継続します。I4-CはChatGPT review待ちです。I5 manifest/reader、I6 API、I7 interpreter/OWS/DBOS wire、I8 acceptanceは未着手です。I2 Windows guardはDEFERRED / NON-BLOCKINGのままです。D1全体はDRAFT、strict run admissionはOFFです。
