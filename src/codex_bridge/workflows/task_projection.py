@@ -26,6 +26,7 @@ from .service import (
     _strict_json,
     _validated_run_directory,
 )
+from .strict_reader_gate import RunFormatVersion, classify_readonly
 
 _JOURNAL_NAME = "node_events.sqlite"
 _JOURNAL_SCHEMA_VERSION = 1
@@ -610,10 +611,22 @@ def _verified_run_source(
         manifest_path = run_dir / "manifest.json"
         workflow_path = run_dir / "workflow.yaml"
         input_path = run_dir / "input.json"
-        for path in (manifest_path, workflow_path, input_path):
+        if _is_reparse_point(manifest_path):
+            raise _ProjectionIssue("run_integrity_invalid")
+        manifest_bytes = _read_regular_file(manifest_path, limit=32 * 1024)
+        run_format = classify_readonly(
+            root,
+            row.run_id,
+            manifest_bytes,
+            expected_workflow_id=row.workflow_id,
+            expected_request_digest=row.request_digest,
+        )
+        if run_format is not RunFormatVersion.LEGACY_V1:
+            raise _ProjectionIssue("run_integrity_invalid")
+        for path in (workflow_path, input_path):
             if _is_reparse_point(path):
                 raise _ProjectionIssue("run_integrity_invalid")
-        manifest = _strict_json(_read_regular_file(manifest_path, limit=32 * 1024))
+        manifest = _strict_json(manifest_bytes)
         if not isinstance(manifest, dict):
             raise _ProjectionIssue("run_integrity_invalid")
         if (

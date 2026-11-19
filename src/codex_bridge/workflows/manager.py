@@ -20,6 +20,7 @@ from .startup_diagnostics import (
     WorkflowStartupStage,
     current_startup_diagnostic,
 )
+from .strict_reader_gate import RunFormatVersion, classify_readonly
 
 WorkerMode = Literal["start", "recover"]
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
@@ -566,14 +567,42 @@ class WorkflowWorkerManager:
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise WorkflowManagerError("workflow run manifest is unavailable")
         try:
+            manifest_bytes = manifest_path.read_bytes()
             value = json.loads(
-                manifest_path.read_text(encoding="utf-8"),
+                manifest_bytes,
                 object_pairs_hook=_unique_json_object,
             )
         except (OSError, ValueError):
             raise WorkflowManagerError("workflow run manifest is invalid") from None
         if not isinstance(value, dict):
             raise WorkflowManagerError("workflow run manifest must be an object")
+        if "run_format_version" in value:
+            raise WorkflowManagerError("workflow run format is unsupported")
+
+        request_database = run_dir.parent / "requests.sqlite"
+        try:
+            if request_database.is_symlink():
+                raise WorkflowManagerError("workflow request storage is unavailable")
+            if request_database.exists():
+                if not request_database.is_file():
+                    raise WorkflowManagerError("workflow request storage is unavailable")
+                workflow_id = value.get("workflow_id")
+                request_digest = value.get("request_digest")
+                if type(workflow_id) is not str or type(request_digest) is not str:
+                    raise WorkflowManagerError("workflow request binding is invalid")
+                run_format = classify_readonly(
+                    run_dir.parent,
+                    run_dir.name,
+                    manifest_bytes,
+                    expected_workflow_id=workflow_id,
+                    expected_request_digest=request_digest,
+                )
+                if run_format is not RunFormatVersion.LEGACY_V1:
+                    raise WorkflowManagerError("workflow run format is unsupported")
+        except WorkflowManagerError:
+            raise
+        except Exception:
+            raise WorkflowManagerError("workflow request binding is invalid") from None
         return value
 
     def _validate_workspace(
@@ -712,8 +741,19 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
             if manifest_path.is_symlink() or not manifest_path.is_file():
                 complete = False
                 continue
+            manifest_bytes = manifest_path.read_bytes()
+            run_format = classify_readonly(
+                canonical_root,
+                run_id,
+                manifest_bytes,
+                expected_workflow_id=workflow_id,
+                expected_request_digest=request_digest,
+            )
+            if run_format is not RunFormatVersion.LEGACY_V1:
+                complete = False
+                continue
             manifest = json.loads(
-                manifest_path.read_text(encoding="utf-8"),
+                manifest_bytes,
                 object_pairs_hook=_unique_json_object,
             )
             if not isinstance(manifest, dict):
@@ -727,7 +767,7 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
                 manifest,
                 max_live_codex_jobs=declared_limit,
             )
-        except (OSError, ValueError, WorkflowManagerError):
+        except Exception:
             complete = False
             continue
         if (
