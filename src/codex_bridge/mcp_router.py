@@ -21,8 +21,6 @@ _CPP_TOOL_ALLOWLIST = frozenset(
         "codex_threads",
         "codex_status",
         "codex_wait",
-        "codex_start",
-        "codex_continue",
     }
 )
 
@@ -168,14 +166,6 @@ class ToolRouter:
                 raise MCPError(
                     code=types.INVALID_PARAMS,
                     message="Tool is not authorized for this MCP credential",
-                ) from None
-            if (
-                params.name == "codex_start"
-                and (params.arguments or {}).get("sandbox_mode") == "danger-full-access"
-            ):
-                raise MCPError(
-                    code=types.INVALID_PARAMS,
-                    message="danger-full-access is not authorized for this MCP credential",
                 ) from None
         route = self._routes.get(params.name)
         if route is None:

@@ -224,7 +224,7 @@ not supported. CodexBridge does not synchronize project files between machines.
 | `CODEX_BRIDGE_CONTROL_TOKEN` | unset | Per-launch Console control token; never persisted. |
 | `CODEX_BRIDGE_LAN_ENABLED` | `false` | Explicit LAN MCP access; use `bridge.lan_enabled` in managed TOML. |
 | `CODEX_BRIDGE_MCP_TOKEN` | unset | Environment-only LAN MCP Bearer token, 32–256 URL-safe ASCII characters. |
-| `CODEX_BRIDGE_CPP_MCP_TOKEN` | unset | Optional environment-only ChatPanelPlus token, 32–256 URL-safe ASCII characters; limited to six Codex tools. |
+| `CODEX_BRIDGE_CPP_MCP_TOKEN` | unset | Optional environment-only ChatPanelPlus token, 32–256 URL-safe ASCII characters; limited to four read-only Codex tools. |
 | `CODEX_BRIDGE_TUNNEL_EXECUTABLE` | resolver | Explicit tunnel client path. |
 | `CODEX_BRIDGE_TUNNEL_PROFILE` | `codex-bridge` | Existing tunnel profile name. |
 | `CODEX_BRIDGE_WAIT_DEFAULT_SECONDS` | `50` | Default `codex_wait` long-poll duration. |
@@ -321,15 +321,16 @@ allowed_origins = ["chrome-extension://REPLACE_WITH_EXTENSION_ID"]
 
 Keep any existing Tunnel Host/Origin entries in these lists. Supply `CODEX_BRIDGE_MCP_TOKEN`
 to the Bridge process environment (and the Console parent environment when Console launches it).
-Optionally supply a distinct `CODEX_BRIDGE_CPP_MCP_TOKEN` to limit ChatPanelPlus to
-`codex_targets`, `codex_threads`, `codex_status`, `codex_wait`, `codex_start`, and `codex_continue`.
+Optionally supply a distinct `CODEX_BRIDGE_CPP_MCP_TOKEN` to limit ChatPanelPlus to the read-only
+tools `codex_targets`, `codex_threads`, `codex_status`, and `codex_wait`.
 LAN enablement without a token is rejected; secrets are excluded from configuration repr, HTTP
 errors, and request-observation logs. Each non-loopback request requires `Authorization: Bearer
 <token>`; missing, malformed, duplicate, or incorrect credentials receive HTTP 401 with
 `WWW-Authenticate: Bearer`. The existing token grants the full MCP catalog. The distinct
-ChatPanelPlus token lists and permits only the six named Codex tools; it rejects `codex_start` when
-`sandbox_mode` is `danger-full-access`. Loopback clients without Authorization retain legacy access,
-while an explicitly supplied invalid Authorization is rejected. HTTP does not encrypt the token.
+ChatPanelPlus token lists and permits only those four read-only tools. It rejects all other tools,
+including `codex_start` and `codex_continue`, at the router entry. Loopback clients without
+Authorization retain legacy access, while an explicitly supplied invalid Authorization is rejected.
+HTTP does not encrypt the token.
 
 Actual loopback socket peers remain exempt for existing local clients and the local Tunnel
 forwarder. The Tunnel retains responsibility for its own remote authentication. Forwarded headers

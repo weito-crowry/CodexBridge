@@ -28,8 +28,6 @@ CPP_TOOLS = {
     "codex_threads",
     "codex_status",
     "codex_wait",
-    "codex_start",
-    "codex_continue",
 }
 
 
@@ -188,6 +186,21 @@ async def test_request_identity_survives_shared_session_and_concurrent_calls(
                     assert "file_put" in full_names and "codex_start" in full_names
                     assert session_ids
 
+                    full_write = await _post_rpc(
+                        url,
+                        session_id=session_ids[0],
+                        protocol_version=initialized.protocol_version,
+                        token=FULL_TOKEN,
+                        request_id=30,
+                        method="tools/call",
+                        params={
+                            "name": "file_put",
+                            "arguments": {"filename": "full-token.txt", "content": "isolated"},
+                        },
+                    )
+                    assert "error" not in _rpc_payload(full_write)
+                    assert (inbox / "full-token.txt").read_text(encoding="utf-8") == "isolated"
+
                     # Both principals deliberately reuse the same SDK session.
                     cpp_response, full_response = await asyncio.gather(
                         _post_rpc(
@@ -255,6 +268,24 @@ async def test_request_identity_survives_shared_session_and_concurrent_calls(
                         params={"name": "codex_status", "arguments": {"thread_id": "desktop"}},
                     )
                     assert "error" not in _rpc_payload(permitted_status)
+                    _state.set_terminal("desktop", "turn-1", "completed")
+                    permitted_wait = await _post_rpc(
+                        url,
+                        session_id=session_ids[0],
+                        protocol_version=initialized.protocol_version,
+                        token=CPP_TOKEN,
+                        request_id=40,
+                        method="tools/call",
+                        params={
+                            "name": "codex_wait",
+                            "arguments": {
+                                "thread_id": "desktop",
+                                "turn_id": "turn-1",
+                                "timeout_seconds": 0,
+                            },
+                        },
+                    )
+                    assert "error" not in _rpc_payload(permitted_wait)
                     methods_before_denials = list(app_server.methods)
 
                     denied_file = await _post_rpc(
@@ -270,38 +301,41 @@ async def test_request_identity_survives_shared_session_and_concurrent_calls(
                         },
                     )
                     assert "error" in _rpc_payload(denied_file)
+                    assert CPP_TOKEN not in denied_file.text
                     assert not (inbox / "must-not-exist.txt").exists()
 
-                    denied_danger = await _post_rpc(
-                        url,
-                        session_id=session_ids[0],
-                        protocol_version=initialized.protocol_version,
-                        token=CPP_TOKEN,
-                        request_id=35,
-                        method="tools/call",
-                        params={
-                            "name": "codex_start",
-                            "arguments": {
+                    denied_calls = (
+                        (35, "codex_start", {"cwd": str(tmp_path), "prompt": "must not start"}),
+                        (
+                            36,
+                            "codex_start",
+                            {
                                 "cwd": str(tmp_path),
                                 "prompt": "must not start",
                                 "sandbox_mode": "danger-full-access",
                             },
-                        },
-                    )
-                    assert "error" in _rpc_payload(denied_danger)
-                    assert "turn/start" not in app_server.methods
-
-                    for request_id, denied_name in enumerate(
-                        (
-                            "github_get_file_contents",
-                            "git_status",
-                            "workflow_runs_list",
-                            "codex_approval",
-                            "codex_interrupt",
-                            "codex_steer",
                         ),
-                        start=39,
-                    ):
+                        (
+                            39,
+                            "codex_continue",
+                            {"thread_id": "desktop", "prompt": "must not continue"},
+                        ),
+                        (
+                            41,
+                            "github_get_file_contents",
+                            {"owner": "example", "repo": "repo", "path": "file.txt"},
+                        ),
+                        (42, "git_status", {"repo_path": str(tmp_path)}),
+                        (43, "workflow_runs_list", {}),
+                        (44, "codex_approval", {"request_id": 1, "decision": "accept"}),
+                        (45, "codex_interrupt", {"thread_id": "desktop", "turn_id": "turn-1"}),
+                        (
+                            46,
+                            "codex_steer",
+                            {"thread_id": "desktop", "turn_id": "turn-1", "prompt": "no"},
+                        ),
+                    )
+                    for request_id, denied_name, arguments in denied_calls:
                         denied = await _post_rpc(
                             url,
                             session_id=session_ids[0],
@@ -309,9 +343,10 @@ async def test_request_identity_survives_shared_session_and_concurrent_calls(
                             token=CPP_TOKEN,
                             request_id=request_id,
                             method="tools/call",
-                            params={"name": denied_name, "arguments": {}},
+                            params={"name": denied_name, "arguments": arguments},
                         )
                         assert "error" in _rpc_payload(denied)
+                        assert CPP_TOKEN not in denied.text
                     assert app_server.methods == methods_before_denials
 
     logs = log_path.read_text(encoding="utf-8")
