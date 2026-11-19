@@ -1,8 +1,8 @@
 # D1-I5-B2 manager / task projection reader evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
+- **実装状態:** ACCEPTED (with documented caveats)
 - **I5-A / I5-B1:** ACCEPTED (with documented caveats)
-- **I5-B2:** PENDING_CHATGPT_REVIEW。対象は manager と task/event projection の reader gate です。
+- **I5-B2:** ACCEPTED (with documented caveats)。ChatGPT GitHub reviewは2026-11-20。実装commit `55ef907172932eed65d88fe15e5d8316792866e2` とfixture修正commit `12b7257403657b1afe7c5c0e651fa1596a8d6970` を確認しました。対象は manager と task/event projection の reader gate です。
 - **I5-B3:** NOT_STARTED。worker、worker entry/start/recover、および最終全reader監査は未完了です。
 - **I5全体:** IN_PROGRESS。**D1全体:** DRAFT。**strict run admission:** OFF。
 - **実装日:** 2026-11-20。
@@ -71,8 +71,9 @@ ChatGPTによるGitHub実装commit `55ef907172932eed65d88fe15e5d8316792866e2` �
 ## 制約と後続作業
 
 - このsliceが扱うのはmanagerとtask/event projectionだけです。有効なstrict v2もmanagerでは起動できず、projectionでは意図的にunavailableとなります。strict run実行・worker有効化は追加していません。
+- strict manager start/recoverおよびstrict graph/event projectionは引き続き利用できません。worker/worker_entryと最終all-reader auditはI5-B3で確認します。
 - B1 serviceの2入口およびB2 reader以外に、worker、worker_entry、start/recover reader、status/recovery等の経路が残っています。I5-B3の接続と最終all-reader auditが終わるまで全reader coverageを主張しません。
-- DBOS checkpointは未接続・未検証です。full pytestは未実行です。I5-A/I5-B1はACCEPTED (with documented caveats)、B2はreview待ち、B3はNOT_STARTEDです。D1はDRAFT、strict run admissionはOFFです。
+- DBOS checkpointは未接続・未検証です。full pytestは未実行です。I5-A/I5-B1/I5-B2はACCEPTED (with documented caveats)、B3はNOT_STARTEDです。D1はDRAFT、strict run admissionはOFFです。
 - SQLite read-only接続でWAL sidecar metadataが変わる可能性があります。比較したmain DB/snapshot bytesの不変性のみを記録します。
 
 ## Stage / rollback
