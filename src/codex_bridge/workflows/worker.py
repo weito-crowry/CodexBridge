@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -46,6 +47,13 @@ from .job_adapter import (
 )
 from .node_events import NodeEventWriter
 from .process_identity import get_process_identity
+from .strict_manifest import _is_symlink_or_junction
+from .strict_reader_gate import (
+    RunFormatVersion,
+    StrictReaderGateError,
+    _decode_manifest,
+    classify_readonly,
+)
 
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
 APPLICATION_VERSION = "1.0.3-subset"
@@ -127,8 +135,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
-    manifest_path = run_dir / "manifest.json"
-    manifest = _read_json(manifest_path)
+    manifest, _manifest_bytes = _read_run_manifest(run_dir)
     definition_path = run_dir / "workflow.yaml"
     input_path = run_dir / "input.json"
     try:
@@ -193,6 +200,67 @@ def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
         if request_digest != manifest.get("request_digest"):
             raise OwsError("three-job request digest does not match the manifest")
     return manifest, definition_text, input_data
+
+
+def _read_run_manifest(run_dir: Path) -> tuple[dict[str, Any], bytes]:
+    manifest_path = run_dir / "manifest.json"
+    if _is_symlink_or_junction(manifest_path):
+        raise OwsError("workflow run manifest is unavailable")
+    try:
+        canonical_run_dir = run_dir.resolve(strict=True)
+        resolved = manifest_path.resolve(strict=True)
+        if resolved.parent != canonical_run_dir or not stat.S_ISREG(resolved.stat().st_mode):
+            raise ValueError("manifest is not a regular file")
+        manifest_bytes = resolved.read_bytes()
+        manifest, _ = _decode_manifest(manifest_bytes)
+    except Exception:
+        raise OwsError("workflow run manifest is invalid") from None
+    if "run_format_version" in manifest:
+        raise OwsError("workflow run format is unsupported")
+    _validate_managed_legacy_manifest(canonical_run_dir, manifest, manifest_bytes)
+    return manifest, manifest_bytes
+
+
+def _validate_managed_legacy_manifest(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    manifest_bytes: bytes,
+) -> None:
+    request_database = run_dir.parent / "requests.sqlite"
+    if _is_symlink_or_junction(request_database):
+        raise OwsError("workflow request binding is invalid")
+    try:
+        metadata = request_database.stat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise OwsError("workflow request binding is invalid") from None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OwsError("workflow request binding is invalid")
+
+    workflow_id = manifest.get("workflow_id")
+    manifest_run_id = manifest.get("run_id")
+    request_digest = manifest.get("request_digest")
+    if (
+        type(workflow_id) is not str
+        or not workflow_id
+        or type(manifest_run_id) is not str
+        or manifest_run_id != run_dir.name
+        or type(request_digest) is not str
+    ):
+        raise OwsError("workflow request binding is invalid")
+    try:
+        run_format = classify_readonly(
+            run_dir.parent,
+            run_dir.name,
+            manifest_bytes,
+            expected_workflow_id=workflow_id,
+            expected_request_digest=request_digest,
+        )
+    except StrictReaderGateError:
+        raise OwsError("workflow request binding is invalid") from None
+    if run_format is not RunFormatVersion.LEGACY_V1:
+        raise OwsError("workflow request binding is invalid")
 
 
 def _dbos_config(database_path: Path) -> DBOSConfig:
