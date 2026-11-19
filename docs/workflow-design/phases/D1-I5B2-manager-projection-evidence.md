@@ -28,11 +28,13 @@ service.py、strict reader/manifest、I3/I4、worker/worker_entry、graph.py、A
 
 ## 検証結果
 
+### B2実装時点の初回結果（fixture修正前・履歴）
+
 | 検証 | 結果 |
 | --- | --- |
 | `tests/test_workflow_d1_i5b2_reader_gate.py` | PASS — 30 passed、FAIL 0 |
 | 既存manager/task projection/service/B1専用回帰（4 filesを一括実行） | PASS — 134 passed。FAIL — 1。SKIP — 1（Windows symlink作成権限） |
-| 既存回帰FAILの内容 | `test_shutdown_preserves_turns_from_durable_requests_after_manager_recreation` は、B1が認識するlegacy v0/v1 schema要件を満たさない `workflow_requests` 単独tableを完全なownershipとして期待します。今回のdiscriminatorはそのrunを検証済みlegacyとして列挙せず、ownershipをincompleteにします。既存testは変更していません。 |
+| 既存回帰FAILの当時の記録 | `test_shutdown_preserves_turns_from_durable_requests_after_manager_recreation` は、B1が認識するlegacy v0/v1 schema要件を満たさない `workflow_requests` 単独tableを完全なownershipとして期待します。今回のdiscriminatorはそのrunを検証済みlegacyとして列挙せず、ownershipをincompleteにします。初回記録時点では既存testを変更していません。 |
 | `uv run --no-sync ruff check src/codex_bridge tests/test_workflow_d1_i5b2_reader_gate.py` | PASS |
 | `uv run --no-sync ruff format --check src/codex_bridge/workflows/manager.py src/codex_bridge/workflows/task_projection.py tests/test_workflow_d1_i5b2_reader_gate.py` | PASS |
 | `uv run --no-sync mypy src/codex_bridge` | PASS — 143 source files |
@@ -40,6 +42,29 @@ service.py、strict reader/manifest、I3/I4、worker/worker_entry、graph.py、A
 | `git diff --check` | PASS |
 | Full pytest suite | NOT_RUN |
 | DBOS checkpoint / strict execution | NOT_RUN |
+
+### 2026-11-20 ChatGPT review findingとfixture修正
+
+ChatGPTによるGitHub実装commit `55ef907172932eed65d88fe15e5d8316792866e2` の独立reviewで、上記failureはproduction regressionではなく不完全なtest fixtureが原因と確認されました。当該testは7列の `workflow_requests` だけを手作業で作り、canonical legacy v0 schemaに含まれる `workflow_request_sources` を作っていません。productionの `service._initialize_write_connection(connection)` が初期化する両tableとindices、および `PRAGMA user_version=0` がlegacy v0の正規形です。B1 shared classifierが不完全DBをfail-closedにし、B2 managerがownershipをincompleteとする挙動は正しいため、production gateは変更していません。
+
+修正では該当manager testだけが `_initialize_write_connection` を使って隔離 `tmp_path` にcanonical v0 DBを作成し、両tableの存在と `user_version=0` を局所確認します。legacy schemaの `workflow_request_sources` は空のままにしてsource contract binding rowは挿入せず、version 1にも上げません。既存のprepared Codex jobと期待assertion（`ownership_complete=True`、owned turn `("workflow-thread-123", "workflow-turn-123")`）は維持しました。product code、manifest、job adapter semantics、DB schemaは変更していません。
+
+### fixture修正後の再実行結果（2026-11-20）
+
+| 検証 | PASS | FAIL | SKIP | NOT_RUN / 注記 |
+| --- | ---: | ---: | ---: | --- |
+| `uv run --no-sync pytest -q tests/test_workflows_manager.py::test_shutdown_preserves_turns_from_durable_requests_after_manager_recreation` | 1 | 0 | 0 | — |
+| `uv run --no-sync pytest -q tests/test_workflows_manager.py` | 17 | 0 | 0 | — |
+| `uv run --no-sync pytest -q tests/test_workflow_d1_i5b2_reader_gate.py` | 30 | 0 | 0 | — |
+| `uv run --no-sync pytest -q tests/test_workflows_manager.py tests/test_workflow_task_projection.py tests/test_workflows_service.py tests/test_workflow_d1_i5b1_service_gate.py` | 135 | 0 | 1 | `tests/test_workflow_task_projection.py:1456`、Windows symlink作成時の `OSError` |
+| `uv run --no-sync ruff check tests/test_workflows_manager.py` | 1 | 0 | 0 | — |
+| `uv run --no-sync ruff format --check tests/test_workflows_manager.py` | 1 | 0 | 0 | — |
+| `git diff --check` | 1 | 0 | 0 | — |
+| Full pytest suite | 0 | 0 | 0 | NOT_RUN |
+| src向け Ruff / mypy / compileall | 0 | 0 | 0 | NOT_RUN（変更はtest fixtureとevidence文書のみでproduct code変更なし） |
+| DBOS checkpoint / strict execution | 0 | 0 | 0 | NOT_RUN |
+
+修正後の指定4-file回帰ではPASS 135、FAIL 0、SKIP 1です。残るSKIPはWindows symlink作成権限による既存条件のみです。B2専用gateもPASS 30、FAIL 0、SKIP 0です。初回の134 PASS / 1 FAIL / 1 SKIPは修正前履歴として上記に保持しています。
 
 新規suiteはmanager start/recoverにおけるversion 2/1/3/bool/null拒否、config/spawn不在、legacy standalone、legacy v0/v1 binding照合、DB不在row・破損・未対応schema、persisted ownership、strict binding付きunversioned manifest、strict/v2・unknown version・missing binding・corrupt DB・malformed manifestのprojection unavailableを確認します。strict projection fixtureはI3/I5-Aの隔離store/writer/reservationで作り、reserved verifierも通します。request DB main bytesとsnapshot main bytesはprojection前後で比較し、WAL sidecar bytes不変性は主張しません。
 

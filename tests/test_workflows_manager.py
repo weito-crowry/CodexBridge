@@ -14,6 +14,7 @@ from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter
 from codex_bridge.workflows.http_client import CONTROL_TOKEN_ENV
 from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
 from codex_bridge.workflows.manager import WorkflowManagerError, WorkflowWorkerManager
+from codex_bridge.workflows.service import _initialize_write_connection
 
 _DUMMY_TOKEN = "phase5b-test-token-never-persist"
 
@@ -98,10 +99,12 @@ async def test_shutdown_preserves_turns_from_durable_requests_after_manager_recr
     )
 
     requests_db = sqlite3.connect(state_root / "requests.sqlite")
-    requests_db.execute(
-        "CREATE TABLE workflow_requests (client_request_id TEXT, workflow_id TEXT, "
-        "run_id TEXT, request_digest TEXT, state TEXT, created_at TEXT, updated_at TEXT)"
-    )
+    _initialize_write_connection(requests_db)
+    request_tables = {
+        row[0] for row in requests_db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert {"workflow_requests", "workflow_request_sources"} <= request_tables
+    assert requests_db.execute("PRAGMA user_version").fetchone() == (0,)
     requests_db.execute(
         "INSERT INTO workflow_requests VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
