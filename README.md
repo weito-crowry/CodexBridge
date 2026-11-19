@@ -196,9 +196,10 @@ Workflow MCP tools are disabled by default. Set `[workflow] mcp_permissions = ["
 TOML (or `CODEX_BRIDGE_WORKFLOW_MCP_PERMISSIONS=read` in the environment) to publish the three
 read-only tools for existing runs. `write` and `execute` are accepted permission values for future
 phases; they do not publish additional tools in Phase B1. This setting applies only to Workflow MCP
-tools. These permissions are separate from the optional fixed six-tool ChatPanelPlus MCP
-credential; they do not change the existing Codex MCP tool permissions. `mcp_token` remains
-transport authentication and is separate from Workflow permissions.
+tools. These permissions are separate from the optional ChatPanelPlus MCP credential, limited to
+the four read-only tools `codex_targets`, `codex_threads`, `codex_status`, and `codex_wait`; they do
+not change the existing Codex MCP tool permissions. `mcp_token` remains transport authentication
+and is separate from Workflow permissions.
 
 `allowed_roots` is required at Bridge startup and every supplied or persisted working directory is
 validated as an absolute, existing, canonicalized directory inside one of those roots.
@@ -285,8 +286,8 @@ file yourself when it is ready for another workflow.
 These tools are available to MCP clients that can reach the existing `/mcp` endpoint. Allowed roots
 bound file and Git access, and the configured inbox bounds writes. Host and Origin allowlists protect
 the HTTP transport boundary. The full MCP token authenticates existing clients; the optional
-ChatPanelPlus token grants the fixed six-tool Codex catalog. Keep the endpoint reachable only from
-clients you trust.
+ChatPanelPlus token grants only `codex_targets`, `codex_threads`, `codex_status`, and `codex_wait`.
+Keep the endpoint reachable only from clients you trust.
 
 ## Connecting through a tunnel
 
