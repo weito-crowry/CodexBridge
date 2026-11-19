@@ -1,9 +1,9 @@
 # D1-I4-C mutation ledger evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
-- **実装commit:** この証跡を含む単一の実装commit（full SHAは完了報告のGitHub review対象HEADを参照）
+- **実装状態:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19
+- **実装commit:** `f8a904c4caad458bfb0d1058ab86c488178d904f`（I4-C実装）、`9af677eedd3bcc7d5b533a27a0a09d96ca5e648b`（CLOSED frame read guard修正）
 - **対象branch:** `codex/workflow-d1-i4-variable-store`
-- **設計境界:** D1全体はDRAFT、strict run admissionはOFF。I4-A/I4-BはACCEPTED (with documented caveats)、I4全体はIN_PROGRESS / PENDING_I4C_REVIEW。
+- **設計境界:** I4-A/I4-B/I4-CおよびI4全体はACCEPTED (with documented caveats)。I5のmanifest/readers、I7のruntime/DBOS接続は後続作業。D1全体はDRAFT、strict run admissionはOFF。
 
 ## 実装範囲
 
@@ -43,15 +43,28 @@
 | `uv run --no-sync python -m compileall -q src/codex_bridge` | PASS |
 | `uv run --no-sync ruff check src/codex_bridge tests/test_workflow_d1_i4c_mutations.py` | PASS |
 | `uv run --no-sync ruff format --check` on touched Python files | PASS |
-| `git diff --check` | PASS |
+| I4-C implementation changes: `git diff --check` | PASS |
+| I4受入記録 docs-only change: relative Markdown links / status consistency / `git diff --check` | PASS — docs-only checks |
+| I4受入記録 docs-only change: pytest / Ruff / mypy / compileall | NOT_RUN — documentation only; implementation results above are from prior runs |
 | Full pytest suite | NOT_RUN |
 | 今回のI3-A/I3-B、D1-I0、focused legacy suites | NOT_RUN — CLOSED read guardに直接関係するI4-A/B、I1、I3-Cだけを実行 |
 | DBOS real checkpoint / strict runtime / manifest-reader-API integration / production migration / external Codex job | NOT_RUN — I5以降または別境界 |
+
+## ChatGPT受入決定と残る留保
+
+ChatGPT GitHub reviewはI4-CおよびI4全体 (A/B/C) を **ACCEPTED (with documented caveats)** としました。受入は次の限界を残した状態での判定です。
+
+- DBにはpayload正文とmutation contextが保存されないため、保存されたpayload digest/contextをDB単独で独立再構成できません。元request replay時には照合します。
+- 呼出し元が渡すbinding値の独立真正性は証明しません。
+- DBOS本体と実checkpointは未接続・未検証です。SQLite単一DB内ではstate/ledger更新が原子的ですが、複数DBやDBOS checkpointとは原子的ではありません。
+- 全体pytest suiteは未実施です。最大ledger 10,000件などの性能・資源上限は内部budgetであり、大規模runでの性能を証明するものではありません。
+
+I5ではstrict manifest v2とreader/version-aware検証を接続します。I7ではruntime/OWS mutationとDBOS checkpointの接続・再開境界を扱います。これらの後続接続完了まではstrict run admissionをOFFのまま維持します。
 
 ## ChatGPTレビュー修正 — CLOSED frame read guard (2026-11-19)
 
 ChatGPT review対象commit `f8a904c4caad458bfb0d1058ab86c488178d904f` で、`read_current(frame_id, declaration_id)` がframeの存在だけを確認し、CLOSED frame上の既存stateとmissing stateを返す欠陥が指摘されました。設計 [D1 §11.3](D1-input-output-variables.md) に従い、対象frameを特定した直後に`status != ACTIVE`を確認し、既存のvalue-free `StrictWorkflowVariableConflict` で拒否します。declaration解決/history read前の局所guardであり、frame状態やread-only監査経路は変更していません。
 
-修正後のI4-C testはactive rootでのmissing/current read、CLOSED child上の既存stateと同scope未初期化宣言のread拒否を確認します。同じCLOSED childで`get_mutation`と`inspect_ledger()`が履歴を検証でき、既存execution keyの`apply()` replayはversion 1の保存結果を返し、version 2のlatest stateを保持することも確認します。CLOSED childへの新規mutationは拒否され、別のACTIVE childとrootのreadは成功します。I4-CはIMPLEMENTED / PENDING_CHATGPT_REVIEWのままで、ChatGPTの再レビュー前に受入済みとはしません。
+修正後のI4-C testはactive rootでのmissing/current read、CLOSED child上の既存stateと同scope未初期化宣言のread拒否を確認します。同じCLOSED childで`get_mutation`と`inspect_ledger()`が履歴を検証でき、既存execution keyの`apply()` replayはversion 1の保存結果を返し、version 2のlatest stateを保持することも確認します。CLOSED childへの新規mutationは拒否され、別のACTIVE childとrootのreadは成功します。この段落に記録した修正commit時点の状態はIMPLEMENTED / PENDING_CHATGPT_REVIEWでした。その後の受入結果は上記「ChatGPT受入決定」を参照してください。
 
-既存I4-B FrameStoreはvariable state/ledger非空時のenter/close/inspect拒否を維持し、新I4-C ledger-aware frame APIだけが全chain監査を通じてlifecycleを継続します。I4-CはChatGPT review待ちです。I5 manifest/reader、I6 API、I7 interpreter/OWS/DBOS wire、I8 acceptanceは未着手です。I2 Windows guardはDEFERRED / NON-BLOCKINGのままです。D1全体はDRAFT、strict run admissionはOFFです。
+既存I4-B FrameStoreはvariable state/ledger非空時のenter/close/inspect拒否を維持し、新I4-C ledger-aware frame APIだけが全chain監査を通じてlifecycleを継続します。修正commit `9af677eedd3bcc7d5b533a27a0a09d96ca5e648b`を含むI4-Cは、2026-11-19のChatGPT GitHub reviewでACCEPTED (with documented caveats)となり、I4全体 (A/B/C) も同判定です。I5 manifest/reader、I6 API、I7 interpreter/OWS/DBOS wire、I8 acceptanceは未着手です。I2 Windows guardはDEFERRED / NON-BLOCKINGのままです。D1全体はDRAFT、strict run admissionはOFFです。
