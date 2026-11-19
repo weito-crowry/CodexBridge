@@ -1,9 +1,10 @@
 # D1-I5-A strict manifest v2 codec / snapshot evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW
-- **I5全体:** IN_PROGRESS。I5-Aは本証跡の対象、I5-BはNOT_STARTED。
+- **実装状態:** ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19
+- **I5全体:** IN_PROGRESS。I5-Aは受入済み、I5-Bは未着手で次工程はI5-B1です。
 - **対象branch:** `codex/workflow-d1-i5-manifest-readers`
-- **実装commit:** 本証跡と実装を含む単一commit。full SHAはGitHub review対象branch HEAD。
+- **実装commit:** `982b461ba47bdfa0a62bf6da4d648c47a6545e9c`
+- **レビュー修正commit:** `2fda398abbce7299c5f1e3ae0a565aebd04ab6e9`
 - **D1境界:** I4全体はACCEPTED (with documented caveats)。I5-Aはmanifest codecとisolated snapshot準備・検証に限定します。D1全体はDRAFT、strict run admissionはOFFです。
 
 ## 実装内容
@@ -82,4 +83,19 @@ SQLite test dataはすべてpytest `tmp_path`内です。本番Bridge/Worker、�
 
 追加テストは、I3正規化結果を使う通常パスとnullable `null`、自己hashが整合するcaller作成dataclassのschema違反/default不足/required不足/不許可`null`/additional property違反、異常時の値非漏洩と新run directory未作成を確認します。また、予約済みrunにおけるmutationなしのACTIVE/CLOSED child frame受入、child追加後のpre-reservation拒否、frame identity/path/parent reference改ざんの拒否、mutationなしのstate row拒否、既存nonempty ledger経路を確認します。
 
-上記の従来33 PASS/2 SKIPおよび372 PASS/3 SKIPは前commitの過去結果としてそのまま保全し、今回の結果には合算していません。I5-Aは引き続き `IMPLEMENTED / PENDING_CHATGPT_REVIEW`、I5-Bは `NOT_STARTED`、I5全体は `IN_PROGRESS`、D1は `DRAFT`、strict run admissionは `OFF` です。`verify_reserved()` の複数DB間non-atomic境界およびDBOS checkpoint対応は未確認です。
+上記の従来33 PASS/2 SKIPおよび372 PASS/3 SKIPは前commitの過去結果としてそのまま保全し、レビュー修正後の45 PASS/2 SKIPおよび246 PASS/2 SKIPとは区別しています。結果は合算していません。
+
+## ChatGPT GitHub受入判定 — 2026-11-19
+
+レビュー対象は実装commit `982b461ba47bdfa0a62bf6da4d648c47a6545e9c` とレビュー修正commit `2fda398abbce7299c5f1e3ae0a565aebd04ab6e9` です。判定は **ACCEPTED (with documented caveats)** です。pinned contractに基づく入力再正規化とcaller入力との完全一致検証、およびmutation 0件で合法なchild frameを持つreserved runの受入を確認しました。修正後のI5-A専用suite 45 PASS/2 SKIP、I1/I3/I4 focused regression 246 PASS/2 SKIP、Ruff/mypy/compileallは記録済みの結果どおりPASSです。
+
+受入時点の留保は次のとおりです。
+
+- 複数snapshot filesとSQLite DB間のatomicityはありません。read-only SQLite参照でもWAL sidecar metadataが変わる可能性があります。
+- I5-B reader接続、DBOS接続と実checkpoint対応は未実施です。reserved verifierはDBOS checkpointを検証しません。
+- Windows symlink権限により2件はSKIPです。full pytest suiteはNOT_RUNです。
+- I5-Aはisolated opt-in APIです。strict run admissionはOFFのままで、既存service readerへ接続していません。
+
+I5-Aは `ACCEPTED (with documented caveats)`、I5全体は `IN_PROGRESS`、I5-Bは未着手です。次工程はI5-B1のcommon run format discriminatorとservice reader gateであり、B1完了時点でも全reader互換完了とは扱いません。D1全体は `DRAFT`、strict run admissionは `OFF` です。
+
+この受入記録を追加したdocs-only commitでは、`git diff --check`を実行し、pytest/Ruff/mypy/compileallはNOT_RUNです。これは上記のI5-A実装・修正commitで記録された検証実測とは別です。
