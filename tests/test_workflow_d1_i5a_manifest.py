@@ -67,7 +67,12 @@ def _schema(value_type: str = "object", **extra: object) -> dict[str, object]:
     }
 
 
-def _contract(*, variables: bool = True) -> dict[str, object]:
+def _contract(
+    *,
+    variables: bool = True,
+    required_input: tuple[str, ...] = (),
+    nullable_mode: bool = True,
+) -> dict[str, object]:
     variable_declarations: list[dict[str, object]] = []
     if variables:
         variable_declarations.append(
@@ -80,15 +85,21 @@ def _contract(*, variables: bool = True) -> dict[str, object]:
                 "initial": 0,
             }
         )
+    input_schema = _schema(
+        "object",
+        properties={
+            "mode": {
+                "type": ["string", "null"] if nullable_mode else "string",
+                "default": "safe",
+            },
+            "secret": {"type": "string"},
+        },
+    )
+    if required_input:
+        input_schema["required"] = list(required_input)
     return {
         "contract_version": 1,
-        "input_schema": _schema(
-            "object",
-            properties={
-                "mode": {"type": ["string", "null"], "default": "safe"},
-                "secret": {"type": "string"},
-            },
-        ),
+        "input_schema": input_schema,
         "output_schema": _schema(),
         "variables": variable_declarations,
     }
@@ -112,6 +123,8 @@ def _base_fixture(
     raw_input: object | None = None,
     source_yaml: str = _VALID_YAML,
     variables: bool = True,
+    required_input: tuple[str, ...] = (),
+    nullable_mode: bool = True,
 ) -> _Fixture:
     state_root = tmp_path / "state"
     workspace = tmp_path / "workspace"
@@ -127,7 +140,11 @@ def _base_fixture(
         mutation_request_id="i5a-definition-create-0001",
         source_yaml=source_yaml,
         max_live_codex_jobs=1,
-        contract=_contract(variables=variables),
+        contract=_contract(
+            variables=variables,
+            required_input=required_input,
+            nullable_mode=nullable_mode,
+        ),
     )
     normalization = StrictWorkflowBindingVerifier(state_root).normalize_for_definition(
         definition.definition_id,
@@ -261,6 +278,95 @@ def test_i3_normalization_gives_same_digest_for_missing_or_explicit_default_and_
     assert missing.normalized_input_sha256 != explicit_null.normalized_input_sha256
 
 
+def test_writer_accepts_i3_normalized_nullable_null_input(tmp_path: Path) -> None:
+    fixture = _base_fixture(
+        tmp_path,
+        raw_input={"mode": None, "secret": _SECRET_SENTINEL},
+    )
+
+    manifest = _prepare(fixture)
+
+    assert fixture.verifier.verify_pre_reservation(_RUN_ID).manifest == manifest
+
+
+@pytest.mark.parametrize(
+    ("required_input", "nullable_mode", "valid_input", "forged_input"),
+    [
+        (
+            (),
+            True,
+            {"secret": _SECRET_SENTINEL},
+            {"mode": 13, "secret": _SECRET_SENTINEL},
+        ),
+        ((), True, {"secret": _SECRET_SENTINEL}, {"secret": _SECRET_SENTINEL}),
+        (
+            ("secret",),
+            True,
+            {"secret": _SECRET_SENTINEL},
+            {"mode": _SECRET_SENTINEL},
+        ),
+        (
+            (),
+            False,
+            {"secret": _SECRET_SENTINEL},
+            {"mode": None, "secret": _SECRET_SENTINEL},
+        ),
+        (
+            (),
+            True,
+            {"secret": _SECRET_SENTINEL},
+            {"mode": "safe", "secret": _SECRET_SENTINEL, "extra": "x"},
+        ),
+    ],
+    ids=(
+        "schema-invalid",
+        "default-missing",
+        "required-missing",
+        "null-disallowed",
+        "additional-property",
+    ),
+)
+def test_writer_rejects_forged_invalid_normalization_before_creating_run_directory(
+    tmp_path: Path,
+    required_input: tuple[str, ...],
+    nullable_mode: bool,
+    valid_input: dict[str, object],
+    forged_input: dict[str, object],
+) -> None:
+    fixture = _base_fixture(
+        tmp_path,
+        raw_input=valid_input,
+        required_input=required_input,
+        nullable_mode=nullable_mode,
+    )
+    run_id = "run-ffffffffffffffffffffffffffffffff"
+    forged = StrictWorkflowInputNormalization(
+        definition_id=fixture.definition.definition_id,
+        definition_revision=fixture.definition.revision,
+        normalized_input=forged_input,
+        normalized_input_sha256=sha256_json(forged_input),
+    )
+
+    with pytest.raises(StrictWorkflowSnapshotError) as caught:
+        fixture.writer.prepare_snapshot(
+            workflow_id=_WORKFLOW_ID,
+            run_id=run_id,
+            definition_id=fixture.definition.definition_id,
+            definition_revision=fixture.definition.revision,
+            workspace_root=str(fixture.workspace.resolve()),
+            normalized_input=forged,
+            created_at=_CREATED_AT,
+        )
+
+    assert _SECRET_SENTINEL not in str(caught.value)
+    assert _SECRET_SENTINEL not in repr(caught.value)
+    run_directory = fixture.state_root / run_id
+    assert not run_directory.exists()
+    assert not (run_directory / "workflow.yaml").exists()
+    assert not (run_directory / "input.json").exists()
+    assert not (run_directory / "manifest.json").exists()
+
+
 def test_manifest_codec_is_canonical_allowlisted_and_value_free(tmp_path: Path) -> None:
     fixture = _base_fixture(tmp_path, raw_input={"secret": _SECRET_SENTINEL})
     manifest = _prepare(fixture)
@@ -368,6 +474,90 @@ def test_reserved_snapshot_verifies_cross_database_binding_and_nonempty_ledger(
     result = fixture.verifier.verify_reserved(_RUN_ID)
     assert result.reservation_verified is True
     assert result.mutation_count == 2  # initialize and increment are both ledgered.
+
+
+@pytest.mark.parametrize("close_child", [False, True], ids=["active", "closed"])
+def test_reserved_snapshot_accepts_child_frames_without_mutations(
+    tmp_path: Path,
+    close_child: bool,
+) -> None:
+    fixture = _base_fixture(tmp_path)
+    manifest = _prepare(fixture)
+    _reserve(fixture, manifest)
+    mutation_store = StrictWorkflowVariableMutationStore(
+        fixture.run_directory,
+        fixture.binding,
+        fixture.definition.contract,
+    )
+    child = mutation_store.enter_frame("workflow-root", "/do/1", [], _CREATED_AT)
+    if close_child:
+        child = mutation_store.close_frame(child.frame_id, _CREATED_AT)
+
+    result = fixture.verifier.verify_reserved(_RUN_ID)
+
+    assert result.reservation_verified is True
+    assert result.mutation_count == 0
+    with pytest.raises(StrictWorkflowSnapshotError):
+        fixture.verifier.verify_pre_reservation(_RUN_ID)
+
+
+@pytest.mark.parametrize("tamper", ["identity", "path", "foreign_key"])
+def test_reserved_snapshot_rejects_tampered_child_frame_without_mutations(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    fixture = _base_fixture(tmp_path)
+    manifest = _prepare(fixture)
+    _reserve(fixture, manifest)
+    mutation_store = StrictWorkflowVariableMutationStore(
+        fixture.run_directory,
+        fixture.binding,
+        fixture.definition.contract,
+    )
+    child = mutation_store.enter_frame("workflow-root", "/do/1", [], _CREATED_AT)
+    with sqlite3.connect(fixture.run_directory / "variables.sqlite") as connection:
+        if tamper == "identity":
+            connection.execute(
+                "UPDATE scope_frames SET frame_id=? WHERE frame_id=?",
+                ("frame-" + "f" * 64, child.frame_id),
+            )
+        elif tamper == "path":
+            connection.execute(
+                "UPDATE scope_frames SET scope_path='/do/2' WHERE frame_id=?",
+                (child.frame_id,),
+            )
+        else:
+            connection.execute(
+                "UPDATE scope_frames SET parent_frame_id=? WHERE frame_id=?",
+                ("frame-" + "e" * 64, child.frame_id),
+            )
+
+    with pytest.raises(StrictWorkflowSnapshotError):
+        fixture.verifier.verify_reserved(_RUN_ID)
+
+
+def test_reserved_snapshot_rejects_state_without_any_mutations(tmp_path: Path) -> None:
+    fixture = _base_fixture(tmp_path)
+    manifest = _prepare(fixture)
+    _reserve(fixture, manifest)
+    with sqlite3.connect(fixture.run_directory / "variables.sqlite") as connection:
+        connection.execute(
+            """
+            INSERT INTO variable_states (
+                run_id, frame_id, declaration_id, name, present,
+                value_json, version, value_digest, updated_at
+            ) VALUES (?, 'workflow-root', 'counter', 'counter', 1, ?, 1, ?, ?)
+            """,
+            (
+                _RUN_ID,
+                canonical_json(0),
+                sha256_json(0),
+                _CREATED_AT.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+
+    with pytest.raises(StrictWorkflowSnapshotError):
+        fixture.verifier.verify_reserved(_RUN_ID)
 
 
 def test_reserved_snapshot_without_request_binding_is_reconciliation_error(tmp_path: Path) -> None:

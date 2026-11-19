@@ -20,7 +20,7 @@ from typing import Any, NoReturn
 import yaml
 
 from ..paths import AllowedPathPolicy
-from .contracts import canonical_json, parse_strict_json, sha256_json
+from .contracts import canonical_json, normalize_input, parse_strict_json, sha256_json
 from .strict_binding import (
     StrictWorkflowBindingVerifier,
     StrictWorkflowInputNormalization,
@@ -295,6 +295,21 @@ class StrictWorkflowSnapshotWriter:
                 definition_id,
                 definition_revision,
             )
+            normalized_value = normalize_input(contract, verified_input.normalized_input)
+            supplied_input_json = canonical_json(verified_input.normalized_input)
+            normalized_input_json = canonical_json(normalized_value)
+            normalized_input_sha256 = sha256_json(normalized_value)
+            if (
+                normalized_input_json != supplied_input_json
+                or normalized_input_sha256 != verified_input.normalized_input_sha256
+            ):
+                _raise_snapshot_error()
+            verified_input = StrictWorkflowInputNormalization(
+                definition_id=definition_id,
+                definition_revision=definition_revision,
+                normalized_input=normalized_value,
+                normalized_input_sha256=normalized_input_sha256,
+            )
             source_bytes = _source_bytes(definition)
             workflow_value = _parse_workflow_source(source_bytes)
             if canonical_json(workflow_value) != canonical_json(definition.definition):
@@ -446,15 +461,16 @@ class StrictWorkflowSnapshotVerifier:
             if ledger.run_id != run_id:
                 _raise_snapshot_error()
             if ledger.mutation_count == 0:
-                if ledger.state_count != 0 or ledger.frame_count != 1:
+                if ledger.state_count != 0 or ledger.frame_count < 1:
                     _raise_snapshot_error()
-                info = _inspect_initial_variable_store(
-                    checked.run_directory,
-                    manifest,
-                    _parse_manifest_timestamp(manifest.created_at),
-                )
-                if info.frame_count != 1 or info.variable_state_count != 0:
-                    _raise_snapshot_error()
+                if ledger.frame_count == 1:
+                    info = _inspect_initial_variable_store(
+                        checked.run_directory,
+                        manifest,
+                        _parse_manifest_timestamp(manifest.created_at),
+                    )
+                    if info.frame_count != 1 or info.variable_state_count != 0:
+                        _raise_snapshot_error()
             elif ledger.state_count < 1:
                 _raise_snapshot_error()
             return StrictWorkflowSnapshotVerification(
