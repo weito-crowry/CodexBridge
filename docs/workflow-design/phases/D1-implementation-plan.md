@@ -3,7 +3,7 @@
 - **文書状態:** PLANNING / DRAFT（レビュー待ち）
 - **対象:** Workflow D1詳細設計
 - **前提文書:** [基本仕様 v0.2](../requirements.md)、[D1詳細設計 DRAFT](D1-input-output-variables.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)〜[ADR 0006](../decisions/0006-public-api-mcp-etag-error-contract.md)、[ADR 0007 Proposed](../decisions/0007-variable-call-adapter.md)
-- **実装状態:** I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I3-A/I3-B/I3-CおよびI3全体はACCEPTED (with documented caveats)、I4〜I8はNOT_STARTEDです。D1全体はDRAFTで、strict run admissionはOFFです。
+- **実装状態:** I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-Aは過去に実装済み・未接続、I2全体はNOT_ACCEPTED、I2-Bは停止）、I3-A/I3-B/I3-CおよびI3全体はACCEPTED (with documented caveats)、I4はIN_PROGRESS（I4-AはACCEPTED (with documented caveats)、I4-B/I4-CはNOT_STARTED）、I5〜I8はNOT_STARTEDです。D1全体はDRAFTで、strict run admissionはOFFです。
 
 ## 1. 目的と適用境界
 
@@ -23,7 +23,7 @@ I0の実績は[D1-I0-baseline-evidence.md](D1-I0-baseline-evidence.md)、I1の�
 | D1-I1 Pure contract core | ACCEPTED (with documented caveats) | I0 |
 | D1-I2 Windows protection/controller primitives | DEFERRED / NON-BLOCKING（I2-A historical implemented、I2全体NOT_ACCEPTED、I2-B停止） | 独立。I3以後の依存ではない |
 | D1-I3 Definition contract storage/migration | ACCEPTED (with documented caveats)（I3-A/I3-B/I3-C） | I0, I1 |
-| D1-I4 Variable Store/Mutation Ledger | NOT_STARTED（次工程） | I1, I3 |
+| D1-I4 Variable Store/Mutation Ledger | IN_PROGRESS（I4-A ACCEPTED、I4-B/I4-C NOT_STARTED） | I1, I3 |
 | D1-I5 Manifest v2 / reader integration | NOT_STARTED（I4の後） | I3, I4 |
 | D1-I6 HTTP/MCP contract surface | NOT_STARTED | I3, I5 |
 | D1-I7 Strict root runtime/OWS call adapter | NOT_STARTED | I4, I5, I6 |
@@ -161,4 +161,4 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 
 ## 5. Slice運用上の最終状態
 
-I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I3-A/I3-B/I3-CおよびI3全体はACCEPTED (with documented caveats)、I4〜I8はNOT_STARTEDです。I3-A、I3-B、I3-Cの証跡は各phase evidence文書に記録します。I4 Variable Store/Mutation Ledgerが次工程で、I5 Manifest v2 / reader integrationはI4の後です。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。D1全体はDRAFT、strict run admissionはOFFで、実Codex job、共有/production DB migration、production反映は行っていません。
+I0/I1はACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING（I2-A historical implemented but not connected、I2全体NOT_ACCEPTED、I2-B停止）、I3-A/I3-B/I3-CおよびI3全体はACCEPTED (with documented caveats)です。I4はIN_PROGRESSでI4-AはACCEPTED (with documented caveats)、I4-Bが次工程、I4-Cは未着手、I5〜I8は未着手です。I3-A、I3-B、I3-Cの証跡とI4-Aの受入証跡は各phase evidence文書に記録します。I5 Manifest v2 / reader integrationはI4の後です。I番号は実装分割であり、D1全体の最終承認やstrict workflow機能のproduction enableを示しません。D1全体はDRAFT、strict run admissionはOFFで、実Codex job、共有/production DB migration、production反映は行っていません。
