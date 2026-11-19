@@ -89,7 +89,7 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 - **検証:** `BEGIN IMMEDIATE`、unique key、CAS/version/digest、schema/user_version/integrity/foreign-key check、stateとledgerの同一transaction、tombstone対JSON null、RFC 6901、required property delete rollback、boolean/number厳密性、NaN/Inf拒否、duplicate replay防止、older historical after replay後のlatest state維持、commit前後DBOS crash、現行resource/privacy checks。
 - **受入gate:** 同一execution_key再生は保存済みhistorical resultを返し、latest stateを巻き戻さず、同key異payloadはfail closed。Codex MAYBE_SENT状態機械を流用しません。
 - **rollback:** isolated run DBだけを使用し、shared run dataは削除・再作成しません。chain不整合はsuccessにせずreconciliation扱い。strict dataが存在する場合はschema downgradeしません。
-- **I4-A進捗 (2026-11-19):** variables.sqlite v1 physical schema、明示初期化、RunBinding/root ScopeFrameの同一transaction作成、read-onlyの厳格な初期状態検査を実装しました。専用証跡は[I4-A variable schema evidence](D1-I4A-variable-schema-evidence.md)。I4-B/Cは未着手で、I4全体はIN_PROGRESS・未受入です。runtime/DBOSには未接続でstrict run admissionはOFFです。
+- **I4-A進捗 (2026-11-19):** variables.sqlite v1 physical schema、明示初期化、RunBinding/root ScopeFrameの同一transaction作成、read-onlyの厳格な初期状態検査がChatGPT GitHub reviewでACCEPTED (with documented caveats)となりました。[I4-A証跡](D1-I4A-variable-schema-evidence.md)。I4全体はIN_PROGRESSで、I4-B（declarations、typed operations、frame lifecycle）とI4-C（mutation ledger、CAS、historical replay）はNOT_STARTEDです。I0/I1/I3はACCEPTED、I2はDEFERRED / NON-BLOCKING、I5〜I8はNOT_STARTEDです。D1はDRAFT、runtime/DBOSには未接続、strict run admissionはOFFです。
 
 ### D1-I5 — Request binding / manifest v2 / reader gates
 

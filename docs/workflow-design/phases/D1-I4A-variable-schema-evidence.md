@@ -1,8 +1,9 @@
 # D1-I4-A variables.sqlite v1 schema evidence
 
-**Status: IMPLEMENTED / PENDING_CHATGPT_REVIEW**
+**Status: ACCEPTED (with documented caveats) — ChatGPT GitHub review 2026-11-19**
 **Date:** 2026-11-19
 **Branch:** `codex/workflow-d1-i4-variable-store`
+**Implementation commit:** `ee9fa4b6bf2e55fca6085ea000b6ec22993066e7`
 
 ## Scope and current phase state
 
@@ -14,9 +15,10 @@ runtime, worker, interpreter, API, MCP surface, or DBOS checkpoint.
 
 I4-B declarations, typed variable operations, and frame lifecycle are not
 implemented. I4-C mutation ledger semantics, CAS, and DBOS replay safety are
-not implemented. The inspector rejects non-empty variable tables and any frame
-other than the initial root, so it does not attest to unimplemented histories.
-I4-A implementation does not constitute acceptance of I4 as a whole.
+not implemented. I4 as a whole remains IN_PROGRESS; I4-B/C are NOT_STARTED.
+The inspector rejects non-empty variable tables and any frame other than the
+initial root, so it does not attest to unimplemented histories. I4-A acceptance
+does not approve production run admission or DBOS integration.
 
 Current D1 state recorded for this slice: I0, I1, and I3 are ACCEPTED (with
 caveats); I2 is DEFERRED / NON-BLOCKING; I4 is IN_PROGRESS; I5-I8 are
@@ -54,6 +56,22 @@ sidecar metadata while reading an existing WAL database. Tests compare the
 database rows and initial state across inspection rather than treating
 sidecar-only changes as application-data writes.
 
+## Accepted caveats
+
+- I4-B and I4-C must extend validation for `variable_states` and
+  `variable_mutations` rows, including version-chain and replay-history
+  verification. The current I4-A inspector is limited to an initial empty
+  variable store and one root frame.
+- Before I5 production integration, validate the provenance of caller-supplied
+  run-directory metadata and the run-root ownership relationship. This slice
+  does not establish metadata authenticity or guarantees for concurrent access
+  to a shared production run directory.
+- WAL read-side sidecar adjustment and I4-A initialization error cleanup were
+  exercised in isolated tests. Those results do not establish concurrent
+  ownership or operational guarantees for production/shared runs.
+- This acceptance is limited to I4-A's implementation and evidence. It does
+  not authorize production run admission, runtime wiring, or DBOS integration.
+
 ## Verification
 
 The focused pytest invocation covered the new I4-A tests, I3-A/B/C, I1, I0,
@@ -62,6 +80,9 @@ and focused legacy definition/request paths:
 ```text
 274 passed, 4 skipped, 0 failed
 ```
+
+The separately recorded I4-A-only run was `60 passed, 2 skipped`. These are
+the original run results; this docs-only review update did not rerun tests.
 
 All four skips were Windows symlink-creation tests skipped because the current
 Windows account lacks `SeCreateSymbolicLinkPrivilege` (WinError 1314). The two
@@ -80,6 +101,10 @@ rollback, and read-only missing-database behavior.
 | Full pytest suite | NOT_RUN |
 | Live Bridge/Worker, Workflow POST, DBOS checkpoint, or production/shared database | NOT_RUN |
 
+The PASS entries and pytest counts above are the original implementation-run
+results. In this docs-only review update, pytest, Ruff, mypy, and compileall
+were NOT_RUN.
+
 Existing legacy implementation files were not changed. The five user-owned
-untracked workspace entries were preserved. The implementation and evidence
-still require ChatGPT GitHub review; no I4-B/C acceptance is implied.
+untracked workspace entries were preserved. I4-B/C remain unaccepted and
+unimplemented.
