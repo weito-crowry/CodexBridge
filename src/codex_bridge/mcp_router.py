@@ -8,12 +8,28 @@ from mcp import MCPError, types
 from mcp.server import MCPServer, ServerRequestContext
 
 from .config import GitHubMcpConfig
+from .lan_auth import MCP_PRINCIPAL_CPP, MCP_PRINCIPAL_SCOPE_KEY
 from .logging_utils import log_event
 from .mcp_catalog import CatalogError, CatalogListToolsResult, CatalogSnapshot, build_catalog
 from .mcp_remote import RemoteMcpError, RemoteMcpProvider
 
 _LEGACY_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"})
 _MODERN_PROTOCOL_VERSION = "2026-07-28"
+_CPP_TOOL_ALLOWLIST = frozenset(
+    {
+        "codex_targets",
+        "codex_threads",
+        "codex_status",
+        "codex_wait",
+    }
+)
+
+
+def _is_cpp_request(context: ServerRequestContext[Any] | None) -> bool:
+    request = None if context is None else getattr(context, "request", None)
+    scope = getattr(request, "scope", None)
+    state = scope.get("state") if isinstance(scope, dict) else None
+    return isinstance(state, dict) and state.get(MCP_PRINCIPAL_SCOPE_KEY) == MCP_PRINCIPAL_CPP
 
 
 class RemoteProviderLike(Protocol):
@@ -110,6 +126,8 @@ class ToolRouter:
         if snapshot is None:
             raise RuntimeError("MCP tool router is not started")
         tools = list(snapshot.tools)
+        if _is_cpp_request(context):
+            tools = [tool for tool in tools if tool.name in _CPP_TOOL_ALLOWLIST]
         if context is not None:
             legacy_protocol = _is_legacy_protocol(context)
             if legacy_protocol:
@@ -117,7 +135,7 @@ class ToolRouter:
                     tool.model_copy(update={"output_schema": None})
                     if tool.output_schema is not None and tool.output_schema.get("type") != "object"
                     else tool
-                    for tool in snapshot.tools
+                    for tool in tools
                 ]
         log_event(
             "mcp.tools.list",
@@ -143,6 +161,12 @@ class ToolRouter:
         params: types.CallToolRequestParams,
     ) -> types.CallToolResult | types.InputRequiredResult:
         legacy_protocol = _is_legacy_protocol(context) if context is not None else False
+        if _is_cpp_request(context):
+            if params.name not in _CPP_TOOL_ALLOWLIST:
+                raise MCPError(
+                    code=types.INVALID_PARAMS,
+                    message="Tool is not authorized for this MCP credential",
+                ) from None
         route = self._routes.get(params.name)
         if route is None:
             raise MCPError(

@@ -30,7 +30,7 @@ from .file_put import file_put as put_file
 from .file_tools import FileTools
 from .git_tools import git_diff as run_git_diff
 from .git_tools import git_status as run_git_status
-from .lan_auth import LanMcpAuthMiddleware
+from .lan_auth import McpAuthMiddleware
 from .logging_utils import configure_logging, log_event
 from .mcp_remote import RemoteMcpProvider
 from .mcp_router import ToolRouter
@@ -876,9 +876,15 @@ def create_app(
             observer.server_shutdown()
 
     middleware = [Middleware(MCPObservabilityMiddleware, observer=observer)]
-    if config.lan_enabled:
-        assert config.mcp_token is not None  # BridgeConfig validates explicit LAN configuration.
-        middleware.append(Middleware(LanMcpAuthMiddleware, token=config.mcp_token))
+    middleware.append(
+        Middleware(
+            McpAuthMiddleware,
+            token=config.mcp_token,
+            cpp_token=config.cpp_mcp_token,
+            lan_enabled=config.lan_enabled,
+        )
+    )
+    if config.lan_enabled or config.cpp_mcp_token is not None:
         if config.allowed_origins:
             middleware.insert(
                 1,

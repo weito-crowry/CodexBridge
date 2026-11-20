@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -11,6 +12,13 @@ from pathlib import Path
 from ..paths import AllowedPathPolicy, PathPolicyError
 from .http_client import CONTROL_TOKEN_ENV
 from .manager import missing_workflow_dependencies
+from .strict_manifest import _is_symlink_or_junction
+from .strict_reader_gate import (
+    RunFormatVersion,
+    StrictReaderGateError,
+    _decode_manifest,
+    classify_readonly,
+)
 
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
 _SHUTDOWN_FILE_RE = re.compile(r"^worker-shutdown-[0-9a-f]{32}\.request$")
@@ -118,15 +126,62 @@ def _validate_run_directory(value: Path) -> Path:
 
 def _read_manifest(run_dir: Path) -> dict[str, object]:
     path = run_dir / "manifest.json"
-    if path.is_symlink() or not path.is_file():
+    if _is_symlink_or_junction(path):
         raise WorkflowWorkerEntryError("workflow run manifest is unavailable")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        resolved = path.resolve(strict=True)
+        if resolved.parent != run_dir or not stat.S_ISREG(resolved.stat().st_mode):
+            raise ValueError("manifest is not a regular file")
+        manifest_bytes = resolved.read_bytes()
+        value, _ = _decode_manifest(manifest_bytes)
+    except Exception:
         raise WorkflowWorkerEntryError("workflow run manifest is invalid") from None
-    if not isinstance(value, dict):
-        raise WorkflowWorkerEntryError("workflow run manifest must be an object")
+    if "run_format_version" in value:
+        raise WorkflowWorkerEntryError("workflow run format is unsupported")
+    _validate_managed_legacy_manifest(run_dir, value, manifest_bytes)
     return value
+
+
+def _validate_managed_legacy_manifest(
+    run_dir: Path,
+    manifest: dict[str, object],
+    manifest_bytes: bytes,
+) -> None:
+    request_database = run_dir.parent / "requests.sqlite"
+    if _is_symlink_or_junction(request_database):
+        raise WorkflowWorkerEntryError("workflow request binding is invalid")
+    try:
+        metadata = request_database.stat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise WorkflowWorkerEntryError("workflow request binding is invalid") from None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise WorkflowWorkerEntryError("workflow request binding is invalid")
+
+    workflow_id = manifest.get("workflow_id")
+    manifest_run_id = manifest.get("run_id")
+    request_digest = manifest.get("request_digest")
+    if (
+        type(workflow_id) is not str
+        or not workflow_id
+        or type(manifest_run_id) is not str
+        or manifest_run_id != run_dir.name
+        or type(request_digest) is not str
+    ):
+        raise WorkflowWorkerEntryError("workflow request binding is invalid")
+    try:
+        run_format = classify_readonly(
+            run_dir.parent,
+            run_dir.name,
+            manifest_bytes,
+            expected_workflow_id=workflow_id,
+            expected_request_digest=request_digest,
+        )
+    except StrictReaderGateError:
+        raise WorkflowWorkerEntryError("workflow request binding is invalid") from None
+    if run_format is not RunFormatVersion.LEGACY_V1:
+        raise WorkflowWorkerEntryError("workflow request binding is invalid")
 
 
 def _read_config(config_path: Path, run_dir: Path, mode: str) -> dict[str, object]:

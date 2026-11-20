@@ -946,6 +946,11 @@ def _write_active_request(state_root: Path, run_dir: Path, workflow_id: str, dig
         "run_id TEXT, request_digest TEXT, state TEXT, created_at TEXT, updated_at TEXT)"
     )
     database.execute(
+        "CREATE TABLE workflow_request_sources ("
+        "run_id TEXT PRIMARY KEY, definition_id TEXT NOT NULL, "
+        "revision INTEGER NOT NULL CHECK (revision >= 1), source_sha256 TEXT NOT NULL)"
+    )
+    database.execute(
         "INSERT INTO workflow_requests VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             "phase5e2c1-shutdown-request",

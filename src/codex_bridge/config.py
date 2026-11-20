@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import os
 import re
@@ -452,6 +453,7 @@ class BridgeConfig:
     control_token: str | None = None
     lan_enabled: bool = False
     mcp_token: str | None = field(default=None, repr=False)
+    cpp_mcp_token: str | None = field(default=None, repr=False)
     file_put_dir: str | None = None
     codex_executable_source: str = "default"
     github_mcp: GitHubMcpConfig = field(default_factory=GitHubMcpConfig)
@@ -470,6 +472,21 @@ class BridgeConfig:
         if self.mcp_token is not None and _CONTROL_TOKEN_PATTERN.fullmatch(self.mcp_token) is None:
             raise ConfigurationError(
                 "CODEX_BRIDGE_MCP_TOKEN must be 32-256 ASCII URL-safe characters"
+            )
+        if (
+            self.cpp_mcp_token is not None
+            and _CONTROL_TOKEN_PATTERN.fullmatch(self.cpp_mcp_token) is None
+        ):
+            raise ConfigurationError(
+                "CODEX_BRIDGE_CPP_MCP_TOKEN must be 32-256 ASCII URL-safe characters"
+            )
+        if (
+            self.cpp_mcp_token is not None
+            and self.mcp_token is not None
+            and hmac.compare_digest(self.cpp_mcp_token, self.mcp_token)
+        ):
+            raise ConfigurationError(
+                "CODEX_BRIDGE_CPP_MCP_TOKEN must differ from CODEX_BRIDGE_MCP_TOKEN"
             )
         if self.lan_enabled and not self.mcp_token:
             raise ConfigurationError("LAN access requires CODEX_BRIDGE_MCP_TOKEN")
@@ -642,6 +659,7 @@ class BridgeConfig:
                 "bridge.lan_enabled",
             ),
             mcp_token=values.get("CODEX_BRIDGE_MCP_TOKEN") or None,
+            cpp_mcp_token=values.get("CODEX_BRIDGE_CPP_MCP_TOKEN") or None,
             file_put_dir=file_put_dir,
             codex_executable_source=executable_source,
             github_mcp=GitHubMcpConfig.from_sources(
