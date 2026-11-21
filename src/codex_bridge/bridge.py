@@ -42,7 +42,7 @@ from .models import (
 from .paths import AllowedPathPolicy
 from .setup_capabilities import normalize_capabilities
 from .state import StateStore
-from .thread_observations import ThreadObservations
+from .thread_observations import ACTIVE, ThreadObservations
 from .thread_titles import derive_thread_title, normalize_explicit_title
 from .turn_input import build_turn_input
 from .turn_outcome import PersistedTurnReader, TurnOutcomeHints
@@ -202,6 +202,14 @@ def _sanitize_thread_history(thread: object) -> object:
         for turn in turns
     ]
     return sanitized
+
+
+def _is_running_observation(value: Mapping[str, Any]) -> bool:
+    state = value.get("state")
+    evidence = value.get("evidence")
+    if evidence == "live":
+        return state in ACTIVE
+    return state == "estimated_running" and evidence == "inferred"
 
 
 def _permission_path(value: object) -> dict[str, Any]:
@@ -894,9 +902,18 @@ class Bridge:
         include_history: bool = False,
         limit: int = 20,
         cursor: str | None = None,
+        running_only: bool = False,
     ) -> dict[str, Any]:
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
+        if running_only:
+            if thread_id is not None:
+                raise ValueError("running_only cannot be combined with thread_id")
+            if include_history:
+                raise ValueError("running_only cannot be combined with include_history")
+            if cursor is not None:
+                raise ValueError("running_only cannot be combined with cursor")
+            return await self._running_threads()
         if thread_id is not None:
             metadata = await self._app_server.request(
                 "thread/read", {"threadId": thread_id, "includeTurns": False}
@@ -954,6 +971,76 @@ class Bridge:
                 "backwards_cursor": response.get("backwardsCursor"),
             }
         )
+
+    async def _running_threads(self) -> dict[str, Any]:
+        observed = self.observations.external_snapshot()
+        candidate_ids: list[str] = []
+        seen: set[str] = set()
+
+        def add_if_running(thread_id: object) -> None:
+            if not isinstance(thread_id, str) or thread_id in seen:
+                return
+            current = self.observations.current(thread_id, observed)
+            if _is_running_observation(current):
+                seen.add(thread_id)
+                candidate_ids.append(thread_id)
+
+        for thread_id, _turn_id in self._state.active_turns():
+            add_if_running(thread_id)
+        external_threads = observed.get("threads")
+        if isinstance(external_threads, Mapping):
+            for thread_id in external_threads:
+                add_if_running(thread_id)
+
+        visible: list[dict[str, object]] = []
+        missing_title_rows: list[dict[str, object]] = []
+        for thread_id in candidate_ids:
+            try:
+                metadata = await self._app_server.request(
+                    "thread/read", {"threadId": thread_id, "includeTurns": False}
+                )
+                thread = self._thread_from_response(metadata)
+                self._validate_thread_metadata(thread, thread_id)
+            except (BridgeError, ValueError):
+                continue
+            self._remember_thread_metadata(thread)
+            public_row = _sanitize(thread)
+            if not isinstance(public_row, dict):
+                continue
+            public_row.pop("turns", None)
+            visible.append(public_row)
+            if not (isinstance(thread.get("name"), str) and thread["name"].strip()):
+                missing_title_rows.append(public_row)
+
+        missing_title_ids = [
+            row_id for row in missing_title_rows if isinstance((row_id := row.get("id")), str)
+        ]
+        local_titles = _read_local_thread_titles(missing_title_ids)
+        for row in missing_title_rows:
+            row_id = row.get("id")
+            if not isinstance(row_id, str):
+                continue
+            title = _usable_local_display_title(local_titles.get(row_id), row.get("preview"))
+            if title is not None:
+                row["name"] = title
+
+        result = self.observations.attach_list(
+            {"threads": visible, "next_cursor": None, "backwards_cursor": None}
+        )
+        result["threads"] = [
+            row
+            for row in result["threads"]
+            if isinstance(row, dict)
+            and isinstance(row.get("current_execution"), Mapping)
+            and _is_running_observation(row["current_execution"])
+        ]
+        returned_ids = {row["id"] for row in result["threads"] if isinstance(row.get("id"), str)}
+        result["external_threads"] = [
+            row
+            for row in result["external_threads"]
+            if isinstance(row, dict) and row.get("id") in returned_ids
+        ]
+        return result
 
     async def rename_thread(
         self,

@@ -706,11 +706,83 @@ async def test_remote_thread_list_is_scoped_and_native_id_can_be_adopted() -> No
 
 
 @pytest.mark.asyncio
+async def test_default_local_thread_list_keeps_original_bridge_arguments() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    await router.codex_threads()
+
+    assert bridge.calls == [
+        ("threads", (None,), {"include_history": False, "limit": 20, "cursor": None})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_thread_list_requires_selection_when_multiple_targets_are_configured() -> None:
     router, _, _ = make_router(LOCAL, NOTEBOOK, OTHER)
 
     with pytest.raises(ExecutionTargetError, match="target_id is required"):
         await router.codex_threads()
+
+
+@pytest.mark.asyncio
+async def test_running_only_is_forwarded_to_remote_without_target_id() -> None:
+    remote = FakeRemote({"threads": [{"id": "active"}], "next_cursor": None})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    result = await router.codex_threads(target_id="notebook", running_only=True)
+
+    assert remote.calls == [
+        (
+            "codex_threads",
+            {
+                "thread_id": None,
+                "include_history": False,
+                "limit": 20,
+                "cursor": None,
+                "running_only": True,
+            },
+        )
+    ]
+    assert "target_id" not in remote.calls[0][1]
+    assert result["threads"][0]["id"] == "notebook::active"
+    assert result["threads"][0]["target_id"] == "notebook"
+    assert result["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_default_remote_thread_list_omits_running_only_for_old_remote_compatibility() -> None:
+    remote = FakeRemote({"threads": [], "next_cursor": None})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_threads(target_id="notebook")
+
+    assert "running_only" not in remote.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_remote_running_only_returns_safe_upstream_error() -> None:
+    class OldRemote(FakeRemote):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            if arguments.get("running_only") is True:
+                raise ExecutionTargetError("execution target returned an upstream tool error")
+            return {"threads": [], "next_cursor": None}
+
+    remote = OldRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_threads(target_id="notebook")
+    with pytest.raises(ExecutionTargetError, match="upstream tool error"):
+        await router.codex_threads(target_id="notebook", running_only=True)
+
+    assert len(remote.calls) == 2
+    assert "target_id" not in remote.calls[1][1]
 
 
 @pytest.mark.parametrize("native_id", [1, "1"])

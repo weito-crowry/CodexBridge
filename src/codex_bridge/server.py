@@ -809,8 +809,9 @@ def create_app(
         include_history: bool = False,
         limit: int = 20,
         cursor: str | None = None,
+        running_only: bool = False,
     ) -> dict[str, Any]:
-        """List native Codex threads or read one native thread's bounded history."""
+        """List native Codex threads, optionally limited to threads observed running by Bridge."""
         return await _run_tool(
             lambda: execution_router.codex_threads(
                 thread_id,
@@ -818,6 +819,7 @@ def create_app(
                 include_history=include_history,
                 limit=limit,
                 cursor=cursor,
+                running_only=running_only,
             )
         )
 

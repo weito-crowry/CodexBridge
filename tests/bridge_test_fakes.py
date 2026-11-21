@@ -15,6 +15,7 @@ class FakeAppServer:
         self.responses: list[tuple[int | str, dict[str, Any]]] = []
         self.rejections: list[tuple[int | str, int, str]] = []
         self.thread_cwds: dict[str, str] = {}
+        self.thread_metadata: dict[str, dict[str, Any]] = {}
         self.thread_histories: dict[str, list[dict[str, Any]]] = {}
         self.thread_history_modes: dict[str, str] = {}
         self.thread_paths: dict[str, str] = {}
@@ -108,6 +109,7 @@ class FakeAppServer:
                 thread["historyMode"] = self.thread_history_modes[params["threadId"]]
             if params["threadId"] in self.thread_paths:
                 thread["path"] = self.thread_paths[params["threadId"]]
+            thread.update(self.thread_metadata.get(params["threadId"], {}))
             return {"thread": thread}
         if method == "thread/turns/list":
             return self.turns_response

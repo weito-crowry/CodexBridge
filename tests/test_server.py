@@ -32,6 +32,7 @@ class FakeBridge:
     error: Exception | None = None
     start_count: int = 0
     start_options: dict[str, Any] | None = None
+    thread_options: dict[str, Any] | None = None
 
     async def start(
         self,
@@ -73,6 +74,24 @@ class FakeBridge:
                 {"id": "danger-full-access", "display_name": "Full access"},
             ],
         }
+
+    async def threads(
+        self,
+        thread_id: str | None = None,
+        *,
+        include_history: bool = False,
+        limit: int = 20,
+        cursor: str | None = None,
+        running_only: bool = False,
+    ) -> dict[str, Any]:
+        self.thread_options = {
+            "thread_id": thread_id,
+            "include_history": include_history,
+            "limit": limit,
+            "cursor": cursor,
+            "running_only": running_only,
+        }
+        return {"threads": [], "next_cursor": None}
 
 
 class FakeRuntime:
@@ -915,6 +934,31 @@ async def test_execution_target_tool_schemas_are_explicit_and_optional(tmp_path)
     ] == ["auto_review", "user"]
     assert "target_id" in tools["codex_threads"].input_schema["properties"]
     assert "target_id" not in tools["codex_threads"].input_schema.get("required", [])
+    assert tools["codex_threads"].input_schema["properties"]["running_only"]["type"] == "boolean"
+    assert "running_only" not in tools["codex_threads"].input_schema.get("required", [])
+
+
+@pytest.mark.asyncio
+async def test_codex_threads_forwards_running_only_to_local_bridge(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_threads"
+    )
+
+    async with app.router.lifespan_context(app):
+        result = await tool.fn(running_only=True)
+
+    assert result["threads"] == []
+    assert runtime.bridge.thread_options == {
+        "thread_id": None,
+        "include_history": False,
+        "limit": 20,
+        "cursor": None,
+        "running_only": True,
+    }
 
 
 def test_setup_tools_bind_the_app_resource_and_app_only_visibility(tmp_path) -> None:

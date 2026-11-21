@@ -100,6 +100,7 @@ class BridgePort(Protocol):
         include_history: bool = False,
         limit: int = 20,
         cursor: str | None = None,
+        running_only: bool = False,
     ) -> dict[str, Any]: ...
 
     async def status(
@@ -764,7 +765,15 @@ class ExecutionTargetRouter:
         include_history: bool = False,
         limit: int = 20,
         cursor: str | None = None,
+        running_only: bool = False,
     ) -> dict[str, Any]:
+        if running_only:
+            if thread_id is not None:
+                raise ExecutionTargetError("running_only cannot be combined with thread_id")
+            if include_history:
+                raise ExecutionTargetError("running_only cannot be combined with include_history")
+            if cursor is not None:
+                raise ExecutionTargetError("running_only cannot be combined with cursor")
         if thread_id is None:
             target = self._select_target(target_id)
             native_id = None
@@ -776,18 +785,28 @@ class ExecutionTargetRouter:
             "limit": limit,
             "cursor": cursor,
         }
+        if running_only:
+            arguments["running_only"] = True
         if target.kind == "remote":
             result = await self._remote_clients[target.id].call_tool("codex_threads", arguments)
             return self._rewrite_result(target, result)
-        return self._rewrite_result(
-            target,
-            await self._bridge().threads(
+        bridge = self._bridge()
+        if running_only:
+            result = await bridge.threads(
                 native_id,
                 include_history=include_history,
                 limit=limit,
                 cursor=cursor,
-            ),
-        )
+                running_only=True,
+            )
+        else:
+            result = await bridge.threads(
+                native_id,
+                include_history=include_history,
+                limit=limit,
+                cursor=cursor,
+            )
+        return self._rewrite_result(target, result)
 
     async def _request_call(
         self, name: str, request_id: RequestId, values: dict[str, Any]
