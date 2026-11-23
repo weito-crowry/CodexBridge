@@ -5,12 +5,20 @@ import sqlite3
 import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .account_auth import AccountAuthService
 from .activity import ActivityStatus, ActivityStore, ActivityType
 from .config import WAIT_HARD_MAX_SECONDS
+from .final_answers import (
+    FINAL_ANSWER_SOURCE,
+    MAX_FINAL_ANSWER_UTF16_CODE_UNITS,
+    FinalAnswerStore,
+    FinalAnswerStoreError,
+    is_valid_final_answer_identifier,
+)
 from .history import (
     HistoryValidationError,
     project_items_response,
@@ -76,9 +84,24 @@ _PERMISSION_METHOD = "item/permissions/requestApproval"
 _PERMISSION_TEXT_LIMIT = 16_000
 _ACTIVITY_LIMIT_MIN = 1
 _ACTIVITY_LIMIT_MAX = 100
+_FINAL_ANSWER_WRITE_QUEUE_CAPACITY = 4
 _LOCAL_THREAD_CATALOG_PATH = Path.home() / ".codex" / "sqlite" / "codex-dev.db"
 _LOCAL_THREAD_TITLE_MAX_CHARS = 200
 _MAX_EPOCH_MILLISECONDS = 253_402_300_799_999
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalAnswerWrite:
+    kind: Literal["item", "terminal"]
+    thread_id: str
+    turn_id: str
+    value: object
+    item_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalAnswerReadBarrier:
+    completed: asyncio.Future[None]
 
 
 def _safe_item_timestamp(value: object) -> int | None:
@@ -339,6 +362,7 @@ class Bridge:
         path_policy: AllowedPathPolicy,
         *,
         activity_store: ActivityStore | None = None,
+        final_answer_store: FinalAnswerStore | None = None,
         wait_default_seconds: float = 50.0,
         wait_max_seconds: float = WAIT_HARD_MAX_SECONDS,
     ) -> None:
@@ -347,10 +371,20 @@ class Bridge:
         self._state = state
         self._path_policy = path_policy
         self._activities = activity_store if activity_store is not None else ActivityStore()
+        self._final_answer_store = final_answer_store
         self._item_lifecycle = ItemLifecycleStore()
         self._wait_default_seconds = wait_default_seconds
         self._wait_max_seconds = min(wait_max_seconds, WAIT_HARD_MAX_SECONDS)
         self._approval_lock = asyncio.Lock()
+        self._final_answer_lock = asyncio.Lock()
+        self._final_answer_write_queue: (
+            asyncio.Queue[_FinalAnswerWrite | _FinalAnswerReadBarrier | None] | None
+        ) = None
+        self._final_answer_writer_task: asyncio.Task[None] | None = None
+        self._final_answer_enqueue_tasks: set[asyncio.Task[None]] = set()
+        self._final_answer_close_task: asyncio.Task[None] | None = None
+        self._final_answer_writer_closing = False
+        self._final_answer_writer_closed = False
         self._turn_outcomes = TurnOutcomeHints()
         self._persisted_reader = PersistedTurnReader()
         self.observations = ThreadObservations(
@@ -424,6 +458,7 @@ class Bridge:
         item: dict[str, Any],
         *,
         timestamp_ms: int | None = None,
+        persist_final_answer: bool = True,
     ) -> None:
         item_id = item.get("id") if isinstance(item.get("id"), str) else None
         item_type = item.get("type")
@@ -506,6 +541,19 @@ class Bridge:
             return
         if method == "item/completed" and item_type == "agentMessage":
             text = item.get("text")
+            if (
+                item.get("phase") == "final_answer"
+                and persist_final_answer
+                and self._final_answer_store is not None
+                and is_valid_final_answer_identifier(thread_id)
+                and is_valid_final_answer_identifier(turn_id)
+                and isinstance(item_id, str)
+                and is_valid_final_answer_identifier(item_id)
+            ):
+                try:
+                    self._final_answer_store.record_final_answer(thread_id, turn_id, item_id, text)
+                except Exception as exc:
+                    log_event("final_answer.capture_error", error_type=exc.__class__.__name__)
             if isinstance(text, str):
                 self._state.update_latest_message(thread_id, turn_id, text)
                 agent_activity_type: ActivityType = "agent_message"
@@ -1347,7 +1395,208 @@ class Bridge:
             return
         await self._app_server.reject(request_id, -32601, "unsupported App Server request")
 
-    def handle_notification(self, message: Mapping[str, Any]) -> None:
+   def _final_answer_write_from_notification(
+        self, message: Mapping[str, Any]
+    ) -> _FinalAnswerWrite | None:
+        if self._final_answer_store is None:
+            return None
+        method = message.get("method")
+        params = message.get("params")
+        if not isinstance(method, str) or not isinstance(params, dict):
+            return None
+        thread_id = params.get("threadId")
+        if not isinstance(thread_id, str) or not is_valid_final_answer_identifier(thread_id):
+            return None
+        if method == "item/completed":
+            turn_id = params.get("turnId")
+            item = params.get("item")
+            if (
+                not isinstance(turn_id, str)
+                or not is_valid_final_answer_identifier(turn_id)
+                or not isinstance(item, dict)
+                or item.get("type") != "agentMessage"
+                or item.get("phase") != "final_answer"
+            ):
+                return None
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not is_valid_final_answer_identifier(item_id):
+                return None
+            return _FinalAnswerWrite("item", thread_id, turn_id, item.get("text"), item_id)
+        if method == "turn/completed":
+            turn = params.get("turn")
+            if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
+                return None
+            turn_id = turn["id"]
+            event_turn_id = params.get("turnId")
+            if not is_valid_final_answer_identifier(turn_id) or (
+                event_turn_id is not None and event_turn_id != turn_id
+            ):
+                return None
+            raw_status = turn.get("status")
+            status = (
+                raw_status
+                if isinstance(raw_status, str)
+                and raw_status in {"completed", "failed", "interrupted"}
+                else "unknown"
+            )
+            return _FinalAnswerWrite("terminal", thread_id, turn_id, status)
+        if method == "error" and params.get("willRetry") is not True:
+            turn_id = params.get("turnId")
+            if isinstance(turn_id, str) and is_valid_final_answer_identifier(turn_id):
+                return _FinalAnswerWrite("terminal", thread_id, turn_id, "failed")
+        return None
+
+    def _ensure_final_answer_writer(
+        self,
+    ) -> asyncio.Queue[_FinalAnswerWrite | _FinalAnswerReadBarrier | None] | None:
+        if self._final_answer_store is None or self._final_answer_writer_closing:
+            return None
+        if self._final_answer_write_queue is None:
+            self._final_answer_write_queue = asyncio.Queue(
+                maxsize=_FINAL_ANSWER_WRITE_QUEUE_CAPACITY
+            )
+        task = self._final_answer_writer_task
+        if task is None or task.done():
+            if task is not None and not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    log_event("final_answer.writer_error", error_type=error.__class__.__name__)
+            self._final_answer_writer_task = asyncio.create_task(self._run_final_answer_writer())
+        return self._final_answer_write_queue
+
+    def _record_final_answer_write(self, write: _FinalAnswerWrite) -> None:
+        store = self._final_answer_store
+        if store is None:
+            return
+        if write.kind == "item":
+            assert write.item_id is not None
+            store.record_final_answer(write.thread_id, write.turn_id, write.item_id, write.value)
+        else:
+            assert isinstance(write.value, str)
+            store.record_terminal(write.thread_id, write.turn_id, write.value)
+
+    async def _run_final_answer_writer(self) -> None:
+        queue = self._final_answer_write_queue
+        if queue is None:
+            return
+        while True:
+            entry = await queue.get()
+            try:
+                if entry is None:
+                    return
+                if isinstance(entry, _FinalAnswerReadBarrier):
+                    if not entry.completed.done():
+                        entry.completed.set_result(None)
+                    continue
+                try:
+                    await asyncio.to_thread(self._record_final_answer_write, entry)
+                except Exception as exc:
+                    event = (
+                        "final_answer.capture_error"
+                        if entry.kind == "item"
+                        else "final_answer.terminal_error"
+                    )
+                    log_event(event, error_type=exc.__class__.__name__)
+            finally:
+                queue.task_done()
+
+    def _final_answer_enqueue_done(self, task: asyncio.Task[None]) -> None:
+        self._final_answer_enqueue_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log_event("final_answer.queue_error", error_type=error.__class__.__name__)
+
+    async def _enqueue_final_answer_entry(
+        self,
+        queue: asyncio.Queue[_FinalAnswerWrite | _FinalAnswerReadBarrier | None],
+        entry: _FinalAnswerWrite | _FinalAnswerReadBarrier | None,
+    ) -> None:
+        try:
+            queue.put_nowait(entry)
+            return
+        except asyncio.QueueFull:
+            pass
+        task = asyncio.create_task(queue.put(entry))
+        self._final_answer_enqueue_tasks.add(task)
+        task.add_done_callback(self._final_answer_enqueue_done)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event("final_answer.queue_error", error_type=exc.__class__.__name__)
+        finally:
+            if task.done():
+                self._final_answer_enqueue_tasks.discard(task)
+
+    async def _wait_for_final_answer_enqueues(self) -> None:
+        while self._final_answer_enqueue_tasks:
+            pending = tuple(self._final_answer_enqueue_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _close_final_answer_writer(self) -> None:
+        await self._wait_for_final_answer_enqueues()
+        queue = self._final_answer_write_queue
+        writer_task = self._final_answer_writer_task
+        if queue is not None and writer_task is not None and not writer_task.done():
+            await self._enqueue_final_answer_entry(queue, None)
+            await asyncio.shield(writer_task)
+        self._final_answer_writer_closed = True
+
+    async def handle_notification_async(self, message: Mapping[str, Any]) -> None:
+        async with self._final_answer_lock:
+            await self._wait_for_final_answer_enqueues()
+            write = self._final_answer_write_from_notification(message)
+            self.handle_notification(message, persist_final_answer=False)
+            if write is not None:
+                queue = self._ensure_final_answer_writer()
+                if queue is None:
+                    log_event("final_answer.queue_unavailable")
+                else:
+                    await self._enqueue_final_answer_entry(queue, write)
+
+    async def drain_final_answer_writes(self, *, close: bool = False) -> None:
+        close_task: asyncio.Task[None] | None = None
+        barrier: _FinalAnswerReadBarrier | None = None
+        if close:
+            async with self._final_answer_lock:
+                if self._final_answer_writer_closed:
+                    return
+                if self._final_answer_close_task is None:
+                    self._ensure_final_answer_writer()
+                    self._final_answer_writer_closing = True
+                    self._final_answer_close_task = asyncio.create_task(
+                        self._close_final_answer_writer()
+                    )
+                close_task = self._final_answer_close_task
+                assert close_task is not None
+            await asyncio.shield(close_task)
+            return
+
+        async with self._final_answer_lock:
+            await self._wait_for_final_answer_enqueues()
+            if self._final_answer_writer_closed:
+                return
+            close_task = self._final_answer_close_task
+            if self._final_answer_writer_closing and close_task is not None:
+                barrier = None
+            else:
+                close_task = None
+                queue = self._ensure_final_answer_writer()
+                if queue is None:
+                    return
+                barrier = _FinalAnswerReadBarrier(asyncio.get_running_loop().create_future())
+                await self._enqueue_final_answer_entry(queue, barrier)
+        if close_task is not None:
+            await asyncio.shield(close_task)
+        elif barrier is not None:
+            await barrier.completed
+
+    def handle_notification(
+        self, message: Mapping[str, Any], *, persist_final_answer: bool = True
+    ) -> None:
         self._account_auth.on_notification(message)
         self._turn_outcomes.observe(message)
         method = message.get("method")
@@ -1456,7 +1705,12 @@ class Bridge:
                                     thread_id, turn_id, item_id, timestamp
                                 )
                         self._record_item_activity(
-                            method, thread_id, turn_id, item, timestamp_ms=timestamp
+                            method,
+                            thread_id,
+                            turn_id,
+                            item,
+                            timestamp_ms=timestamp,
+                            persist_final_answer=persist_final_answer,
                         )
                         self._activities.publish_transient(
                             thread_id=thread_id,
@@ -1480,6 +1734,22 @@ class Bridge:
                 auth_category = self._account_auth.observe_execution_error(
                     turn_error, turn_state=status
                 )
+                event_turn_id = params.get("turnId")
+                if (
+                    persist_final_answer
+                    and self._final_answer_store is not None
+                    and is_valid_final_answer_identifier(thread_id)
+                    and is_valid_final_answer_identifier(turn["id"])
+                    and (event_turn_id is None or event_turn_id == turn["id"])
+                ):
+                    final_status = turn.get("status")
+                    if not isinstance(final_status, str) or final_status not in {
+                        "completed",
+                        "failed",
+                        "interrupted",
+                    }:
+                        final_status = "unknown"
+                    self._record_final_answer_terminal(thread_id, turn["id"], final_status)
                 error_text = (
                     "Authentication may be required. Refresh the Codex account status."
                     if auth_category == "auth_check"
@@ -1517,6 +1787,8 @@ class Bridge:
                 will_retry = params.get("willRetry")
                 retryable = will_retry is True
                 if not retryable:
+                    if persist_final_answer:
+                        self._record_final_answer_terminal(thread_id, turn_id, "failed")
                     self._state.set_terminal(thread_id, turn_id, "failed", error_summary)
                 self._record_activity(
                     thread_id=thread_id,
@@ -1525,6 +1797,88 @@ class Bridge:
                     status="in_progress" if retryable else "failed",
                     summary=error_summary or "App Server error",
                 )
+
+    def _record_final_answer_terminal(self, thread_id: str, turn_id: str, status: str) -> None:
+        store = self._final_answer_store
+        if store is None:
+            return
+        try:
+            store.record_terminal(thread_id, turn_id, status)
+        except Exception as exc:
+            log_event("final_answer.terminal_error", error_type=exc.__class__.__name__)
+
+    def final_answer(self, thread_id: str, turn_id: str) -> dict[str, object]:
+        if not is_valid_final_answer_identifier(thread_id) or not is_valid_final_answer_identifier(
+            turn_id
+        ):
+            raise BridgeError("thread_id or turn_id is malformed")
+        store = self._final_answer_store
+        if store is None:
+            return {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": "unavailable",
+                "reason": "storage_unavailable",
+            }
+        try:
+            result = store.read(thread_id, turn_id)
+        except FinalAnswerStoreError:
+            result = {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": "unavailable",
+                "reason": "storage_unavailable",
+            }
+        if result.get("thread_id") != thread_id or result.get("turn_id") != turn_id:
+            return {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": "incomplete",
+                "reason": "stored_identity_mismatch",
+            }
+        result_status = result.get("status")
+        if not isinstance(result_status, str) or result_status not in {
+            "retrieved",
+            "pending",
+            "incomplete",
+            "unavailable",
+        }:
+            return {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": "incomplete",
+                "reason": "stored_result_invalid",
+            }
+        if result.get("status") == "retrieved":
+            text = result.get("text")
+            if (
+                result.get("source") != FINAL_ANSWER_SOURCE
+                or not isinstance(text, str)
+                or not text.strip()
+                or len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+                > MAX_FINAL_ANSWER_UTF16_CODE_UNITS
+            ):
+                return {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "status": "incomplete",
+                    "reason": "stored_record_invalid",
+                }
+            return result
+        if not isinstance(result.get("reason"), str) or not result["reason"]:
+            return {
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "status": "incomplete",
+                "reason": "stored_result_invalid",
+            }
+        result.pop("text", None)
+        result.pop("source", None)
+        return result
+
+    async def final_answer_async(self, thread_id: str, turn_id: str) -> dict[str, object]:
+        await self.drain_final_answer_writes()
+        return await asyncio.to_thread(self.final_answer, thread_id, turn_id)
 
     def _public_snapshot(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         snapshot = self._state.snapshot_if_known(thread_id, turn_id)

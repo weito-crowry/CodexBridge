@@ -16,6 +16,11 @@ from mcp.client.streamable_http import (  # type: ignore[attr-defined]
 )
 
 from .config import ExecutionTargetConfig
+from .final_answers import (
+    FINAL_ANSWER_SOURCE,
+    MAX_FINAL_ANSWER_UTF16_CODE_UNITS,
+    is_valid_final_answer_identifier,
+)
 from .logging_utils import log_event
 from .models import (
     ApprovalDecision,
@@ -107,6 +112,10 @@ class BridgePort(Protocol):
         self, thread_id: str, turn_id: str | None = None, activity_limit: int = 20
     ) -> dict[str, Any]: ...
 
+    async def final_answer_async(self, thread_id: str, turn_id: str) -> dict[str, object]: ...
+
+    def final_answer(self, thread_id: str, turn_id: str) -> dict[str, object]: ...
+
 
 def _extract_dict_result(result: object) -> dict[str, Any]:
     if isinstance(result, types.InputRequiredResult):
@@ -152,10 +161,18 @@ class ExecutionTargetClient:
         self._session: Any | None = None
         self._connected = False
         self._leaf_target_id: str | None = None
+        self._supported_tools: frozenset[str] = frozenset()
 
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def leaf_target_id(self) -> str | None:
+        return self._leaf_target_id
+
+    def supports_tool(self, name: str) -> bool:
+        return name in self._supported_tools
 
     async def start(self) -> None:
         try:
@@ -214,7 +231,8 @@ class ExecutionTargetClient:
         session = self._session
         if session is None:
             raise ExecutionTargetError("execution target is unavailable")
-        if not _REQUIRED_TARGET_TOOLS.issubset(await self._list_tools(session)):
+        tool_names = await self._list_tools(session)
+        if not _REQUIRED_TARGET_TOOLS.issubset(tool_names):
             raise ExecutionTargetError("execution target is protocol-incompatible")
         targets = _extract_dict_result(await session.call_tool("codex_targets", {}))
         rows = targets.get("targets")
@@ -228,6 +246,7 @@ class ExecutionTargetClient:
         ):
             raise ExecutionTargetError("execution target must be a single-target leaf")
         self._leaf_target_id = rows[0]["id"]
+        self._supported_tools = frozenset(tool_names)
 
     async def _close_stack(self) -> None:
         stack = self._stack
@@ -267,6 +286,8 @@ class ExecutionTargetClient:
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         session = await self._session_for_call()
+        if name == "codex_final_answer" and not self.supports_tool(name):
+            raise ExecutionTargetError("execution target does not support final-answer retrieval")
         try:
             result = await session.call_tool(name, arguments)
             return _extract_dict_result(result)
@@ -756,6 +777,170 @@ class ExecutionTargetRouter:
             {"turn_id": turn_id, "activity_limit": activity_limit},
             lambda native: lambda: self._bridge().status(native, turn_id, activity_limit),
         )
+
+    @staticmethod
+    def _final_answer_result(
+        value: object,
+        *,
+        thread_id: str,
+        turn_id: str,
+        expected_target_id: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(value, Mapping):
+            return None, "remote_response_invalid"
+        if value.get("thread_id") != thread_id or value.get("turn_id") != turn_id:
+            return None, "remote_response_identity_mismatch"
+        if expected_target_id is not None and value.get("target_id") != expected_target_id:
+            return None, "remote_response_identity_mismatch"
+        status = value.get("status")
+        if not isinstance(status, str) or status not in {
+            "retrieved",
+            "pending",
+            "incomplete",
+            "unavailable",
+        }:
+            return None, "remote_response_invalid"
+        result: dict[str, Any] = {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "status": status,
+        }
+        if expected_target_id is not None:
+            result["target_id"] = expected_target_id
+        if status == "retrieved":
+            answer_text = value.get("text")
+            item_id = value.get("item_id")
+            if (
+                value.get("source") != FINAL_ANSWER_SOURCE
+                or not is_valid_final_answer_identifier(item_id)
+                or not isinstance(answer_text, str)
+                or not answer_text.strip()
+            ):
+                return None, "remote_response_invalid"
+            try:
+                units = len(answer_text.encode("utf-16-le", errors="strict")) // 2
+                answer_text.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                return None, "remote_response_invalid"
+            if units > MAX_FINAL_ANSWER_UTF16_CODE_UNITS:
+                return None, "remote_response_invalid"
+            result.update(
+                {
+                    "item_id": item_id,
+                    "source": FINAL_ANSWER_SOURCE,
+                    "text": answer_text,
+                }
+            )
+        else:
+            reason = value.get("reason")
+            if (
+                not isinstance(reason, str)
+                or not reason
+                or len(reason) > 128
+                or not reason.isascii()
+                or not all(character.isalnum() or character == "_" for character in reason)
+            ):
+                return None, "remote_response_invalid"
+            result["reason"] = reason
+        return result, None
+
+    async def codex_final_answer(
+        self,
+        thread_id: str,
+        turn_id: str,
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
+        if target_id is not None and not is_valid_final_answer_identifier(target_id):
+            raise ExecutionTargetError("target_id is malformed")
+        if not is_valid_final_answer_identifier(thread_id) or not is_valid_final_answer_identifier(
+            turn_id
+        ):
+            raise ExecutionTargetError("thread_id or turn_id is malformed")
+        target, native_thread_id = self._thread_target(thread_id, target_id)
+        if not is_valid_final_answer_identifier(native_thread_id):
+            raise ExecutionTargetError("thread_id is malformed")
+        public_thread_id = _public_thread_id(target, native_thread_id)
+        if target.kind == "local":
+            try:
+                bridge = self._bridge()
+                read_async = getattr(bridge, "final_answer_async", None)
+                if callable(read_async):
+                    value = await read_async(native_thread_id, turn_id)
+                else:
+                    value = await asyncio.to_thread(bridge.final_answer, native_thread_id, turn_id)
+            except Exception:
+                value = {
+                    "thread_id": native_thread_id,
+                    "turn_id": turn_id,
+                    "status": "unavailable",
+                    "reason": "storage_unavailable",
+                }
+            checked, reason = self._final_answer_result(
+                value, thread_id=native_thread_id, turn_id=turn_id
+            )
+            if checked is None:
+                checked = {
+                    "thread_id": native_thread_id,
+                    "turn_id": turn_id,
+                    "status": "incomplete",
+                    "reason": reason or "local_response_invalid",
+                }
+            return self._rewrite_result(target, checked)
+
+        client = self._remote_clients[target.id]
+        supports = getattr(client, "supports_tool", None)
+        explicit_support = callable(supports) and supports("codex_final_answer") is True
+        if not explicit_support:
+            connected = getattr(client, "connected", True)
+            reason = "remote_tool_unsupported" if connected else "remote_target_unavailable"
+            return {
+                "target_id": target.id,
+                "thread_id": public_thread_id,
+                "turn_id": turn_id,
+                "status": "unavailable",
+                "reason": reason,
+            }
+        leaf_target_id = getattr(client, "leaf_target_id", None)
+        if not is_valid_final_answer_identifier(leaf_target_id):
+            return {
+                "target_id": target.id,
+                "thread_id": public_thread_id,
+                "turn_id": turn_id,
+                "status": "unavailable",
+                "reason": "remote_target_identity_unavailable",
+            }
+        try:
+            value = await client.call_tool(
+                "codex_final_answer",
+                {
+                    "thread_id": native_thread_id,
+                    "turn_id": turn_id,
+                    "target_id": leaf_target_id,
+                },
+            )
+        except Exception:
+            return {
+                "target_id": target.id,
+                "thread_id": public_thread_id,
+                "turn_id": turn_id,
+                "status": "unavailable",
+                "reason": "remote_target_unavailable",
+            }
+        checked, reason = self._final_answer_result(
+            value,
+            thread_id=native_thread_id,
+            turn_id=turn_id,
+            expected_target_id=leaf_target_id,
+        )
+        if checked is None:
+            return {
+                "target_id": target.id,
+                "thread_id": public_thread_id,
+                "turn_id": turn_id,
+                "status": "incomplete",
+                "reason": reason or "remote_response_invalid",
+            }
+        return self._rewrite_result(target, checked)
 
     async def codex_threads(
         self,

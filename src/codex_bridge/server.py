@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from importlib.resources import files as package_files
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from mcp.server import MCPServer
@@ -28,6 +29,7 @@ from .execution_targets import ExecutionTargetRouter
 from .external_sessions import CodexSessionScanner, ExternalExecutionMonitor
 from .file_put import file_put as put_file
 from .file_tools import FileTools
+from .final_answers import FinalAnswerStore
 from .git_tools import git_diff as run_git_diff
 from .git_tools import git_status as run_git_status
 from .lan_auth import McpAuthMiddleware
@@ -76,6 +78,7 @@ class BridgeRuntime:
             await self.ui_server.start()
         except BaseException:
             await self.app_server.shutdown(self.config.shutdown_grace_seconds)
+            await self.bridge.drain_final_answer_writes(close=True)
             raise
         refresh_account_auth = getattr(self.bridge, "refresh_account_auth", None)
         if callable(refresh_account_auth):
@@ -132,6 +135,10 @@ class BridgeRuntime:
             await self.app_server.shutdown(self.config.shutdown_grace_seconds)
         except BaseException as error:
             shutdown_error = shutdown_error or error
+        try:
+            await self.bridge.drain_final_answer_writes(close=True)
+        except BaseException as error:
+            shutdown_error = shutdown_error or error
         log_event("bridge.shutdown")
         if shutdown_error is not None:
             raise shutdown_error
@@ -164,6 +171,7 @@ def build_runtime(
     config: BridgeConfig,
     *,
     shutdown_callback: ShutdownCallback | None = None,
+    final_answer_database_path: Path | None = None,
 ) -> BridgeRuntime:
     config = prepare_config(config)
     state = StateStore()
@@ -174,6 +182,7 @@ def build_runtime(
         state,
         AllowedPathPolicy(config.allowed_roots),
         activity_store=activity_store,
+        final_answer_store=FinalAnswerStore(final_answer_database_path),
         wait_default_seconds=config.wait_default_seconds,
         wait_max_seconds=config.wait_max_seconds,
     )
@@ -181,7 +190,7 @@ def build_runtime(
         CodexSessionScanner(allowed_roots=config.allowed_roots)
     )
     app_server.set_handlers(
-        on_notification=bridge.handle_notification,
+        on_notification=bridge.handle_notification_async,
         on_server_request=bridge.handle_server_request,
         on_failure=bridge.handle_app_server_failure,
     )
@@ -830,6 +839,17 @@ def create_app(
         """Return the current safe state and recent activities for a native Codex turn."""
         return await _run_tool(
             lambda: execution_router.codex_status(thread_id, turn_id, activity_limit)
+        )
+
+    @mcp.tool()
+    async def codex_final_answer(
+        thread_id: str,
+        turn_id: str,
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one confirmed final-answer item for the exact completed thread turn."""
+        return await _run_tool(
+            lambda: execution_router.codex_final_answer(thread_id, turn_id, target_id)
         )
 
     remote_provider = RemoteMcpProvider(config.github_mcp)

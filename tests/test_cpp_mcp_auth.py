@@ -28,6 +28,7 @@ CPP_TOOLS = {
     "codex_threads",
     "codex_status",
     "codex_wait",
+    "codex_final_answer",
 }
 
 
@@ -268,6 +269,28 @@ async def test_request_identity_survives_shared_session_and_concurrent_calls(
                         params={"name": "codex_status", "arguments": {"thread_id": "desktop"}},
                     )
                     assert "error" not in _rpc_payload(permitted_status)
+                    permitted_final_answer = await _post_rpc(
+                        url,
+                        session_id=session_ids[0],
+                        protocol_version=initialized.protocol_version,
+                        token=CPP_TOKEN,
+                        request_id=49,
+                        method="tools/call",
+                        params={
+                            "name": "codex_final_answer",
+                            "arguments": {"thread_id": "desktop", "turn_id": "turn-1"},
+                        },
+                    )
+                    final_answer_payload = _rpc_payload(permitted_final_answer)
+                    assert "error" not in final_answer_payload
+                    final_answer_result = final_answer_payload.get("result")
+                    assert isinstance(final_answer_result, dict)
+                    assert final_answer_result.get("isError") is not True
+                    final_answer_structured = final_answer_result.get("structuredContent")
+                    assert isinstance(final_answer_structured, dict)
+                    assert final_answer_structured.get("status") == "unavailable"
+                    assert final_answer_structured.get("reason") == "storage_unavailable"
+                    assert "text" not in final_answer_structured
                     _state.set_terminal("desktop", "turn-1", "completed")
                     permitted_wait = await _post_rpc(
                         url,
