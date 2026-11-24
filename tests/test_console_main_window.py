@@ -98,7 +98,12 @@ def test_settings_menu_contains_config_actions_and_existing_appearance_modes() -
     assert labels[3] == "Language (restart required)"
     assert labels[5] == "Appearance"
     assert labels[7] == "Restart Console to apply pending settings…"
-    assert labels[-2:] == ["Notification settings", "Developer"]
+    assert labels[-3:] == ["Notification settings", "Codex account", "Developer"]
+    account_menu = next(action for action in actions if action.text() == "Codex account")
+    assert [action.text() for action in account_menu.menu().actions()] == [
+        "Sign in / Re-sign in",
+        "Sign in with device code",
+    ]
     developer_menu = actions[-1].menu()
     assert developer_menu is not None
     assert [action.text() for action in developer_menu.actions()] == ["Control API token…"]

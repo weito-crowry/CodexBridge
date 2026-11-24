@@ -47,6 +47,13 @@ class SettingsActionController:
         )
         window._apply_pending_settings_action.setEnabled(pending_enabled)
         menu.addAction(tr("Notification settings"), window._show_notification_settings)
+        account_menu = menu.addMenu(tr("Codex account"))
+        window._settings_actions["Sign in / Re-sign in"] = account_menu.addAction(
+            tr("Sign in / Re-sign in"), window._account_auth_controller.start_chatgpt_login
+        )
+        window._settings_actions["Sign in with device code"] = account_menu.addAction(
+            tr("Sign in with device code"), window._account_auth_controller.start_device_code_login
+        )
         developer_menu = menu.addMenu(tr("Developer"))
         window._settings_actions["Control API token…"] = developer_menu.addAction(
             tr("Control API token…"), window._show_control_token_dialog

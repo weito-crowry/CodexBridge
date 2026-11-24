@@ -394,6 +394,27 @@ def test_api_client_rejects_oversized_control_response_without_exposing_body() -
     assert failures == [("control", "Bridge control request failed")]
 
 
+def test_api_client_caps_private_account_auth_response() -> None:
+    _application()
+    reply = FakeReply(b'{"auth_url":"PRIVATE"}' + b" " * 5_000, status=200)
+    manager = FakeManager([reply])
+    client = ApiClient("http://127.0.0.1:8001", manager=manager)
+    failures: list[tuple[str, str]] = []
+    client.composer_json_failed.connect(lambda key, message: failures.append((key, message)))
+
+    assert client.post_control_json(
+        "/ui-api/control/account/auth/login/start",
+        {"flow_type": "chatgpt"},
+        "control-token",
+        key="account-auth:start",
+    )
+    reply.finished.emit()
+
+    assert failures == [("account-auth:start", "invalid_response")]
+    assert reply.deleted
+    assert "PRIVATE" not in repr(failures)
+
+
 def test_api_client_rejects_oversized_http_failure_body_with_fixed_message() -> None:
     _application()
     reply = FakeReply(b"server-secret" * 512, status=403)

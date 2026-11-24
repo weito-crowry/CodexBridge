@@ -99,6 +99,7 @@ class ApiClient(QObject):
         self._control_response_bodies: dict[str, bytearray] = {}
         self._control_kinds: dict[str, str] = {}
         self._composer_replies: dict[str, Any] = {}
+        self._private_control_replies: set[str] = set()
         self._workflow_replies: dict[str, Any] = {}
         self._workflow_response_sizes: dict[str, int] = {}
         self._workflow_response_bodies: dict[str, bytearray] = {}
@@ -230,6 +231,8 @@ class ApiClient(QObject):
             self.composer_json_failed.emit(key, "request_error")
             return False
         self._composer_replies[key] = reply
+        if path.startswith("/ui-api/control/account/auth/"):
+            self._private_control_replies.add(key)
         reply.finished.connect(lambda key=key, reply=reply: self._finish_composer_json(key, reply))
         return True
 
@@ -549,6 +552,8 @@ class ApiClient(QObject):
         if self._composer_replies.get(key) is not reply:
             return
         self._composer_replies.pop(key, None)
+        private_response = key in self._private_control_replies
+        self._private_control_replies.discard(key)
         network_reply = cast(QNetworkReply, reply)
         try:
             status = self._status(network_reply)
@@ -573,6 +578,8 @@ class ApiClient(QObject):
                 raise ApiClientError("network_error")
             try:
                 body = bytes(cast(Any, network_reply.readAll()))
+                if private_response and len(body) > _MAX_CONTROL_RESPONSE_BYTES:
+                    raise ApiClientError("invalid_response")
                 payload = json.loads(body.decode("utf-8"))
             except (UnicodeDecodeError, ValueError, TypeError) as exc:
                 raise ApiClientError("invalid_response") from exc
@@ -903,6 +910,7 @@ class ApiClient(QObject):
         self.abort_workflow_requests()
         composer_replies = tuple(self._composer_replies.values())
         self._composer_replies.clear()
+        self._private_control_replies.clear()
         for reply in composer_replies:
             reply.abort()
             reply.deleteLater()

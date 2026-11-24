@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Protocol
 
+from .account_auth import AccountAuthService
 from .activity import ActivityStatus, ActivityStore, ActivityType
 from .config import WAIT_HARD_MAX_SECONDS
 from .history import (
@@ -334,6 +335,7 @@ class Bridge:
         wait_max_seconds: float = WAIT_HARD_MAX_SECONDS,
     ) -> None:
         self._app_server = app_server
+        self._account_auth = AccountAuthService(app_server.request)
         self._state = state
         self._path_policy = path_policy
         self._activities = activity_store if activity_store is not None else ActivityStore()
@@ -860,6 +862,7 @@ class Bridge:
             active = interruptible_turns()
 
     def handle_app_server_failure(self, error: str) -> None:
+        self._account_auth.disconnect()
         lines = error.splitlines()
         error_summary = _bounded_text(lines[0] if lines else error)
         for thread_id, turn_id in self._state.active_turns():
@@ -983,6 +986,21 @@ class Bridge:
 
     async def rate_limits(self) -> dict[str, Any]:
         return await self._app_server.request("account/rateLimits/read", {})
+
+    def account_auth_status(self) -> dict[str, object]:
+        return self._account_auth.status()
+
+    async def refresh_account_auth(self) -> dict[str, object]:
+        return await self._account_auth.refresh()
+
+    def disconnect_account_auth(self) -> None:
+        self._account_auth.disconnect()
+
+    async def start_account_login(self, flow_type: str) -> dict[str, str]:
+        return await self._account_auth.start_login(flow_type)
+
+    async def cancel_account_login(self, login_id: str) -> dict[str, object]:
+        return await self._account_auth.cancel_login(login_id)
 
     async def _history_metadata(self, thread_id: str) -> tuple[dict[str, Any], str, str]:
         response = await self._app_server.request(
@@ -1241,6 +1259,7 @@ class Bridge:
         await self._app_server.reject(request_id, -32601, "unsupported App Server request")
 
     def handle_notification(self, message: Mapping[str, Any]) -> None:
+        self._account_auth.on_notification(message)
         self._turn_outcomes.observe(message)
         method = message.get("method")
         params = message.get("params")
@@ -1368,9 +1387,16 @@ class Bridge:
                 and isinstance(turn.get("id"), str)
             ):
                 status = _native_state(turn.get("status"))
-                self._state.set_terminal(
-                    thread_id, turn["id"], status, _bounded_text(turn.get("error"))
+                turn_error = turn.get("error")
+                auth_category = self._account_auth.observe_execution_error(
+                    turn_error, turn_state=status
                 )
+                error_text = (
+                    "Authentication may be required. Refresh the Codex account status."
+                    if auth_category == "auth_check"
+                    else _bounded_text(turn_error)
+                )
+                self._state.set_terminal(thread_id, turn["id"], status, error_text)
                 activity_types: dict[str, ActivityType] = {
                     "completed": "turn_completed",
                     "failed": "turn_failed",
@@ -1378,7 +1404,7 @@ class Bridge:
                 }
                 activity_type = activity_types.get(status)
                 if activity_type is not None:
-                    error_summary = _bounded_text(turn.get("error"))
+                    error_summary = error_text
                     self._record_activity(
                         thread_id=thread_id,
                         turn_id=turn["id"],
@@ -1390,7 +1416,13 @@ class Bridge:
             return
         if method == "error":
             if isinstance(thread_id, str) and isinstance(turn_id, str):
-                error_summary = _bounded_text(params.get("error"))
+                raw_error = params.get("error")
+                auth_category = self._account_auth.observe_execution_error(raw_error)
+                error_summary = (
+                    "Authentication may be required. Refresh the Codex account status."
+                    if auth_category == "auth_check"
+                    else _bounded_text(raw_error)
+                )
                 if error_summary is None:
                     error_summary = _bounded_text(params.get("message"))
                 will_retry = params.get("willRetry")
