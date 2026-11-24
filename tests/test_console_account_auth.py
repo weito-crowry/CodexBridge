@@ -108,6 +108,12 @@ def test_account_auth_controller_keeps_status_private_and_uses_control_route() -
         {
             "login_id": "PRIVATE-LOGIN-ID",
             "flow_type": "chatgpt",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
             "auth_url": "https://auth.openai.com/oauth/authorize?state=PRIVATE-URL",
         },
     )
@@ -127,6 +133,7 @@ def test_account_auth_controller_shows_device_code_only_in_local_dialog() -> Non
     controller = AccountAuthController(
         window, browser_opener=lambda url: opened.append(url) is None
     )
+    controller.on_connection_changed(True)
     controller.start_device_code_login()
     _, _, _, key = window._client.posts[-1]
     controller._on_control_success(
@@ -134,6 +141,12 @@ def test_account_auth_controller_shows_device_code_only_in_local_dialog() -> Non
         {
             "login_id": "PRIVATE-LOGIN-ID",
             "flow_type": "chatgptDeviceCode",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
             "verification_url": "https://auth.openai.com/codex/device",
             "user_code": "PRIVATE-DEVICE-CODE",
         },
@@ -162,14 +175,34 @@ def test_account_auth_controller_rejects_unsafe_url_and_stale_start_response() -
         {
             "login_id": "PRIVATE-LOGIN-ID",
             "flow_type": "chatgpt",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
             "auth_url": "https://auth.openai.com@evil.example/oauth/authorize?PRIVATE=1",
         },
     )
     assert not opened
+    cancel_key = window._client.posts[-1][3]
+    assert window._client.posts[-1][0].endswith("/login/cancel")
+    controller._on_control_success(
+        cancel_key,
+        {
+            "state": "login_required",
+            "login_state": "cancelled",
+            "login_result": "cancelled",
+            "login_revision": 1,
+            "revision": 3,
+        },
+    )
 
     controller.start_chatgpt_login()
     _, _, _, stale_key = window._client.posts[-1]
     controller.on_connection_changed(False)
+    controller.on_connection_changed(True)
+    controller.start_chatgpt_login()
     controller._on_control_success(
         stale_key,
         {
@@ -226,9 +259,19 @@ def test_account_auth_completion_refreshes_status_and_usage_without_opening_brow
     _, _, _, start_key = window._client.posts[-1]
     window._client.composer_json_succeeded.emit(
         start_key,
-        {"login_id": "PRIVATE-LOGIN-ID", "flow_type": "chatgpt", "login_state": "completed"},
+        {
+            "login_id": "PRIVATE-LOGIN-ID",
+            "flow_type": "chatgpt",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "checking",
+            "login_state": "checking",
+            "login_result": "none",
+            "auth_warning": "none",
+        },
     )
     assert not opened
+    controller._poll_status()
     status_path, status_key = window._client.gets[-1]
     assert status_path == "/ui-api/account/auth"
     window._client.json_succeeded.emit(
@@ -237,11 +280,185 @@ def test_account_auth_completion_refreshes_status_and_usage_without_opening_brow
             "state": "signed_in",
             "account_type": "chatgpt",
             "plan_type": "plus",
-            "login_state": "idle",
+            "login_state": "succeeded",
+            "login_result": "succeeded",
+            "login_revision": 1,
+            "revision": 3,
         },
     )
     assert window.usage_refreshes == 1
     assert "sign-in was confirmed" in controller._dialogs[-1].text().lower()
+    controller.close()
+    window.deleteLater()
+
+
+def test_cancelled_attempt_with_existing_signed_in_account_is_not_success() -> None:
+    _application()
+    window = FakeWindow()
+    controller = AccountAuthController(window, browser_opener=lambda _url: True)
+    controller.on_connection_changed(True)
+    controller.start_chatgpt_login()
+    assert not window.account_auth_login_button.isEnabled()
+    _, _, _, start_key = window._client.posts[-1]
+    controller._on_control_success(
+        start_key,
+        {
+            "login_id": "PRIVATE-LOGIN-ID",
+            "flow_type": "chatgpt",
+            "login_revision": 1,
+            "revision": 3,
+            "state": "signed_in",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
+            "auth_url": "https://auth.openai.com/oauth/authorize?state=temporary",
+        },
+    )
+    controller.cancel_login()
+    _path, _payload, _token, cancel_key = window._client.posts[-1]
+    controller._on_control_success(
+        cancel_key,
+        {
+            "state": "signed_in",
+            "login_state": "cancelled",
+            "login_result": "cancelled",
+            "login_revision": 1,
+            "revision": 5,
+            "auth_warning": "none",
+        },
+    )
+
+    assert window.usage_refreshes == 0
+    assert "canceled" in controller._dialogs[-1].text().lower()
+    assert not controller._login_pending
+    assert window.account_auth_login_button.isEnabled()
+    assert window.account_auth_device_button.isEnabled()
+    controller.close()
+    window.deleteLater()
+
+
+def test_status_started_before_new_login_cannot_complete_that_attempt() -> None:
+    _application()
+    window = FakeWindow()
+    controller = AccountAuthController(window, browser_opener=lambda _url: True)
+    controller.on_connection_changed(True)
+    controller._request_status()
+    _path, stale_status_key = window._client.gets[-1]
+
+    controller.start_chatgpt_login()
+    assert not window.account_auth_login_button.isEnabled()
+    window._client.json_succeeded.emit(
+        stale_status_key,
+        {
+            "state": "signed_in",
+            "login_state": "succeeded",
+            "login_result": "succeeded",
+            "login_revision": 1,
+            "revision": 99,
+        },
+    )
+    assert controller._login_pending
+    assert window.usage_refreshes == 0
+
+    _path, _payload, _token, start_key = window._client.posts[-1]
+    controller._on_control_success(
+        start_key,
+        {
+            "login_id": "PRIVATE-LOGIN-ID",
+            "flow_type": "chatgpt",
+            "login_revision": 2,
+            "revision": 100,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
+            "auth_url": "https://auth.openai.com/oauth/authorize?state=current",
+        },
+    )
+    assert controller._login_pending
+    assert window.usage_refreshes == 0
+    assert not window.account_auth_login_button.isEnabled()
+    controller.close()
+    window.deleteLater()
+
+
+def test_cancel_failure_keeps_attempt_unresolved_and_allows_recancel() -> None:
+    _application()
+    window = FakeWindow()
+    controller = AccountAuthController(window, browser_opener=lambda _url: True)
+    controller.on_connection_changed(True)
+    controller.start_chatgpt_login()
+    _path, _payload, _token, start_key = window._client.posts[-1]
+    controller._on_control_success(
+        start_key,
+        {
+            "login_id": "PRIVATE-LOGIN-ID",
+            "flow_type": "chatgpt",
+            "login_revision": 7,
+            "revision": 10,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
+            "auth_url": "https://auth.openai.com/oauth/authorize?state=temporary",
+        },
+    )
+    controller._on_login_timeout()
+    assert "start again" not in controller._dialogs[-1].text().lower()
+    first_cancel_path, first_cancel_payload, _, first_cancel_key = window._client.posts[-1]
+    assert first_cancel_path == "/ui-api/control/account/auth/login/cancel"
+    assert first_cancel_payload == {"login_id": "PRIVATE-LOGIN-ID", "login_revision": 7}
+
+    controller._on_control_failure(first_cancel_key, "request failed")
+    assert controller._login_pending
+    assert controller._login_id == "PRIVATE-LOGIN-ID"
+    assert window.account_auth_cancel_button.isEnabled()
+    assert not window.account_auth_login_button.isEnabled()
+
+    controller.cancel_login()
+    second_cancel_path, second_cancel_payload, _, second_cancel_key = window._client.posts[-1]
+    assert second_cancel_path == first_cancel_path
+    assert second_cancel_payload == first_cancel_payload
+    controller._on_control_success(
+        second_cancel_key,
+        {
+            "state": "signed_in",
+            "login_state": "failed",
+            "login_result": "failed",
+            "login_revision": 7,
+            "revision": 14,
+            "issue": "login_not_found",
+            "auth_warning": "none",
+        },
+    )
+    assert window.usage_refreshes == 0
+    assert not controller._login_pending
+    assert window.account_auth_login_button.isEnabled()
+    controller.close()
+    window.deleteLater()
+
+
+def test_account_auth_warning_is_visible_without_claiming_expiry() -> None:
+    _application()
+    window = FakeWindow()
+    controller = AccountAuthController(window)
+    controller.on_connection_changed(True)
+    controller._apply_status(
+        {
+            "state": "signed_in",
+            "account_type": "chatgpt",
+            "plan_type": "plus",
+            "login_state": "idle",
+            "login_result": "none",
+            "auth_warning": "execution_auth_error",
+            "revision": 8,
+            "login_revision": 0,
+        }
+    )
+    label = window.account_auth_status_label.text().lower()
+    assert "account recognized" in label
+    assert "authentication error" in label
+    assert window.usage_refreshes == 0
     controller.close()
     window.deleteLater()
 
@@ -264,17 +481,29 @@ def test_cancel_completion_race_keeps_polling_until_status_is_confirmed() -> Non
         {
             "login_id": "PRIVATE-LOGIN-ID",
             "flow_type": "chatgpt",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
             "auth_url": "https://auth.openai.com/oauth/authorize?state=temporary",
         },
     )
     controller.cancel_login()
     cancel_path, cancel_payload, _token, cancel_key = window._client.posts[-1]
     assert cancel_path == "/ui-api/control/account/auth/login/cancel"
-    assert cancel_payload == {"login_id": "PRIVATE-LOGIN-ID"}
+    assert cancel_payload == {"login_id": "PRIVATE-LOGIN-ID", "login_revision": 1}
 
     controller._on_control_success(
         cancel_key,
-        {"state": "login_required", "login_state": "checking"},
+        {
+            "state": "login_required",
+            "login_state": "checking",
+            "login_result": "none",
+            "login_revision": 1,
+            "revision": 3,
+        },
     )
     assert controller._login_pending
     assert controller._login_id is None
@@ -290,7 +519,11 @@ def test_cancel_completion_race_keeps_polling_until_status_is_confirmed() -> Non
             "state": "signed_in",
             "account_type": "chatgpt",
             "plan_type": "plus",
-            "login_state": "idle",
+            "login_state": "succeeded",
+            "login_result": "succeeded",
+            "login_revision": 1,
+            "revision": 4,
+            "auth_warning": "none",
         },
     )
     assert not controller._login_pending
@@ -304,6 +537,7 @@ def test_account_auth_timeout_sends_only_correlated_cancel() -> None:
     _application()
     window = FakeWindow()
     controller = AccountAuthController(window, browser_opener=lambda _url: True)
+    controller.on_connection_changed(True)
     controller.start_chatgpt_login()
     _, _, _, start_key = window._client.posts[-1]
     controller._on_control_success(
@@ -311,13 +545,19 @@ def test_account_auth_timeout_sends_only_correlated_cancel() -> None:
         {
             "login_id": "PRIVATE-LOGIN-ID",
             "flow_type": "chatgpt",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
             "auth_url": "https://auth.openai.com/oauth/authorize?state=temporary",
         },
     )
     controller._on_login_timeout()
     path, payload, token, _key = window._client.posts[-1]
     assert path == "/ui-api/control/account/auth/login/cancel"
-    assert payload == {"login_id": "PRIVATE-LOGIN-ID"}
+    assert payload == {"login_id": "PRIVATE-LOGIN-ID", "login_revision": 1}
     assert token == "control-secret"
     assert "PRIVATE-LOGIN-ID" not in controller._dialogs[-1].text()
     controller.close()

@@ -48,12 +48,27 @@ _UNKNOWN_STATUS: dict[str, object] = {
     "auth_mode": None,
     "plan_type": None,
     "login_state": "idle",
+    "login_result": "none",
+    "login_revision": 0,
+    "auth_warning": "none",
+    "revision": 0,
     "issue": None,
 }
 _PUBLIC_STATES = frozenset({"unknown", "checking", "signed_in", "login_required", "not_required"})
 _LOGIN_STATES = frozenset(
-    {"idle", "starting", "waiting", "cancelling", "cancelled", "checking", "failed"}
+    {
+        "idle",
+        "starting",
+        "waiting",
+        "cancelling",
+        "cancelled",
+        "checking",
+        "succeeded",
+        "failed",
+    }
 )
+_LOGIN_RESULTS = frozenset({"none", "succeeded", "failed", "cancelled"})
+_AUTH_WARNINGS = frozenset({"none", "execution_auth_error"})
 _LOGIN_ISSUES = frozenset(
     {
         "login_start_failed",
@@ -62,8 +77,8 @@ _LOGIN_ISSUES = frozenset(
         "login_not_found",
         "unsupported_cancel_response",
         "cancel_failed",
+        "cancel_unknown",
         "not_confirmed",
-        "execution_auth_error",
     }
 )
 
@@ -138,6 +153,16 @@ def project_account_auth_status(payload: object) -> dict[str, object]:
     login_state = payload.get("login_state")
     if isinstance(login_state, str) and login_state in _LOGIN_STATES:
         defaults["login_state"] = login_state
+    login_result = payload.get("login_result")
+    if isinstance(login_result, str) and login_result in _LOGIN_RESULTS:
+        defaults["login_result"] = login_result
+    auth_warning = payload.get("auth_warning")
+    if isinstance(auth_warning, str) and auth_warning in _AUTH_WARNINGS:
+        defaults["auth_warning"] = auth_warning
+    for revision_name in ("revision", "login_revision"):
+        revision = payload.get(revision_name)
+        if type(revision) is int and 0 <= revision <= 2**53 - 1:
+            defaults[revision_name] = revision
     issue = payload.get("issue")
     if isinstance(issue, str) and issue in _LOGIN_ISSUES:
         defaults["issue"] = issue
@@ -197,160 +222,221 @@ class AccountAuthService:
         self._request = request
         self._status = dict(_UNKNOWN_STATUS)
         self._generation = 0
-        self._read_task: asyncio.Task[dict[str, object]] | None = None
-        self._active_login: dict[str, str | bool] | None = None
-        self._login_starting = False
-        self._early_completions: dict[str, bool] = {}
+        self._read_epoch = 0
+        self._read_tasks: dict[tuple[int, int], asyncio.Task[dict[str, object]]] = {}
+        self._refresh_dispatch_id = 0
+        self._scheduled_refresh_owner: tuple[int, int] | None = None
+        self._state_revision = 0
+        self._login_revision = 0
+        self._start_owner: tuple[int, int] | None = None
+        self._active_login: dict[str, object] | None = None
+        self._early_completions: dict[tuple[int, int], dict[str, bool]] = {}
         self._finished_login_ids: list[str] = []
+        self._auth_recovery_login_revision: int | None = None
 
     def status(self) -> dict[str, object]:
         return dict(self._status)
 
+    def _touch(self) -> None:
+        self._state_revision += 1
+        self._status["revision"] = self._state_revision
+
     async def refresh(self) -> dict[str, object]:
-        task = self._read_task
-        if task is not None and not task.done():
-            return dict(await asyncio.shield(task))
         generation = self._generation
-        self._status["state"] = "checking"
-        task = asyncio.create_task(self._read_account(generation))
-        self._read_task = task
+        epoch = self._read_epoch
+        key = (generation, epoch)
+        task = self._read_tasks.get(key)
+        if task is None or task.done():
+            self._status["state"] = "checking"
+            self._touch()
+            task = asyncio.create_task(self._read_account(generation, epoch))
+            self._read_tasks[key] = task
         try:
             return dict(await asyncio.shield(task))
         finally:
-            if self._read_task is task and task.done():
-                self._read_task = None
+            if self._read_tasks.get(key) is task and task.done():
+                self._read_tasks.pop(key, None)
 
-    async def _read_account(self, generation: int) -> dict[str, object]:
+    async def _read_account(self, generation: int, epoch: int) -> dict[str, object]:
         try:
             payload = await self._request("account/read", {})
             projected = project_account_read(payload)
+            read_succeeded = True
         except Exception:
-            projected = dict(_UNKNOWN_STATUS)
-        if generation != self._generation:
+            projected = {"state": "unknown"}
+            read_succeeded = False
+        if generation != self._generation or epoch != self._read_epoch:
             return self.status()
-        login_state = self._status.get("login_state", "idle")
-        issue = self._status.get("issue")
-        if login_state == "checking":
-            if projected.get("state") == "signed_in":
-                login_state, issue = "idle", None
+        for field in ("state", "account_type", "auth_mode", "plan_type"):
+            self._status[field] = projected.get(field)
+        if self._auth_recovery_login_revision == self._login_revision:
+            if read_succeeded and projected.get("state") == "signed_in":
+                self._status["login_state"] = "succeeded"
+                self._status["login_result"] = "succeeded"
+                self._status["issue"] = None
+                self._status["auth_warning"] = "none"
             else:
-                login_state, issue = "failed", "not_confirmed"
-        elif (
-            projected.get("state") == "signed_in"
-            and login_state == "failed"
-            and issue in {"not_confirmed", "execution_auth_error"}
-        ):
-            login_state, issue = "idle", None
-        projected["login_state"] = login_state
-        projected["issue"] = issue
-        self._status = projected
+                self._status["login_state"] = "failed"
+                self._status["login_result"] = "failed"
+                self._status["issue"] = "not_confirmed"
+            self._auth_recovery_login_revision = None
+        self._touch()
         return self.status()
 
-    async def start_login(self, flow_type: str) -> dict[str, str]:
+    async def start_login(self, flow_type: str) -> dict[str, object]:
         if flow_type not in {"chatgpt", "chatgptDeviceCode"}:
             raise AccountAuthError("unsupported_login_flow")
-        if self._active_login is not None or self._login_starting:
+        if self._active_login is not None or self._start_owner is not None:
             raise AccountAuthError("login_in_progress")
         generation = self._generation
-        self._login_starting = True
+        self._login_revision += 1
+        login_revision = self._login_revision
+        owner = (generation, login_revision)
+        self._start_owner = owner
+        self._early_completions.pop(owner, None)
+        self._auth_recovery_login_revision = None
         self._status["login_state"] = "starting"
+        self._status["login_result"] = "none"
+        self._status["login_revision"] = login_revision
         self._status["issue"] = None
+        self._touch()
         try:
             response = await self._request("account/login/start", {"type": flow_type})
         except Exception:
-            if generation != self._generation:
-                self._login_starting = False
+            if self._start_owner != owner:
                 raise AccountAuthError("connection_lost") from None
+            self._start_owner = None
+            self._early_completions.pop(owner, None)
             self._login_failed("login_start_failed")
             raise AccountAuthError("login_start_failed") from None
-        if generation != self._generation:
-            self._login_starting = False
-            raise AccountAuthError("connection_lost")
+        if self._start_owner != owner:
+            raise AccountAuthError("connection_lost") from None
+        self._start_owner = None
         if not isinstance(response, Mapping):
+            self._early_completions.pop(owner, None)
             self._login_failed("unsupported_login_response")
             raise AccountAuthError("unsupported_login_response")
         login_id = response.get("loginId")
         response_type = response.get("type")
-        if (
-            not isinstance(login_id, str)
-            or not login_id.strip()
-            or len(login_id) > 256
-            or response_type != flow_type
-        ):
+        if not isinstance(login_id, str) or not login_id.strip() or len(login_id) > 256:
+            self._early_completions.pop(owner, None)
             self._login_failed("unsupported_login_response")
             raise AccountAuthError("unsupported_login_response")
         if login_id in self._finished_login_ids:
             self._finished_login_ids.remove(login_id)
-        result: dict[str, str] = {"loginId": login_id, "type": flow_type}
         self._active_login = {
             "login_id": login_id,
             "flow_type": flow_type,
+            "login_revision": login_revision,
+            "generation": generation,
             "cancel_requested": False,
         }
-        completed = self._early_completions.pop(login_id, None)
+        early = self._early_completions.pop(owner, {})
+        completed = early.get(login_id) if response_type == flow_type else None
+        if response_type != flow_type:
+            result = self._start_result(login_id, flow_type, login_revision)
+            result["start_issue"] = "unsupported_login_response"
+            self._set_login_waiting("unsupported_login_response")
+            await self._cancel_invalid_login(login_id, login_revision)
+            result.update(self.status())
+            return result
         if completed is not None:
-            self._login_starting = False
-            await self._complete_login(login_id, completed)
-            result["login_state"] = "completed" if completed else "failed"
+            await self._complete_login(login_id, login_revision, completed)
+            result = self._start_result(login_id, flow_type, login_revision)
+            result.update(self.status())
             return result
         url_field = "authUrl" if flow_type == "chatgpt" else "verificationUrl"
         url = response.get(url_field)
-        if not isinstance(url, str) or not validate_auth_url(url, flow_type):
-            self._active_login = None
-            await self._cancel_invalid_login(login_id)
-            self._remember_finished_login(login_id)
-            self._login_failed("unsupported_login_response")
-            raise AccountAuthError("unsupported_login_response")
+        invalid = not isinstance(url, str) or not validate_auth_url(url, flow_type)
+        result = self._start_result(login_id, flow_type, login_revision)
+        if invalid:
+            result["start_issue"] = "unsupported_login_response"
+            self._set_login_waiting("unsupported_login_response")
+            await self._cancel_invalid_login(login_id, login_revision)
+            result.update(self.status())
+            return result
         result[url_field] = url
         if flow_type == "chatgptDeviceCode":
             code = response.get("userCode")
             if not isinstance(code, str) or not code.strip() or len(code) > 128:
-                self._active_login = None
-                await self._cancel_invalid_login(login_id)
-                self._remember_finished_login(login_id)
-                self._login_failed("unsupported_login_response")
-                raise AccountAuthError("unsupported_login_response")
+                result.pop(url_field, None)
+                result["start_issue"] = "unsupported_login_response"
+                self._set_login_waiting("unsupported_login_response")
+                await self._cancel_invalid_login(login_id, login_revision)
+                result.update(self.status())
+                return result
             result["userCode"] = code
-        self._login_starting = False
-        self._status["login_state"] = "waiting"
-        self._status["issue"] = None
+        self._set_login_waiting(None)
+        result.update(self.status())
         return result
 
-    async def _cancel_invalid_login(self, login_id: str) -> None:
+    def _start_result(
+        self, login_id: str, flow_type: str, login_revision: int
+    ) -> dict[str, object]:
+        return {
+            "loginId": login_id,
+            "type": flow_type,
+            "login_revision": login_revision,
+        }
+
+    def _set_login_waiting(self, issue: str | None) -> None:
+        self._status["login_state"] = "waiting"
+        self._status["login_result"] = "none"
+        self._status["issue"] = issue
+        self._touch()
+
+    async def _cancel_invalid_login(self, login_id: str, login_revision: int) -> None:
         try:
-            await self._request("account/login/cancel", {"loginId": login_id})
-        except Exception:
+            await self.cancel_login(login_id, login_revision)
+        except AccountAuthError:
             return
 
-    async def cancel_login(self, login_id: str) -> dict[str, object]:
+    async def cancel_login(self, login_id: str | None, login_revision: int) -> dict[str, object]:
         active = self._active_login
-        if active is None or login_id != active.get("login_id"):
+        if (
+            active is None
+            or type(login_revision) is not int
+            or login_revision != active.get("login_revision")
+            or (login_id is not None and login_id != active.get("login_id"))
+        ):
             raise AccountAuthError("login_not_active")
         active["cancel_requested"] = True
         self._status["login_state"] = "cancelling"
+        self._status["issue"] = None
+        self._touch()
         try:
-            response = await self._request("account/login/cancel", {"loginId": login_id})
+            response = await self._request("account/login/cancel", {"loginId": active["login_id"]})
         except Exception:
             if self._active_login is active:
                 active["cancel_requested"] = False
                 self._status["login_state"] = "waiting"
                 self._status["issue"] = "cancel_failed"
+                self._touch()
                 raise AccountAuthError("cancel_failed") from None
             return self.status()
         if self._active_login is not active:
             return self.status()
         result = response.get("status") if isinstance(response, Mapping) else None
-        self._active_login = None
-        self._remember_finished_login(login_id)
-        if result == "Canceled":
+        if result == "canceled":
+            self._active_login = None
+            self._remember_finished_login(str(active["login_id"]))
             self._status["login_state"] = "cancelled"
+            self._status["login_result"] = "cancelled"
             self._status["issue"] = None
-        elif result == "NotFound":
+        elif result == "notFound":
+            self._active_login = None
+            self._remember_finished_login(str(active["login_id"]))
             self._status["login_state"] = "failed"
+            self._status["login_result"] = "failed"
             self._status["issue"] = "login_not_found"
         else:
-            self._status["login_state"] = "failed"
-            self._status["issue"] = "unsupported_cancel_response"
+            active["cancel_requested"] = False
+            self._status["login_state"] = "waiting"
+            self._status["issue"] = "cancel_unknown"
+            self._touch()
+            raise AccountAuthError("unsupported_cancel_response")
+        self._touch()
+        self._invalidate_and_schedule_read()
         return self.status()
 
     def on_notification(self, message: Mapping[str, Any]) -> None:
@@ -359,7 +445,7 @@ class AccountAuthService:
         if not isinstance(params, Mapping):
             return
         if method == "account/updated":
-            self._schedule_refresh()
+            self._invalidate_and_schedule_read()
             return
         if method != "account/login/completed":
             return
@@ -371,33 +457,52 @@ class AccountAuthService:
             return
         active = self._active_login
         if active is None:
-            self._early_completions[login_id] = success
-            if len(self._early_completions) > 8:
-                self._early_completions.pop(next(iter(self._early_completions)))
+            owner = self._start_owner
+            if owner is not None:
+                self._early_completions.setdefault(owner, {})[login_id] = success
+                early = self._early_completions[owner]
+                while len(early) > 8:
+                    early.pop(next(iter(early)))
             return
         if login_id == active.get("login_id"):
-            self._active_login = None
-            self._remember_finished_login(login_id)
-            if success:
-                self._status["login_state"] = "checking"
-                self._status["issue"] = None
-            else:
-                self._status["login_state"] = "failed"
-                self._status["issue"] = "login_failed"
-            self._schedule_refresh()
+            self._finish_login_completion(active, success)
 
-    async def _complete_login(self, login_id: str, success: bool) -> None:
-        active = self._active_login
-        if active is None or active.get("login_id") != login_id:
+    def _finish_login_completion(self, active: dict[str, object], success: bool) -> None:
+        login_id = active.get("login_id")
+        login_revision = active.get("login_revision")
+        if (
+            not isinstance(login_id, str)
+            or type(login_revision) is not int
+            or self._active_login is not active
+        ):
             return
         self._active_login = None
         self._remember_finished_login(login_id)
         if success:
             self._status["login_state"] = "checking"
+            self._status["login_result"] = "none"
             self._status["issue"] = None
+            self._auth_recovery_login_revision = login_revision
         else:
             self._status["login_state"] = "failed"
+            self._status["login_result"] = "failed"
             self._status["issue"] = "login_failed"
+            self._auth_recovery_login_revision = None
+        self._touch()
+        self._invalidate_and_schedule_read()
+
+    async def _complete_login(self, login_id: str, login_revision: int, success: bool) -> None:
+        active = self._active_login
+        if (
+            active is None
+            or active.get("login_id") != login_id
+            or active.get("login_revision") != login_revision
+        ):
+            return
+        self._finish_login_completion(active, success)
+        owner = self._scheduled_refresh_owner
+        if owner is not None and owner[0] == self._generation:
+            self._scheduled_refresh_owner = None
         await self.refresh()
 
     def _remember_finished_login(self, login_id: str) -> None:
@@ -410,27 +515,58 @@ class AccountAuthService:
     def observe_execution_error(self, error: object, *, turn_state: str | None = None) -> str:
         category = classify_execution_error(error, turn_state=turn_state)
         if category == "auth_check":
-            self._status["login_state"] = "checking"
-            self._status["issue"] = "execution_auth_error"
-            self._schedule_refresh()
+            self._status["auth_warning"] = "execution_auth_error"
+            self._auth_recovery_login_revision = None
+            self._touch()
+            self._invalidate_and_schedule_read()
         return category
 
     def disconnect(self) -> None:
         self._generation += 1
-        self._read_task = None
+        self._read_epoch += 1
+        self._read_tasks.clear()
+        self._refresh_dispatch_id += 1
+        self._scheduled_refresh_owner = None
+        auth_warning = self._status.get("auth_warning", "none")
         self._active_login = None
-        self._login_starting = False
+        self._start_owner = None
         self._early_completions.clear()
+        self._finished_login_ids.clear()
+        self._auth_recovery_login_revision = None
         self._status = dict(_UNKNOWN_STATUS)
+        self._status["auth_warning"] = auth_warning
+        self._status["login_revision"] = self._login_revision
+        self._touch()
 
-    def _schedule_refresh(self) -> None:
+    def _invalidate_and_schedule_read(self) -> None:
+        self._read_epoch += 1
+        self._status["state"] = "checking"
+        self._touch()
         try:
-            asyncio.get_running_loop().create_task(self.refresh())
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             self._status["state"] = "unknown"
+            self._touch()
+            return
+        if self._scheduled_refresh_owner is not None:
+            return
+        self._refresh_dispatch_id += 1
+        owner = (self._generation, self._refresh_dispatch_id)
+        self._scheduled_refresh_owner = owner
+        loop.call_soon(self._launch_scheduled_read, owner)
+
+    def _launch_scheduled_read(self, owner: tuple[int, int]) -> None:
+        if self._scheduled_refresh_owner != owner:
+            return
+        self._scheduled_refresh_owner = None
+        if owner[0] == self._generation:
+            asyncio.create_task(self.refresh())
 
     def _login_failed(self, issue: str) -> None:
         self._active_login = None
-        self._login_starting = False
+        self._start_owner = None
         self._status["login_state"] = "failed"
+        self._status["login_result"] = "failed"
         self._status["issue"] = issue
+        self._auth_recovery_login_revision = None
+        self._touch()

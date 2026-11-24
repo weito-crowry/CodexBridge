@@ -164,14 +164,12 @@ async def test_explicit_auth_error_refreshes_account_without_exposing_raw_error(
             "PRIVATE-URL",
         )
     )
-    assert await bridge.refresh_account_auth() == {
-        "state": "login_required",
-        "account_type": None,
-        "auth_mode": None,
-        "plan_type": None,
-        "login_state": "failed",
-        "issue": "not_confirmed",
-    }
+    auth_status = await bridge.refresh_account_auth()
+    assert auth_status["state"] == "login_required"
+    assert auth_status["login_state"] == "idle"
+    assert auth_status["login_result"] == "none"
+    assert auth_status["auth_warning"] == "execution_auth_error"
+    assert auth_status["issue"] is None
     assert app.calls.count(("account/read", {})) >= 1
 
 

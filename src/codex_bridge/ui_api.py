@@ -89,9 +89,11 @@ class UiBridge(Protocol):
 
     async def refresh_account_auth(self) -> dict[str, object]: ...
 
-    async def start_account_login(self, flow_type: str) -> dict[str, str]: ...
+    async def start_account_login(self, flow_type: str) -> dict[str, object]: ...
 
-    async def cancel_account_login(self, login_id: str) -> dict[str, object]: ...
+    async def cancel_account_login(
+        self, login_id: str | None, revision: int
+    ) -> dict[str, object]: ...
 
 
 ShutdownCallback = Callable[[], Awaitable[None] | None]
@@ -454,27 +456,50 @@ def create_ui_app(
             login = await bridge.start_account_login(flow_type)
             login_id = login.get("loginId")
             response_type = login.get("type")
+            login_revision = login.get("login_revision")
             if (
                 not isinstance(login_id, str)
                 or not login_id.strip()
                 or len(login_id) > 256
                 or response_type != flow_type
+                or type(login_revision) is not int
+                or login_revision <= 0
+                or login_revision > 2**53 - 1
             ):
                 return _auth_response({"error": "unsupported_login_response"}, status_code=502)
-            private_result: dict[str, str] = {"login_id": login_id, "flow_type": flow_type}
-            login_state = login.get("login_state")
-            if login_state in {"completed", "failed"}:
-                private_result["login_state"] = login_state
+            private_result: dict[str, object] = {
+                "login_id": login_id,
+                "flow_type": flow_type,
+                **project_account_auth_status(login),
+            }
+            start_issue = login.get("start_issue")
+            if start_issue == "unsupported_login_response":
+                private_result["start_issue"] = start_issue
+                return _auth_response(private_result)
+            if private_result["login_result"] in {"succeeded", "failed", "cancelled"}:
                 return _auth_response(private_result)
             url_field = "authUrl" if flow_type == "chatgpt" else "verificationUrl"
             url = login.get(url_field)
             if not isinstance(url, str) or not validate_auth_url(url, flow_type):
-                return _auth_response({"error": "unsupported_login_response"}, status_code=502)
+                try:
+                    status = await bridge.cancel_account_login(login_id, login_revision)
+                except Exception:
+                    status = bridge.account_auth_status()
+                private_result.update(project_account_auth_status(status))
+                private_result["start_issue"] = "unsupported_login_response"
+                return _auth_response(private_result)
             private_result["auth_url" if flow_type == "chatgpt" else "verification_url"] = url
             if flow_type == "chatgptDeviceCode":
                 user_code = login.get("userCode")
                 if not isinstance(user_code, str) or not user_code.strip() or len(user_code) > 128:
-                    return _auth_response({"error": "unsupported_login_response"}, status_code=502)
+                    try:
+                        status = await bridge.cancel_account_login(login_id, login_revision)
+                    except Exception:
+                        status = bridge.account_auth_status()
+                    private_result.update(project_account_auth_status(status))
+                    private_result.pop("verification_url", None)
+                    private_result["start_issue"] = "unsupported_login_response"
+                    return _auth_response(private_result)
                 private_result["user_code"] = user_code
             return _auth_response(private_result)
         except ValueError:
@@ -489,11 +514,27 @@ def create_ui_app(
         if not local_auth_control(request):
             return _auth_response({"error": "forbidden"}, status_code=403)
         try:
-            payload = await _account_auth_json(request, {"login_id"})
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise ValueError("invalid account authentication request")
+            raw = await request.body()
+            if not raw or len(raw) > 4_096:
+                raise ValueError("invalid account authentication request")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) not in (
+                {"login_revision"},
+                {"login_id", "login_revision"},
+            ):
+                raise ValueError("invalid account authentication request")
             login_id = payload.get("login_id")
-            if not isinstance(login_id, str) or not login_id.strip() or len(login_id) > 256:
+            login_revision = payload.get("login_revision")
+            if login_id is not None and (
+                not isinstance(login_id, str) or not login_id.strip() or len(login_id) > 256
+            ):
                 return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)
-            status = await bridge.cancel_account_login(login_id)
+            if type(login_revision) is not int or not 1 <= login_revision <= 2**53 - 1:
+                return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)
+            status = await bridge.cancel_account_login(login_id, login_revision)
             return _auth_response(project_account_auth_status(status))
         except ValueError:
             return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)

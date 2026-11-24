@@ -123,6 +123,10 @@ class FakeBridge:
             "auth_mode": "chatgpt",
             "plan_type": "plus",
             "login_state": "idle",
+            "login_result": "none",
+            "login_revision": 0,
+            "auth_warning": "none",
+            "revision": 1,
             "issue": None,
             "email": "private@example.test",
             "user_id": "private-user-id",
@@ -132,19 +136,35 @@ class FakeBridge:
         self.calls.append(("refresh_account_auth", (), {}))
         return self.account_auth_status()
 
-    async def start_account_login(self, flow_type: str) -> dict[str, str]:
+    async def start_account_login(self, flow_type: str) -> dict[str, object]:
         self.calls.append(("start_account_login", (flow_type,), {}))
         return {
             "type": flow_type,
             "loginId": "private-login-id",
+            "login_revision": 1,
+            "revision": 2,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
+            "issue": None,
             "authUrl": "https://auth.openai.com/oauth/authorize?state=private-url",
             "verificationUrl": "https://auth.openai.com/codex/device",
             "userCode": "PRIVATE-CODE",
         }
 
-    async def cancel_account_login(self, login_id: str) -> dict[str, object]:
-        self.calls.append(("cancel_account_login", (login_id,), {}))
-        return {**self.account_auth_status(), "loginId": "private-login-id"}
+    async def cancel_account_login(
+        self, login_id: str | None, login_revision: int
+    ) -> dict[str, object]:
+        self.calls.append(("cancel_account_login", (login_id, login_revision), {}))
+        return {
+            **self.account_auth_status(),
+            "login_state": "cancelled",
+            "login_result": "cancelled",
+            "login_revision": login_revision,
+            "revision": 3,
+            "loginId": "private-login-id",
+        }
 
     async def approve(self, request_id: int | str, decision: str) -> dict[str, Any]:
         self.calls.append(("approve", (request_id, decision), {}))
@@ -385,6 +405,10 @@ async def test_account_auth_status_projects_only_non_secret_enums(tmp_path) -> N
         "auth_mode": "chatgpt",
         "plan_type": "plus",
         "login_state": "idle",
+        "login_result": "none",
+        "login_revision": 0,
+        "auth_warning": "none",
+        "revision": 1,
         "issue": None,
     }
     assert "private" not in response.body.decode("utf-8")
@@ -475,6 +499,16 @@ async def test_account_auth_login_start_keeps_secret_response_local_and_uncached
     assert await _json_response(response) == {
         "login_id": "private-login-id",
         "flow_type": "chatgpt",
+        "state": "login_required",
+        "account_type": None,
+        "auth_mode": None,
+        "plan_type": None,
+        "login_state": "waiting",
+        "login_result": "none",
+        "login_revision": 1,
+        "auth_warning": "none",
+        "revision": 2,
+        "issue": None,
         "auth_url": "https://auth.openai.com/oauth/authorize?state=private-url",
     }
     assert bridge.calls == [("start_account_login", ("chatgpt",), {})]
@@ -503,20 +537,79 @@ async def test_device_code_start_returns_only_private_local_flow_fields(tmp_path
     assert await _json_response(response) == {
         "login_id": "private-login-id",
         "flow_type": "chatgptDeviceCode",
+        "state": "login_required",
+        "account_type": None,
+        "auth_mode": None,
+        "plan_type": None,
+        "login_state": "waiting",
+        "login_result": "none",
+        "login_revision": 1,
+        "auth_warning": "none",
+        "revision": 2,
+        "issue": None,
         "verification_url": "https://auth.openai.com/codex/device",
         "user_code": "PRIVATE-CODE",
     }
 
 
 @pytest.mark.asyncio
+async def test_invalid_login_start_url_is_canceled_without_returning_url_or_code(tmp_path) -> None:
+    bridge = FakeBridge()
+
+    async def unsafe_login(_flow_type: str) -> dict[str, object]:
+        return {
+            "type": "chatgptDeviceCode",
+            "loginId": "private-login-id",
+            "login_revision": 4,
+            "state": "login_required",
+            "login_state": "waiting",
+            "login_result": "none",
+            "auth_warning": "none",
+            "revision": 10,
+            "verificationUrl": "https://auth.openai.com@evil.example/codex/device",
+            "userCode": "PRIVATE-CODE",
+        }
+
+    bridge.start_account_login = unsafe_login  # type: ignore[method-assign]
+    app = create_ui_app(
+        bridge, ActivityStore(), replace(config(tmp_path), control_token="control-secret")
+    )
+    response = await _route(app, "/ui-api/control/account/auth/login/start").endpoint(
+        _request(
+            "/ui-api/control/account/auth/login/start",
+            method="POST",
+            authorization="Bearer control-secret",
+            body=b'{"flow_type":"chatgptDeviceCode"}',
+        )
+    )
+
+    body = await _json_response(response)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert body["start_issue"] == "unsupported_login_response"
+    assert body["login_id"] == "private-login-id"
+    assert body["login_revision"] == 4
+    assert "verification_url" not in body
+    assert "user_code" not in body
+    assert "evil.example" not in response.body.decode("utf-8")
+    assert "PRIVATE-CODE" not in response.body.decode("utf-8")
+    assert bridge.calls == [("cancel_account_login", ("private-login-id", 4), {})]
+
+
+@pytest.mark.asyncio
 async def test_completed_before_login_start_response_does_not_return_auth_url(tmp_path) -> None:
     bridge = FakeBridge()
 
-    async def completed_login(_flow_type: str) -> dict[str, str]:
+    async def completed_login(_flow_type: str) -> dict[str, object]:
         return {
             "type": "chatgpt",
             "loginId": "private-login-id",
-            "login_state": "completed",
+            "login_revision": 1,
+            "state": "signed_in",
+            "login_state": "succeeded",
+            "login_result": "succeeded",
+            "auth_warning": "none",
+            "revision": 4,
         }
 
     bridge.start_account_login = completed_login  # type: ignore[method-assign]
@@ -538,7 +631,16 @@ async def test_completed_before_login_start_response_does_not_return_auth_url(tm
     assert await _json_response(response) == {
         "login_id": "private-login-id",
         "flow_type": "chatgpt",
-        "login_state": "completed",
+        "state": "signed_in",
+        "account_type": None,
+        "auth_mode": None,
+        "plan_type": None,
+        "login_state": "succeeded",
+        "login_result": "succeeded",
+        "login_revision": 1,
+        "auth_warning": "none",
+        "revision": 4,
+        "issue": None,
     }
 
 
@@ -556,7 +658,7 @@ async def test_account_auth_login_cancel_uses_private_control_and_sanitizes_resu
             "/ui-api/control/account/auth/login/cancel",
             method="POST",
             authorization="Bearer control-secret",
-            body=b'{"login_id":"private-login-id"}',
+            body=b'{"login_id":"private-login-id","login_revision":1}',
         )
     )
 
@@ -566,11 +668,35 @@ async def test_account_auth_login_cancel_uses_private_control_and_sanitizes_resu
         "account_type": "chatgpt",
         "auth_mode": "chatgpt",
         "plan_type": "plus",
-        "login_state": "idle",
+        "login_state": "cancelled",
+        "login_result": "cancelled",
+        "login_revision": 1,
+        "auth_warning": "none",
+        "revision": 3,
         "issue": None,
     }
     assert "private-login-id" not in response.body.decode("utf-8")
-    assert bridge.calls == [("cancel_account_login", ("private-login-id",), {})]
+    assert bridge.calls == [("cancel_account_login", ("private-login-id", 1), {})]
+
+
+@pytest.mark.asyncio
+async def test_cancel_control_can_use_nonsecret_revision_when_login_id_is_unknown(tmp_path) -> None:
+    bridge = FakeBridge()
+    app = create_ui_app(
+        bridge, ActivityStore(), replace(config(tmp_path), control_token="control-secret")
+    )
+    response = await _route(app, "/ui-api/control/account/auth/login/cancel").endpoint(
+        _request(
+            "/ui-api/control/account/auth/login/cancel",
+            method="POST",
+            authorization="Bearer control-secret",
+            body=b'{"login_revision":1}',
+        )
+    )
+
+    assert response.status_code == 200
+    assert "private-login-id" not in response.body.decode("utf-8")
+    assert bridge.calls == [("cancel_account_login", (None, 1), {})]
 
 
 @pytest.mark.asyncio

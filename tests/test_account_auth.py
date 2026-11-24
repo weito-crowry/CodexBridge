@@ -166,6 +166,257 @@ async def test_service_reads_account_without_refresh_and_coalesces_reads() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fresh_read_first", [False, True])
+async def test_login_completion_invalidates_inflight_read_in_either_response_order(
+    fresh_read_first: bool,
+) -> None:
+    read_started = [asyncio.Event(), asyncio.Event()]
+    read_release = [asyncio.Event(), asyncio.Event()]
+    read_responses = [
+        {"account": None, "requiresOpenaiAuth": True},
+        {
+            "account": {"type": "chatgpt", "planType": "plus"},
+            "requiresOpenaiAuth": True,
+        },
+    ]
+    read_index = 0
+
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal read_index
+        if method == "account/login/start":
+            return {
+                "type": "chatgpt",
+                "loginId": "fresh-login",
+                "authUrl": "https://auth.openai.com/oauth/authorize?state=fresh",
+            }
+        if method == "account/read":
+            index = read_index
+            read_index += 1
+            read_started[index].set()
+            await read_release[index].wait()
+            return read_responses[index]
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    await service.start_login("chatgpt")
+    old_read = asyncio.create_task(service.refresh())
+    await read_started[0].wait()
+    service.on_notification(
+        {
+            "method": "account/login/completed",
+            "params": {"loginId": "fresh-login", "success": True, "error": None},
+        }
+    )
+    for _ in range(10):
+        if read_started[1].is_set():
+            break
+        await asyncio.sleep(0)
+    assert read_started[1].is_set(), "completion must start a fresh-epoch account/read"
+
+    fresh_read = asyncio.create_task(service.refresh())
+    if fresh_read_first:
+        read_release[1].set()
+        await fresh_read
+        read_release[0].set()
+        await old_read
+    else:
+        read_release[0].set()
+        await old_read
+        assert service.status()["login_result"] == "none"
+        read_release[1].set()
+        await fresh_read
+
+    status = service.status()
+    assert status["state"] == "signed_in"
+    assert status["login_state"] == "succeeded"
+    assert status["login_result"] == "succeeded"
+    assert status["auth_warning"] == "none"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["account/updated", "unauthorized"])
+async def test_auth_event_read_epoch_rejects_old_signed_in_result(event: str) -> None:
+    read_started = [asyncio.Event(), asyncio.Event()]
+    read_release = [asyncio.Event(), asyncio.Event()]
+    read_index = 0
+
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal read_index
+        if method == "account/read":
+            index = read_index
+            read_index += 1
+            read_started[index].set()
+            await read_release[index].wait()
+            if index == 0:
+                return {
+                    "account": {"type": "chatgpt", "planType": "pro"},
+                    "requiresOpenaiAuth": True,
+                }
+            return {"account": None, "requiresOpenaiAuth": True}
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    old_read = asyncio.create_task(service.refresh())
+    await read_started[0].wait()
+    if event == "account/updated":
+        service.on_notification({"method": "account/updated", "params": {}})
+    else:
+        service.observe_execution_error({"codexErrorInfo": "unauthorized"})
+    for _ in range(10):
+        if read_started[1].is_set():
+            break
+        await asyncio.sleep(0)
+    assert read_started[1].is_set(), "semantic auth events must bypass the old read"
+
+    fresh_read = asyncio.create_task(service.refresh())
+    read_release[1].set()
+    await fresh_read
+    read_release[0].set()
+    await old_read
+
+    status = service.status()
+    assert status["state"] == "login_required"
+    assert status["auth_warning"] == ("execution_auth_error" if event == "unauthorized" else "none")
+
+
+@pytest.mark.asyncio
+async def test_execution_auth_warning_survives_recognized_account_until_fresh_login() -> None:
+    reads = 0
+
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal reads
+        if method == "account/read":
+            reads += 1
+            return {
+                "account": {"type": "chatgpt", "planType": "plus"},
+                "requiresOpenaiAuth": True,
+            }
+        if method == "account/login/start":
+            return {
+                "type": "chatgpt",
+                "loginId": "recovery-login",
+                "authUrl": "https://auth.openai.com/oauth/authorize?state=recovery",
+            }
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    await service.refresh()
+    assert service.observe_execution_error({"codexErrorInfo": "unauthorized"}) == "auth_check"
+    for _ in range(10):
+        if reads == 2:
+            break
+        await asyncio.sleep(0)
+    assert service.status()["state"] == "signed_in"
+    assert service.status()["auth_warning"] == "execution_auth_error"
+    assert service.status()["login_state"] == "idle"
+
+    await service.start_login("chatgpt")
+    assert service.status()["auth_warning"] == "execution_auth_error"
+    service.on_notification(
+        {
+            "method": "account/login/completed",
+            "params": {"loginId": "recovery-login", "success": True, "error": None},
+        }
+    )
+    for _ in range(10):
+        if reads == 3 and service.status()["login_result"] == "succeeded":
+            break
+        await asyncio.sleep(0)
+    assert service.status()["login_result"] == "succeeded"
+    assert service.status()["auth_warning"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_auth_error_does_not_replace_active_login_waiting_state() -> None:
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        if method == "account/login/start":
+            return {
+                "type": "chatgpt",
+                "loginId": "active-login",
+                "authUrl": "https://auth.openai.com/oauth/authorize?state=active",
+            }
+        if method == "account/read":
+            return {
+                "account": {"type": "chatgpt", "planType": "plus"},
+                "requiresOpenaiAuth": True,
+            }
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    await service.start_login("chatgpt")
+    service.observe_execution_error({"codexErrorInfo": "unauthorized"})
+    for _ in range(10):
+        if service.status()["state"] == "signed_in":
+            break
+        await asyncio.sleep(0)
+    assert service.status()["login_state"] == "waiting"
+    assert service.status()["auth_warning"] == "execution_auth_error"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_old_start_response_cannot_clear_new_start_owner() -> None:
+    started = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    start_index = 0
+
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal start_index
+        if method == "account/login/start":
+            index = start_index
+            start_index += 1
+            started[index].set()
+            await release[index].wait()
+            return {
+                "type": "chatgpt",
+                "loginId": f"login-{index}",
+                "authUrl": f"https://auth.openai.com/oauth/authorize?state={index}",
+            }
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    old_start = asyncio.create_task(service.start_login("chatgpt"))
+    await started[0].wait()
+    service.disconnect()
+    new_start = asyncio.create_task(service.start_login("chatgpt"))
+    await started[1].wait()
+
+    release[0].set()
+    with pytest.raises(AccountAuthError, match="connection_lost"):
+        await old_start
+    with pytest.raises(AccountAuthError, match="login_in_progress"):
+        await service.start_login("chatgptDeviceCode")
+
+    release[1].set()
+    result = await new_start
+    assert result["loginId"] == "login-1"
+    assert service.status()["login_state"] == "waiting"
+    assert service.status()["login_revision"] == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_before_any_start_is_not_retained_for_future_attempt() -> None:
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        if method == "account/login/start":
+            return {
+                "type": "chatgpt",
+                "loginId": "reused-login-id",
+                "authUrl": "https://auth.openai.com/oauth/authorize?state=current",
+            }
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    service.on_notification(
+        {
+            "method": "account/login/completed",
+            "params": {"loginId": "reused-login-id", "success": True, "error": None},
+        }
+    )
+    await service.start_login("chatgpt")
+    assert service.status()["login_state"] == "waiting"
+    assert service.status()["login_result"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_service_login_completion_must_match_login_id_and_reads_account() -> None:
     calls: list[tuple[str, dict[str, object]]] = []
 
@@ -210,9 +461,11 @@ async def test_service_login_completion_must_match_login_id_and_reads_account() 
     )
     await asyncio.sleep(0)
     await asyncio.sleep(0)
+    await service.refresh()
     state = service.status()
     assert state["state"] == "signed_in"
-    assert state["login_state"] == "idle"
+    assert state["login_state"] == "succeeded"
+    assert state["login_result"] == "succeeded"
     assert "must-not-escape" not in repr(state)
     assert calls == [
         ("account/login/start", {"type": "chatgpt"}),
@@ -323,10 +576,11 @@ async def test_service_accepts_completion_that_arrives_before_login_start_respon
     start_response = await starting
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert start_response["login_state"] == "completed"
+    assert start_response["login_state"] == "succeeded"
+    assert start_response["login_result"] == "succeeded"
     assert "authUrl" not in start_response
     assert service.status()["state"] == "signed_in"
-    assert service.status()["login_state"] == "idle"
+    assert service.status()["login_state"] == "succeeded"
     assert calls == ["account/login/start", "account/read"]
 
 
@@ -346,7 +600,7 @@ async def test_service_cancel_is_correlated_and_disconnect_discards_stale_read()
                 "userCode": "ABCD-EFGH",
             }
         if method == "account/login/cancel":
-            return {"status": "Canceled"}
+            return {"status": "canceled"}
         if method == "account/read":
             read_started.set()
             await read_release.wait()
@@ -354,10 +608,11 @@ async def test_service_cancel_is_correlated_and_disconnect_discards_stale_read()
         raise AssertionError(method)
 
     service = AccountAuthService(request)
-    await service.start_login("chatgptDeviceCode")
+    started = await service.start_login("chatgptDeviceCode")
+    login_revision = int(started["login_revision"])
     with pytest.raises(AccountAuthError):
-        await service.cancel_login("wrong-id")
-    canceled = await service.cancel_login("login-2")
+        await service.cancel_login("wrong-id", login_revision)
+    canceled = await service.cancel_login("login-2", login_revision)
     assert canceled["login_state"] == "cancelled"
     refresh = asyncio.create_task(service.refresh())
     await read_started.wait()
@@ -388,7 +643,7 @@ async def test_completion_notification_wins_a_cancel_response_race() -> None:
         if method == "account/login/cancel":
             cancel_started.set()
             await cancel_release.wait()
-            return {"status": "Canceled"}
+            return {"status": "canceled"}
         if method == "account/read":
             return {
                 "account": {"type": "chatgpt", "planType": "plus"},
@@ -397,8 +652,8 @@ async def test_completion_notification_wins_a_cancel_response_race() -> None:
         raise AssertionError(method)
 
     service = AccountAuthService(request)
-    await service.start_login("chatgpt")
-    cancel = asyncio.create_task(service.cancel_login("race-1"))
+    started = await service.start_login("chatgpt")
+    cancel = asyncio.create_task(service.cancel_login("race-1", int(started["login_revision"])))
     await cancel_started.wait()
     service.on_notification(
         {
@@ -411,21 +666,32 @@ async def test_completion_notification_wins_a_cancel_response_race() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert service.status()["state"] == "signed_in"
-    assert service.status()["login_state"] == "idle"
+    assert service.status()["login_state"] == "succeeded"
 
 
 @pytest.mark.asyncio
 async def test_service_rejects_unsupported_or_unsafe_login_response() -> None:
-    async def request(_method: str, _params: dict[str, object]) -> dict[str, object]:
-        return {
-            "type": "chatgpt",
-            "loginId": "login-unsafe",
-            "authUrl": "https://auth.openai.com@attacker.invalid/oauth/authorize",
-        }
+    calls: list[str] = []
+
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        calls.append(method)
+        if method == "account/login/start":
+            return {
+                "type": "chatgpt",
+                "loginId": "login-unsafe",
+                "authUrl": "https://auth.openai.com@attacker.invalid/oauth/authorize",
+            }
+        if method == "account/login/cancel":
+            return {"status": "canceled"}
+        raise AssertionError(method)
 
     service = AccountAuthService(request)
-    with pytest.raises(AccountAuthError):
-        await service.start_login("chatgpt")
+    started = await service.start_login("chatgpt")
+    assert started["start_issue"] == "unsupported_login_response"
+    assert "authUrl" not in started
+    assert service.status()["login_state"] == "cancelled"
+    assert service.status()["login_result"] == "cancelled"
+    assert calls == ["account/login/start", "account/login/cancel"]
 
 
 @pytest.mark.asyncio

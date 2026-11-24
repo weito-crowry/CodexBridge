@@ -996,11 +996,11 @@ class Bridge:
     def disconnect_account_auth(self) -> None:
         self._account_auth.disconnect()
 
-    async def start_account_login(self, flow_type: str) -> dict[str, str]:
+    async def start_account_login(self, flow_type: str) -> dict[str, Any]:
         return await self._account_auth.start_login(flow_type)
 
-    async def cancel_account_login(self, login_id: str) -> dict[str, object]:
-        return await self._account_auth.cancel_login(login_id)
+    async def cancel_account_login(self, login_id: str | None, revision: int) -> Any:
+        return await self._account_auth.cancel_login(login_id, revision)
 
     async def _history_metadata(self, thread_id: str) -> tuple[dict[str, Any], str, str]:
         response = await self._app_server.request(
