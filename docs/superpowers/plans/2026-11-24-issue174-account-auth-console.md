@@ -39,5 +39,5 @@ The approved architecture is the existing App Server RPC -> Bridge -> narrow UI 
 - Focused auth, UI API, Bridge, Console client, and menu regression suite: 156 passed after the final race fix.
 - Ruff check/format, `mypy src`, `compileall src tests`, and `git diff --check`: passed.
 - Module-size guard: failed on 22 existing files outside this change; the new auth modules were not reported.
-- Full `uv run --no-sync pytest -q`: still running in the isolated test profile; no final exit code yet.
+- Full `uv run --no-sync pytest -q`: interrupted after about 87 minutes at approximately 25% progress in a sustained CPU-heavy case. It did not produce a complete suite result.
 - Real Windows visible Console/browser/login/turn acceptance: NOT_RUN by instruction.
