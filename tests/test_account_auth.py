@@ -354,6 +354,63 @@ async def test_auth_error_does_not_replace_active_login_waiting_state() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fresh_read_fails", [False, True])
+async def test_unauthorized_during_login_recovery_read_ends_as_failed(
+    fresh_read_fails: bool,
+) -> None:
+    read_started = [asyncio.Event(), asyncio.Event()]
+    read_release = [asyncio.Event(), asyncio.Event()]
+    read_index = 0
+
+    async def request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal read_index
+        if method == "account/login/start":
+            return {
+                "type": "chatgpt",
+                "loginId": "recovery-race-login",
+                "authUrl": "https://auth.openai.com/oauth/authorize?state=race",
+            }
+        if method == "account/read":
+            index = read_index
+            read_index += 1
+            read_started[index].set()
+            await read_release[index].wait()
+            if index == 1 and fresh_read_fails:
+                raise RuntimeError("private account read error")
+            return {
+                "account": {"type": "chatgpt", "planType": "plus"},
+                "requiresOpenaiAuth": True,
+            }
+        raise AssertionError(method)
+
+    service = AccountAuthService(request)
+    await service.start_login("chatgpt")
+    service.on_notification(
+        {
+            "method": "account/login/completed",
+            "params": {"loginId": "recovery-race-login", "success": True},
+        }
+    )
+    await read_started[0].wait()
+
+    service.observe_execution_error({"codexErrorInfo": "unauthorized"})
+    await read_started[1].wait()
+    read_release[0].set()
+    read_release[1].set()
+    for _ in range(10):
+        if service.status()["login_result"] == "failed":
+            break
+        await asyncio.sleep(0)
+
+    status = service.status()
+    assert status["login_state"] == "failed"
+    assert status["login_result"] == "failed"
+    assert status["issue"] == "not_confirmed"
+    assert status["auth_warning"] == "execution_auth_error"
+    assert status["state"] == ("unknown" if fresh_read_fails else "signed_in")
+
+
+@pytest.mark.asyncio
 async def test_disconnect_old_start_response_cannot_clear_new_start_owner() -> None:
     started = [asyncio.Event(), asyncio.Event()]
     release = [asyncio.Event(), asyncio.Event()]

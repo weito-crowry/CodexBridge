@@ -233,6 +233,7 @@ class AccountAuthService:
         self._early_completions: dict[tuple[int, int], dict[str, bool]] = {}
         self._finished_login_ids: list[str] = []
         self._auth_recovery_login_revision: int | None = None
+        self._auth_recovery_auth_error = False
 
     def status(self) -> dict[str, object]:
         return dict(self._status)
@@ -270,7 +271,11 @@ class AccountAuthService:
         for field in ("state", "account_type", "auth_mode", "plan_type"):
             self._status[field] = projected.get(field)
         if self._auth_recovery_login_revision == self._login_revision:
-            if read_succeeded and projected.get("state") == "signed_in":
+            if (
+                read_succeeded
+                and projected.get("state") == "signed_in"
+                and not self._auth_recovery_auth_error
+            ):
                 self._status["login_state"] = "succeeded"
                 self._status["login_result"] = "succeeded"
                 self._status["issue"] = None
@@ -280,6 +285,7 @@ class AccountAuthService:
                 self._status["login_result"] = "failed"
                 self._status["issue"] = "not_confirmed"
             self._auth_recovery_login_revision = None
+            self._auth_recovery_auth_error = False
         self._touch()
         return self.status()
 
@@ -295,6 +301,7 @@ class AccountAuthService:
         self._start_owner = owner
         self._early_completions.pop(owner, None)
         self._auth_recovery_login_revision = None
+        self._auth_recovery_auth_error = False
         self._status["login_state"] = "starting"
         self._status["login_result"] = "none"
         self._status["login_revision"] = login_revision
@@ -488,6 +495,7 @@ class AccountAuthService:
             self._status["login_result"] = "failed"
             self._status["issue"] = "login_failed"
             self._auth_recovery_login_revision = None
+            self._auth_recovery_auth_error = False
         self._touch()
         self._invalidate_and_schedule_read()
 
@@ -516,7 +524,12 @@ class AccountAuthService:
         category = classify_execution_error(error, turn_state=turn_state)
         if category == "auth_check":
             self._status["auth_warning"] = "execution_auth_error"
-            self._auth_recovery_login_revision = None
+            if (
+                self._auth_recovery_login_revision == self._login_revision
+                and self._status.get("login_state") == "checking"
+                and self._status.get("login_result") == "none"
+            ):
+                self._auth_recovery_auth_error = True
             self._touch()
             self._invalidate_and_schedule_read()
         return category
@@ -533,6 +546,7 @@ class AccountAuthService:
         self._early_completions.clear()
         self._finished_login_ids.clear()
         self._auth_recovery_login_revision = None
+        self._auth_recovery_auth_error = False
         self._status = dict(_UNKNOWN_STATUS)
         self._status["auth_warning"] = auth_warning
         self._status["login_revision"] = self._login_revision
@@ -569,4 +583,5 @@ class AccountAuthService:
         self._status["login_result"] = "failed"
         self._status["issue"] = issue
         self._auth_recovery_login_revision = None
+        self._auth_recovery_auth_error = False
         self._touch()

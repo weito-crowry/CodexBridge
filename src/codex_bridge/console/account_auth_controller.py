@@ -170,7 +170,7 @@ class AccountAuthController(QObject):
             "/ui-api/control/account/auth/login/start",
             {"flow_type": flow_type},
         )
-        if not accepted:
+        if not accepted and self._login_pending:
             self._forget_login()
             self._show_local_message(tr("The account request could not be started."))
 
@@ -276,7 +276,9 @@ class AccountAuthController(QObject):
                 return
             self._cancel_in_flight = False
             self._local_issue = None
-        self._apply_status(payload, request=request)
+        status_applied = self._apply_status(payload, request=request)
+        if request.kind == "refresh" and status_applied:
+            self._release_unstarted_attempt_if_confirmed(request)
         if (
             request.kind == "cancel"
             and self._login_pending
@@ -292,15 +294,16 @@ class AccountAuthController(QObject):
             self._poll_timer.start()
         self.refresh_controls()
 
-    def _on_control_failure(self, key: str, _message: str) -> None:
+    def _on_control_failure(self, key: str, message: str) -> None:
         request = self._take_request(key)
         if request is None:
             return
         if request.kind == "start":
-            self._start_in_flight = False
-            self._local_issue = "start_unknown"
-            self._render_status(self._last_status)
-            self._request_status()
+            if message in {"request_error", "http_400", "http_403"}:
+                self._forget_login()
+                self._show_local_message(tr("Codex sign-in could not be started."))
+            else:
+                self._await_start_reconciliation()
         elif request.kind == "cancel":
             if request.login_revision != self._login_revision or not self._login_pending:
                 return
@@ -322,7 +325,7 @@ class AccountAuthController(QObject):
             return None
         return request
 
-    def _apply_status(self, payload: object, *, request: _RequestOwner | None = None) -> None:
+    def _apply_status(self, payload: object, *, request: _RequestOwner | None = None) -> bool:
         safe_payload = project_account_auth_status(payload)
         revision_value = safe_payload.get("revision", 0)
         revision = revision_value if type(revision_value) is int else 0
@@ -331,13 +334,52 @@ class AccountAuthController(QObject):
         ):
             if self._login_pending:
                 self._reconcile_login_status(self._last_status)
-            return
+            return False
         if request is not None and request.login_generation != self._login_generation:
-            return
+            return False
         self._last_server_revision = revision
         self._last_status = safe_payload
         self._render_status(safe_payload)
         self._reconcile_login_status(safe_payload)
+        return True
+
+    def _release_unstarted_attempt_if_confirmed(self, request: _RequestOwner) -> None:
+        status = self._last_status
+        status_revision = status.get("revision") if status is not None else None
+        if (
+            not self._login_pending
+            or self._login_revision is not None
+            or self._start_in_flight
+            or self._local_issue != "start_unknown"
+            or status is None
+            or status.get("login_revision") != self._baseline_login_revision
+            or type(status_revision) is not int
+            or status_revision < request.server_revision
+        ):
+            return
+        login_state = status.get("login_state")
+        login_result = status.get("login_result")
+        no_active_attempt = (
+            (login_state == "idle" and login_result == "none")
+            or (login_state == "succeeded" and login_result == "succeeded")
+            or (login_state == "failed" and login_result == "failed")
+            or (login_state == "cancelled" and login_result == "cancelled")
+        )
+        if no_active_attempt:
+            self._forget_login()
+            self._show_local_message(
+                tr("No active sign-in attempt was found after refresh. You can try again.")
+            )
+
+    def _await_start_reconciliation(self) -> None:
+        self._start_in_flight = False
+        self._local_issue = "start_unknown"
+        self._poll_timer.setInterval(_LOGIN_POLL_MS)
+        self._poll_timer.start()
+        self._render_status(self._last_status)
+        self._request_status()
+        if self._can_control():
+            self._send_control("refresh", "/ui-api/control/account/auth/refresh", {})
 
     def _reconcile_login_status(self, status: Mapping[str, object] | None) -> None:
         if not self._login_pending or status is None:
@@ -505,10 +547,7 @@ class AccountAuthController(QObject):
         self._request_status()
 
     def _start_response_unresolved(self) -> None:
-        self._start_in_flight = False
-        self._local_issue = "start_unknown"
-        self._render_status(self._last_status)
-        self._request_status()
+        self._await_start_reconciliation()
 
     def _reject_start_response(self) -> None:
         self._local_issue = "start_response_rejected"
