@@ -1,9 +1,9 @@
 # D1-I5-B4B verified service and projection evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats) — ChatGPT GitHub review of `ac095df0a5b353a739cd6ec3e9e58ea579371f71`。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** `origin/dev` at `483c341af5b2411ea17710d704d5eb2b9f908d32`。
-- **I5-B4A review:** ChatGPT GitHub review of `27a2fbfc2700fb5aa9875eb2f57f2b7f301fe41a` はACCEPTED (with documented caveats)。full pytest、DBOS、実Worker/job、WAL metadataはそのreviewの留保として記録済み。
+- **I5-B4A review:** ChatGPT GitHub review of `27a2fbfc2700fb5aa9875eb2f57f2b7f301fe41a` はACCEPTED (with documented caveats)。
 - **今回の範囲:** service status/resultとtask/event projectionをB4A共通verified readerへ接続。
 - **I5-B4全体 / I5全体:** IN_PROGRESS。**strict run admission:** OFF。**I2:** DEFERRED / NON-BLOCKING。**D1全体:** DRAFT。
 
@@ -39,14 +39,21 @@ pytestはWindows native環境の隔離 `tmp_path` DB/snapshotのみを使いま�
 | mypy `src/codex_bridge` | PASS — 151 source files |
 | `python -m compileall -q src/codex_bridge` | PASS |
 | `git diff --check` | PASS。文書のCRLF変換に関するGit warningのみ |
-| full pytest | NOT_RUN — 今回の指定範囲外 |
-| CPP MCP/account-auth境界回帰 | NOT_RUN — 今回のfocused対象外 |
+| full pytest | NOT_RUN — 今回の指定範囲外。B4B review留保 |
+| CPP MCP/account-auth境界回帰 | NOT_RUN — 今回のfocused対象外。B4B review留保 |
 
 runtime-artifact拒否を調べるためのfake worker/job/journal/DBOS/result filesは隔離pytest `tmp_path`内だけに作成し、strict readersがそれらを開かないことをassertしました。実Bridge/worker、実Codex job、DBOS実行、共有/production DB、Workflow再POSTは使用していません。WAL metadata不変性は主張しません。
 
 ## 残件
 
-- ChatGPT GitHub review待ち。Codex作業終了時点でB4B受入済みとは扱いません。
+- ChatGPT GitHub reviewでB4BはACCEPTED (with documented caveats)となりました。これはD1全体の最終承認ではありません。
 - I5-B4のworker reservation ordering、manager/worker/worker_entryへのreserved verification接続は未実施です。
 - strict runtimeおよび実job/output成功判定はI7以降の対象です。I5-B4Bは実行許可を追加しません。
 - strict run admissionはOFF、I5-B4全体とI5全体はIN_PROGRESSです。D1全体はDRAFTです。
+
+## ChatGPT reviewの留保
+
+- full pytest、CPP MCP/account-auth境界回帰は未実施です。
+- 実Worker、DBOS、実Codex jobは未検証です。
+- WAL metadata不変性は主張していません。
+- I6 strict admission接続時には、`_snapshot_for_row` の `forced_state` がinvalid strict runをlegacy forced stateへ上書きしないことを確認する必要があります。strict admission OFFの現時点ではB4B/I5のblockerではありません。

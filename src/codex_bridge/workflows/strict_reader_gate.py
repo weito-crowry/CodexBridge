@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 from contextlib import closing
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
@@ -21,7 +22,12 @@ from .strict_manifest import (
     StrictWorkflowSnapshotVerifier,
     parse_strict_manifest_v2,
 )
-from .strict_requests import StrictWorkflowRequestStore
+from .strict_requests import (
+    StrictWorkflowRequestInput,
+    StrictWorkflowRequestReservation,
+    StrictWorkflowRequestStore,
+    _same_request,
+)
 
 _REASON_CODE = "NEEDS_RECONCILIATION"
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -205,6 +211,107 @@ def verify_strict_reserved_readonly(
         return verification
     except Exception:
         raise StrictReaderGateError() from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _VerifiedStrictReservation:
+    reservation: StrictWorkflowRequestReservation = field(repr=False)
+    verification: StrictWorkflowSnapshotVerification = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "_VerifiedStrictReservation(<verified>)"
+
+
+def _reserve_prepared_strict_run(
+    state_root: Path,
+    run_id: str,
+    *,
+    client_request_id: str,
+    allowed_roots: tuple[str, ...],
+) -> _VerifiedStrictReservation:
+    """Reserve one verified prepared snapshot or read its existing replay.
+
+    This internal coordinator is intentionally not used by legacy admission.
+    The request database keeps its own transaction boundary; if the follow-up
+    snapshot verification fails, the committed row remains available for a
+    later reconciliation attempt.
+    """
+    try:
+        store = StrictWorkflowRequestStore(state_root)
+        verifier = StrictWorkflowSnapshotVerifier(state_root, allowed_roots)
+        existing = store.read_binding(run_id)
+        if existing is None:
+            prepared = verifier.verify_pre_reservation(run_id)
+            request = _request_input_from_manifest(prepared.manifest, client_request_id)
+            reservation = store.reserve_strict(request)
+        else:
+            manifest_bytes = _read_manifest_bytes(state_root, run_id)
+            manifest = parse_strict_manifest_v2(manifest_bytes)
+            request = _request_input_from_manifest(manifest, client_request_id)
+            if not _same_request(request, existing):
+                _fail()
+            reservation = existing
+
+        if not _same_request(request, reservation):
+            _fail()
+        manifest_bytes = _read_manifest_bytes(state_root, run_id)
+        verification = verify_strict_reserved_readonly(
+            state_root,
+            run_id,
+            manifest_bytes,
+            expected_workflow_id=request.workflow_id,
+            expected_request_digest=request.request_digest,
+            allowed_roots=allowed_roots,
+        )
+        if verification is None or verification.manifest != parse_strict_manifest_v2(
+            manifest_bytes
+        ):
+            _fail()
+        return _VerifiedStrictReservation(reservation, verification)
+    except Exception:
+        raise StrictReaderGateError() from None
+
+
+def _request_input_from_manifest(
+    manifest: StrictWorkflowManifestV2,
+    client_request_id: str,
+) -> StrictWorkflowRequestInput:
+    return StrictWorkflowRequestInput(
+        client_request_id=client_request_id,
+        workflow_id=manifest.workflow_id,
+        run_id=manifest.run_id,
+        request_digest=manifest.request_digest,
+        definition_id=manifest.definition_id,
+        definition_revision=manifest.definition_revision,
+        source_sha256=manifest.source_sha256,
+        contract_sha256=manifest.contract_sha256,
+        binding_digest=manifest.binding_digest,
+        normalized_input_sha256=manifest.normalized_input_sha256,
+        created_at=manifest.created_at,
+        run_format_version=manifest.run_format_version,
+        contract_version=manifest.contract_version,
+    )
+
+
+def _read_manifest_bytes(state_root: Path, run_id: str) -> bytes:
+    if type(run_id) is not str or _RUN_ID.fullmatch(run_id) is None:
+        _fail()
+    root = _resolve_state_root(Path(state_root))
+    run_directory = root / run_id
+    if run_directory.is_symlink() or not run_directory.is_dir():
+        _fail()
+    resolved_run_directory = run_directory.resolve(strict=True)
+    if resolved_run_directory.parent != root:
+        _fail()
+    path = resolved_run_directory / "manifest.json"
+    if path.is_symlink() or not path.is_file():
+        _fail()
+    resolved_path = path.resolve(strict=True)
+    if resolved_path.parent != resolved_run_directory:
+        _fail()
+    payload = resolved_path.read_bytes()
+    parse_strict_manifest_v2(payload)
+    return payload
 
 
 def _decode_manifest(manifest: bytes | dict[str, Any]) -> tuple[dict[str, Any], bytes]:

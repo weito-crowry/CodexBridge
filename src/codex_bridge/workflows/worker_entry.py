@@ -18,6 +18,7 @@ from .strict_reader_gate import (
     StrictReaderGateError,
     _decode_manifest,
     classify_readonly,
+    verify_strict_reserved_readonly,
 )
 
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
@@ -50,7 +51,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run_dir = _validate_run_directory(args.run_dir)
         config = _read_config(args.config, run_dir, args.mode)
-        manifest = _read_manifest(run_dir)
+        raw_roots = config.get("allowed_roots")
+        allowed_roots = (
+            tuple(root for root in raw_roots if type(root) is str)
+            if isinstance(raw_roots, list) and all(type(root) is str for root in raw_roots)
+            else ()
+        )
+        manifest = _read_manifest(run_dir, allowed_roots=allowed_roots)
+        if manifest.get("run_format_version") == 2:
+            raise WorkflowWorkerEntryError("strict workflow runtime is not supported")
         control = manifest.get("control", {})
         if not isinstance(control, dict):
             raise WorkflowWorkerEntryError("workflow manifest control must be an object")
@@ -124,7 +133,11 @@ def _validate_run_directory(value: Path) -> Path:
     return run_dir
 
 
-def _read_manifest(run_dir: Path) -> dict[str, object]:
+def _read_manifest(
+    run_dir: Path,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> dict[str, object]:
     path = run_dir / "manifest.json"
     if _is_symlink_or_junction(path):
         raise WorkflowWorkerEntryError("workflow run manifest is unavailable")
@@ -137,7 +150,26 @@ def _read_manifest(run_dir: Path) -> dict[str, object]:
     except Exception:
         raise WorkflowWorkerEntryError("workflow run manifest is invalid") from None
     if "run_format_version" in value:
-        raise WorkflowWorkerEntryError("workflow run format is unsupported")
+        if type(value.get("run_format_version")) is not int or value["run_format_version"] != 2:
+            raise WorkflowWorkerEntryError("workflow run format is unsupported")
+        workflow_id = value.get("workflow_id")
+        request_digest = value.get("request_digest")
+        if type(workflow_id) is not str or type(request_digest) is not str:
+            raise WorkflowWorkerEntryError("workflow request binding is invalid")
+        try:
+            verification = verify_strict_reserved_readonly(
+                run_dir.parent,
+                run_dir.name,
+                manifest_bytes,
+                expected_workflow_id=workflow_id,
+                expected_request_digest=request_digest,
+                allowed_roots=allowed_roots,
+            )
+        except StrictReaderGateError:
+            raise WorkflowWorkerEntryError("workflow request binding is invalid") from None
+        if verification is None:
+            raise WorkflowWorkerEntryError("workflow request binding is invalid")
+        return verification.manifest.to_dict()
     _validate_managed_legacy_manifest(run_dir, value, manifest_bytes)
     return value
 

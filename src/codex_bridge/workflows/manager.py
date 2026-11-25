@@ -20,7 +20,12 @@ from .startup_diagnostics import (
     WorkflowStartupStage,
     current_startup_diagnostic,
 )
-from .strict_reader_gate import RunFormatVersion, classify_readonly
+from .strict_reader_gate import (
+    RunFormatVersion,
+    StrictReaderGateError,
+    classify_readonly,
+    verify_strict_reserved_readonly,
+)
 
 WorkerMode = Literal["start", "recover"]
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
@@ -179,6 +184,8 @@ class WorkflowWorkerManager:
                 if current is not None and current.state == "running":
                     raise WorkflowManagerError("a worker is already running for this workflow run")
                 manifest = self._read_manifest(canonical_run_dir)
+                if manifest.get("run_format_version") == 2:
+                    raise WorkflowManagerError("strict workflow runtime is not supported")
                 live = _codex_job_live(
                     manifest,
                     max_live_codex_jobs=max_live_codex_jobs,
@@ -480,7 +487,10 @@ class WorkflowWorkerManager:
         ownership_complete = True
         errors: list[str] = []
         ownership_runs: dict[Path, bool] = {record.run_dir: record.live for record in records}
-        persisted_runs, persisted_complete = _persisted_live_run_directories(self.state_root)
+        persisted_runs, persisted_complete = _persisted_live_run_directories(
+            self.state_root,
+            allowed_roots=self.allowed_roots,
+        )
         if not persisted_complete:
             ownership_complete = False
             errors.append("persisted workflow run list is incomplete")
@@ -577,7 +587,26 @@ class WorkflowWorkerManager:
         if not isinstance(value, dict):
             raise WorkflowManagerError("workflow run manifest must be an object")
         if "run_format_version" in value:
-            raise WorkflowManagerError("workflow run format is unsupported")
+            if type(value.get("run_format_version")) is not int or value["run_format_version"] != 2:
+                raise WorkflowManagerError("workflow run format is unsupported")
+            workflow_id = value.get("workflow_id")
+            request_digest = value.get("request_digest")
+            if type(workflow_id) is not str or type(request_digest) is not str:
+                raise WorkflowManagerError("workflow request binding is invalid")
+            try:
+                verification = verify_strict_reserved_readonly(
+                    run_dir.parent,
+                    run_dir.name,
+                    manifest_bytes,
+                    expected_workflow_id=workflow_id,
+                    expected_request_digest=request_digest,
+                    allowed_roots=self.allowed_roots,
+                )
+            except StrictReaderGateError:
+                raise WorkflowManagerError("workflow request binding is invalid") from None
+            if verification is None:
+                raise WorkflowManagerError("workflow request binding is invalid")
+            return verification.manifest.to_dict()
 
         request_database = run_dir.parent / "requests.sqlite"
         try:
@@ -659,7 +688,11 @@ def default_workflow_state_root() -> Path:
     return Path(local_app_data) / "CodexBridge" / "workflows"
 
 
-def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...], bool]:
+def _persisted_live_run_directories(
+    state_root: Path,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> tuple[tuple[Path, ...], bool]:
     root = Path(state_root)
     if root.is_symlink():
         return (), False
@@ -742,14 +775,17 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
                 complete = False
                 continue
             manifest_bytes = manifest_path.read_bytes()
-            run_format = classify_readonly(
+            verification = verify_strict_reserved_readonly(
                 canonical_root,
                 run_id,
                 manifest_bytes,
                 expected_workflow_id=workflow_id,
                 expected_request_digest=request_digest,
+                allowed_roots=allowed_roots,
             )
-            if run_format is not RunFormatVersion.LEGACY_V1:
+            if verification is not None:
+                # Strict v2 has no worker ownership implementation yet. Keep
+                # shutdown ownership incomplete and do not inspect legacy job DBs.
                 complete = False
                 continue
             manifest = json.loads(

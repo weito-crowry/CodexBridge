@@ -309,7 +309,12 @@ async def test_manager_rejects_every_explicit_run_format_before_config_or_spawn(
     monkeypatch.setattr("codex_bridge.workflows.manager.asyncio.create_subprocess_exec", fake_spawn)
     manager = WorkflowWorkerManager(state_root=state_root, frozen=False)
 
-    with pytest.raises(WorkflowManagerError, match="^workflow run format is unsupported$"):
+    expected_error = (
+        "workflow request binding is invalid"
+        if type(version) is int and version == 2
+        else "workflow run format is unsupported"
+    )
+    with pytest.raises(WorkflowManagerError, match=f"^{expected_error}$"):
         await manager.start_worker(run_dir, mode=mode)  # type: ignore[arg-type]
 
     assert spawned == []

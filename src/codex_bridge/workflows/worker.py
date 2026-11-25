@@ -53,6 +53,7 @@ from .strict_reader_gate import (
     StrictReaderGateError,
     _decode_manifest,
     classify_readonly,
+    verify_strict_reserved_readonly,
 )
 
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
@@ -134,8 +135,26 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
-    manifest, _manifest_bytes = _read_run_manifest(run_dir)
+def load_run_request(
+    run_dir: Path,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], str, Any]:
+    manifest, _manifest_bytes, verification = _read_run_manifest(
+        run_dir,
+        allowed_roots=allowed_roots,
+    )
+    if verification is not None:
+        definition = verification._definition
+        normalized_input = verification._normalized_input
+        if (
+            definition is None
+            or type(definition.source_yaml) is not str
+            or type(normalized_input) is not dict
+        ):
+            raise OwsError("workflow request binding is invalid")
+        return manifest, definition.source_yaml, normalized_input
+
     definition_path = run_dir / "workflow.yaml"
     input_path = run_dir / "input.json"
     try:
@@ -202,7 +221,11 @@ def load_run_request(run_dir: Path) -> tuple[dict[str, Any], str, Any]:
     return manifest, definition_text, input_data
 
 
-def _read_run_manifest(run_dir: Path) -> tuple[dict[str, Any], bytes]:
+def _read_run_manifest(
+    run_dir: Path,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], bytes, Any | None]:
     manifest_path = run_dir / "manifest.json"
     if _is_symlink_or_junction(manifest_path):
         raise OwsError("workflow run manifest is unavailable")
@@ -216,9 +239,31 @@ def _read_run_manifest(run_dir: Path) -> tuple[dict[str, Any], bytes]:
     except Exception:
         raise OwsError("workflow run manifest is invalid") from None
     if "run_format_version" in manifest:
-        raise OwsError("workflow run format is unsupported")
+        if (
+            type(manifest.get("run_format_version")) is not int
+            or manifest["run_format_version"] != 2
+        ):
+            raise OwsError("workflow run format is unsupported")
+        workflow_id = manifest.get("workflow_id")
+        request_digest = manifest.get("request_digest")
+        if type(workflow_id) is not str or type(request_digest) is not str:
+            raise OwsError("workflow request binding is invalid")
+        try:
+            verification = verify_strict_reserved_readonly(
+                canonical_run_dir.parent,
+                canonical_run_dir.name,
+                manifest_bytes,
+                expected_workflow_id=workflow_id,
+                expected_request_digest=request_digest,
+                allowed_roots=allowed_roots,
+            )
+        except StrictReaderGateError:
+            raise OwsError("workflow request binding is invalid") from None
+        if verification is None:
+            raise OwsError("workflow request binding is invalid")
+        return verification.manifest.to_dict(), manifest_bytes, verification
     _validate_managed_legacy_manifest(canonical_run_dir, manifest, manifest_bytes)
-    return manifest, manifest_bytes
+    return manifest, manifest_bytes, None
 
 
 def _validate_managed_legacy_manifest(
@@ -1083,7 +1128,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     run_dir = args.run_dir.resolve()
-    manifest, definition_text, input_data = load_run_request(run_dir)
+    manifest, definition_text, input_data = load_run_request(
+        run_dir,
+        allowed_roots=tuple(args.allowed_root),
+    )
+    if manifest.get("run_format_version") == 2:
+        raise OwsError("strict workflow runtime is not supported")
     startup_override = args.startup_file.resolve() if args.startup_file is not None else None
     if startup_override is not None:
         try:
