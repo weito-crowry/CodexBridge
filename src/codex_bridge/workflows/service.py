@@ -25,9 +25,7 @@ from .startup_diagnostics import (
     startup_diagnostic_scope,
 )
 from .strict_reader_gate import (
-    RunFormatVersion,
     StrictReaderGateError,
-    classify_readonly,
     verify_strict_reserved_readonly,
 )
 
@@ -190,6 +188,7 @@ class _RunInspection:
     updated_at: str
     max_live_codex_jobs: int = 1
     jobs: tuple[WorkflowJobSnapshot, ...] = ()
+    _strict_verified: bool = False
 
 
 class WorkflowService:
@@ -555,7 +554,9 @@ class WorkflowService:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise WorkflowRequestError("workflow list limit must be between 1 and 100")
         try:
-            return await asyncio.to_thread(_list_workflows, self._state_root, limit)
+            return await asyncio.to_thread(
+                _list_workflows, self._state_root, limit, allowed_roots=self._allowed_roots
+            )
         except WorkflowServiceUnavailable:
             raise
         except (OSError, sqlite3.Error, ValueError):
@@ -567,7 +568,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            return await asyncio.to_thread(_snapshot, self._state_root, row)
+            return await asyncio.to_thread(
+                _snapshot, self._state_root, row, allowed_roots=self._allowed_roots
+            )
         except WorkflowNotFoundError:
             raise
         except WorkflowServiceUnavailable:
@@ -581,7 +584,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
             snapshot = _snapshot_from_inspection(row, inspection)
             return WorkflowResultSnapshot(snapshot, inspection.result)
         except WorkflowNotFoundError:
@@ -597,7 +602,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
             from .task_projection import project_workflow_tasks
 
             return await asyncio.to_thread(
@@ -605,6 +612,7 @@ class WorkflowService:
                 self._state_root,
                 row,
                 inspection,
+                allowed_roots=self._allowed_roots,
             )
         except (WorkflowNotFoundError, WorkflowServiceUnavailable):
             raise
@@ -627,7 +635,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
             from .task_projection import project_workflow_task_events
 
             return await asyncio.to_thread(
@@ -637,6 +647,7 @@ class WorkflowService:
                 inspection,
                 after_id=after_id,
                 limit=limit,
+                allowed_roots=self._allowed_roots,
             )
         except (WorkflowNotFoundError, WorkflowServiceUnavailable):
             raise
@@ -677,7 +688,9 @@ class WorkflowService:
         deadline = time.monotonic() + _WORKER_START_TIMEOUT_SECONDS
         while True:
             try:
-                inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+                inspection = await asyncio.to_thread(
+                    _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+                )
             except (OSError, sqlite3.Error, ValueError) as error:
                 if diagnostic is not None:
                     diagnostic.fail(
@@ -704,12 +717,14 @@ class WorkflowService:
         forced_state: str | None = None,
     ) -> WorkflowSnapshot:
         try:
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
         except (OSError, sqlite3.Error, ValueError):
             inspection = _RunInspection(
                 "needs_reconciliation", "unknown", None, None, None, row.updated_at
             )
-        if forced_state is not None:
+        if forced_state is not None and not inspection._strict_verified:
             inspection = _RunInspection(
                 forced_state,
                 inspection.worker_state,
@@ -1125,7 +1140,12 @@ def _find_workflow(state_root: Path, workflow_id: str) -> _RequestRow | None:
     return None if row is None else _row_from_sql(row)
 
 
-def _list_workflows(state_root: Path, limit: int) -> list[WorkflowSnapshot]:
+def _list_workflows(
+    state_root: Path,
+    limit: int,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> list[WorkflowSnapshot]:
     root = _ensure_state_root(state_root, create=False)
     if root is None:
         return []
@@ -1147,7 +1167,7 @@ def _list_workflows(state_root: Path, limit: int) -> list[WorkflowSnapshot]:
     snapshots: list[WorkflowSnapshot] = []
     for raw in rows:
         row = _row_from_sql(raw)
-        snapshots.append(_snapshot(state_root, row))
+        snapshots.append(_snapshot(state_root, row, allowed_roots=allowed_roots))
     return snapshots
 
 
@@ -1193,7 +1213,9 @@ def _reserve_request(
         active_workspaces: list[Path] = []
         for candidate_sql in candidates:
             candidate = _row_from_sql(candidate_sql)
-            inspection = _inspect_run(state_root, candidate)
+            inspection = _inspect_run(
+                state_root, candidate, allowed_roots=tuple(worker_manager.allowed_roots)
+            )
             if inspection.status in _TERMINAL_STATES:
                 connection.execute(
                     "UPDATE workflow_requests SET state = ?, updated_at = ? WHERE run_id = ?",
@@ -1494,20 +1516,35 @@ def _strict_json(payload: bytes) -> Any:
     return json.loads(payload, parse_constant=reject_constant, object_pairs_hook=unique_object)
 
 
-def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
+def _inspect_run(
+    state_root: Path,
+    row: _RequestRow,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> _RunInspection:
     base_updated = row.updated_at
     try:
         run_dir = _validated_run_directory(state_root, row.run_id)
         manifest_bytes = _read_regular_file(run_dir / "manifest.json", limit=32 * 1024)
-        run_format = classify_readonly(
+        strict_verification = verify_strict_reserved_readonly(
             state_root,
             row.run_id,
             manifest_bytes,
             expected_workflow_id=row.workflow_id,
             expected_request_digest=row.request_digest,
+            allowed_roots=allowed_roots,
         )
-        if run_format is RunFormatVersion.STRICT_V2:
-            return _RunInspection("needs_reconciliation", "unknown", None, None, None, base_updated)
+        if strict_verification is not None:
+            return _RunInspection(
+                "needs_reconciliation",
+                "unknown",
+                None,
+                None,
+                None,
+                base_updated,
+                max_live_codex_jobs=strict_verification.manifest.max_live_codex_jobs,
+                _strict_verified=True,
+            )
         manifest_value = _strict_json(manifest_bytes)
         if not isinstance(manifest_value, dict):
             raise ValueError("manifest is invalid")
@@ -2365,8 +2402,15 @@ def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _snapshot(state_root: Path, row: _RequestRow) -> WorkflowSnapshot:
-    return _snapshot_from_inspection(row, _inspect_run(state_root, row))
+def _snapshot(
+    state_root: Path,
+    row: _RequestRow,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> WorkflowSnapshot:
+    return _snapshot_from_inspection(
+        row, _inspect_run(state_root, row, allowed_roots=allowed_roots)
+    )
 
 
 def _snapshot_from_inspection(row: _RequestRow, inspection: _RunInspection) -> WorkflowSnapshot:

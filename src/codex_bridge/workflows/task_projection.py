@@ -26,7 +26,7 @@ from .service import (
     _strict_json,
     _validated_run_directory,
 )
-from .strict_reader_gate import RunFormatVersion, classify_readonly
+from .strict_reader_gate import verify_strict_reserved_readonly
 
 _JOURNAL_NAME = "node_events.sqlite"
 _JOURNAL_SCHEMA_VERSION = 1
@@ -141,6 +141,8 @@ def project_workflow_tasks(
     state_root: Path,
     row: _RequestRow,
     inspection: _RunInspection,
+    *,
+    allowed_roots: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     snapshot = _snapshot_from_inspection(row, inspection)
     base = {
@@ -156,7 +158,9 @@ def project_workflow_tasks(
         "counts": {"nodes": 0, "edges": 0, "executions": 0},
     }
     try:
-        run_dir, definition, max_jobs = _verified_run_source(state_root, row)
+        run_dir, definition, max_jobs, strict_v2 = _verified_run_source(
+            state_root, row, allowed_roots=allowed_roots
+        )
     except _ProjectionIssue as issue:
         base["coverage_reason"] = issue.reason
         return _attach_snapshot_version(base, snapshot, None, ())
@@ -174,6 +178,9 @@ def project_workflow_tasks(
         base["coverage"] = "partial"
         base["coverage_reason"] = "graph_invalid"
         return _attach_snapshot_version(base, snapshot, None, ())
+
+    if strict_v2:
+        return _project_strict_static_tasks(base, snapshot, static_nodes, static_edges)
 
     node_ids = {node["node_id"] for node in static_nodes}
     journal_reason: str | None = None
@@ -480,6 +487,50 @@ def project_workflow_tasks(
     return _attach_snapshot_version(_fit_task_response(result), snapshot, dbos_status, jobs)
 
 
+def _project_strict_static_tasks(
+    base: dict[str, Any],
+    snapshot: Any,
+    static_nodes: list[dict[str, Any]],
+    static_edges: list[dict[str, Any]],
+) -> dict[str, Any]:
+    nodes = [
+        {
+            "node_id": node["node_id"],
+            "operation": node["operation"],
+            "parent_scope": node["parent_scope"],
+            "order": node["order"],
+            "state": "unknown",
+            "completion_observed": False,
+            "executions": [],
+        }
+        for node in static_nodes[:_MAX_STATIC_NODES]
+    ]
+    included_node_ids = {node["node_id"] for node in nodes}
+    edges = [
+        {"source": edge["source"], "target": edge["target"], "kind": edge["kind"]}
+        for edge in static_edges[:_MAX_EDGES]
+        if _edge_is_visible(edge, included_node_ids)
+    ]
+    result = {
+        **base,
+        "coverage": "partial",
+        "coverage_reason": "workflow_not_confirmed",
+        "latest_event_id": 0,
+        "truncated": len(static_nodes) > _MAX_STATIC_NODES or len(static_edges) > _MAX_EDGES,
+        "nodes": nodes,
+        "edges": edges,
+        "counts": {
+            "nodes": len(static_nodes),
+            "edges": len(static_edges),
+            "executions": 0,
+        },
+    }
+    fitted = _fit_task_response(result)
+    fitted["coverage"] = "partial"
+    fitted["coverage_reason"] = "workflow_not_confirmed"
+    return _attach_snapshot_version(fitted, snapshot, None, ())
+
+
 def project_workflow_task_events(
     state_root: Path,
     row: _RequestRow,
@@ -487,6 +538,7 @@ def project_workflow_task_events(
     *,
     after_id: int,
     limit: int,
+    allowed_roots: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if type(after_id) is not int or not 0 <= after_id <= 2**63 - 1:
         raise ValueError("after_id is invalid")
@@ -504,7 +556,9 @@ def project_workflow_task_events(
         "coverage": "unavailable",
     }
     try:
-        run_dir, definition, max_jobs = _verified_run_source(state_root, row)
+        run_dir, definition, max_jobs, strict_v2 = _verified_run_source(
+            state_root, row, allowed_roots=allowed_roots
+        )
         graph = project_workflow_graph(
             definition,
             codex_job_live=True,
@@ -513,6 +567,10 @@ def project_workflow_task_events(
         nodes = graph["nodes"]
         edges = graph["edges"]
         _validate_static_graph(nodes, edges)
+        if strict_v2:
+            base["coverage"] = "partial"
+            base["coverage_reason"] = "workflow_not_confirmed"
+            return base
         events, latest = _read_journal(run_dir, row, {node["node_id"] for node in nodes})
     except _ProjectionIssue as issue:
         base["coverage_reason"] = issue.reason
@@ -599,7 +657,9 @@ def project_workflow_task_events(
 def _verified_run_source(
     state_root: Path,
     row: _RequestRow,
-) -> tuple[Path, dict[str, Any], int]:
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> tuple[Path, dict[str, Any], int, bool]:
     try:
         root = Path(state_root)
         if _is_reparse_point(root):
@@ -614,15 +674,24 @@ def _verified_run_source(
         if _is_reparse_point(manifest_path):
             raise _ProjectionIssue("run_integrity_invalid")
         manifest_bytes = _read_regular_file(manifest_path, limit=32 * 1024)
-        run_format = classify_readonly(
+        strict_verification = verify_strict_reserved_readonly(
             root,
             row.run_id,
             manifest_bytes,
             expected_workflow_id=row.workflow_id,
             expected_request_digest=row.request_digest,
+            allowed_roots=allowed_roots,
         )
-        if run_format is not RunFormatVersion.LEGACY_V1:
-            raise _ProjectionIssue("run_integrity_invalid")
+        if strict_verification is not None:
+            pinned_definition = strict_verification._definition
+            if pinned_definition is None:
+                raise _ProjectionIssue("run_integrity_invalid")
+            return (
+                run_dir,
+                pinned_definition.definition,
+                strict_verification.manifest.max_live_codex_jobs,
+                True,
+            )
         for path in (workflow_path, input_path):
             if _is_reparse_point(path):
                 raise _ProjectionIssue("run_integrity_invalid")
@@ -704,7 +773,7 @@ def _verified_run_source(
                 input_data,
                 input_kind=three_live_codex_job_input_kind(definition),
             )
-        return run_dir, definition, max_jobs
+        return run_dir, definition, max_jobs, False
     except _ProjectionIssue:
         raise
     except Exception:

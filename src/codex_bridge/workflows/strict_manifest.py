@@ -145,6 +145,7 @@ class StrictWorkflowSnapshotVerification:
     manifest: StrictWorkflowManifestV2 = field(repr=False)
     reservation_verified: bool = field(repr=False)
     mutation_count: int = field(repr=False)
+    _definition: StrictDefinitionRevision | None = field(default=None, repr=False, compare=False)
 
     def __repr__(self) -> str:
         return "StrictWorkflowSnapshotVerification(<verified>)"
@@ -477,6 +478,7 @@ class StrictWorkflowSnapshotVerifier:
                 manifest=manifest,
                 reservation_verified=True,
                 mutation_count=ledger.mutation_count,
+                _definition=checked.definition,
             )
         except StrictWorkflowSnapshotError:
             raise

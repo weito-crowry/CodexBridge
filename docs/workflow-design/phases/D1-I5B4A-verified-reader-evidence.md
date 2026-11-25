@@ -1,6 +1,6 @@
 # D1-I5-B4A verified reader evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats) — ChatGPT GitHub review of `27a2fbfc2700fb5aa9875eb2f57f2b7f301fe41a`。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** `origin/dev` at `483c341af5b2411ea17710d704d5eb2b9f908d32`。
 - **I5-B4A:** 共通strict v2予約済みsnapshot reader検証とservice workspace reader接続。
@@ -46,7 +46,14 @@
 
 ## レビュー・残件
 
-- ChatGPT GitHub review待ち。Codex作業終了時点でI5-B4A受入済みとは扱いません。
+- ChatGPT GitHub reviewでI5-B4AはACCEPTED (with documented caveats)となりました。受入はD1全体の最終承認を意味しません。
 - I5-B4の残りworker reservation ordering、I5全体の受入、I6〜I8は未実施です。
 - strict run admissionはOFFのままです。status/resultおよびworkerがstrict v2を成功・実行扱いしないことを維持します。
 - 旧I5-B3受入commitから `origin/dev` までの後続22 commitsを確認し、対象workflow reader source/test pathsに変更がないことを確認しました。
+
+## ChatGPT reviewの留保
+
+- full pytestは実行していません。
+- DBOS、実Worker、実Codex jobは検証していません。
+- WAL metadata不変性は主張していません。
+- これらはI5-B4Aのreview留保として記録し、今回追加のB4B検証結果とは区別します。
