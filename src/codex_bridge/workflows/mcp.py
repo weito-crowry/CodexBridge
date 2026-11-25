@@ -14,6 +14,7 @@ from .service import (
     WorkflowResultSnapshot,
     WorkflowServiceUnavailable,
     WorkflowSnapshot,
+    strict_run_metadata_json,
 )
 
 _MAX_MCP_RESPONSE_BYTES = 64 * 1024
@@ -121,13 +122,16 @@ def register_workflow_tools(
                 error_code = "workflow_failed"
             else:
                 error_code = "workflow_state_unknown"
-            return _bounded_response(
-                {
-                    "error": error_code,
-                    "workflow_id": snapshot.workflow_id,
-                    "status": status,
-                }
-            )
+            response: dict[str, Any] = {
+                "error": error_code,
+                "workflow_id": snapshot.workflow_id,
+                "status": status,
+            }
+            strict_metadata = strict_run_metadata_json(snapshot)
+            if strict_metadata:
+                response["run_id"] = snapshot.run_id
+                response.update(strict_metadata)
+            return _bounded_response(response)
         except ValueError:
             return {"error": "invalid_workflow_id"}
         except WorkflowNotFoundError:

@@ -94,6 +94,7 @@ def _strict_fixture(
     *,
     max_live_codex_jobs: int = 1,
     source_yaml: str = _STRICT_YAML,
+    input_default: str | None = None,
 ) -> _StrictFixture:
     state_root = tmp_path / "state"
     state_root.mkdir()
@@ -109,11 +110,14 @@ def _strict_fixture(
         "type": "object",
         "additionalProperties": False,
     }
+    input_properties: dict[str, object] = {"secret": {"type": "string"}}
+    if input_default is not None:
+        input_properties["mode"] = {"type": "string", "default": input_default}
     contract = {
         "contract_version": 1,
         "input_schema": {
             **schema,
-            "properties": {"secret": {"type": "string"}},
+            "properties": input_properties,
         },
         "output_schema": schema,
         "variables": [

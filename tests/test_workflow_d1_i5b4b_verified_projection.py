@@ -270,7 +270,12 @@ def test_strict_projection_reports_graph_invalid_for_unsupported_nodes(
     assert tasks["coverage"] == "partial"
     assert tasks["coverage_reason"] == "graph_invalid"
     assert tasks["nodes"] == [] and tasks["edges"] == []
+    assert tasks["contract_version"] == 1
+    assert tasks["contract_sha256"] == fixture.manifest["contract_sha256"]
+    assert tasks["reason_code"] == "strict_execution_uncertain"
     assert events["coverage"] == "partial"
     assert events["coverage_reason"] == "graph_invalid"
     assert events["events"] == []
     assert events["next_after_id"] == 3
+    assert events["binding_digest"] == fixture.manifest["binding_digest"]
+    assert events["reason_code"] == "strict_execution_uncertain"

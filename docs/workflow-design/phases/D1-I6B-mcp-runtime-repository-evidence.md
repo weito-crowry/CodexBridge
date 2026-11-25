@@ -1,6 +1,6 @@
 # D1-I6B MCP definition and runtime repository evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats)。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I6-A commit `36ab6a8ece2a1ffd6fea03065bd901f4d811fe40` (ChatGPT ACCEPTED with documented caveats)。
 - **範囲:** 既存MCP definition toolsへのcontract surface接続と、startup時のread-only definition repository selection。
@@ -30,9 +30,11 @@ I6-Aの`WorkflowService.start_saved_workflow` guardは維持し、strict revisio
 
 専用suiteのskipはこのWindows hostでfile symlink作成権限がなく、selectorのsymlink testを実行できなかったためです。focused aggregateには既存state/database symlink testsの同理由による2 skipも含みます。selectorは新規v2 DBと、隔離v1 fixtureを明示migrationした後のlegacy historyを読み分けます。未知version・破損v2・read-only byte不変は隔離`tmp_path` DBで確認しました。production/shared DB、live Bridge/worker、実Codex jobは使用していません。
 
-## ChatGPT review前の制限
+## ChatGPT review
 
-I6-BはChatGPT review待ちで、受入済みとは扱いません。I6-A reviewの留保（full pytest、CPP/account-auth、live API、実Worker/DBOS/job、WAL metadata未検証）を引き継ぎます。I6-Cではrun-start/status/result metadata、request-id lookupをallocation前に行うreplay境界、`reservation.replayed`単独でfresh reservationを判定しないこと、`_snapshot_for_row`のforced_stateとinvalid strict/replayを確認します。I7/I8までstrict runtime/admissionは接続しません。
+ChatGPT GitHub review of `8626667daaf78985d164d3fd5d1efd8a363ac9b5` はI6-BをACCEPTED (with documented caveats)としました。review時の集計は242 passed / 3 skipped、I6-B専用suiteは5 passed / 1 skippedです。skipはWindows symlink privilege制約です。full pytest、CPP/account-auth回帰、live API、実Worker/DBOS/job、WAL metadataは未検証です。
+
+I6-Cではrun-start/status/result metadata、request-id lookupをallocation前に行うreplay境界、`reservation.replayed`単独でfresh reservationを判定しないこと、`_snapshot_for_row`のforced_stateとinvalid strict/replayを確認します。I7/I8までstrict runtime/admissionは接続しません。
 
 ## 変更path
 

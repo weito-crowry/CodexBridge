@@ -424,7 +424,7 @@ async def test_saved_strict_definition_is_rejected_before_legacy_run_start_side_
             definition_id=saved.definition_id,
             revision=saved.revision,
             client_request_id="i6a-strict-start-client",
-            input_data={"secret": "not-normalized"},
+            input_data={},
             workspace_root=str(workspace),
         )
 

@@ -25,6 +25,8 @@ from .service import (
     _snapshot_from_inspection,
     _strict_json,
     _validated_run_directory,
+    strict_run_metadata_json,
+    strict_verification_metadata_json,
 )
 from .strict_reader_gate import verify_strict_reserved_readonly
 
@@ -158,12 +160,21 @@ def project_workflow_tasks(
         "counts": {"nodes": 0, "edges": 0, "executions": 0},
     }
     try:
-        run_dir, definition, max_jobs, strict_v2 = _verified_run_source(
+        run_dir, definition, max_jobs, strict_verification = _verified_run_source(
             state_root, row, allowed_roots=allowed_roots
         )
     except _ProjectionIssue as issue:
         base["coverage_reason"] = issue.reason
+        base.update(
+            strict_run_metadata_json(
+                snapshot, reason_only=True, reason_code="run_integrity_invalid"
+            )
+        )
         return _attach_snapshot_version(base, snapshot, None, ())
+
+    strict_v2 = strict_verification is not None
+    if strict_verification is not None:
+        base.update(strict_verification_metadata_json(strict_verification))
 
     try:
         graph = project_workflow_graph(
@@ -556,9 +567,11 @@ def project_workflow_task_events(
         "coverage": "unavailable",
     }
     try:
-        run_dir, definition, max_jobs, strict_v2 = _verified_run_source(
+        run_dir, definition, max_jobs, strict_verification = _verified_run_source(
             state_root, row, allowed_roots=allowed_roots
         )
+        if strict_verification is not None:
+            base.update(strict_verification_metadata_json(strict_verification))
         graph = project_workflow_graph(
             definition,
             codex_job_live=True,
@@ -567,13 +580,20 @@ def project_workflow_task_events(
         nodes = graph["nodes"]
         edges = graph["edges"]
         _validate_static_graph(nodes, edges)
-        if strict_v2:
+        if strict_verification is not None:
             base["coverage"] = "partial"
             base["coverage_reason"] = "workflow_not_confirmed"
             return base
         events, latest = _read_journal(run_dir, row, {node["node_id"] for node in nodes})
     except _ProjectionIssue as issue:
         base["coverage_reason"] = issue.reason
+        base.update(
+            strict_run_metadata_json(
+                _snapshot_from_inspection(row, inspection),
+                reason_only=True,
+                reason_code="run_integrity_invalid",
+            )
+        )
         return base
     except Exception:
         base["coverage"] = "partial"
@@ -659,7 +679,7 @@ def _verified_run_source(
     row: _RequestRow,
     *,
     allowed_roots: tuple[str, ...] = (),
-) -> tuple[Path, dict[str, Any], int, bool]:
+) -> tuple[Path, dict[str, Any], int, Any | None]:
     try:
         root = Path(state_root)
         if _is_reparse_point(root):
@@ -690,7 +710,7 @@ def _verified_run_source(
                 run_dir,
                 pinned_definition.definition,
                 strict_verification.manifest.max_live_codex_jobs,
-                True,
+                strict_verification,
             )
         for path in (workflow_path, input_path):
             if _is_reparse_point(path):
@@ -773,7 +793,7 @@ def _verified_run_source(
                 input_data,
                 input_kind=three_live_codex_job_input_kind(definition),
             )
-        return run_dir, definition, max_jobs, False
+        return run_dir, definition, max_jobs, None
     except _ProjectionIssue:
         raise
     except Exception:

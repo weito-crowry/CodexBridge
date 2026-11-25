@@ -35,12 +35,17 @@ from .definitions import (
 from .graph import project_workflow_graph
 from .service import (
     WorkflowConcurrencyConflict,
+    WorkflowInputInvalid,
     WorkflowReconciliationRequired,
     WorkflowRequestConflict,
     WorkflowRequestError,
+    WorkflowResourceLimit,
     WorkflowService,
     WorkflowServiceUnavailable,
     WorkflowStartFailed,
+)
+from .service import (
+    WorkflowContractUnavailable as WorkflowRunContractUnavailable,
 )
 
 _MAX_SOURCE_YAML_BYTES = 64 * 1024
@@ -217,6 +222,10 @@ def create_workflow_definition_routes(
             )
         except WorkflowPayloadTooLarge:
             return _payload_too_large()
+        except WorkflowResourceLimit:
+            return JSONResponse({"error": "workflow_resource_limit"}, status_code=413)
+        except WorkflowInputInvalid:
+            return JSONResponse({"error": "workflow_input_invalid"}, status_code=400)
         except WorkflowRequestError:
             return _invalid_error()
         except WorkflowRequestConflict:
@@ -243,6 +252,8 @@ def create_workflow_definition_routes(
                 },
                 status_code=409,
             )
+        except WorkflowRunContractUnavailable:
+            return JSONResponse({"error": "workflow_contract_unavailable"}, status_code=503)
         except WorkflowServiceUnavailable:
             return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
         except DefinitionError as error:

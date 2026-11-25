@@ -19,6 +19,7 @@ from .service import (
     WorkflowServiceUnavailable,
     WorkflowSnapshot,
     WorkflowStartFailed,
+    strict_run_metadata_json,
 )
 
 _MAX_BODY_BYTES = 128 * 1024
@@ -167,7 +168,18 @@ def create_workflow_routes(
                     status_code=202,
                 )
             if status == "needs_reconciliation":
-                return JSONResponse({"error": "workflow_needs_reconciliation"}, status_code=409)
+                response: dict[str, object] = {"error": "workflow_needs_reconciliation"}
+                strict_metadata = strict_run_metadata_json(result.workflow)
+                if strict_metadata:
+                    response.update(
+                        {
+                            "workflow_id": result.workflow.workflow_id,
+                            "run_id": result.workflow.run_id,
+                            "status": status,
+                            **strict_metadata,
+                        }
+                    )
+                return JSONResponse(response, status_code=409)
             if status == "failed_to_start":
                 return JSONResponse({"error": "workflow_failed_to_start"}, status_code=409)
             if status == "failed":
@@ -371,6 +383,7 @@ def _snapshot_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
             }
             for job in snapshot.jobs
         ]
+    result.update(strict_run_metadata_json(snapshot))
     return result
 
 
@@ -385,4 +398,5 @@ def _list_item_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
         result["job_id"] = snapshot.job_id
     if snapshot.thread_id is not None:
         result["thread_id"] = snapshot.thread_id
+    result.update(strict_run_metadata_json(snapshot))
     return result
