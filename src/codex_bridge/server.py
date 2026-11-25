@@ -47,6 +47,9 @@ from .state import StateStore
 from .ui_api import ShutdownCallback, create_ui_app
 from .ui_server import LocalUiServer, UvicornShutdownController
 from .workflows.definition_mcp import register_workflow_definition_tools
+from .workflows.definition_repository_selection import (
+    select_workflow_definition_repository,
+)
 from .workflows.definitions import WorkflowDefinitionRepository
 from .workflows.manager import WorkflowShutdownReport, WorkflowWorkerManager
 from .workflows.mcp import register_workflow_tools
@@ -201,7 +204,7 @@ def build_runtime(
         allowed_roots=config.allowed_roots,
         control_token=config.control_token,
     )
-    workflow_definitions = WorkflowDefinitionRepository(workflow_manager.state_root)
+    workflow_definitions = select_workflow_definition_repository(workflow_manager.state_root)
     workflow_service = WorkflowService(workflow_manager, codex_bridge_port=config.ui_port)
     ui_server = LocalUiServer(
         create_ui_app(

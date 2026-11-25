@@ -1,6 +1,6 @@
 # D1-I6A definition repository and HTTP evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** IMPLEMENTED / ACCEPTED (with documented caveats)。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I5-B4C / I5 accepted at review commit `85f1fd206aea0db77d6ccd1e1d78f1551d6d89ec`。
 - **範囲:** 明示準備済みdefinitions.sqlite v2のdefinition repository adapter、HTTP definition contract面、strict saved-runのlegacy runtime拒否。
@@ -50,7 +50,11 @@ Windows nativeのpytest `tmp_path` DBと既存fake fixtureを使用します。�
 
 ## 次sliceと留保
 
-- **I6-B:** MCP definition optional contractをshared parser/serializerへ接続し、明示準備済みv2 repositoryのみを選択するruntime wiringを追加します。自動migrationは行いません。
+- **I6-B (後続slice):** MCP definition optional contractをshared parser/serializerへ接続し、明示準備済みv2 repositoryのみを選択するruntime wiringを追加する計画でした。実装結果は[D1-I6B証跡](D1-I6B-mcp-runtime-repository-evidence.md)に記録し、現在I6-BはIMPLEMENTED / PENDING_CHATGPT_REVIEWです。自動migrationは行っていません。
 - **I6-C:** strict run-start DTO/status/result metadataとreplayを実装します。request-id lookupは新規run allocation前に行います。I5-B4C coordinatorのreservationはrun_idでreplay照合するため、`reservation.replayed`単独でfresh reservationを推定しません。I5-B4Bで記録した`_snapshot_for_row` forced_stateとinvalid strict/replayの相互作用も接続時に確認します。
 - strict runtime、worker/DBOS/job、output成功判定、公開strict run admissionはI6-Aの対象外です。I7/I8とChatGPT reviewを経るまでstrict run admissionはOFFです。
-- ChatGPT review前のため、I6-Aはaccepted扱いにしません。D1全体もDRAFTのままです。
+- I6-AはChatGPT review受入済みですが、I6全体とD1全体の承認を意味しません。D1はDRAFTのままです。
+
+## ChatGPT GitHub review acceptance
+
+ChatGPT reviewed commit `36ab6a8ece2a1ffd6fea03065bd901f4d811fe40` and ACCEPTED I6-A with documented caveats. The dedicated I6-A suite recorded 9 passed; the focused aggregate recorded 168 passed / 2 skipped. Full pytest, CPP/account-auth regression, live API, real Worker/DBOS/job, and WAL metadata were not verified. This acceptance covers only the I6-A definition repository and HTTP contract surface; I6-B/C, strict runtime, and D1 overall remain pending.
