@@ -1395,7 +1395,7 @@ class Bridge:
             return
         await self._app_server.reject(request_id, -32601, "unsupported App Server request")
 
-   def _final_answer_write_from_notification(
+    def _final_answer_write_from_notification(
         self, message: Mapping[str, Any]
     ) -> _FinalAnswerWrite | None:
         if self._final_answer_store is None:
