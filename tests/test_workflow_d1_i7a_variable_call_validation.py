@@ -141,7 +141,7 @@ def _validate_strict(
             "operation": "object_delete",
             "declaration_id": "decision",
             "scope": "workflow",
-            "path": "",
+            "path": "/field",
         },
         {"operation": "variable_delete", "declaration_id": "decision", "scope": "workflow"},
     ],
@@ -150,6 +150,29 @@ def test_strict_validator_accepts_all_static_variable_operations_and_zero_job_pr
     arguments: dict[str, Any],
 ) -> None:
     _validate_strict(_definition(arguments))
+
+
+def test_strict_object_mutation_rejects_empty_pointer() -> None:
+    object_contract = _contract()
+    object_contract["variables"][0]["value_schema"] = {
+        "type": "object",
+        "properties": {"field": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    object_contract["variables"][0].pop("initial")
+    with pytest.raises(OwsError):
+        _validate_strict(
+            _definition(
+                {
+                    "operation": "object_set",
+                    "declaration_id": "decision",
+                    "scope": "workflow",
+                    "path": "",
+                    "value": "REVIEWED",
+                }
+            ),
+            object_contract,
+        )
 
 
 def test_strict_literal_null_requires_a_nullable_declaration_schema() -> None:

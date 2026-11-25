@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import unicodedata
@@ -8,15 +9,23 @@ from dataclasses import dataclass
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jq
 import yaml
 from jsonschema import Draft202012Validator
 
-from .contracts import CompiledContract
+from .contracts import CompiledContract, canonical_json
 from .job_adapter import JobRequestError, validate_mock_job_request
-from .strict_variable_logic import StrictVariableLogicError, _pointer_segments
+from .strict_variable_logic import (
+    MISSING,
+    StrictVariableLogicError,
+    _pointer_segments,
+    calculate_variable_candidate,
+)
+
+if TYPE_CHECKING:
+    from .strict_variable_runtime import StrictWorkflowVariableRuntimeAdapter
 
 SCHEMA_PATH: Traversable = files("codex_bridge.workflows").joinpath("schema", "workflow.yaml")
 SUPPORTED_TASKS = frozenset({"do", "set", "switch", "for", "call"})
@@ -154,6 +163,7 @@ def _validate_dataflow_config(
     expression_key: str,
     path: str,
     jq_variables: frozenset[str],
+    strict_contract: CompiledContract | None = None,
 ) -> None:
     if not isinstance(config, dict):
         raise OwsError(f"unsupported {config_name} configuration at {path}; expected an object")
@@ -169,7 +179,12 @@ def _validate_dataflow_config(
             f"unsupported {config_name}.{expression_key} type at {path}; "
             "only strict jq expression strings are supported"
         )
-    _compile_required_expression(expression, f"{path}.{expression_key}", jq_variables)
+    _compile_required_expression(
+        expression,
+        f"{path}.{expression_key}",
+        jq_variables,
+        strict_contract=strict_contract,
+    )
 
 
 def _validate_max_live_codex_jobs(value: object) -> int:
@@ -491,6 +506,7 @@ def _validate_subset(
             expression_key="as",
             path="output",
             jq_variables=frozenset(output_variables),
+            strict_contract=strict_contract,
         )
 
     tasks = definition.get("do")
@@ -621,6 +637,7 @@ def _validate_task_list(
                 expression_key="from",
                 path=f"{task_path}.input",
                 jq_variables=jq_variables.union({"context"}),
+                strict_contract=strict_contract,
             )
         if "output" in task_spec:
             _validate_dataflow_config(
@@ -629,6 +646,7 @@ def _validate_task_list(
                 expression_key="as",
                 path=f"{task_path}.output",
                 jq_variables=jq_variables.union({"context", "input"}),
+                strict_contract=strict_contract,
             )
         if "export" in task_spec:
             _validate_dataflow_config(
@@ -637,6 +655,7 @@ def _validate_task_list(
                 expression_key="as",
                 path=f"{task_path}.export",
                 jq_variables=jq_variables.union({"context", "input", "output"}),
+                strict_contract=strict_contract,
             )
         _validate_action(
             operation,
@@ -749,6 +768,7 @@ def _validate_action(
                     arguments["prompt_from"],
                     f"{task_path}.with.prompt_from",
                     jq_variables,
+                    strict_contract=strict_contract,
                 )
             return
         if target != "mock-job":
@@ -782,13 +802,19 @@ def _validate_action(
             arguments["payload"],
             f"{task_path}.with.payload",
             jq_variables.union({"context", "input"}),
+            strict_contract=strict_contract,
         )
         return
     if operation == "set":
         value = action["set"]
         if not isinstance(value, (dict, str)):
             raise OwsError(f"set on '{task_name}' must be a map or string")
-        _validate_set_value(value, task_path, jq_variables.union({"context", "input"}))
+        _validate_set_value(
+            value,
+            task_path,
+            jq_variables.union({"context", "input"}),
+            strict_contract=strict_contract,
+        )
         return
     if operation == "do":
         _validate_task_list(
@@ -817,6 +843,7 @@ def _validate_action(
             for_spec["in"],
             f"{task_path}.for.in",
             jq_variables.union({"context", "input"}),
+            strict_contract=strict_contract,
         )
         each_name = for_spec.get("each", "item")
         at_name = for_spec.get("at", "index")
@@ -866,6 +893,7 @@ def _validate_action(
                     case_spec["when"],
                     f"{task_path}.switch.{case_name}.when",
                     jq_variables.union({"context", "input"}),
+                    strict_contract=strict_contract,
                 )
         if defaults > 1:
             raise OwsError(f"switch on '{task_name}' has more than one default")
@@ -932,31 +960,29 @@ def _validate_strict_variable_call(
             value,
             f"{task_path}.with.value",
             jq_variables,
+            strict_contract=contract,
         )
-        value_schema = None
-        if operation in {"initialize", "assign"}:
-            value_schema = declaration["value_schema"]
-        elif operation == "append":
-            declared_schema = declaration["value_schema"]
-            declared_items = declared_schema.get("items")
-            if (
-                declared_schema.get("type") == "array"
-                and isinstance(declared_items, dict)
-                and "$ref" not in declared_items
-            ):
-                value_schema = declared_items
-        if value_schema is not None and _is_static_json_value(value, f"{task_path}.with.value"):
+        if operation in {"initialize", "assign"} and _is_static_json_value(
+            value, f"{task_path}.with.value"
+        ):
             try:
-                valid = Draft202012Validator(value_schema).is_valid(value)
+                calculate_variable_candidate(
+                    contract,
+                    declaration_id,
+                    "workflow",
+                    operation,
+                    previous_exists=False,
+                    previous_present=False,
+                    previous_value=MISSING,
+                    value=value,
+                )
             except Exception:
-                valid = False
-            if not valid:
-                raise OwsError("codexbridge-variable value does not match its declaration")
+                raise OwsError(
+                    "codexbridge-variable value does not match its declaration"
+                ) from None
 
 
 def _valid_rfc6901_pointer(value: Any) -> bool:
-    if value == "":
-        return type(value) is str
     try:
         _pointer_segments(value)
     except StrictVariableLogicError:
@@ -976,19 +1002,29 @@ def _is_static_json_value(value: Any, path: str) -> bool:
     return True
 
 
-def _validate_set_value(value: Any, path: str, jq_variables: frozenset[str]) -> None:
+def _validate_set_value(
+    value: Any,
+    path: str,
+    jq_variables: frozenset[str],
+    *,
+    strict_contract: CompiledContract | None = None,
+) -> None:
     if isinstance(value, str):
         expression = _optional_expression(value, path)
         if expression is not None:
-            _compile_jq(expression, path, jq_variables)
+            _compile_jq(expression, path, jq_variables, strict_contract=strict_contract)
         return
     if isinstance(value, dict):
         for key, child in value.items():
-            _validate_set_value(child, f"{path}.{key}", jq_variables)
+            _validate_set_value(
+                child, f"{path}.{key}", jq_variables, strict_contract=strict_contract
+            )
         return
     if isinstance(value, list):
         for index, child in enumerate(value):
-            _validate_set_value(child, f"{path}[{index}]", jq_variables)
+            _validate_set_value(
+                child, f"{path}[{index}]", jq_variables, strict_contract=strict_contract
+            )
 
 
 def _validate_directive_shape(directive: Any, task_name: str) -> None:
@@ -1075,14 +1111,188 @@ def _required_expression(value: Any, path: str) -> str:
     return expression
 
 
-def _compile_required_expression(value: Any, path: str, jq_variables: frozenset[str]) -> None:
-    _compile_jq(_required_expression(value, path), path, jq_variables)
+def _rewrite_strict_cbvars(expression: str, contract: CompiledContract) -> str:
+    """Guard supported static root lookups so absent values cannot become null."""
+    if type(expression) is not str:
+        raise OwsError("strict jq expression is invalid")
+    declarations = [
+        item
+        for item in contract.variables
+        if item.get("owner_scope") == "workflow"
+        and type(item.get("declaration_id")) is str
+        and type(item.get("name")) is str
+    ]
+
+    def lookup_id(key: str, *, shorthand: bool) -> str:
+        if shorthand:
+            matches = [item for item in declarations if item["name"] == key]
+        else:
+            matches = [item for item in declarations if item["declaration_id"] == key]
+        unique = {item["declaration_id"]: item for item in matches}
+        if len(unique) != 1:
+            raise OwsError("strict jq references an unsupported workflow variable")
+        declaration_id = next(iter(unique.values())).get("declaration_id")
+        if type(declaration_id) is not str:
+            raise OwsError("strict jq references an unsupported workflow variable")
+        return declaration_id
+
+    def guarded(name: str) -> str:
+        literal = json.dumps(name, ensure_ascii=False)
+        return (
+            f"((if ($cbvars.workflow | has({literal})) then "
+            f"$cbvars.workflow[{literal}] "
+            'else error("strict workflow variable is missing") end))'
+        )
+
+    def scan(start: int, *, stop_at_paren: bool = False) -> tuple[str, int]:
+        output: list[str] = []
+        index = start
+        depth = 0
+        while index < len(expression):
+            character = expression[index]
+            if character == '"':
+                output.append(character)
+                index += 1
+                while index < len(expression):
+                    current = expression[index]
+                    if current == "\\" and index + 1 < len(expression):
+                        next_character = expression[index + 1]
+                        if next_character == "(":
+                            output.append("\\(")
+                            nested, index = scan(index + 2, stop_at_paren=True)
+                            output.append(nested)
+                            output.append(")")
+                            continue
+                        output.append(expression[index : index + 2])
+                        index += 2
+                        continue
+                    output.append(current)
+                    index += 1
+                    if current == '"':
+                        break
+                else:
+                    raise OwsError("strict jq string is invalid")
+                continue
+            if character == "#":
+                end = expression.find("\n", index)
+                if end < 0:
+                    output.append(expression[index:])
+                    return "".join(output), len(expression)
+                output.append(expression[index:end])
+                index = end
+                continue
+            if character == "(":
+                depth += 1
+                output.append(character)
+                index += 1
+                continue
+            if character == ")":
+                if stop_at_paren and depth == 0:
+                    return "".join(output), index + 1
+                depth = max(0, depth - 1)
+                output.append(character)
+                index += 1
+                continue
+            if expression.startswith("$cbvars", index) and (
+                index + len("$cbvars") == len(expression)
+                or not (expression[index + 7].isalnum() or expression[index + 7] == "_")
+            ):
+                replacement, index = parse_lookup(index + len("$cbvars"))
+                output.append(replacement)
+                continue
+            output.append(character)
+            index += 1
+        if stop_at_paren:
+            raise OwsError("strict jq interpolation is invalid")
+        return "".join(output), index
+
+    def parse_lookup(index: int) -> tuple[str, int]:
+        def skip_space(position: int) -> int:
+            while position < len(expression) and expression[position].isspace():
+                position += 1
+            return position
+
+        position = skip_space(index)
+        if position >= len(expression) or expression[position] != ".":
+            raise OwsError("strict jq requires a static workflow variable lookup")
+        position = skip_space(position + 1)
+        if not expression.startswith("workflow", position):
+            raise OwsError("strict jq requires a workflow variable lookup")
+        after_scope = position + len("workflow")
+        if after_scope < len(expression) and (
+            expression[after_scope].isalnum() or expression[after_scope] == "_"
+        ):
+            raise OwsError("strict jq requires a workflow variable lookup")
+        position = skip_space(after_scope)
+        if position < len(expression) and expression[position] == "[":
+            position = skip_space(position + 1)
+            if position >= len(expression) or expression[position] != '"':
+                raise OwsError("strict jq requires a static workflow variable lookup")
+            try:
+                key, consumed = json.JSONDecoder().raw_decode(expression[position:])
+            except Exception:
+                raise OwsError("strict jq requires a static workflow variable lookup") from None
+            if type(key) is not str:
+                raise OwsError("strict jq requires a static workflow variable lookup")
+            position = skip_space(position + consumed)
+            if position >= len(expression) or expression[position] != "]":
+                raise OwsError("strict jq requires a static workflow variable lookup")
+            declaration_id = lookup_id(key, shorthand=False)
+            return guarded(declaration_id), position + 1
+        if position < len(expression) and expression[position] == ".":
+            name_start = position + 1
+            match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", expression[name_start:])
+            if match is None:
+                raise OwsError("strict jq requires a static workflow variable lookup")
+            declaration_id = lookup_id(match.group(0), shorthand=True)
+            return guarded(declaration_id), name_start + len(match.group(0))
+        raise OwsError("strict jq requires a static workflow variable lookup")
+
+    rewritten, _end = scan(0)
+    return rewritten
 
 
-def _compile_jq(expression: str, path: str, jq_variables: frozenset[str]) -> None:
+def _uses_strict_cbvars(value: Any, contract: CompiledContract) -> bool:
+    if isinstance(value, str):
+        expression = _optional_expression(value, "strict")
+        return expression is not None and _rewrite_strict_cbvars(expression, contract) != expression
+    if isinstance(value, dict):
+        return any(_uses_strict_cbvars(child, contract) for child in value.values())
+    if isinstance(value, list):
+        return any(_uses_strict_cbvars(child, contract) for child in value)
+    return False
+
+
+def _compile_required_expression(
+    value: Any,
+    path: str,
+    jq_variables: frozenset[str],
+    *,
+    strict_contract: CompiledContract | None = None,
+) -> None:
+    _compile_jq(
+        _required_expression(value, path),
+        path,
+        jq_variables,
+        strict_contract=strict_contract,
+    )
+
+
+def _compile_jq(
+    expression: str,
+    path: str,
+    jq_variables: frozenset[str],
+    *,
+    strict_contract: CompiledContract | None = None,
+) -> None:
     args = {name: None for name in jq_variables}
     try:
-        jq.compile(expression, args=args)
+        jq.compile(
+            _rewrite_strict_cbvars(expression, strict_contract)
+            if strict_contract is not None
+            else expression,
+            args=args,
+        )
     except Exception as error:
         raise OwsError(f"jq compile failed at {path}: {error}") from error
 
@@ -1095,26 +1305,49 @@ def _normalize_jq_outputs(outputs: Sequence[Any]) -> Any:
     return list(outputs)
 
 
-def evaluate_jq(value: str, data: Any, variables: Mapping[str, Any] | None = None) -> Any:
+def evaluate_jq(
+    value: str,
+    data: Any,
+    variables: Mapping[str, Any] | None = None,
+    *,
+    strict_contract: CompiledContract | None = None,
+) -> Any:
     expression = _required_expression(value, "runtime")
     args = dict(variables or {})
     try:
-        outputs = jq.compile(expression, args=args).input_value(data).all()
+        compiled_expression = (
+            _rewrite_strict_cbvars(expression, strict_contract)
+            if strict_contract is not None
+            else expression
+        )
+        outputs = jq.compile(compiled_expression, args=args).input_value(data).all()
     except Exception as error:
         raise OwsError(f"jq evaluation failed for {value!r}: {error}") from error
     return _normalize_jq_outputs(outputs)
 
 
-def _evaluate_set_value(value: Any, data: Any, variables: Mapping[str, Any]) -> Any:
+def _evaluate_set_value(
+    value: Any,
+    data: Any,
+    variables: Mapping[str, Any],
+    *,
+    strict_contract: CompiledContract | None = None,
+) -> Any:
     if isinstance(value, str):
         expression = _optional_expression(value, "set")
         if expression is None:
             return value
-        return evaluate_jq(value, data, variables)
+        return evaluate_jq(value, data, variables, strict_contract=strict_contract)
     if isinstance(value, dict):
-        return {key: _evaluate_set_value(child, data, variables) for key, child in value.items()}
+        return {
+            key: _evaluate_set_value(child, data, variables, strict_contract=strict_contract)
+            for key, child in value.items()
+        }
     if isinstance(value, list):
-        return [_evaluate_set_value(child, data, variables) for child in value]
+        return [
+            _evaluate_set_value(child, data, variables, strict_contract=strict_contract)
+            for child in value
+        ]
     return value
 
 
@@ -1123,14 +1356,23 @@ def compute_task_action(
     task_spec: Mapping[str, Any],
     input_data: Any,
     variables: Mapping[str, Any],
+    *,
+    strict_contract: CompiledContract | None = None,
 ) -> Any:
     """Compute one pure supported task action for direct or DBOS execution."""
     if operation == "set":
-        return _evaluate_set_value(task_spec["set"], input_data, variables)
+        return _evaluate_set_value(
+            task_spec["set"], input_data, variables, strict_contract=strict_contract
+        )
     if operation == "do":
         return input_data
     if operation == "for":
-        value = evaluate_jq(task_spec["for"]["in"], input_data, variables)
+        value = evaluate_jq(
+            task_spec["for"]["in"],
+            input_data,
+            variables,
+            strict_contract=strict_contract,
+        )
         if not isinstance(value, list):
             raise OwsError("for.in must produce an array")
         return value
@@ -1141,7 +1383,12 @@ def compute_task_action(
             if "when" not in case_spec:
                 default = case_spec["then"]
                 continue
-            condition = evaluate_jq(case_spec["when"], input_data, variables)
+            condition = evaluate_jq(
+                case_spec["when"],
+                input_data,
+                variables,
+                strict_contract=strict_contract,
+            )
             if not isinstance(condition, bool):
                 raise OwsError("switch condition must produce a boolean")
             if condition:
@@ -1203,12 +1450,22 @@ class Interpreter:
         codex_job_live: bool = False,
         max_live_codex_jobs: int = 1,
         observer: Callable[[_InterpreterEvent], None] | None = None,
+        strict_variable_runtime: StrictWorkflowVariableRuntimeAdapter | None = None,
     ) -> None:
         validate_workflow(
             definition,
             codex_job_live=codex_job_live,
             max_live_codex_jobs=max_live_codex_jobs,
+            strict_contract=(
+                strict_variable_runtime.compiled_contract
+                if strict_variable_runtime is not None
+                else None
+            ),
         )
+        if strict_variable_runtime is not None:
+            pinned = strict_variable_runtime.pinned_definition
+            if pinned is None or canonical_json(definition) != canonical_json(pinned):
+                raise OwsError("strict workflow does not match its verified pinned definition")
         if max_tasks < 1:
             raise ValueError("max_tasks must be positive")
         self.definition = definition
@@ -1216,6 +1473,7 @@ class Interpreter:
         self.step_runner = step_runner
         self.max_live_codex_jobs = max_live_codex_jobs
         self.observer = observer
+        self.strict_variable_runtime = strict_variable_runtime
         self._task_count = 0
 
     def run(self, input_data: Any) -> Any:
@@ -1231,11 +1489,24 @@ class Interpreter:
             workflow_input = evaluate_jq(workflow_input_config["from"], input_data)
         context = _WorkflowContext(workflow_input)
         result = self._run_scope(
-            self.definition["do"], workflow_input, {}, context, "do", "/do"
+            self.definition["do"], workflow_input, {}, context, "do", "/do", ()
         ).value
         workflow_output_config = self.definition.get("output", {})
         if "as" in workflow_output_config:
-            return evaluate_jq(workflow_output_config["as"], result, {"context": context.value})
+            output_variables: dict[str, Any] = {"context": context.value}
+            output_variables = self._strict_phase_variables(
+                output_variables,
+                workflow_output_config["as"],
+                "/output",
+                "workflow_output",
+                (),
+            )
+            return evaluate_jq(
+                workflow_output_config["as"],
+                result,
+                output_variables,
+                strict_contract=self._strict_contract,
+            )
         return result
 
     def _observe(self, event: _InterpreterEvent) -> None:
@@ -1255,6 +1526,7 @@ class Interpreter:
         context: _WorkflowContext,
         scope_path: str,
         scope_node_pointer: str,
+        iteration_vector: tuple[int, ...],
     ) -> _ScopeResult:
         names = [next(iter(task)) for task in tasks]
         name_to_index = {name: index for index, name in enumerate(names)}
@@ -1282,7 +1554,19 @@ class Interpreter:
             input_config = task_spec.get("input", {})
             if "from" in input_config:
                 try:
-                    task_input = evaluate_jq(input_config["from"], current, task_input_variables)
+                    task_input_variables = self._strict_phase_variables(
+                        task_input_variables,
+                        input_config["from"],
+                        node_id,
+                        "task_input",
+                        iteration_vector,
+                    )
+                    task_input = evaluate_jq(
+                        input_config["from"],
+                        current,
+                        task_input_variables,
+                        strict_contract=self._strict_contract,
+                    )
                 except Exception:
                     self._observe(
                         _InterpreterEvent(
@@ -1297,9 +1581,23 @@ class Interpreter:
             task_variables = dict(variables)
             task_variables["context"] = context.value
             task_variables["input"] = task_input
+            operation_variables = self._strict_phase_variables(
+                task_variables,
+                self._operation_jq_values(operation, task_spec),
+                node_id,
+                "operation",
+                iteration_vector,
+            )
             try:
                 action_result = self._execute_step(
-                    task_path, task_name, operation, task_spec, task_input, task_variables
+                    task_path,
+                    task_name,
+                    operation,
+                    task_spec,
+                    task_input,
+                    operation_variables,
+                    node_id=node_id,
+                    iteration_vector=iteration_vector,
                 )
             except Exception:
                 if self.step_runner is None and operation in {"set", "for", "switch"}:
@@ -1332,6 +1630,7 @@ class Interpreter:
                     context,
                     child_scope_identity,
                     child_node_pointer,
+                    iteration_vector,
                 )
                 self._observe(
                     _InterpreterEvent(
@@ -1379,6 +1678,7 @@ class Interpreter:
                         context,
                         child_scope_identity,
                         f"{node_id}/do",
+                        iteration_vector + (loop_index,),
                     )
                     self._observe(
                         _InterpreterEvent(
@@ -1411,8 +1711,18 @@ class Interpreter:
                 raw_output_variables = dict(variables)
                 raw_output_variables.update({"context": context.value, "input": task_input})
                 try:
+                    raw_output_variables = self._strict_phase_variables(
+                        raw_output_variables,
+                        output_config["as"],
+                        node_id,
+                        "output",
+                        iteration_vector,
+                    )
                     transformed_task_output = evaluate_jq(
-                        output_config["as"], raw_task_output, raw_output_variables
+                        output_config["as"],
+                        raw_task_output,
+                        raw_output_variables,
+                        strict_contract=self._strict_contract,
                     )
                 except Exception:
                     self._observe(
@@ -1439,8 +1749,18 @@ class Interpreter:
                     }
                 )
                 try:
+                    export_variables = self._strict_phase_variables(
+                        export_variables,
+                        export_config["as"],
+                        node_id,
+                        "export",
+                        iteration_vector,
+                    )
                     context.value = evaluate_jq(
-                        export_config["as"], transformed_task_output, export_variables
+                        export_config["as"],
+                        transformed_task_output,
+                        export_variables,
+                        strict_contract=self._strict_contract,
                     )
                 except Exception:
                     self._observe(
@@ -1524,7 +1844,24 @@ class Interpreter:
         task_spec: dict[str, Any],
         input_data: Any,
         variables: dict[str, Any],
+        *,
+        node_id: str,
+        iteration_vector: tuple[int, ...],
     ) -> Any:
+        if operation == "call" and task_spec.get("call") == "codexbridge-variable":
+            if self.strict_variable_runtime is None:
+                raise OwsError("codexbridge-variable requires a verified strict runtime")
+            evaluated_arguments = _evaluate_set_value(
+                task_spec["with"],
+                input_data,
+                variables,
+                strict_contract=self._strict_contract,
+            )
+            return self.strict_variable_runtime.execute_mutation(
+                evaluated_arguments,
+                node_id=node_id,
+                iteration_vector=iteration_vector,
+            )
         if self.step_runner is not None:
             return self.step_runner(
                 identity,
@@ -1534,4 +1871,49 @@ class Interpreter:
                 input_data,
                 variables,
             )
-        return compute_task_action(operation, task_spec, input_data, variables)
+        return compute_task_action(
+            operation,
+            task_spec,
+            input_data,
+            variables,
+            strict_contract=self._strict_contract,
+        )
+
+    @property
+    def _strict_contract(self) -> CompiledContract | None:
+        if self.strict_variable_runtime is None:
+            return None
+        return self.strict_variable_runtime.compiled_contract
+
+    def _strict_phase_variables(
+        self,
+        variables: dict[str, Any],
+        expressions: Any,
+        node_id: str,
+        phase: str,
+        iteration_vector: tuple[int, ...],
+    ) -> dict[str, Any]:
+        contract = self._strict_contract
+        adapter = self.strict_variable_runtime
+        if contract is None or adapter is None or not _uses_strict_cbvars(expressions, contract):
+            return variables
+        result = dict(variables)
+        result["cbvars"] = adapter.projection_for_phase(phase, node_id, iteration_vector)
+        return result
+
+    @staticmethod
+    def _operation_jq_values(operation: str, task_spec: dict[str, Any]) -> Any:
+        if operation == "call":
+            return task_spec.get("with")
+        if operation == "set":
+            return task_spec.get("set")
+        if operation == "for":
+            return task_spec.get("for", {}).get("in")
+        if operation == "switch":
+            return [
+                case_spec.get("when")
+                for case in task_spec.get("switch", [])
+                for case_spec in case.values()
+                if isinstance(case_spec, dict) and "when" in case_spec
+            ]
+        return None

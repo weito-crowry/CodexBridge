@@ -201,6 +201,28 @@ def test_initialize_distinguishes_no_initial_from_explicit_json_null() -> None:
         _calculate(contract, "null", "initialize", exists=True, present=False)
 
 
+def test_initialize_explicit_value_overrides_initial_but_no_argument_is_unchanged() -> None:
+    contract = _contract(
+        [
+            _variable("with-initial", "with_initial", value_schema=_schema("integer"), initial=3),
+            _variable("without-initial", "without_initial", value_schema=_schema("integer")),
+            _variable("nullable", "nullable", value_schema=_schema("null"), initial=None),
+        ]
+    )
+
+    explicit = _calculate(contract, "with-initial", "initialize", value=8)
+    legacy = _calculate(contract, "without-initial", "initialize")
+    explicit_null = _calculate(contract, "nullable", "initialize", value=None)
+
+    assert explicit.value == 8
+    assert explicit.present is True
+    assert legacy.state_exists is False and legacy.present is False
+    assert explicit_null.state_exists is True and explicit_null.present is True
+    assert explicit_null.value is None
+    with pytest.raises(StrictVariableLogicConflict):
+        _calculate(contract, "with-initial", "initialize", exists=True, present=False, value=9)
+
+
 def test_all_eight_operations_calculate_candidates_only() -> None:
     contract = _contract(
         [

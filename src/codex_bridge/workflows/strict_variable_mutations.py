@@ -253,7 +253,14 @@ class StrictWorkflowVariableMutationStore:
             frame = frames.get(context.frame_id)
             if frame is None:
                 raise StrictWorkflowVariableConflict()
-            if _frames._decode_iteration_vector(frame["iteration_vector_json"]) != vector:
+            stored_vector = _frames._decode_iteration_vector(frame["iteration_vector_json"])
+            is_root_frame = (
+                context.frame_id == "workflow-root"
+                and frame["parent_frame_id"] is None
+                and frame["scope_path"] == "workflow"
+                and not stored_vector
+            )
+            if not is_root_frame and stored_vector != vector:
                 raise StrictWorkflowVariableInvalidMetadata()
             declaration = resolve_variable_declaration(
                 self._compiled_contract, declaration_id, frame["scope_path"]
@@ -492,6 +499,42 @@ class StrictWorkflowVariableMutationStore:
                 total_current_value_bytes=current_bytes,
                 mutations=records,
             )
+        except (StrictWorkflowVariableError, StrictVariableLogicError):
+            raise
+        except Exception:
+            raise StrictWorkflowVariableStorageUnavailable() from None
+        finally:
+            self._close_read_connection(connection)
+
+    def read_root_projection(self) -> dict[str, Any]:
+        """Read all present workflow variables from one audited root snapshot."""
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._open_read_connection()
+            connection.execute("BEGIN")
+            frames = self._validate_database(connection)
+            root = frames.get("workflow-root")
+            if (
+                root is None
+                or root["parent_frame_id"] is not None
+                or root["scope_path"] != "workflow"
+                or root["status"] != "ACTIVE"
+                or _frames._decode_iteration_vector(root["iteration_vector_json"])
+            ):
+                raise StrictWorkflowVariableConflict()
+            _mutations, _state_count, current_bytes = self._audit_all(connection, frames)
+            if current_bytes > _MAX_STATE_BYTES:
+                raise StrictWorkflowVariableStorageUnavailable()
+            projection: dict[str, Any] = {}
+            for declaration in self._declarations.values():
+                if declaration.owner_scope != "workflow":
+                    continue
+                history = self._load_history(connection, root, declaration)
+                latest = history.states[max(history.states)]
+                if history.state_row is None or not latest.present or latest.value_json is None:
+                    continue
+                projection[declaration.declaration_id] = parse_strict_json(latest.value_json)
+            return projection
         except (StrictWorkflowVariableError, StrictVariableLogicError):
             raise
         except Exception:
@@ -768,6 +811,11 @@ class StrictWorkflowVariableMutationStore:
             "mutation_context": context_identity,
         }
         return "mutation-" + sha256_json(identity)
+
+    def execution_key_for(self, context: MutationContext) -> str:
+        """Derive the established key for one validated execution context."""
+        context_identity, _vector = self._validate_context(context)
+        return self._execution_key(context_identity)
 
     def _payload_digest(
         self,

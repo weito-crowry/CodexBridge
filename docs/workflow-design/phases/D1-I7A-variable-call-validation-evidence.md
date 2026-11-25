@@ -1,6 +1,6 @@
 # D1-I7-A strict variable-call validation and reader evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats) by ChatGPT GitHub review。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I6-C commit `61a6ddbb22ce38768289004a2b834b0512119e32` (ChatGPT ACCEPTED with documented caveats)。
 - **範囲:** strict contract context付きstatic OWS validator、strict v2 definition/read/graph integration。
@@ -35,11 +35,11 @@ aggregateは最終validator変更後の同一treeで実行しました。11 skip
 
 ## 残件と境界
 
-- ChatGPT GitHub review待ちで、I7-Aは受入済みとは扱いません。I7はIN_PROGRESSです。
-- I7-BではI4 variable store adapter、root frame連携、strict `$cbvars` read snapshot/missing semantics、mutation ledger/replayを接続します。
+- ChatGPT GitHub review of `8dc2399dcd443de13f6d60119a08ef343ba01d09` はI7-AをACCEPTED (with documented caveats)としました。レビュー時は947 passed / 11 skipped、専用suite 29 passedです。full pytest、CPP/account-auth、live API、実Worker/DBOS/job、WAL metadataは未検証です。受入はstatic validator/definition-reader接続までで、runtime semantic mismatchesはI7-Bで対応します。
+- I7-BではI4 variable store adapter、root ACTIVE frame連携、strict `$cbvars` root projection/missing semantics、mutation ledger/replayを接続します。
 - I7-Cではworker/DBOS/output validation/reason mappingとisolated strict admission integrationを扱います。I6-C review caveatのcorrupt request-source ledger replayでID保持前にunavailableとなり得る境界をここで再確認します。
 - I8 isolated acceptance/full pytest/go-no-go、strict admission enablement、D1最終承認は未実施です。I2はDEFERRED / NON-BLOCKINGです。
-- D1はDRAFT、strict run admissionはOFFです。
+- D1はDRAFT、strict run admissionはOFFです。I7-B runtime接続もD1/ADR 0007全体の承認を意味しません。
 
 ## 変更path
 
