@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
+from .contracts import CompiledContract
 from .definition_contract import (
     CONTRACT_MISSING,
     compile_definition_contract,
     definition_contract_object,
 )
 from .definitions import (
+    DefinitionInvalid,
     DefinitionPage,
     DefinitionRepositoryUnavailable,
     DefinitionRevision,
@@ -47,15 +48,16 @@ class StrictWorkflowDefinitionRepository(WorkflowDefinitionRepository):
         max_live_codex_jobs: int,
         *,
         contract: object = CONTRACT_MISSING,
+        strict_contract: CompiledContract | None = None,
     ) -> DefinitionValidation:
-        validation = super().validate(source_yaml, max_live_codex_jobs)
-        if contract is CONTRACT_MISSING:
-            return validation
-        compiled = compile_definition_contract(contract)
-        return replace(
-            validation,
-            contract_version=compiled.contract_version,
-            contract_sha256=compiled.contract_sha256,
+        if contract is not CONTRACT_MISSING:
+            if strict_contract is not None:
+                raise DefinitionInvalid("workflow validation request is invalid") from None
+            strict_contract = compile_definition_contract(contract)
+        return super().validate(
+            source_yaml,
+            max_live_codex_jobs,
+            strict_contract=strict_contract,
         )
 
     def create(

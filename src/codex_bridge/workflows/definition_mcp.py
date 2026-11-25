@@ -11,7 +11,12 @@ from pydantic import Field
 
 from ..config import BridgeConfig
 from .definition_api import _revision_detail_json, _revision_metadata, _summary_json
-from .definition_contract import CONTRACT_MISSING, compile_definition_contract
+from .definition_contract import (
+    CONTRACT_MISSING,
+    compile_definition_contract,
+    compiled_contract_for_revision,
+    validate_definition_source,
+)
 from .definitions import (
     DefinitionError,
     DefinitionInvalid,
@@ -133,6 +138,7 @@ def register_workflow_definition_tools(
                         saved.definition,
                         codex_job_live=True,
                         max_live_codex_jobs=saved.max_live_codex_jobs,
+                        strict_contract=compiled_contract_for_revision(saved),
                     )
                     return saved, graph
 
@@ -181,7 +187,11 @@ def register_workflow_definition_tools(
             assert repository is not None
             try:
                 validation = await asyncio.to_thread(
-                    repository.validate, source_yaml, max_live_codex_jobs
+                    validate_definition_source,
+                    repository,
+                    source_yaml,
+                    max_live_codex_jobs,
+                    contract=contract,
                 )
                 result = {
                     "valid": True,
@@ -189,10 +199,9 @@ def register_workflow_definition_tools(
                     "canonical_sha256": validation.canonical_sha256,
                     "max_live_codex_jobs": validation.max_live_codex_jobs,
                 }
-                if contract is not CONTRACT_MISSING:
-                    compiled = compile_definition_contract(contract)
-                    result["contract_version"] = compiled.contract_version
-                    result["contract_sha256"] = compiled.contract_sha256
+                if validation.contract_version is not None:
+                    result["contract_version"] = validation.contract_version
+                    result["contract_sha256"] = validation.contract_sha256
                 return _bounded_definition_response(result)
             except DefinitionError as definition_error:
                 return _definition_error(definition_error)

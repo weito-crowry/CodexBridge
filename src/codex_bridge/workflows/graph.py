@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from .contracts import CompiledContract
 from .interpreter import OwsError, validate_workflow
 
 _TASK_OPERATIONS = frozenset({"do", "set", "switch", "for", "call"})
@@ -43,6 +44,7 @@ def project_workflow_graph(
     *,
     codex_job_live: bool = False,
     max_live_codex_jobs: int = 1,
+    strict_contract: CompiledContract | None = None,
 ) -> dict[str, Any]:
     """Project a validated OWS subset definition into a static JSON graph."""
     if not isinstance(definition, Mapping):
@@ -61,6 +63,7 @@ def project_workflow_graph(
         copied_definition,
         codex_job_live=codex_job_live,
         max_live_codex_jobs=max_live_codex_jobs,
+        strict_contract=strict_contract,
     )
 
     nodes: list[dict[str, Any]] = []

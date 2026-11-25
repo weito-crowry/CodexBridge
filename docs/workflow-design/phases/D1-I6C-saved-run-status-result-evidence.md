@@ -1,10 +1,10 @@
 # D1-I6C saved-run status, result, and replay evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats) by ChatGPT GitHub review。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I6-B commit `8626667daaf78985d164d3fd5d1efd8a363ac9b5` (ChatGPT ACCEPTED with documented caveats)。
 - **範囲:** strict saved-run request preflight、request-id replay boundary、HTTP/MCP status/result/task/event metadataとsafe error mapping。
-- **全体境界:** I6はIN_PROGRESS、I6-A/I6-BはACCEPTED (with documented caveats)、I2はDEFERRED / NON-BLOCKING、D1はDRAFT、strict run admissionはOFF。
+- **全体境界:** I6/I6-A/I6-B/I6-CはACCEPTED (with documented caveats)、I7はIN_PROGRESS、I2はDEFERRED / NON-BLOCKING、D1はDRAFT、strict run admissionはOFF。
 
 ## 実装
 
@@ -33,9 +33,10 @@ Focused aggregateの6 skipはこのWindows hostでtest symlinkを作成できな
 
 ## 残件と境界
 
-- I6-CはChatGPT review待ちで、受入済みとは扱いません。I6はIN_PROGRESSです。
+- ChatGPT GitHub review of `61a6ddbb22ce38768289004a2b834b0512119e32` はI6-CおよびI6全体をACCEPTED (with documented caveats)としました。レビュー時の記録は上表の419 passed / 6 skippedと専用suite 11 passedです。
 - strict admissionはOFFのままです。新規strict reservation、run directory作成、worker起動、DB migration、strict runtime execution、output validationはありません。
 - I7でstrict runtime/output validation/reason mapping/実行接続が残っています。I8のenablement・full acceptanceも未実施です。
+- corrupt request-source ledgerがあるstrict replayは、workflow/run IDを保持する前にunavailableとなる可能性があります。I7 admission integration時に、ID保持とsafe reconciliationの境界を再確認します。
 - I6-B ChatGPT review of `8626667daaf78985d164d3fd5d1efd8a363ac9b5` はACCEPTED (with documented caveats)です。review時は242 passed / 3 skipped、I6-B専用suiteは5 passed / 1 skippedでした。full pytest、CPP/account-auth、live API、real Worker/DBOS/job、WAL metadataは未検証です。
 - D1全体はDRAFT、I2はDEFERRED / NON-BLOCKINGです。
 

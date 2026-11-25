@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .contracts import CompiledContract
 from .interpreter import OwsError, parse_workflow_text, validate_workflow
 
 _DATABASE_NAME = "definitions.sqlite"
@@ -140,7 +141,13 @@ class WorkflowDefinitionRepository:
     def __init__(self, state_root: Path) -> None:
         self._state_root = Path(state_root)
 
-    def validate(self, source_yaml: str, max_live_codex_jobs: int) -> DefinitionValidation:
+    def validate(
+        self,
+        source_yaml: str,
+        max_live_codex_jobs: int,
+        *,
+        strict_contract: CompiledContract | None = None,
+    ) -> DefinitionValidation:
         source_bytes = _validate_source_fields(source_yaml, max_live_codex_jobs)
         try:
             definition = parse_workflow_text(source_yaml)
@@ -152,6 +159,7 @@ class WorkflowDefinitionRepository:
                 definition,
                 codex_job_live=True,
                 max_live_codex_jobs=max_live_codex_jobs,
+                strict_contract=strict_contract,
             )
         except OwsError as error:
             if str(error).startswith(_SCHEMA_UNAVAILABLE_PREFIX):
@@ -175,6 +183,8 @@ class WorkflowDefinitionRepository:
             source_sha256=hashlib.sha256(source_bytes).hexdigest(),
             canonical_sha256=hashlib.sha256((canonical_json + "\n").encode("utf-8")).hexdigest(),
             max_live_codex_jobs=max_live_codex_jobs,
+            contract_version=(strict_contract.contract_version if strict_contract else None),
+            contract_sha256=(strict_contract.contract_sha256 if strict_contract else None),
         )
 
     def create(
@@ -612,7 +622,12 @@ class WorkflowDefinitionRepository:
             raise DefinitionRepositoryUnavailable("workflow definition storage is unavailable")
         return self._revision_from_row(row)
 
-    def _revision_from_row(self, row: sqlite3.Row) -> DefinitionRevision:
+    def _revision_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        strict_contract: CompiledContract | None = None,
+    ) -> DefinitionRevision:
         definition_id = row["definition_id"]
         revision = row["revision"]
         source_yaml = row["source_yaml"]
@@ -635,7 +650,11 @@ class WorkflowDefinitionRepository:
         ):
             raise DefinitionRepositoryUnavailable("workflow definition storage is unavailable")
         try:
-            validated = self.validate(source_yaml, max_live_codex_jobs)
+            validated = self.validate(
+                source_yaml,
+                max_live_codex_jobs,
+                strict_contract=strict_contract,
+            )
         except DefinitionError:
             raise DefinitionRepositoryUnavailable(
                 "workflow definition storage is unavailable"

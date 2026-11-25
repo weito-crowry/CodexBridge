@@ -175,12 +175,21 @@ def project_workflow_tasks(
     strict_v2 = strict_verification is not None
     if strict_verification is not None:
         base.update(strict_verification_metadata_json(strict_verification))
+        pinned_definition = strict_verification._definition
+        if pinned_definition is None or pinned_definition.contract is None:
+            base["coverage"] = "unavailable"
+            base["coverage_reason"] = "run_integrity_invalid"
+            return _attach_snapshot_version(base, snapshot, None, ())
+        strict_contract = pinned_definition.contract
+    else:
+        strict_contract = None
 
     try:
         graph = project_workflow_graph(
             definition,
             codex_job_live=True,
             max_live_codex_jobs=max_jobs,
+            strict_contract=strict_contract,
         )
         static_nodes = graph["nodes"]
         static_edges = graph["edges"]
@@ -572,10 +581,17 @@ def project_workflow_task_events(
         )
         if strict_verification is not None:
             base.update(strict_verification_metadata_json(strict_verification))
+            pinned_definition = strict_verification._definition
+            if pinned_definition is None or pinned_definition.contract is None:
+                raise _ProjectionIssue("run_integrity_invalid")
+            strict_contract = pinned_definition.contract
+        else:
+            strict_contract = None
         graph = project_workflow_graph(
             definition,
             codex_job_live=True,
             max_live_codex_jobs=max_jobs,
+            strict_contract=strict_contract,
         )
         nodes = graph["nodes"]
         edges = graph["edges"]

@@ -4,7 +4,6 @@ import asyncio
 import json
 import re
 from collections.abc import Callable
-from dataclasses import replace
 from typing import Any
 
 from starlette.requests import Request
@@ -17,7 +16,12 @@ from .api import (
     _json_payload,
     _snapshot_json,
 )
-from .definition_contract import CONTRACT_MISSING, compile_definition_contract
+from .definition_contract import (
+    CONTRACT_MISSING,
+    compile_definition_contract,
+    compiled_contract_for_revision,
+    validate_definition_source,
+)
 from .definitions import (
     DefinitionError,
     DefinitionInvalid,
@@ -152,14 +156,13 @@ def create_workflow_definition_routes(
             source_yaml, profile = _source_fields(
                 payload.get("source_yaml"), payload.get("max_live_codex_jobs")
             )
-            validation = await asyncio.to_thread(repository.validate, source_yaml, profile)
-            if "contract" in payload:
-                compiled = compile_definition_contract(payload["contract"])
-                validation = replace(
-                    validation,
-                    contract_version=compiled.contract_version,
-                    contract_sha256=compiled.contract_sha256,
-                )
+            validation = await asyncio.to_thread(
+                validate_definition_source,
+                repository,
+                source_yaml,
+                profile,
+                contract=(payload["contract"] if "contract" in payload else CONTRACT_MISSING),
+            )
             validation_json = {
                 "valid": True,
                 "source_sha256": validation.source_sha256,
@@ -391,6 +394,7 @@ def create_workflow_definition_routes(
                     revision.definition,
                     codex_job_live=True,
                     max_live_codex_jobs=revision.max_live_codex_jobs,
+                    strict_contract=compiled_contract_for_revision(revision),
                 )
                 return revision, graph
 

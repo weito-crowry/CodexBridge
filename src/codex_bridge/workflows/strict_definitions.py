@@ -479,7 +479,11 @@ class StrictWorkflowDefinitionStore:
         if replay is not None:
             return replay
         _validate_source_fields(source_yaml, max_live_codex_jobs)
-        validated = self._validator.validate(source_yaml, max_live_codex_jobs)
+        validated = self._validator.validate(
+            source_yaml,
+            max_live_codex_jobs,
+            strict_contract=compiled,
+        )
         definition_id = str(uuid.uuid4())
         created_at = _utc_now()
         contract_values = (
@@ -594,7 +598,25 @@ class StrictWorkflowDefinitionStore:
         canonical_id = _validate_definition_id(definition_id)
         _validate_revision(expected_revision)
         _validate_source_fields(source_yaml, max_live_codex_jobs)
-        validated = self._validator.validate(source_yaml, max_live_codex_jobs)
+        try:
+            validated = self._validator.validate(
+                source_yaml,
+                max_live_codex_jobs,
+                strict_contract=compiled,
+            )
+        except DefinitionInvalid as validation_error:
+            if compiled is None:
+                try:
+                    current = self.get(canonical_id)
+                except DefinitionNotFound:
+                    raise validation_error from None
+                if current.revision != expected_revision:
+                    raise DefinitionPreconditionFailed(
+                        "workflow definition revision precondition failed"
+                    ) from None
+                if current.is_strict:
+                    raise WorkflowContractRequired("workflow contract is required") from None
+            raise validation_error from None
         updated_at = _utc_now()
 
         with self._write_transaction() as connection:
@@ -899,11 +921,6 @@ class StrictWorkflowDefinitionStore:
         *,
         contract_values: tuple[object, object, object, object] | None | object = _MISSING,
     ) -> StrictDefinitionRevision:
-        try:
-            base = self._validator._revision_from_row(row)
-        except DefinitionError:
-            raise DefinitionRepositoryUnavailable(_UNAVAILABLE) from None
-
         if contract_values is _MISSING:
             contract_row = connection.execute(
                 """
@@ -911,7 +928,7 @@ class StrictWorkflowDefinitionStore:
                 FROM workflow_definition_contracts
                 WHERE definition_id = ? AND revision = ?
                 """,
-                (base.definition_id, base.revision),
+                (row["definition_id"], row["revision"]),
             ).fetchone()
             contract_values = (
                 (
@@ -933,10 +950,14 @@ class StrictWorkflowDefinitionStore:
                   AND result_etag GLOB '"workflow-definition-v2-*'
                 LIMIT 1
                 """,
-                (base.definition_id, base.revision),
+                (row["definition_id"], row["revision"]),
             ).fetchone()
             if strict_mutation is not None:
                 raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+            try:
+                base = self._validator._revision_from_row(row)
+            except DefinitionError:
+                raise DefinitionRepositoryUnavailable(_UNAVAILABLE) from None
             return _strict_revision(base, None, None, None, None, base.etag)
         canonical, stored_sha, stored_binding, created_at = contract_values
         if (
@@ -945,7 +966,7 @@ class StrictWorkflowDefinitionStore:
             or not _SHA256.fullmatch(stored_sha)
             or not isinstance(stored_binding, str)
             or not _SHA256.fullmatch(stored_binding)
-            or created_at != base.created_at
+            or created_at != row["created_at"]
         ):
             raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
         try:
@@ -958,6 +979,10 @@ class StrictWorkflowDefinitionStore:
         except ContractError:
             raise DefinitionRepositoryUnavailable(_UNAVAILABLE) from None
         except Exception:
+            raise DefinitionRepositoryUnavailable(_UNAVAILABLE) from None
+        try:
+            base = self._validator._revision_from_row(row, strict_contract=compiled)
+        except DefinitionError:
             raise DefinitionRepositoryUnavailable(_UNAVAILABLE) from None
         expected_binding = _binding_digest(
             base.definition_id,

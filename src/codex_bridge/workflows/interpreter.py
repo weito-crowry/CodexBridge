@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
@@ -13,7 +14,9 @@ import jq
 import yaml
 from jsonschema import Draft202012Validator
 
+from .contracts import CompiledContract
 from .job_adapter import JobRequestError, validate_mock_job_request
+from .strict_variable_logic import StrictVariableLogicError, _pointer_segments
 
 SCHEMA_PATH: Traversable = files("codex_bridge.workflows").joinpath("schema", "workflow.yaml")
 SUPPORTED_TASKS = frozenset({"do", "set", "switch", "for", "call"})
@@ -133,11 +136,13 @@ def validate_workflow(
     *,
     codex_job_live: bool = False,
     max_live_codex_jobs: int = 1,
+    strict_contract: CompiledContract | None = None,
 ) -> None:
     _validate_subset(
         definition,
         codex_job_live=codex_job_live,
         max_live_codex_jobs=max_live_codex_jobs,
+        strict_contract=strict_contract,
     )
     validate_official_schema(definition, schema_path=schema_path)
 
@@ -442,7 +447,10 @@ def _validate_subset(
     *,
     codex_job_live: bool = False,
     max_live_codex_jobs: int = 1,
+    strict_contract: CompiledContract | None = None,
 ) -> None:
+    if strict_contract is not None and not isinstance(strict_contract, CompiledContract):
+        raise OwsError("strict workflow validation context is invalid")
     max_live_codex_jobs = _validate_max_live_codex_jobs(max_live_codex_jobs)
     if max_live_codex_jobs in {2, 3} and not codex_job_live:
         raise OwsError(f"max_live_codex_jobs={max_live_codex_jobs} requires codex-job live mode")
@@ -474,12 +482,15 @@ def _validate_subset(
             jq_variables=frozenset(),
         )
     if "output" in definition:
+        output_variables = {"context"}
+        if strict_contract is not None:
+            output_variables.add("cbvars")
         _validate_dataflow_config(
             definition["output"],
             config_name="output",
             expression_key="as",
             path="output",
-            jq_variables=frozenset({"context"}),
+            jq_variables=frozenset(output_variables),
         )
 
     tasks = definition.get("do")
@@ -489,7 +500,11 @@ def _validate_subset(
     if codex_calls and not codex_job_live:
         raise OwsError("codex-job requires --codex-job-live")
     if codex_job_live:
-        if max_live_codex_jobs == 1 and len(codex_calls) != 1:
+        if (
+            max_live_codex_jobs == 1
+            and len(codex_calls) != 1
+            and not (strict_contract is not None and not codex_calls)
+        ):
             raise OwsError("codex-job live mode requires exactly one codex-job call")
         if max_live_codex_jobs == 2:
             _validate_two_live_codex_job_shape(definition, tasks)
@@ -508,9 +523,10 @@ def _validate_subset(
     _validate_task_list(
         tasks,
         "do",
-        frozenset(),
+        frozenset({"cbvars"}) if strict_contract is not None else frozenset(),
         codex_job_live=codex_job_live,
         max_live_codex_jobs=max_live_codex_jobs,
+        strict_contract=strict_contract,
     )
 
 
@@ -547,6 +563,7 @@ def _validate_task_list(
     *,
     codex_job_live: bool = False,
     max_live_codex_jobs: int = 1,
+    strict_contract: CompiledContract | None = None,
 ) -> None:
     if not isinstance(tasks, list) or not tasks:
         raise OwsError(f"{scope_path} must be a non-empty task list")
@@ -629,6 +646,7 @@ def _validate_task_list(
             jq_variables,
             codex_job_live=codex_job_live,
             max_live_codex_jobs=max_live_codex_jobs,
+            strict_contract=strict_contract,
         )
         directive = task_spec.get("then")
         if directive is not None:
@@ -691,9 +709,20 @@ def _validate_action(
     *,
     codex_job_live: bool = False,
     max_live_codex_jobs: int = 1,
+    strict_contract: CompiledContract | None = None,
 ) -> None:
     if operation == "call":
         target = action["call"]
+        if target == "codexbridge-variable":
+            if strict_contract is None:
+                raise OwsError("unsupported call target 'codexbridge-variable'")
+            _validate_strict_variable_call(
+                action.get("with"),
+                task_path,
+                jq_variables.union({"context", "input"}),
+                strict_contract,
+            )
+            return
         if target == "codex-job":
             if not codex_job_live:
                 raise OwsError("codex-job requires --codex-job-live")
@@ -768,6 +797,7 @@ def _validate_action(
             jq_variables,
             codex_job_live=codex_job_live,
             max_live_codex_jobs=max_live_codex_jobs,
+            strict_contract=strict_contract,
         )
         return
     if operation == "for":
@@ -800,12 +830,15 @@ def _validate_action(
             raise OwsError(
                 f"for.each and for.at on '{task_name}' cannot shadow OWS dataflow variables"
             )
+        if strict_contract is not None and "cbvars" in {each_name, at_name}:
+            raise OwsError("strict for.each and for.at cannot shadow $cbvars")
         _validate_task_list(
             body,
             f"{task_path}.do",
             jq_variables.union({each_name, at_name}),
             codex_job_live=codex_job_live,
             max_live_codex_jobs=max_live_codex_jobs,
+            strict_contract=strict_contract,
         )
         return
     if operation == "switch":
@@ -836,6 +869,111 @@ def _validate_action(
                 )
         if defaults > 1:
             raise OwsError(f"switch on '{task_name}' has more than one default")
+
+
+def _validate_strict_variable_call(
+    arguments: Any,
+    task_path: str,
+    jq_variables: frozenset[str],
+    contract: CompiledContract,
+) -> None:
+    operation_arguments: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+        "initialize": (frozenset({"value"}), frozenset()),
+        "assign": (frozenset({"value"}), frozenset()),
+        "increment": (frozenset(), frozenset({"by"})),
+        "decrement": (frozenset(), frozenset({"by"})),
+        "append": (frozenset({"value"}), frozenset()),
+        "object_set": (frozenset({"path", "value"}), frozenset()),
+        "object_delete": (frozenset({"path"}), frozenset()),
+        "variable_delete": (frozenset(), frozenset()),
+    }
+    if not isinstance(arguments, dict):
+        raise OwsError("codexbridge-variable with must be an argument object")
+    operation = arguments.get("operation")
+    if type(operation) is not str or operation not in operation_arguments:
+        raise OwsError("codexbridge-variable operation is invalid")
+    declaration_id = arguments.get("declaration_id")
+    declaration = next(
+        (
+            item
+            for item in contract.variables
+            if item.get("declaration_id") == declaration_id
+            and item.get("owner_scope") == "workflow"
+        ),
+        None,
+    )
+    if type(declaration_id) is not str or declaration is None:
+        raise OwsError("codexbridge-variable declaration is invalid")
+    if arguments.get("scope") != "workflow":
+        raise OwsError("codexbridge-variable scope must be workflow")
+
+    required, optional = operation_arguments[operation]
+    allowed = {"operation", "declaration_id", "scope"} | required | optional
+    if set(arguments) - allowed:
+        raise OwsError("codexbridge-variable arguments contain unsupported keys")
+    required_keys = {"operation", "declaration_id", "scope"} | required
+    if not required_keys.issubset(arguments):
+        raise OwsError("codexbridge-variable arguments are incomplete")
+
+    if operation in {"increment", "decrement"}:
+        amount = arguments.get("by", 1)
+        if (
+            type(amount) not in {int, float}
+            or (type(amount) is float and not math.isfinite(amount))
+            or amount < 0
+        ):
+            raise OwsError("codexbridge-variable by must be a finite non-negative number")
+    if operation in {"object_set", "object_delete"}:
+        if not _valid_rfc6901_pointer(arguments.get("path")):
+            raise OwsError("codexbridge-variable path must be an RFC 6901 JSON Pointer")
+    if "value" in required:
+        value = arguments["value"]
+        _validate_set_value(
+            value,
+            f"{task_path}.with.value",
+            jq_variables,
+        )
+        value_schema = None
+        if operation in {"initialize", "assign"}:
+            value_schema = declaration["value_schema"]
+        elif operation == "append":
+            declared_schema = declaration["value_schema"]
+            declared_items = declared_schema.get("items")
+            if (
+                declared_schema.get("type") == "array"
+                and isinstance(declared_items, dict)
+                and "$ref" not in declared_items
+            ):
+                value_schema = declared_items
+        if value_schema is not None and _is_static_json_value(value, f"{task_path}.with.value"):
+            try:
+                valid = Draft202012Validator(value_schema).is_valid(value)
+            except Exception:
+                valid = False
+            if not valid:
+                raise OwsError("codexbridge-variable value does not match its declaration")
+
+
+def _valid_rfc6901_pointer(value: Any) -> bool:
+    if value == "":
+        return type(value) is str
+    try:
+        _pointer_segments(value)
+    except StrictVariableLogicError:
+        return False
+    return True
+
+
+def _is_static_json_value(value: Any, path: str) -> bool:
+    if isinstance(value, str):
+        return _optional_expression(value, path) is None
+    if isinstance(value, dict):
+        return all(_is_static_json_value(child, f"{path}.{key}") for key, child in value.items())
+    if isinstance(value, list):
+        return all(
+            _is_static_json_value(child, f"{path}[{index}]") for index, child in enumerate(value)
+        )
+    return True
 
 
 def _validate_set_value(value: Any, path: str, jq_variables: frozenset[str]) -> None:
