@@ -77,6 +77,9 @@ class BridgeRuntime:
         except BaseException:
             await self.app_server.shutdown(self.config.shutdown_grace_seconds)
             raise
+        refresh_account_auth = getattr(self.bridge, "refresh_account_auth", None)
+        if callable(refresh_account_auth):
+            asyncio.create_task(refresh_account_auth())
         if self.external_monitor is not None:
             await self.external_monitor.start()
         log_event("bridge.start")
@@ -122,6 +125,9 @@ class BridgeRuntime:
             await self.ui_server.shutdown(self.config.shutdown_grace_seconds)
         except BaseException as error:
             shutdown_error = shutdown_error or error
+        disconnect_account_auth = getattr(self.bridge, "disconnect_account_auth", None)
+        if callable(disconnect_account_auth):
+            disconnect_account_auth()
         try:
             await self.app_server.shutdown(self.config.shutdown_grace_seconds)
         except BaseException as error:

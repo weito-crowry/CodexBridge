@@ -143,6 +143,9 @@ class BridgeLifecycleController:
         window._bridge_managed_retry_coordinator.reset_after_ready()
         window._bridge_transition = False
         window._set_runtime_state("console_started", label=tr("Runtime: started by Console"))
+        account_auth = getattr(window, "_account_auth_controller", None)
+        if account_auth is not None:
+            account_auth.refresh_controls()
         window.bottom_status_label.setText(tr("Bridge started by Console"))
         set_tunnel_bridge_ready(window, True)
         window._begin_usage_sequence()
@@ -195,6 +198,9 @@ class BridgeLifecycleController:
         window._bridge_runtime_observer.reset_loss_count()
         window._launch_in_progress = False
         window._tunnel.set_bridge_ready(False)
+        account_auth = getattr(window, "_account_auth_controller", None)
+        if account_auth is not None:
+            account_auth.on_connection_changed(False)
         window._bridge_transition_coordinator.clear_pending_action()
         if action == "restart" and not stop_outcome_was_uncertain:
             resolution = window._codex_resolution

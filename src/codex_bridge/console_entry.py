@@ -152,6 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _set_windows_app_user_model_id()
     application = QApplication([sys.argv[0]])
+    application.setStyle("Fusion")
     application.setWindowIcon(_load_application_icon())
     window = MainWindow(config, enable_external_thread_monitor=False)
     window.show()

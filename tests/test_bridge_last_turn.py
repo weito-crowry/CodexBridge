@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -100,6 +101,76 @@ async def test_live_stop_retry_and_disconnect_are_distinct(allowed_dir):
         }
     )
     assert (await bridge.status("native-thread"))["last_turn"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_explicit_auth_error_refreshes_account_without_exposing_raw_error(
+    allowed_dir, caplog
+):
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.account_response = {
+        "account": None,
+        "userId": "PRIVATE-USER",
+        "requiresOpenaiAuth": True,
+        "workspaceRouting": None,
+    }
+    await bridge.start(str(allowed_dir), "prompt")
+    subscription = bridge._activities.subscribe()
+
+    bridge.handle_notification(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "native-thread",
+                "turn": {
+                    "id": "native-turn",
+                    "status": "failed",
+                    "error": {
+                        "message": "PRIVATE-LOGIN-URL and PRIVATE-CODE",
+                        "codexErrorInfo": "unauthorized",
+                    },
+                },
+            },
+        }
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    status = await bridge.status("native-thread", "native-turn")
+    assert status["last_turn"]["status"] == "failed"
+    assert "PRIVATE" not in repr(status)
+    activity = await asyncio.wait_for(subscription.get(), timeout=0.1)
+    assert activity.type == "turn_failed"
+    assert "PRIVATE" not in repr(activity.to_dict())
+    bridge.handle_notification(
+        {
+            "method": "account/login/completed",
+            "params": {
+                "loginId": "PRIVATE-LOGIN-ID",
+                "success": False,
+                "error": "PRIVATE-ERROR",
+                "userCode": "PRIVATE-CODE",
+                "authUrl": "https://auth.openai.com/oauth/authorize?PRIVATE=1",
+            },
+        }
+    )
+    assert subscription._queue.empty()
+    assert not any(
+        secret in caplog.text
+        for secret in (
+            "PRIVATE-LOGIN-ID",
+            "PRIVATE-ERROR",
+            "PRIVATE-CODE",
+            "PRIVATE-URL",
+        )
+    )
+    auth_status = await bridge.refresh_account_auth()
+    assert auth_status["state"] == "login_required"
+    assert auth_status["login_state"] == "idle"
+    assert auth_status["login_result"] == "none"
+    assert auth_status["auth_warning"] == "execution_auth_error"
+    assert auth_status["issue"] is None
+    assert app.calls.count(("account/read", {})) >= 1
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QMessageBox as QMessageBox
 
 from ..tunnel_profile import generate_tunnel_profile
+from .account_auth_controller import AccountAuthController
 from .api_client import ApiClient
 from .api_result_dispatcher import ApiResultDispatcher
 from .appearance import AppearanceController, install_appearance
@@ -186,6 +187,11 @@ class MainWindow(QMainWindow):
     codex_update_button: QPushButton
     status_refresh_button: QPushButton
     status_close_button: QPushButton
+    account_auth_status_label: QLabel
+    account_auth_login_button: QPushButton
+    account_auth_device_button: QPushButton
+    account_auth_cancel_button: QPushButton
+    account_auth_refresh_button: QPushButton
     status_dialog: QDialog
     _appearance_menu: QMenu
     _settings_actions: dict[str, QAction]
@@ -195,6 +201,7 @@ class MainWindow(QMainWindow):
     _appearance_settings: QSettings
     _workflow_management_controller: WorkflowManagementController
     _settings_controller: SettingsActionController
+    _account_auth_controller: AccountAuthController
     _bridge_lifecycle_controller: BridgeLifecycleController
     _project_folder_actions_controller: ProjectFolderActionsController
     advanced_controls: QWidget
@@ -321,6 +328,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.thread_pane.set_thread_statuses(self._thread_turn_statuses)
         install_appearance(self, appearance_settings, appearance_system_scheme_getter)
+        self._account_auth_controller = AccountAuthController(self)
         self._settings_controller = SettingsActionController(self)
         self._install_settings_menu()
         self._notification_controller = NotificationController(
@@ -625,6 +633,7 @@ class MainWindow(QMainWindow):
         self.status_dialog.show()
         self.status_dialog.raise_()
         self.status_dialog.activateWindow()
+        self._account_auth_controller.on_status_opened()
 
     def _show_workflow_management_dialog(self) -> None:
         self._workflow_management_controller.show()
@@ -1124,6 +1133,7 @@ class MainWindow(QMainWindow):
 
     def _on_bridge_transition_started(self, action: str) -> None:
         self._bridge_transition = True
+        self._account_auth_controller.refresh_controls()
         self._sync_tunnel_controls()
         self._set_runtime_state("restarting" if action == "restart" else "stopping")
 
@@ -1393,11 +1403,18 @@ class MainWindow(QMainWindow):
     def _begin_exit(self) -> None:
         if self._closing:
             return
+        self._account_auth_controller.close()
         self._closing = True
         self._notify_workflow_readiness()
         self._workflow_management_controller.shutdown()
         self._bridge_runtime_observer.close()
         self._global_stream_retry_timer.stop()
+        self.signal_timer.stop()
+        self.codex_update_auto_timer.stop()
+        self._invalidate_usage_sequence()
+        abort_update = getattr(self._codex_update_probe, "abort", None)
+        if callable(abort_update):
+            abort_update()
         self._stop_external_thread_monitor()
         self._composer_controller.set_control_available(False)
         self.health_timer.stop()
@@ -1431,13 +1448,8 @@ class MainWindow(QMainWindow):
         self._exit_finished = True
         self._stop_external_thread_monitor()
         self.exit_timer.stop()
-        self.signal_timer.stop()
         self.diagnostics_timer.stop()
         self.stop_confirmation_timer.stop()
-        self._invalidate_usage_sequence()
-        abort_update = getattr(self._codex_update_probe, "abort", None)
-        if callable(abort_update):
-            abort_update()
         self._client.abort_all()
         self._launcher.close()
         if self._usage_history_window is not None:

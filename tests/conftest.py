@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,19 @@ class FakeClipboard:
 
     def clear(self) -> None:
         self._text = ""
+
+
+@pytest.fixture(autouse=True)
+def set_test_application_style_on_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Apply Fusion once when a test creates the shared QApplication."""
+
+    original_init = QApplication.__init__
+
+    def initialize_with_fusion(self: QApplication, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self.setStyle("Fusion")
+
+    monkeypatch.setattr(QApplication, "__init__", initialize_with_fusion)
 
 
 @pytest.fixture
@@ -94,3 +108,36 @@ def console_english_baseline(request, isolated_qsettings_store):
     yield
     settings.setValue("language", "en")
     initialize_language(settings)
+
+
+@pytest.fixture(autouse=True)
+def isolate_fake_client_main_window_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep FakeClient MainWindow tests from starting host executables by default."""
+
+    from codex_bridge.console import main_window as main_window_module
+    from tests.console_main_window_test_support import (
+        FakeClient,
+        FakeCodexProbe,
+        FakeCodexUpdateProbe,
+        FakeLauncher,
+        StableTunnel,
+    )
+
+    original_init = main_window_module.MainWindow.__init__
+    real_tunnel_supervisor = main_window_module.TunnelSupervisor
+    real_tunnel_enumerator = main_window_module.enumerate_tunnel_candidates
+
+    @wraps(original_init)
+    def isolated_init(self: Any, config: Any, parent: Any = None, *args: Any, **kwargs: Any):
+        if isinstance(kwargs.get("api_client"), FakeClient):
+            kwargs.setdefault("codex_probe", FakeCodexProbe())
+            kwargs.setdefault("codex_update_probe", FakeCodexUpdateProbe())
+            kwargs.setdefault("runtime_launcher", FakeLauncher())
+            if (
+                main_window_module.TunnelSupervisor is real_tunnel_supervisor
+                and main_window_module.enumerate_tunnel_candidates is real_tunnel_enumerator
+            ):
+                kwargs.setdefault("tunnel_supervisor", StableTunnel())
+        return original_init(self, config, parent, *args, **kwargs)
+
+    monkeypatch.setattr(main_window_module.MainWindow, "__init__", isolated_init)

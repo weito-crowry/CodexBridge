@@ -34,6 +34,12 @@ class FakeAppServer:
         self.thread_id = "native-thread"
         self.thread_name_error: Exception | None = None
         self.thread_resume_settings: dict[str, Any] = {}
+        self.account_response: dict[str, Any] = {
+            "account": None,
+            "userId": None,
+            "requiresOpenaiAuth": False,
+            "workspaceRouting": None,
+        }
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.methods.append(method)
@@ -105,6 +111,8 @@ class FakeAppServer:
             return self.items_response
         if method == "account/rateLimits/read":
             return self.rate_limits_response
+        if method == "account/read":
+            return self.account_response
         raise AssertionError(f"unexpected method {method}")
 
     async def respond(self, request_id: int | str, result: dict[str, Any]) -> None:

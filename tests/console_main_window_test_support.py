@@ -33,6 +33,8 @@ class FakeClient:
     def __init__(self) -> None:
         self.json_succeeded = Signal()
         self.json_failed = Signal()
+        self.composer_json_succeeded = Signal()
+        self.composer_json_failed = Signal()
         self.activity_received = Signal()
         self.stream_state_changed = Signal()
         self.global_activity_received = Signal()
@@ -48,6 +50,8 @@ class FakeClient:
         self.control_requests: list[tuple[str, str]] = []
         self.approval_requests: list[tuple[str, object, str, str]] = []
         self.json_posts: list[tuple[str, str, dict[str, object]]] = []
+        self.control_json_posts: list[tuple[str, dict[str, object], str, str]] = []
+        self._pending_control_json: set[str] = set()
 
     def get_json(self, path: str, *, key: str, query: dict[str, object] | None = None) -> bool:
         self.requests.append((key, path, query))
@@ -55,6 +59,20 @@ class FakeClient:
 
     def post_json(self, path: str, payload: dict[str, object], *, key: str) -> bool:
         self.json_posts.append((key, path, payload))
+        return True
+
+    def post_control_json(
+        self,
+        path: str,
+        payload: dict[str, object],
+        token: str,
+        *,
+        key: str,
+    ) -> bool:
+        if not path.startswith("/ui-api/control/") or key in self._pending_control_json:
+            return False
+        self.control_json_posts.append((path, dict(payload), token, key))
+        self._pending_control_json.add(key)
         return True
 
     def abort_json_group(self, prefix: str) -> None:
@@ -74,6 +92,7 @@ class FakeClient:
 
     def abort_all(self) -> None:
         self.aborted_all = True
+        self._pending_control_json.clear()
 
     def post_control_shutdown(self, token: str, *, key: str) -> bool:
         self.control_requests.append((token, key))
@@ -96,6 +115,18 @@ class FakeClient:
 
     def control_failure(self, key: str, message: str = "Bridge control request failed") -> None:
         self.control_failed.emit(key, message)
+
+    def control_json_result(self, key: str, payload: object) -> None:
+        if key not in self._pending_control_json:
+            return
+        self._pending_control_json.remove(key)
+        self.composer_json_succeeded.emit(key, payload)
+
+    def control_json_failure(self, key: str, message: str) -> None:
+        if key not in self._pending_control_json:
+            return
+        self._pending_control_json.remove(key)
+        self.composer_json_failed.emit(key, message)
 
     def activity(self, generation: int, payload: dict[str, object]) -> None:
         self.activity_received.emit(generation, payload)
@@ -149,6 +180,7 @@ class FakeCodexUpdateProbe:
         self.check_calls: list[CodexResolution] = []
         self.update_calls: list[CodexResolution] = []
         self.busy = False
+        self.aborts = 0
 
     def check_for_updates(self, resolution: CodexResolution) -> bool:
         self.check_calls.append(resolution)
@@ -163,6 +195,7 @@ class FakeCodexUpdateProbe:
         return True
 
     def abort(self) -> None:
+        self.aborts += 1
         if self.busy:
             self.busy = False
             self.busy_changed.emit(False)
@@ -222,21 +255,37 @@ class StableTunnel:
         self.controls_changed = Signal()
         self.state = "unavailable"
         self.action_state = TunnelActionState(False, False, False)
+        self.validation_status = "not_run"
+        self.validation_detail = "not run"
         self.started = 0
+        self.stopped = 0
+        self.restarted = 0
+        self.closed = 0
+        self.retry_calls = 0
 
     def set_bridge_ready(self, _ready: bool) -> None:
-        pass
+        return
 
     def start(self) -> bool:
         self.started += 1
         return True
 
     def stop(self, *, on_finished=None) -> bool:
+        self.stopped += 1
         if on_finished is not None:
             on_finished()
         return False
 
+    def restart(self) -> bool:
+        self.restarted += 1
+        return True
+
+    def retry_now(self) -> bool:
+        self.retry_calls += 1
+        return True
+
     def close(self, *, on_finished=None) -> None:
+        self.closed += 1
         if on_finished is not None:
             on_finished()
 
@@ -281,7 +330,9 @@ class RecoveringLifecycleTunnel(LifecycleTunnel):
 
 def _application() -> QApplication:
     application = QCoreApplication.instance()
-    return application if isinstance(application, QApplication) else QApplication([])
+    if isinstance(application, QApplication):
+        return application
+    return QApplication([])
 
 
 def _config() -> ConsoleConfig:

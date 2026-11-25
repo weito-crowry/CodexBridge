@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hmac
 import inspect
+import ipaddress
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
@@ -14,6 +16,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from .account_auth import (
+    AccountAuthError,
+    project_account_auth_status,
+    validate_auth_url,
+)
 from .activity import ActivityStore
 from .attachment_policy import AttachmentPolicyError
 from .bridge import ApprovalConflictError, Bridge, BridgeError
@@ -77,6 +84,16 @@ class UiBridge(Protocol):
     ) -> dict[str, Any]: ...
 
     async def rate_limits(self) -> dict[str, Any]: ...
+
+    def account_auth_status(self) -> dict[str, object]: ...
+
+    async def refresh_account_auth(self) -> dict[str, object]: ...
+
+    async def start_account_login(self, flow_type: str) -> dict[str, object]: ...
+
+    async def cancel_account_login(
+        self, login_id: str | None, revision: int
+    ) -> dict[str, object]: ...
 
 
 ShutdownCallback = Callable[[], Awaitable[None] | None]
@@ -146,6 +163,65 @@ def _authorized_control_request(request: Request, token: str | None) -> bool:
         return hmac.compare_digest(authorization[len(prefix) :], token)
     except TypeError:
         return False
+
+
+def _authorized_local_auth_request(request: Request, token: str | None, ui_port: int) -> bool:
+    if not _authorized_control_request(request, token) or request.client is None:
+        return False
+    try:
+        if not ipaddress.ip_address(request.client.host).is_loopback:
+            return False
+        host = urlsplit("//" + request.headers.get("host", ""))
+        if (
+            host.hostname not in {"127.0.0.1", "localhost"}
+            or host.username is not None
+            or host.password is not None
+            or host.path
+            or host.query
+            or host.fragment
+            or (host.port is not None and host.port != ui_port)
+        ):
+            return False
+        origin = request.headers.get("origin")
+        if origin is None:
+            return True
+        parsed_origin = urlsplit(origin)
+        return (
+            parsed_origin.scheme == "http"
+            and parsed_origin.hostname in {"127.0.0.1", "localhost"}
+            and parsed_origin.port == ui_port
+            and parsed_origin.username is None
+            and parsed_origin.password is None
+            and not parsed_origin.path
+            and not parsed_origin.query
+            and not parsed_origin.fragment
+        )
+    except ValueError:
+        return False
+
+
+async def _account_auth_json(request: Request, allowed_fields: set[str]) -> dict[str, object]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise ValueError("invalid account authentication request")
+    raw = await request.body()
+    if not raw or len(raw) > 4_096:
+        raise ValueError("invalid account authentication request")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid account authentication request") from exc
+    if not isinstance(payload, dict) or set(payload) != allowed_fields:
+        raise ValueError("invalid account authentication request")
+    return payload
+
+
+def _auth_response(payload: object, *, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        payload,
+        status_code=status_code,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 def _error_response(exc: Exception) -> JSONResponse:
@@ -351,6 +427,122 @@ def create_ui_app(
         except Exception as exc:
             return _error_response(exc)
 
+    async def account_auth_status(request: Request) -> Response:
+        return _auth_response(project_account_auth_status(bridge.account_auth_status()))
+
+    def local_auth_control(request: Request) -> bool:
+        return _authorized_local_auth_request(request, config.control_token, config.ui_port)
+
+    async def refresh_account_auth(request: Request) -> Response:
+        if not local_auth_control(request):
+            return _auth_response({"error": "forbidden"}, status_code=403)
+        try:
+            status = await bridge.refresh_account_auth()
+            return _auth_response(project_account_auth_status(status))
+        except Exception:
+            return _auth_response({"error": "account_status_unavailable"}, status_code=503)
+
+    async def start_account_login(request: Request) -> Response:
+        if not local_auth_control(request):
+            return _auth_response({"error": "forbidden"}, status_code=403)
+        try:
+            payload = await _account_auth_json(request, {"flow_type"})
+            flow_type = payload.get("flow_type")
+            if not isinstance(flow_type, str) or flow_type not in {
+                "chatgpt",
+                "chatgptDeviceCode",
+            }:
+                return _auth_response({"error": "unsupported_login_flow"}, status_code=400)
+            login = await bridge.start_account_login(flow_type)
+            login_id = login.get("loginId")
+            response_type = login.get("type")
+            login_revision = login.get("login_revision")
+            if (
+                not isinstance(login_id, str)
+                or not login_id.strip()
+                or len(login_id) > 256
+                or response_type != flow_type
+                or type(login_revision) is not int
+                or login_revision <= 0
+                or login_revision > 2**53 - 1
+            ):
+                return _auth_response({"error": "unsupported_login_response"}, status_code=502)
+            private_result: dict[str, object] = {
+                "login_id": login_id,
+                "flow_type": flow_type,
+                **project_account_auth_status(login),
+            }
+            start_issue = login.get("start_issue")
+            if start_issue == "unsupported_login_response":
+                private_result["start_issue"] = start_issue
+                return _auth_response(private_result)
+            if private_result["login_result"] in {"succeeded", "failed", "cancelled"}:
+                return _auth_response(private_result)
+            url_field = "authUrl" if flow_type == "chatgpt" else "verificationUrl"
+            url = login.get(url_field)
+            if not isinstance(url, str) or not validate_auth_url(url, flow_type):
+                try:
+                    status = await bridge.cancel_account_login(login_id, login_revision)
+                except Exception:
+                    status = bridge.account_auth_status()
+                private_result.update(project_account_auth_status(status))
+                private_result["start_issue"] = "unsupported_login_response"
+                return _auth_response(private_result)
+            private_result["auth_url" if flow_type == "chatgpt" else "verification_url"] = url
+            if flow_type == "chatgptDeviceCode":
+                user_code = login.get("userCode")
+                if not isinstance(user_code, str) or not user_code.strip() or len(user_code) > 128:
+                    try:
+                        status = await bridge.cancel_account_login(login_id, login_revision)
+                    except Exception:
+                        status = bridge.account_auth_status()
+                    private_result.update(project_account_auth_status(status))
+                    private_result.pop("verification_url", None)
+                    private_result["start_issue"] = "unsupported_login_response"
+                    return _auth_response(private_result)
+                private_result["user_code"] = user_code
+            return _auth_response(private_result)
+        except ValueError:
+            return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)
+        except AccountAuthError as exc:
+            status_code = 409 if exc.category in {"login_in_progress", "login_not_active"} else 503
+            return _auth_response({"error": exc.category}, status_code=status_code)
+        except Exception:
+            return _auth_response({"error": "account_login_failed"}, status_code=503)
+
+    async def cancel_account_login(request: Request) -> Response:
+        if not local_auth_control(request):
+            return _auth_response({"error": "forbidden"}, status_code=403)
+        try:
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise ValueError("invalid account authentication request")
+            raw = await request.body()
+            if not raw or len(raw) > 4_096:
+                raise ValueError("invalid account authentication request")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or set(payload) not in (
+                {"login_revision"},
+                {"login_id", "login_revision"},
+            ):
+                raise ValueError("invalid account authentication request")
+            login_id = payload.get("login_id")
+            login_revision = payload.get("login_revision")
+            if login_id is not None and (
+                not isinstance(login_id, str) or not login_id.strip() or len(login_id) > 256
+            ):
+                return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)
+            if type(login_revision) is not int or not 1 <= login_revision <= 2**53 - 1:
+                return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)
+            status = await bridge.cancel_account_login(login_id, login_revision)
+            return _auth_response(project_account_auth_status(status))
+        except ValueError:
+            return _auth_response({"error": "invalid_account_auth_request"}, status_code=400)
+        except AccountAuthError as exc:
+            return _auth_response({"error": exc.category}, status_code=409)
+        except Exception:
+            return _auth_response({"error": "account_login_cancel_failed"}, status_code=503)
+
     async def events(request: Request) -> Response:
         thread_id = request.query_params.get("thread_id") or None
         if thread_id is not None:
@@ -446,12 +638,32 @@ def create_ui_app(
         Route("/ui-api/threads/{thread_id}/items", items),
         Route("/ui-api/threads/{thread_id}/status", thread_status),
         Route("/ui-api/account/rate-limits", rate_limits),
+        Route("/ui-api/account/auth", account_auth_status),
         Route("/ui-api/events", events),
     ]
     if config.control_token is not None and shutdown_callback is not None:
         routes.append(Route("/ui-api/control/shutdown", shutdown, methods=["POST"]))
     if config.control_token is not None:
         routes.append(Route("/ui-api/control/approval", approval, methods=["POST"]))
+        routes.extend(
+            [
+                Route(
+                    "/ui-api/control/account/auth/refresh",
+                    refresh_account_auth,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/ui-api/control/account/auth/login/start",
+                    start_account_login,
+                    methods=["POST"],
+                ),
+                Route(
+                    "/ui-api/control/account/auth/login/cancel",
+                    cancel_account_login,
+                    methods=["POST"],
+                ),
+            ]
+        )
         routes.extend(
             create_control_routes(bridge, config, _authorized_control_request, _error_response)
         )

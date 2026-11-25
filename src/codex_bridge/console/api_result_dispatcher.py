@@ -43,6 +43,11 @@ class ApiResultDispatcher:
                 window._bridge_ready = payload.get("bridge") in {"ready", "connected"}
                 window._app_server_ready = payload.get("app_server") in {"ready", "connected"}
                 window._bridge_stop_confirmation.observe_status(True)
+                auth_controller = getattr(window, "_account_auth_controller", None)
+                if auth_controller is not None:
+                    auth_controller.on_connection_changed(
+                        window._bridge_ready and window._app_server_ready
+                    )
             window._maybe_finish_stop_confirmation()
             return
         if key == "health":
@@ -83,6 +88,11 @@ class ApiResultDispatcher:
                     "bridge_unavailable" if not window._bridge_ready else "app_server_unavailable"
                 ),
             )
+            auth_controller = getattr(window, "_account_auth_controller", None)
+            if auth_controller is not None:
+                auth_controller.on_connection_changed(
+                    window._bridge_ready and window._app_server_ready
+                )
             ready = window._usage_ready
             if ready and not was_ready:
                 window._begin_usage_sequence()
@@ -217,6 +227,9 @@ class ApiResultDispatcher:
                 window._app_server_ready = False
                 window.app_server_status_label.setText(tr("App Server: failed"))
                 window._bridge_stop_confirmation.observe_status(False)
+                auth_controller = getattr(window, "_account_auth_controller", None)
+                if auth_controller is not None:
+                    auth_controller.on_connection_changed(False)
             window._maybe_finish_stop_confirmation()
             return
         if key in {"health", "bridge-status"}:
@@ -228,6 +241,9 @@ class ApiResultDispatcher:
                 window._bridge_ready = False
                 window._app_server_ready = False
                 window._invalidate_usage_sequence()
+                auth_controller = getattr(window, "_account_auth_controller", None)
+                if auth_controller is not None:
+                    auth_controller.on_connection_changed(False)
             window.bridge_status_label.setText(tr("Bridge: disconnected"))
             window.app_server_status_label.setText(tr("App Server: failed"))
             window.bottom_status_label.setText(format_api_error(message))

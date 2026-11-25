@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication,
     QButtonGroup,
     QDialog,
     QFormLayout,
@@ -149,11 +148,26 @@ def build_main_window_ui(window: MainWindow) -> None:
     codex_update_controls_layout.addWidget(window.codex_update_button)
     window.status_refresh_button = QPushButton(tr("Refresh"))
     window.status_close_button = QPushButton(tr("Close"))
+    window.account_auth_status_label = QLabel(tr("Codex account: status unavailable"))
+    window.account_auth_login_button = QPushButton(tr("Sign in / Re-sign in"))
+    window.account_auth_device_button = QPushButton(tr("Sign in with device code"))
+    window.account_auth_cancel_button = QPushButton(tr("Cancel sign-in"))
+    window.account_auth_refresh_button = QPushButton(tr("Refresh account status"))
 
     window.status_dialog = QDialog(window)
     window.status_dialog.setWindowTitle(tr("CodexBridge Status"))
     window.status_dialog.setModal(False)
     dialog_layout = QVBoxLayout(window.status_dialog)
+    account_auth_controls = QWidget(window.status_dialog)
+    account_auth_controls_layout = QHBoxLayout(account_auth_controls)
+    account_auth_controls_layout.setContentsMargins(0, 0, 0, 0)
+    for button in (
+        window.account_auth_login_button,
+        window.account_auth_device_button,
+        window.account_auth_cancel_button,
+        window.account_auth_refresh_button,
+    ):
+        account_auth_controls_layout.addWidget(button)
 
     def add_section(title: str, rows: list[tuple[str, QWidget]]) -> None:
         group = QGroupBox(title, window.status_dialog)
@@ -181,6 +195,10 @@ def build_main_window_ui(window: MainWindow) -> None:
             (tr("Status"), window.codex_update_message_label),
             (tr("Runtime"), window.runtime_status_label),
         ],
+    )
+    add_section(
+        tr("Codex account"),
+        [(tr("Account"), window.account_auth_status_label), ("", account_auth_controls)],
     )
     add_section(
         tr("Usage"),
@@ -306,6 +324,3 @@ def build_main_window_ui(window: MainWindow) -> None:
     bottom_bar.addWidget(window.diagnostics_toggle_button)
     layout.addLayout(bottom_bar)
     window.setCentralWidget(root)
-    application = QApplication.instance()
-    if isinstance(application, QApplication):
-        application.setStyle("Fusion")
