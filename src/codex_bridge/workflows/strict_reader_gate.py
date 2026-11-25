@@ -1,8 +1,8 @@
-"""Read-only run format classification for service reader entry points.
+"""Read-only run classification and reserved verification for reader entry points.
 
-Classification only selects the legacy reader or the strict-v2 reconciliation
-path. A strict-v2 result does not verify the complete snapshot or authorize
-execution; a later reader must call the reserved snapshot verifier.
+Classification checks format and request binding only. The shared strict
+reader helper also verifies a reserved v2 snapshot, but does not authorize
+runtime execution.
 """
 
 from __future__ import annotations
@@ -15,7 +15,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
 
-from .strict_manifest import StrictWorkflowManifestV2, parse_strict_manifest_v2
+from .strict_manifest import (
+    StrictWorkflowManifestV2,
+    StrictWorkflowSnapshotVerification,
+    StrictWorkflowSnapshotVerifier,
+    parse_strict_manifest_v2,
+)
 from .strict_requests import StrictWorkflowRequestStore
 
 _REASON_CODE = "NEEDS_RECONCILIATION"
@@ -153,6 +158,53 @@ def classify_readonly(
         raise
     except Exception:
         _fail()
+
+
+def verify_strict_reserved_readonly(
+    state_root: Path,
+    run_id: str,
+    manifest_bytes: bytes,
+    *,
+    expected_workflow_id: str,
+    expected_request_digest: str,
+    allowed_roots: tuple[str, ...],
+) -> StrictWorkflowSnapshotVerification | None:
+    """Verify a strict reserved snapshot, returning ``None`` for valid legacy runs.
+
+    The supplied manifest bytes are the caller's original read. The reserved
+    verifier independently reads the snapshot again; its parsed manifest must
+    match that original value before the verification result is trusted.
+    """
+    try:
+        if type(manifest_bytes) is not bytes:
+            _fail()
+        run_format = classify_readonly(
+            state_root,
+            run_id,
+            manifest_bytes,
+            expected_workflow_id=expected_workflow_id,
+            expected_request_digest=expected_request_digest,
+        )
+        if run_format is RunFormatVersion.LEGACY_V1:
+            return None
+        if run_format is not RunFormatVersion.STRICT_V2:
+            _fail()
+
+        original_manifest = parse_strict_manifest_v2(manifest_bytes)
+        verification = StrictWorkflowSnapshotVerifier(state_root, allowed_roots).verify_reserved(
+            run_id
+        )
+        if (
+            verification.reservation_verified is not True
+            or verification.manifest != original_manifest
+            or verification.manifest.run_id != run_id
+            or verification.manifest.workflow_id != expected_workflow_id
+            or verification.manifest.request_digest != expected_request_digest
+        ):
+            _fail()
+        return verification
+    except Exception:
+        raise StrictReaderGateError() from None
 
 
 def _decode_manifest(manifest: bytes | dict[str, Any]) -> tuple[dict[str, Any], bytes]:

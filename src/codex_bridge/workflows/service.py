@@ -24,7 +24,12 @@ from .startup_diagnostics import (
     current_startup_diagnostic,
     startup_diagnostic_scope,
 )
-from .strict_reader_gate import RunFormatVersion, StrictReaderGateError, classify_readonly
+from .strict_reader_gate import (
+    RunFormatVersion,
+    StrictReaderGateError,
+    classify_readonly,
+    verify_strict_reserved_readonly,
+)
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -1300,15 +1305,16 @@ def _verified_active_workspace(
     try:
         run_dir = _validated_run_directory(state_root, row.run_id)
         manifest_bytes = _read_regular_file(run_dir / "manifest.json", limit=32 * 1024)
-        run_format = classify_readonly(
+        strict_verification = verify_strict_reserved_readonly(
             state_root,
             row.run_id,
             manifest_bytes,
             expected_workflow_id=row.workflow_id,
             expected_request_digest=row.request_digest,
+            allowed_roots=allowed_roots,
         )
-        if run_format is not RunFormatVersion.LEGACY_V1:
-            raise ValueError("strict workflow workspace reader is not connected")
+        if strict_verification is not None:
+            return Path(strict_verification.manifest.workspace_root)
         manifest = _strict_json(manifest_bytes)
         if not isinstance(manifest, dict):
             raise ValueError("workflow manifest is invalid")
