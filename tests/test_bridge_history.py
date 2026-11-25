@@ -34,6 +34,35 @@ async def test_threads_list_and_read_are_bounded_and_sanitized(allowed_dir) -> N
     }
 
 
+@pytest.mark.asyncio
+async def test_thread_turn_exists_checks_full_internal_history_without_changing_public_limit(
+    allowed_dir,
+) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["native-thread"] = str(allowed_dir)
+    app.thread_histories["native-thread"] = [
+        {"id": f"turn-{index}", "raw": "private"} for index in range(101)
+    ]
+
+    assert await bridge._event_thread_turn_exists("native-thread", "turn-99")
+    assert await bridge._event_thread_turn_exists("native-thread", "turn-100")
+    assert not await bridge._event_thread_turn_exists("native-thread", "missing-turn")
+
+    public = await bridge.threads("native-thread", include_history=True)
+    assert len(public["thread"]["turns"]) == 100
+    assert "raw" not in str(public)
+    assert app.calls == [
+        ("thread/read", {"threadId": "native-thread", "includeTurns": False}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": True}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": False}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": True}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": False}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": True}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": False}),
+        ("thread/read", {"threadId": "native-thread", "includeTurns": True}),
+    ]
+
+
 def _write_local_thread_catalog(path: Path, rows: list[tuple[str, str, str]]) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(

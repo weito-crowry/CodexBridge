@@ -10,6 +10,7 @@ _MAX_MESSAGE_CHARS = 16_000
 _MAX_DIFF_CHARS = 32_000
 _MAX_EVENTS = 32
 _MAX_THREAD_METADATA_CHARS = 512
+_TERMINAL_STATES = frozenset({"completed", "failed", "interrupted"})
 _THREAD_METADATA_KEYS = {
     "model_provider": "modelProvider",
     "model": "model",
@@ -143,8 +144,11 @@ class StateStore:
 
     def set_terminal(
         self, thread_id: str, turn_id: str, state: NormalizedState, error: str | None = None
-    ) -> None:
+    ) -> bool:
         turn = self._turn(thread_id, turn_id)
+        first_terminal_transition = state in _TERMINAL_STATES and not turn.terminal_event_emitted
+        if state in _TERMINAL_STATES:
+            turn.terminal_event_emitted = True
         for request_id, pending in tuple(self._pending.items()):
             if pending.thread_id == thread_id and pending.turn_id == turn_id:
                 del self._pending[request_id]
@@ -152,6 +156,7 @@ class StateStore:
         turn.state = state
         turn.error = error[-2_000:] if error else None
         self._touch(turn, f"terminal:{state}")
+        return first_terminal_transition
 
     def put_pending_request(self, pending: PendingRequest) -> None:
         turn = self._turn(pending.thread_id, pending.turn_id)

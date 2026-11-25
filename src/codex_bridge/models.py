@@ -76,6 +76,7 @@ class TurnState:
     current_diff: str = ""
     pending_request_id: RequestId | None = None
     error: str | None = None
+    terminal_event_emitted: bool = False
     generation: int = 0
     recent_events: list[str] = field(default_factory=list)
 
