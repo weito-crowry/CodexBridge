@@ -698,7 +698,9 @@ class Bridge:
             )
             thread = self._thread_from_response(metadata)
             validated_cwd = self._validate_thread_metadata(thread, thread_id)
-            response = await self._app_server.request("thread/resume", {"threadId": thread_id})
+            response = await self._app_server.request(
+                "thread/resume", {"threadId": thread_id, "excludeTurns": True}
+            )
             resumed_thread = self._thread_from_response(response)
             if resumed_thread.get("id") != thread_id:
                 raise BridgeError("thread/resume returned a mismatched thread id")

@@ -71,8 +71,10 @@ async def test_start_and_continue_append_local_images_only_to_turn_input(allowed
     assert "localImage" not in str(app.calls[0][1])
 
     app.calls.clear()
+    app.methods.clear()
     await bridge.continue_thread("native-thread", "follow up", image_paths=(image_paths[1],))
 
+    assert app.methods == ["turn/start"]
     assert app.calls == [
         (
             "turn/start",
@@ -366,16 +368,33 @@ async def test_model_capabilities_preserves_app_server_disconnect(allowed_dir, m
 
 
 @pytest.mark.asyncio
-async def test_continue_resumes_a_thread_not_loaded_in_this_process(allowed_dir) -> None:
+async def test_continue_resumes_a_thread_with_empty_turns_not_loaded_in_this_process(
+    allowed_dir,
+) -> None:
     bridge, app, _ = make_bridge(allowed_dir)
     app.thread_cwds["persisted-thread"] = str(allowed_dir)
 
     await bridge.continue_thread("persisted-thread", "continue")
 
     assert app.methods == ["thread/read", "thread/resume", "turn/start"]
-    assert app.calls[1] == ("thread/resume", {"threadId": "persisted-thread"})
+    assert app.calls[1] == (
+        "thread/resume",
+        {"threadId": "persisted-thread", "excludeTurns": True},
+    )
     assert "approvalsReviewer" not in app.calls[2][1]
     assert "approvalPolicy" not in app.calls[2][1]
+
+
+@pytest.mark.asyncio
+async def test_continue_does_not_start_turn_when_resume_fails(allowed_dir) -> None:
+    bridge, app, _ = make_bridge(allowed_dir)
+    app.thread_cwds["persisted-thread"] = str(allowed_dir)
+    app.thread_resume_error = BridgeError("resume failed")
+
+    with pytest.raises(BridgeError, match="resume failed"):
+        await bridge.continue_thread("persisted-thread", "continue")
+
+    assert app.methods == ["thread/read", "thread/resume"]
 
 
 @pytest.mark.asyncio
@@ -402,7 +421,10 @@ async def test_cold_resume_uses_effective_metadata_without_sandbox_overrides(all
             "approvalsReviewer": "auto_review",
         },
     )
-    assert app.calls[4] == ("thread/resume", {"threadId": "native-thread"})
+    assert app.calls[4] == (
+        "thread/resume",
+        {"threadId": "native-thread", "excludeTurns": True},
+    )
     assert result["thread_metadata"]["sandbox_mode"] == "danger-full-access"
     assert result["thread_metadata"]["approval_policy"] == "on-request"
 

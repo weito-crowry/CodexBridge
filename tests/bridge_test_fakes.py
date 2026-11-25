@@ -33,6 +33,7 @@ class FakeAppServer:
         self.thread_start_error: Exception | None = None
         self.thread_id = "native-thread"
         self.thread_name_error: Exception | None = None
+        self.thread_resume_error: Exception | None = None
         self.thread_resume_settings: dict[str, Any] = {}
         self.account_response: dict[str, Any] = {
             "account": None,
@@ -66,6 +67,8 @@ class FakeAppServer:
         if method == "config/read":
             return self.config_response
         if method == "thread/resume":
+            if self.thread_resume_error is not None:
+                raise self.thread_resume_error
             return {
                 "thread": {
                     "id": params["threadId"],
@@ -73,6 +76,7 @@ class FakeAppServer:
                     "model": "gpt-5",
                     "reasoningEffort": "medium",
                     "cliVersion": "0.1.2",
+                    "turns": [],
                 },
                 "cwd": self.thread_cwds[params["threadId"]],
                 **self.thread_resume_settings,
