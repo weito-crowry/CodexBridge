@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from starlette.requests import Request
@@ -16,6 +17,7 @@ from .api import (
     _json_payload,
     _snapshot_json,
 )
+from .definition_contract import CONTRACT_MISSING, compile_definition_contract
 from .definitions import (
     DefinitionError,
     DefinitionInvalid,
@@ -25,6 +27,9 @@ from .definitions import (
     DefinitionRepositoryUnavailable,
     DefinitionRevision,
     DefinitionSummary,
+    WorkflowContractInvalid,
+    WorkflowContractRequired,
+    WorkflowContractUnavailable,
     WorkflowDefinitionRepository,
 )
 from .graph import project_workflow_graph
@@ -40,7 +45,7 @@ from .service import (
 
 _MAX_SOURCE_YAML_BYTES = 64 * 1024
 _MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
-_STRONG_ETAG = re.compile(r'"workflow-definition-v1-[0-9a-f]{64}"\Z', re.ASCII)
+_STRONG_ETAG = re.compile(r'"workflow-definition-v[12]-[0-9a-f]{64}"\Z', re.ASCII)
 
 
 def create_workflow_definition_routes(
@@ -70,7 +75,9 @@ def create_workflow_definition_routes(
             page = await asyncio.to_thread(repository.list, limit, cursor)
             return _bounded_json_response(
                 {
-                    "definitions": [_summary_json(item) for item in page.items],
+                    "definitions": [
+                        _summary_json(item, include_contract=True) for item in page.items
+                    ],
                     "limit": limit,
                     "next_cursor": page.next_cursor,
                 }
@@ -88,15 +95,30 @@ def create_workflow_definition_routes(
             return _definition_error(DefinitionRepositoryUnavailable("repository unavailable"))
         try:
             payload = await _request_json(request)
-            mutation_request_id, source_yaml, profile = _mutation_fields(payload)
+            mutation_request_id, source_yaml, profile, contract_value = _mutation_fields(
+                payload, allow_contract=True
+            )
+            create_kwargs: dict[str, Any] = {}
+            if contract_value is not CONTRACT_MISSING:
+                if not _supports_contracts(repository):
+                    compile_definition_contract(contract_value)
+                    raise WorkflowContractUnavailable(
+                        "workflow contract storage is unavailable"
+                    ) from None
+                if contract_value is None:
+                    compile_definition_contract(contract_value)
+                create_kwargs["contract"] = contract_value
             created = await asyncio.to_thread(
                 repository.create,
                 mutation_request_id=mutation_request_id,
                 source_yaml=source_yaml,
                 max_live_codex_jobs=profile,
+                **create_kwargs,
             )
             return _bounded_json_response(
-                _revision_metadata(created), status_code=201, etag=created.etag
+                _revision_metadata(created, include_contract=True),
+                status_code=201,
+                etag=created.etag,
             )
         except WorkflowPayloadTooLarge:
             return _payload_too_large()
@@ -117,20 +139,32 @@ def create_workflow_definition_routes(
             return _definition_error(DefinitionRepositoryUnavailable("repository unavailable"))
         try:
             payload = await _request_json(request)
-            if set(payload) != {"source_yaml", "max_live_codex_jobs"}:
+            if set(payload) - {"source_yaml", "max_live_codex_jobs", "contract"} or not {
+                "source_yaml",
+                "max_live_codex_jobs",
+            } <= set(payload):
                 raise DefinitionInvalid("workflow validation fields are invalid")
             source_yaml, profile = _source_fields(
                 payload.get("source_yaml"), payload.get("max_live_codex_jobs")
             )
             validation = await asyncio.to_thread(repository.validate, source_yaml, profile)
-            return _bounded_json_response(
-                {
-                    "valid": True,
-                    "source_sha256": validation.source_sha256,
-                    "canonical_sha256": validation.canonical_sha256,
-                    "max_live_codex_jobs": validation.max_live_codex_jobs,
-                }
-            )
+            if "contract" in payload:
+                compiled = compile_definition_contract(payload["contract"])
+                validation = replace(
+                    validation,
+                    contract_version=compiled.contract_version,
+                    contract_sha256=compiled.contract_sha256,
+                )
+            validation_json = {
+                "valid": True,
+                "source_sha256": validation.source_sha256,
+                "canonical_sha256": validation.canonical_sha256,
+                "max_live_codex_jobs": validation.max_live_codex_jobs,
+            }
+            if validation.contract_version is not None:
+                validation_json["contract_version"] = validation.contract_version
+                validation_json["contract_sha256"] = validation.contract_sha256
+            return _bounded_json_response(validation_json)
         except WorkflowPayloadTooLarge:
             return _payload_too_large()
         except WorkflowRequestError:
@@ -225,7 +259,9 @@ def create_workflow_definition_routes(
         try:
             _strict_query(request, set())
             revision = await asyncio.to_thread(repository.get, request.path_params["definition_id"])
-            return _bounded_json_response(_revision_detail_json(revision), etag=revision.etag)
+            return _bounded_json_response(
+                _revision_detail_json(revision, include_contract=True), etag=revision.etag
+            )
         except DefinitionError as error:
             return _definition_error(error)
         except Exception:
@@ -245,7 +281,9 @@ def create_workflow_definition_routes(
                 request.path_params["definition_id"],
                 revision_number,
             )
-            return _bounded_json_response(_revision_detail_json(revision), etag=revision.etag)
+            return _bounded_json_response(
+                _revision_detail_json(revision, include_contract=True), etag=revision.etag
+            )
         except DefinitionError as error:
             return _definition_error(error)
         except Exception:
@@ -265,9 +303,15 @@ def create_workflow_definition_routes(
         etag = if_match_values[0]
         if not _STRONG_ETAG.fullmatch(etag):
             return _invalid_error()
+        if etag.startswith('"workflow-definition-v2-') and not _supports_contracts(repository):
+            return _definition_error(
+                DefinitionPreconditionFailed("workflow definition revision precondition failed")
+            )
         try:
             payload = await _request_json(request)
-            mutation_request_id, source_yaml, profile = _mutation_fields(payload)
+            mutation_request_id, source_yaml, profile, contract_value = _mutation_fields(
+                payload, allow_contract=True
+            )
 
             definition_id = request.path_params["definition_id"]
 
@@ -282,16 +326,30 @@ def create_workflow_definition_routes(
                     raise DefinitionPreconditionFailed(
                         "workflow definition revision precondition failed"
                     )
+                update_kwargs: dict[str, Any] = {}
+                if contract_value is not CONTRACT_MISSING:
+                    if contract_value is None and _supports_contracts(repository):
+                        update_kwargs["contract"] = None
+                    else:
+                        if not _supports_contracts(repository):
+                            compile_definition_contract(contract_value)
+                            raise WorkflowContractUnavailable(
+                                "workflow contract storage is unavailable"
+                            ) from None
+                        update_kwargs["contract"] = contract_value
                 return repository.update(
                     definition_id=definition_id,
                     expected_revision=expected_revision,
                     mutation_request_id=mutation_request_id,
                     source_yaml=source_yaml,
                     max_live_codex_jobs=profile,
+                    **update_kwargs,
                 )
 
             updated = await asyncio.to_thread(update_from_etag)
-            return _bounded_json_response(_revision_metadata(updated), etag=updated.etag)
+            return _bounded_json_response(
+                _revision_metadata(updated, include_contract=True), etag=updated.etag
+            )
         except WorkflowPayloadTooLarge:
             return _payload_too_large()
         except WorkflowRequestError:
@@ -331,6 +389,7 @@ def create_workflow_definition_routes(
                     "definition_id": revision.definition_id,
                     "revision": revision.revision,
                     "etag": revision.etag,
+                    **(_contract_metadata(revision) if _has_contract(revision) else {}),
                     "graph": graph,
                 },
                 etag=revision.etag,
@@ -381,8 +440,12 @@ async def _request_json(request: Request) -> dict[str, Any]:
     return await _json_payload(request)
 
 
-def _mutation_fields(payload: dict[str, Any]) -> tuple[str, str, int]:
-    if set(payload) != {"mutation_request_id", "source_yaml", "max_live_codex_jobs"}:
+def _mutation_fields(
+    payload: dict[str, Any], *, allow_contract: bool = False
+) -> tuple[str, str, int, object]:
+    required = {"mutation_request_id", "source_yaml", "max_live_codex_jobs"}
+    allowed = required | ({"contract"} if allow_contract else set())
+    if not required <= set(payload) or set(payload) - allowed:
         raise DefinitionInvalid("workflow definition fields are invalid")
     mutation_request_id = payload.get("mutation_request_id")
     if not isinstance(mutation_request_id, str):
@@ -390,7 +453,8 @@ def _mutation_fields(payload: dict[str, Any]) -> tuple[str, str, int]:
     source_yaml, profile = _source_fields(
         payload.get("source_yaml"), payload.get("max_live_codex_jobs")
     )
-    return mutation_request_id, source_yaml, profile
+    contract = payload["contract"] if "contract" in payload else CONTRACT_MISSING
+    return mutation_request_id, source_yaml, profile, contract
 
 
 def _source_fields(source_yaml: object, profile: object) -> tuple[str, int]:
@@ -428,8 +492,8 @@ def _parse_path_revision(value: str) -> int:
     return _parse_positive_query_integer(value)
 
 
-def _summary_json(summary: DefinitionSummary) -> dict[str, Any]:
-    return {
+def _summary_json(summary: DefinitionSummary, *, include_contract: bool = False) -> dict[str, Any]:
+    result = {
         "definition_id": summary.definition_id,
         "latest_revision": summary.latest_revision,
         "document_name": summary.document_name,
@@ -440,10 +504,21 @@ def _summary_json(summary: DefinitionSummary) -> dict[str, Any]:
         "updated_at": summary.updated_at,
         "etag": summary.etag,
     }
+    if include_contract and summary.contract_version is not None:
+        result.update(
+            {
+                "contract_version": summary.contract_version,
+                "contract_sha256": summary.contract_sha256,
+                "binding_digest": summary.binding_digest,
+            }
+        )
+    return result
 
 
-def _revision_metadata(revision: DefinitionRevision) -> dict[str, Any]:
-    return {
+def _revision_metadata(
+    revision: DefinitionRevision, *, include_contract: bool = False
+) -> dict[str, Any]:
+    result = {
         "definition_id": revision.definition_id,
         "revision": revision.revision,
         "source_sha256": revision.source_sha256,
@@ -452,16 +527,40 @@ def _revision_metadata(revision: DefinitionRevision) -> dict[str, Any]:
         "created_at": revision.created_at,
         "etag": revision.etag,
     }
+    if include_contract and _has_contract(revision):
+        result.update(_contract_metadata(revision))
+    return result
 
 
-def _revision_detail_json(revision: DefinitionRevision) -> dict[str, Any]:
+def _revision_detail_json(
+    revision: DefinitionRevision, *, include_contract: bool = False
+) -> dict[str, Any]:
     document = revision.definition.get("document")
     document_name = document.get("name") if isinstance(document, dict) else None
-    return {
-        **_revision_metadata(revision),
+    result = {
+        **_revision_metadata(revision, include_contract=include_contract),
         "document_name": document_name,
         "source_yaml": revision.source_yaml,
     }
+    if include_contract and _has_contract(revision):
+        result["contract"] = revision.contract
+    return result
+
+
+def _contract_metadata(revision: DefinitionRevision) -> dict[str, Any]:
+    return {
+        "contract_version": revision.contract_version,
+        "contract_sha256": revision.contract_sha256,
+        "binding_digest": revision.binding_digest,
+    }
+
+
+def _has_contract(revision: DefinitionRevision) -> bool:
+    return revision.contract_version is not None
+
+
+def _supports_contracts(repository: WorkflowDefinitionRepository) -> bool:
+    return bool(getattr(repository, "supports_contracts", False))
 
 
 def _bounded_json_response(
@@ -483,6 +582,12 @@ def _bounded_json_response(
 
 
 def _definition_error(error: DefinitionError) -> JSONResponse:
+    if isinstance(error, WorkflowContractInvalid):
+        return JSONResponse({"error": "workflow_contract_invalid"}, status_code=400)
+    if isinstance(error, WorkflowContractRequired):
+        return JSONResponse({"error": "workflow_contract_required"}, status_code=400)
+    if isinstance(error, WorkflowContractUnavailable):
+        return JSONResponse({"error": "workflow_contract_unavailable"}, status_code=503)
     if isinstance(error, DefinitionInvalid):
         return JSONResponse({"error": "invalid"}, status_code=400)
     if isinstance(error, DefinitionNotFound):

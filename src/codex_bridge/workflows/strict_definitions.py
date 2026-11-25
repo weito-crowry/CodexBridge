@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .contracts import (
     CompiledContract,
@@ -23,6 +23,7 @@ from .contracts import (
     compile_contract,
     parse_strict_json,
 )
+from .definition_contract import compile_definition_contract
 from .definitions import (
     _DATABASE_NAME,
     _MUTATION_REQUEST_ID,
@@ -31,11 +32,17 @@ from .definitions import (
     DefinitionInvalid,
     DefinitionMutationConflict,
     DefinitionNotFound,
+    DefinitionPage,
     DefinitionPreconditionFailed,
     DefinitionRepositoryUnavailable,
     DefinitionRevision,
+    DefinitionSummary,
+    WorkflowContractRequired,
     WorkflowDefinitionRepository,
     _canonical_json,
+    _decode_cursor,
+    _encode_cursor,
+    _is_canonical_utc_timestamp,
     _is_canonical_uuid,
     _is_symlink_or_junction,
     _mutation_digest,
@@ -52,6 +59,7 @@ _BUSY_TIMEOUT_MS = 10_000
 _STRICT_ETAG_DOMAIN = "codexbridge-workflow-definition-etag-v2"
 _STRICT_MUTATION_DOMAIN = "codexbridge-workflow-definition-mutation-v2"
 _STRICT_ETAG = re.compile(r'"workflow-definition-v2-[0-9a-f]{64}"\Z', re.ASCII)
+_LEGACY_ETAG = re.compile(r'"workflow-definition-v1-[0-9a-f]{64}"\Z', re.ASCII)
 _MISSING = object()
 _UNAVAILABLE = "workflow definition storage is unavailable"
 
@@ -617,7 +625,7 @@ class StrictWorkflowDefinitionStore:
 
             current = self._get_revision(connection, canonical_id, latest_revision)
             if current.is_strict and compiled is None:
-                raise DefinitionInvalid("strict workflow contract is required")
+                raise WorkflowContractRequired("workflow contract is required") from None
             if (
                 current.is_strict == (compiled is not None)
                 and current.source_yaml == validated.source_yaml
@@ -744,23 +752,179 @@ class StrictWorkflowDefinitionStore:
                 raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
             return self._revision_from_row(connection, revision_row)
 
+    def revision_for_etag(self, definition_id: str, etag: str) -> int | None:
+        """Resolve a recorded v1/v2 strong ETag through verified immutable rows."""
+        canonical_id = _validate_definition_id(definition_id)
+        if not isinstance(etag, str) or not (
+            _LEGACY_ETAG.fullmatch(etag) or _STRICT_ETAG.fullmatch(etag)
+        ):
+            raise DefinitionInvalid("workflow definition ETag is invalid")
+
+        with self._read_connection(required=False) as connection:
+            if connection is None:
+                raise DefinitionNotFound("workflow definition was not found")
+            definition_row = connection.execute(
+                "SELECT 1 FROM workflow_definitions WHERE definition_id = ?",
+                (canonical_id,),
+            ).fetchone()
+            if definition_row is None:
+                raise DefinitionNotFound("workflow definition was not found")
+            rows = connection.execute(
+                """
+                SELECT result_revision, result_etag
+                FROM workflow_definition_mutations
+                WHERE definition_id = ? AND result_etag = ?
+                """,
+                (canonical_id, etag),
+            ).fetchall()
+            if not rows:
+                return None
+
+            revisions: set[int] = set()
+            for row in rows:
+                revision = row["result_revision"]
+                if type(revision) is not int or revision < 1 or row["result_etag"] != etag:
+                    raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+                revisions.add(revision)
+            if len(revisions) != 1:
+                raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+            revision = next(iter(revisions))
+            resolved = self._get_revision(connection, canonical_id, revision)
+            if resolved.etag != etag:
+                raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+            return revision
+
+    def list(self, limit: int = 50, cursor: str | None = None) -> DefinitionPage:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise DefinitionInvalid("workflow definition list limit is invalid")
+        after = _decode_cursor(cursor)
+
+        with self._read_connection(required=False) as connection:
+            if connection is None:
+                return DefinitionPage(items=(), next_cursor=None)
+            query = """
+                SELECT d.definition_id, d.latest_revision,
+                       d.created_at AS definition_created_at,
+                       d.updated_at AS definition_updated_at,
+                       r.definition_id AS revision_definition_id,
+                       r.revision, r.source_yaml, r.source_sha256,
+                       r.canonical_sha256, r.max_live_codex_jobs, r.created_at,
+                       c.definition_id AS strict_contract_definition_id,
+                       c.contract_json_canonical AS strict_contract_json_canonical,
+                       c.contract_sha256 AS strict_contract_sha256,
+                       c.binding_digest AS strict_binding_digest,
+                       c.created_at AS strict_contract_created_at
+                FROM workflow_definitions AS d
+                LEFT JOIN workflow_definition_revisions AS r
+                  ON r.definition_id = d.definition_id
+                 AND r.revision = d.latest_revision
+                LEFT JOIN workflow_definition_contracts AS c
+                  ON c.definition_id = r.definition_id AND c.revision = r.revision
+            """
+            if after is None:
+                rows = connection.execute(
+                    query + " ORDER BY d.created_at DESC, d.definition_id DESC LIMIT ?",
+                    (limit + 1,),
+                ).fetchall()
+            else:
+                last_created_at, last_definition_id = after
+                rows = connection.execute(
+                    query
+                    + """
+                    WHERE d.created_at < ?
+                       OR (d.created_at = ? AND d.definition_id < ?)
+                    ORDER BY d.created_at DESC, d.definition_id DESC
+                    LIMIT ?
+                    """,
+                    (last_created_at, last_created_at, last_definition_id, limit + 1),
+                ).fetchall()
+
+            has_more = len(rows) > limit
+            items: list[DefinitionSummary] = []
+            for row in rows[:limit]:
+                if row["revision_definition_id"] is None:
+                    raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+                latest = row["latest_revision"]
+                if type(latest) is not int or row["revision"] != latest:
+                    raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+                contract_values = (
+                    (
+                        row["strict_contract_json_canonical"],
+                        row["strict_contract_sha256"],
+                        row["strict_binding_digest"],
+                        row["strict_contract_created_at"],
+                    )
+                    if row["strict_contract_definition_id"] is not None
+                    else None
+                )
+                revision = self._revision_from_row(connection, row, contract_values=contract_values)
+                document = revision.definition.get("document")
+                document_name = document.get("name") if isinstance(document, dict) else None
+                created_at = row["definition_created_at"]
+                updated_at = row["definition_updated_at"]
+                if (
+                    not isinstance(document_name, str)
+                    or not isinstance(created_at, str)
+                    or not _is_canonical_utc_timestamp(created_at)
+                    or not isinstance(updated_at, str)
+                ):
+                    raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
+                items.append(
+                    DefinitionSummary(
+                        definition_id=revision.definition_id,
+                        latest_revision=revision.revision,
+                        document_name=document_name,
+                        source_sha256=revision.source_sha256,
+                        canonical_sha256=revision.canonical_sha256,
+                        max_live_codex_jobs=revision.max_live_codex_jobs,
+                        created_at=created_at,
+                        updated_at=updated_at,
+                        etag=revision.etag,
+                        contract_version=(1 if revision.is_strict else None),
+                        contract_sha256=revision.contract_sha256,
+                        binding_digest=revision.binding_digest,
+                    )
+                )
+            next_cursor = (
+                _encode_cursor(items[-1].created_at, items[-1].definition_id)
+                if has_more and items
+                else None
+            )
+            return DefinitionPage(items=tuple(items), next_cursor=next_cursor)
+
     def _revision_from_row(
-        self, connection: sqlite3.Connection, row: sqlite3.Row
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        contract_values: tuple[object, object, object, object] | None | object = _MISSING,
     ) -> StrictDefinitionRevision:
         try:
             base = self._validator._revision_from_row(row)
         except DefinitionError:
             raise DefinitionRepositoryUnavailable(_UNAVAILABLE) from None
 
-        contract_row = connection.execute(
-            """
-            SELECT contract_json_canonical, contract_sha256, binding_digest, created_at
-            FROM workflow_definition_contracts
-            WHERE definition_id = ? AND revision = ?
-            """,
-            (base.definition_id, base.revision),
-        ).fetchone()
-        if contract_row is None:
+        if contract_values is _MISSING:
+            contract_row = connection.execute(
+                """
+                SELECT contract_json_canonical, contract_sha256, binding_digest, created_at
+                FROM workflow_definition_contracts
+                WHERE definition_id = ? AND revision = ?
+                """,
+                (base.definition_id, base.revision),
+            ).fetchone()
+            contract_values = (
+                (
+                    contract_row["contract_json_canonical"],
+                    contract_row["contract_sha256"],
+                    contract_row["binding_digest"],
+                    contract_row["created_at"],
+                )
+                if contract_row is not None
+                else None
+            )
+        contract_values = cast(tuple[object, object, object, object] | None, contract_values)
+        if contract_values is None:
             strict_mutation = connection.execute(
                 """
                 SELECT 1
@@ -774,10 +938,7 @@ class StrictWorkflowDefinitionStore:
             if strict_mutation is not None:
                 raise DefinitionRepositoryUnavailable(_UNAVAILABLE)
             return _strict_revision(base, None, None, None, None, base.etag)
-        canonical = contract_row["contract_json_canonical"]
-        stored_sha = contract_row["contract_sha256"]
-        stored_binding = contract_row["binding_digest"]
-        created_at = contract_row["created_at"]
+        canonical, stored_sha, stored_binding, created_at = contract_values
         if (
             not isinstance(canonical, str)
             or not isinstance(stored_sha, str)
@@ -1063,12 +1224,7 @@ def _strict_revision(
 
 
 def _compile_request_contract(raw: object) -> CompiledContract:
-    try:
-        return compile_contract(raw)
-    except ContractError:
-        raise DefinitionInvalid("workflow contract is invalid") from None
-    except Exception:
-        raise DefinitionInvalid("workflow contract is invalid") from None
+    return compile_definition_contract(raw)
 
 
 def _contract_binding(

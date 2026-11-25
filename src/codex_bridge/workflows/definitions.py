@@ -9,7 +9,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,24 @@ class DefinitionRepositoryUnavailable(DefinitionError):
     code = "unavailable"
 
 
+class WorkflowContractInvalid(DefinitionInvalid):
+    """A supplied public workflow contract is invalid."""
+
+    code = "workflow_contract_invalid"
+
+
+class WorkflowContractRequired(DefinitionInvalid):
+    """A strict revision cannot be updated without its contract."""
+
+    code = "workflow_contract_required"
+
+
+class WorkflowContractUnavailable(DefinitionRepositoryUnavailable):
+    """The selected repository cannot persist strict workflow contracts."""
+
+    code = "workflow_contract_unavailable"
+
+
 @dataclass(frozen=True)
 class DefinitionValidation:
     source_yaml: str
@@ -71,6 +89,8 @@ class DefinitionValidation:
     source_sha256: str
     canonical_sha256: str
     max_live_codex_jobs: int
+    contract_version: int | None = None
+    contract_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +104,10 @@ class DefinitionRevision:
     created_at: str
     etag: str
     definition: dict[str, Any]
+    contract_version: int | None = None
+    contract_sha256: str | None = None
+    binding_digest: str | None = None
+    contract: dict[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -97,6 +121,9 @@ class DefinitionSummary:
     created_at: str
     updated_at: str
     etag: str
+    contract_version: int | None = None
+    contract_sha256: str | None = None
+    binding_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +134,8 @@ class DefinitionPage:
 
 class WorkflowDefinitionRepository:
     """Persist validated immutable workflow definition revisions."""
+
+    supports_contracts = False
 
     def __init__(self, state_root: Path) -> None:
         self._state_root = Path(state_root)

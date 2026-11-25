@@ -339,6 +339,12 @@ class WorkflowService:
     ) -> WorkflowSnapshot:
         """Start one explicitly selected immutable definition revision."""
         saved = await asyncio.to_thread(repository.get, definition_id, revision)
+        if (
+            getattr(saved, "contract_version", None) is not None
+            or getattr(saved, "is_strict", False)
+            or getattr(saved, "contract", None) is not None
+        ):
+            raise WorkflowServiceUnavailable("strict workflow execution is not available")
         try:
             source_sha256 = hashlib.sha256(
                 saved.source_yaml.encode("utf-8", errors="strict")

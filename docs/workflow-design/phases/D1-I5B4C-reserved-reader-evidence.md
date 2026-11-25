@@ -1,11 +1,12 @@
 # D1-I5-B4C reserved reader and reservation-order evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats)。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** `origin/dev` at `483c341af5b2411ea17710d704d5eb2b9f908d32`。
 - **B4B review:** ChatGPT GitHub review of `ac095df0a5b353a739cd6ec3e9e58ea579371f71` はACCEPTED (with documented caveats)。full pytest、CPP/account-auth回帰、実Worker/DBOS/job、WAL metadata未検証の留保を[B4B証跡](D1-I5B4B-verified-projection-evidence.md)に記録しました。
+- **B4C / I5 review:** ChatGPT GitHub review of `85f1fd206aea0db77d6ccd1e1d78f1551d6d89ec` はI5-B4C、I5-B4、I5全体をACCEPTED (with documented caveats)としました。受入範囲はreader/reservationのみで、live strict runtimeを含みません。
 - **今回の範囲:** manager、worker_entry、直接worker readerを予約済みstrict v2検証へ接続し、prepared snapshot用の内部予約順序coordinatorを追加。
-- **I5-B4C / I5-B4全体 / I5全体:** ChatGPT review前のためB4CはPENDING_CHATGPT_REVIEW、B4およびI5はIN_PROGRESS。**strict run admission:** OFF。**I2:** DEFERRED / NON-BLOCKING。**D1全体:** DRAFT。
+- **I5-B4C / I5-B4全体 / I5全体:** ACCEPTED (with documented caveats)。受入はreader/reservation scopeに限定し、strict runtime/実Worker実行を受け入れたものではありません。**strict run admission:** OFF。**I2:** DEFERRED / NON-BLOCKING。**D1全体:** DRAFT。
 
 ## 実装
 
@@ -49,7 +50,7 @@ I6 strict admission接続時には、`_snapshot_for_row` の `forced_state` がi
 
 ## 検証
 
-検証はWindows nativeのpytest `tmp_path` DB/snapshotとmockのみです。実行したaggregateにはI5-A/B1/B2/B3/B4A/B4B/B4C、manager、service、multi-APIのfocused回帰を含みます。初回aggregateは **331 passed / 3 failed / 4 skipped** でした。3件はB3のbindingを削除したstrict v2拒否caseが従来の「unsupported」文言を期待していたものです。readerは値非露出の `workflow request binding is invalid` で引き続き拒否していました。期待値だけ更新後、B3全suiteを再実行して **66 passed / 0 failed / 1 skipped**、B4C専用suiteは **14 passed / 0 failed** でした。集計上は **334 passed / 0 failed / 4 skipped** です。
+検証はWindows nativeのpytest `tmp_path` DB/snapshotとmockのみです。実行したaggregateにはI5-A/B1/B2/B3/B4A/B4B/B4C、manager、service、multi-APIのfocused回帰を含みます。初回aggregateは **331 passed / 3 failed / 4 skipped** でした。3件はB3のbindingを削除したstrict v2拒否caseが従来の「unsupported」文言を期待していたものです。readerは値非露出の `workflow request binding is invalid` で引き続き拒否していました。期待値だけを更新し、B3全suiteを対象に再実行して **66 passed / 0 failed / 1 skipped** でした。B4C専用suiteは **14 passed / 0 failed** です。修正後のaggregate相当値 **334 passed / 0 failed / 4 skipped** は初回aggregateと対象B3再実行を反映した訂正集計で、334件を一度に実行した単一rerunではありません。
 
 | 検査 | 結果 |
 | --- | --- |
@@ -62,12 +63,14 @@ I6 strict admission接続時には、`_snapshot_for_row` の `forced_state` がi
 | `git diff --check` | PASS |
 | full pytest | NOT_RUN — I8に残す |
 | CPP MCP/account-auth境界回帰 | NOT_RUN |
+| 実Worker / DBOS / 実Codex job | NOT_RUN |
+| WAL metadata不変性 | NOT_RUN — 主張外 |
 
 4件のskipはI5-A symlink 2件、B3 symlink 1件、multi-API symlink 1件で、Windows symlink権限が利用できないためです。隔離fake job fileはownership拒否確認だけに使いました。production/shared DB、live Bridge/worker、実Codex外部job、実Workflow再POSTは使っていません。DBOS/実Worker/jobは未検証です。WAL metadata不変性は主張しません。
 
 ## Reviewと残件
 
-- ChatGPT GitHub review待ち。Codex作業終了時点でB4CまたはI5全体を受入済みとは扱いません。
+- ChatGPT GitHub reviewでB4C、B4、I5はACCEPTED (with documented caveats)。受入範囲はreader/reservationに限定し、live strict runtimeは未実装です。
 - coordinatorは既存のlegacy admission/startに接続していません。strict admissionはOFFのままです。
 - valid reserved v2の読取り検証とruntime実行許可は別です。strict runtimeと実job/output成功判定はI7以降です。
 - full pytest、CPP/account-auth回帰、実Worker/DBOS/job、WAL metadataは未検証です。D1全体はDRAFTです。
