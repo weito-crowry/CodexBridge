@@ -372,6 +372,19 @@ use `state=estimated_running`, `evidence=inferred`, `source=rollout_unmatched_st
 `unknown`, including initial scan, stale/unavailable observation, and `not_loaded`. The unresolved
 #111 restart-detection report remains unresolved; this API exposes the existing heuristic.
 
+`codex_threads(running_only=true)` returns the `threads` rows for IDs that the Bridge currently
+recognizes as running: managed turns with live `in_progress`, `needs_approval`, or `needs_input`
+observations, plus external `estimated_running` observations. It does not infer running state from
+`last_turn` alone. The Bridge reads metadata only for those known IDs, applies the same cwd
+allowlist and output sanitization, and returns `next_cursor: null`; `limit` does not cap this list
+(it still must be within the accepted 1–100 range). `thread_id`, `include_history=true`, and a
+non-null `cursor` cannot be combined with `running_only=true`. No App Server-wide scan or exact
+total is provided, so this view can omit a thread that is running but not present in Bridge's
+current observations. With the default `running_only=false`, the existing 20-row page, cursor
+pagination, and single-thread/history behavior remain in effect. For remote targets, the false
+default is omitted from forwarded arguments for older Bridge compatibility; a remote that does not
+support `running_only=true` returns its normal safe upstream tool error.
+
 `codex_status(thread_id)` returns the same separate `current_execution` plus #124 `last_turn`
 and attention fields. An external estimate can coexist with an older persisted terminal result.
 List calls do not read every thread's history: unobserved `last_turn` is `unknown`; request an
@@ -413,7 +426,7 @@ LLM-facing tools.
 | `codex_approval` | Resolve one pending command/file/permission approval. |
 | `codex_user_input` | Resolve one pending Codex user-input request. |
 | `codex_interrupt` | Request interruption of an active turn. |
-| `codex_threads` | List threads or read one sanitized thread/history view. |
+| `codex_threads` | List threads, optionally showing only threads the Bridge currently recognizes as running, or read one sanitized thread/history view. |
 | `codex_status` | Read the current safe turn state and recent normalized activity. |
 
 Normalized turn states are `in_progress`, `needs_approval`, `needs_input`, `completed`,

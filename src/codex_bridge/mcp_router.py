@@ -21,6 +21,7 @@ _CPP_TOOL_ALLOWLIST = frozenset(
         "codex_threads",
         "codex_status",
         "codex_wait",
+        "codex_final_answer",
     }
 )
 

@@ -16,6 +16,10 @@ from codex_bridge.execution_targets import (
     _parse_request_handle,
     _request_handle,
 )
+from codex_bridge.final_answers import (
+    MAX_FINAL_ANSWER_UTF16_CODE_UNITS,
+    MAX_IDENTIFIER_UTF16_CODE_UNITS,
+)
 
 LOCAL = ExecutionTargetConfig("main-pc", "Main PC", "local")
 NOTEBOOK = ExecutionTargetConfig(
@@ -110,6 +114,17 @@ class FakeBridge:
     async def status(self, thread_id: str, turn_id=None, activity_limit=20) -> dict[str, Any]:
         return await self._call("status", thread_id, turn_id, activity_limit=activity_limit)
 
+    def final_answer(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        self.calls.append(("final_answer", (thread_id, turn_id), {}))
+        return {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "status": "retrieved",
+            "source": "app_server.item/completed.agentMessage.phase=final_answer",
+            "item_id": "item-final",
+            "text": "synthetic answer",
+        }
+
 
 class FakeRemote:
     def __init__(self, response: dict[str, Any] | None = None) -> None:
@@ -117,6 +132,8 @@ class FakeRemote:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.available = True
         self.error: Exception | None = None
+        self.supported_tools: set[str] = set()
+        self.leaf_target_id = "leaf-local"
 
     async def start(self) -> None:
         if self.error:
@@ -134,6 +151,9 @@ class FakeRemote:
             raise self.error
         return self.response
 
+    def supports_tool(self, name: str) -> bool:
+        return name in self.supported_tools
+
     async def setup_capabilities(self) -> dict[str, Any]:
         return await self.call_tool("codex_setup_capabilities", {"target_id": "local"})
 
@@ -142,6 +162,194 @@ def make_router(*targets: ExecutionTargetConfig, response=None):
     local = FakeBridge()
     remotes = {target.id: FakeRemote(response) for target in targets if target.kind == "remote"}
     return ExecutionTargetRouter(targets, lambda: local, remote_clients=remotes), local, remotes
+
+
+@pytest.mark.asyncio
+async def test_local_final_answer_is_bound_to_resolved_target_thread_and_turn() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    result = await router.codex_final_answer("native-thread", "native-turn")
+
+    assert bridge.calls == [("final_answer", ("native-thread", "native-turn"), {})]
+    assert result["target_id"] == LOCAL.id
+    assert result["thread_id"] == "native-thread"
+    assert result["turn_id"] == "native-turn"
+    assert result["status"] == "retrieved"
+    assert len(result["text"]) == len("synthetic answer")
+
+
+@pytest.mark.asyncio
+async def test_remote_final_answer_without_explicit_tool_support_is_not_forwarded() -> None:
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK)
+
+    result = await router.codex_final_answer(
+        f"{NOTEBOOK.id}::native-remote", "turn-remote", target_id=NOTEBOOK.id
+    )
+
+    assert result["target_id"] == NOTEBOOK.id
+    assert result["thread_id"] == f"{NOTEBOOK.id}::native-remote"
+    assert result["turn_id"] == "turn-remote"
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "remote_tool_unsupported"
+    assert "text" not in result
+    assert remotes[NOTEBOOK.id].calls == []
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_remote_final_answer_forwards_only_explicitly_supported_tool() -> None:
+    response = {
+        "target_id": "leaf-local",
+        "thread_id": "native-remote",
+        "turn_id": "turn-remote",
+        "status": "retrieved",
+        "source": "app_server.item/completed.agentMessage.phase=final_answer",
+        "item_id": "item-final",
+        "text": "synthetic answer",
+    }
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK, response=response)
+    remotes[NOTEBOOK.id].supported_tools.add("codex_final_answer")
+
+    result = await router.codex_final_answer(
+        f"{NOTEBOOK.id}::native-remote", "turn-remote", target_id=NOTEBOOK.id
+    )
+
+    assert remotes[NOTEBOOK.id].calls == [
+        (
+            "codex_final_answer",
+            {
+                "thread_id": "native-remote",
+                "turn_id": "turn-remote",
+                "target_id": "leaf-local",
+            },
+        )
+    ]
+    assert result["target_id"] == NOTEBOOK.id
+    assert result["thread_id"] == f"{NOTEBOOK.id}::native-remote"
+    assert result["turn_id"] == "turn-remote"
+    assert result["status"] == "retrieved"
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_remote_mismatched_response_identity_is_incomplete_without_text() -> None:
+    response = {
+        "target_id": "leaf-local",
+        "thread_id": "another-thread",
+        "turn_id": "turn-remote",
+        "status": "retrieved",
+        "source": "app_server.item/completed.agentMessage.phase=final_answer",
+        "text": "must not escape",
+    }
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK, response=response)
+    remotes[NOTEBOOK.id].supported_tools.add("codex_final_answer")
+
+    result = await router.codex_final_answer(
+        f"{NOTEBOOK.id}::native-remote", "turn-remote", target_id=NOTEBOOK.id
+    )
+
+    assert result["target_id"] == NOTEBOOK.id
+    assert result["thread_id"] == f"{NOTEBOOK.id}::native-remote"
+    assert result["turn_id"] == "turn-remote"
+    assert result["status"] == "incomplete"
+    assert result["reason"] == "remote_response_identity_mismatch"
+    assert "text" not in result
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_remote_mismatched_target_identity_is_incomplete_without_text() -> None:
+    response = {
+        "target_id": "another-leaf",
+        "thread_id": "native-remote",
+        "turn_id": "turn-remote",
+        "status": "retrieved",
+        "source": "app_server.item/completed.agentMessage.phase=final_answer",
+        "item_id": "item-final",
+        "text": "must not escape",
+    }
+    router, _bridge, remotes = make_router(LOCAL, NOTEBOOK, response=response)
+    remotes[NOTEBOOK.id].supported_tools.add("codex_final_answer")
+
+    result = await router.codex_final_answer(
+        f"{NOTEBOOK.id}::native-remote", "turn-remote", target_id=NOTEBOOK.id
+    )
+
+    assert result["status"] == "incomplete"
+    assert result["reason"] == "remote_response_identity_mismatch"
+    assert result["target_id"] == NOTEBOOK.id
+    assert result["thread_id"] == f"{NOTEBOOK.id}::native-remote"
+    assert "text" not in result
+
+
+@pytest.mark.asyncio
+async def test_remote_oversized_response_text_is_rejected_without_echo() -> None:
+    response = {
+        "target_id": "leaf-local",
+        "thread_id": "native-remote",
+        "turn_id": "turn-remote",
+        "status": "retrieved",
+        "source": "app_server.item/completed.agentMessage.phase=final_answer",
+        "item_id": "item-final",
+        "text": "x" * (MAX_FINAL_ANSWER_UTF16_CODE_UNITS + 1),
+    }
+    router, _bridge, remotes = make_router(LOCAL, NOTEBOOK, response=response)
+    remotes[NOTEBOOK.id].supported_tools.add("codex_final_answer")
+
+    result = await router.codex_final_answer(
+        f"{NOTEBOOK.id}::native-remote", "turn-remote", target_id=NOTEBOOK.id
+    )
+
+    assert result["status"] == "incomplete"
+    assert result["reason"] == "remote_response_invalid"
+    assert "text" not in result
+
+
+@pytest.mark.asyncio
+async def test_remote_malformed_status_is_rejected_without_echo() -> None:
+    response = {
+        "target_id": "leaf-local",
+        "thread_id": "native-remote",
+        "turn_id": "turn-remote",
+        "status": {"unexpected": "shape"},
+        "text": "must not escape",
+    }
+    router, _bridge, remotes = make_router(LOCAL, NOTEBOOK, response=response)
+    remotes[NOTEBOOK.id].supported_tools.add("codex_final_answer")
+
+    result = await router.codex_final_answer(
+        f"{NOTEBOOK.id}::native-remote", "turn-remote", target_id=NOTEBOOK.id
+    )
+
+    assert result["status"] == "incomplete"
+    assert result["reason"] == "remote_response_invalid"
+    assert "text" not in result
+
+
+@pytest.mark.asyncio
+async def test_final_answer_rejects_malformed_thread_or_turn_ids_before_routing() -> None:
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError, match="thread_id or turn_id is malformed"):
+        await router.codex_final_answer("../outside", "turn-remote")
+    with pytest.raises(ExecutionTargetError, match="thread_id or turn_id is malformed"):
+        await router.codex_final_answer("native-remote", "invalid/turn")
+
+    assert bridge.calls == []
+    assert remotes[NOTEBOOK.id].calls == []
+
+
+@pytest.mark.asyncio
+async def test_final_answer_rejects_overlong_target_id_before_routing() -> None:
+    router, bridge, remotes = make_router(LOCAL, NOTEBOOK)
+
+    with pytest.raises(ExecutionTargetError, match="target_id is malformed"):
+        await router.codex_final_answer(
+            "native-thread", "native-turn", target_id="x" * (MAX_IDENTIFIER_UTF16_CODE_UNITS + 1)
+        )
+
+    assert bridge.calls == []
+    assert remotes[NOTEBOOK.id].calls == []
 
 
 @pytest.mark.asyncio
@@ -706,11 +914,83 @@ async def test_remote_thread_list_is_scoped_and_native_id_can_be_adopted() -> No
 
 
 @pytest.mark.asyncio
+async def test_default_local_thread_list_keeps_original_bridge_arguments() -> None:
+    router, bridge, _ = make_router(LOCAL)
+
+    await router.codex_threads()
+
+    assert bridge.calls == [
+        ("threads", (None,), {"include_history": False, "limit": 20, "cursor": None})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_thread_list_requires_selection_when_multiple_targets_are_configured() -> None:
     router, _, _ = make_router(LOCAL, NOTEBOOK, OTHER)
 
     with pytest.raises(ExecutionTargetError, match="target_id is required"):
         await router.codex_threads()
+
+
+@pytest.mark.asyncio
+async def test_running_only_is_forwarded_to_remote_without_target_id() -> None:
+    remote = FakeRemote({"threads": [{"id": "active"}], "next_cursor": None})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    result = await router.codex_threads(target_id="notebook", running_only=True)
+
+    assert remote.calls == [
+        (
+            "codex_threads",
+            {
+                "thread_id": None,
+                "include_history": False,
+                "limit": 20,
+                "cursor": None,
+                "running_only": True,
+            },
+        )
+    ]
+    assert "target_id" not in remote.calls[0][1]
+    assert result["threads"][0]["id"] == "notebook::active"
+    assert result["threads"][0]["target_id"] == "notebook"
+    assert result["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_default_remote_thread_list_omits_running_only_for_old_remote_compatibility() -> None:
+    remote = FakeRemote({"threads": [], "next_cursor": None})
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_threads(target_id="notebook")
+
+    assert "running_only" not in remote.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_remote_running_only_returns_safe_upstream_error() -> None:
+    class OldRemote(FakeRemote):
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            if arguments.get("running_only") is True:
+                raise ExecutionTargetError("execution target returned an upstream tool error")
+            return {"threads": [], "next_cursor": None}
+
+    remote = OldRemote()
+    router = ExecutionTargetRouter(
+        (LOCAL, NOTEBOOK), lambda: FakeBridge(), remote_clients={"notebook": remote}
+    )
+
+    await router.codex_threads(target_id="notebook")
+    with pytest.raises(ExecutionTargetError, match="upstream tool error"):
+        await router.codex_threads(target_id="notebook", running_only=True)
+
+    assert len(remote.calls) == 2
+    assert "target_id" not in remote.calls[1][1]
 
 
 @pytest.mark.parametrize("native_id", [1, "1"])
@@ -945,6 +1225,49 @@ async def test_remote_compatibility_requires_all_tools_and_a_leaf_gateway() -> N
     )
     with pytest.raises(ExecutionTargetError, match="single-target leaf"):
         await nested._validate_leaf()
+
+
+@pytest.mark.asyncio
+async def test_remote_final_answer_support_is_explicit_and_does_not_change_leaf_requirement() -> (
+    None
+):
+    supported = ExecutionTargetClient(NOTEBOOK)
+    supported._session = ToolListSession(
+        set(_REQUIRED_TARGET_TOOLS) | {"codex_final_answer"},
+        {"targets": [{"id": "leaf-main"}], "selection_required": False},
+    )
+    await supported._validate_leaf()
+
+    legacy = ExecutionTargetClient(NOTEBOOK)
+    legacy._session = ToolListSession(
+        set(_REQUIRED_TARGET_TOOLS),
+        {"targets": [{"id": "leaf-main"}], "selection_required": False},
+    )
+    await legacy._validate_leaf()
+
+    assert supported.supports_tool("codex_final_answer")
+    assert supported.leaf_target_id == "leaf-main"
+    assert not legacy.supports_tool("codex_final_answer")
+    assert legacy.connected is False
+
+
+@pytest.mark.asyncio
+async def test_remote_client_rechecks_optional_tool_support_before_calling() -> None:
+    class NoCallSession:
+        calls: list[str] = []
+
+        async def call_tool(self, name: str, _arguments: dict[str, Any]) -> None:
+            self.calls.append(name)
+
+    client = ExecutionTargetClient(NOTEBOOK)
+    client._connected = True
+    session = NoCallSession()
+    client._session = session
+
+    with pytest.raises(ExecutionTargetError, match="does not support final-answer"):
+        await client.call_tool("codex_final_answer", {"thread_id": "t", "turn_id": "u"})
+
+    assert session.calls == []
 
 
 def test_remote_result_extraction_prefers_structured_content() -> None:

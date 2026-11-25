@@ -32,6 +32,7 @@ class FakeBridge:
     error: Exception | None = None
     start_count: int = 0
     start_options: dict[str, Any] | None = None
+    thread_options: dict[str, Any] | None = None
 
     async def start(
         self,
@@ -73,6 +74,24 @@ class FakeBridge:
                 {"id": "danger-full-access", "display_name": "Full access"},
             ],
         }
+
+    async def threads(
+        self,
+        thread_id: str | None = None,
+        *,
+        include_history: bool = False,
+        limit: int = 20,
+        cursor: str | None = None,
+        running_only: bool = False,
+    ) -> dict[str, Any]:
+        self.thread_options = {
+            "thread_id": thread_id,
+            "include_history": include_history,
+            "limit": limit,
+            "cursor": cursor,
+            "running_only": running_only,
+        }
+        return {"threads": [], "next_cursor": None}
 
 
 class FakeRuntime:
@@ -206,7 +225,7 @@ async def test_run_server_uses_configured_graceful_timeout_and_shared_log_format
     assert config_used.log_config is None
 
 
-def test_server_registers_nineteen_native_tools_plus_local_probe_tools(tmp_path) -> None:
+def test_server_registers_twenty_native_tools_plus_local_probe_tools(tmp_path) -> None:
     runtime = FakeRuntime()
     app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
 
@@ -221,7 +240,7 @@ def test_server_registers_nineteen_native_tools_plus_local_probe_tools(tmp_path)
         "command_execute_probe",
     }
     assert len(probe_names) == 6
-    assert len(names - probe_names) == 19
+    assert len(names - probe_names) == 20
     assert names - probe_names == {
         "codex_targets",
         "codex_start",
@@ -233,6 +252,7 @@ def test_server_registers_nineteen_native_tools_plus_local_probe_tools(tmp_path)
         "codex_interrupt",
         "codex_threads",
         "codex_status",
+        "codex_final_answer",
         "codex_setup",
         "codex_setup_capabilities",
         "codex_setup_confirm",
@@ -915,6 +935,31 @@ async def test_execution_target_tool_schemas_are_explicit_and_optional(tmp_path)
     ] == ["auto_review", "user"]
     assert "target_id" in tools["codex_threads"].input_schema["properties"]
     assert "target_id" not in tools["codex_threads"].input_schema.get("required", [])
+    assert tools["codex_threads"].input_schema["properties"]["running_only"]["type"] == "boolean"
+    assert "running_only" not in tools["codex_threads"].input_schema.get("required", [])
+
+
+@pytest.mark.asyncio
+async def test_codex_threads_forwards_running_only_to_local_bridge(tmp_path) -> None:
+    runtime = FakeRuntime()
+    app = create_app(config(tmp_path), runtime_factory=lambda _: runtime)
+    tool = next(
+        tool
+        for tool in app.state.mcp_server._tool_manager.list_tools()
+        if tool.name == "codex_threads"
+    )
+
+    async with app.router.lifespan_context(app):
+        result = await tool.fn(running_only=True)
+
+    assert result["threads"] == []
+    assert runtime.bridge.thread_options == {
+        "thread_id": None,
+        "include_history": False,
+        "limit": 20,
+        "cursor": None,
+        "running_only": True,
+    }
 
 
 def test_setup_tools_bind_the_app_resource_and_app_only_visibility(tmp_path) -> None:
@@ -1340,7 +1385,11 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     def callback() -> None:
         pass
 
-    runtime = build_runtime(config(tmp_path), shutdown_callback=callback)
+    runtime = build_runtime(
+        config(tmp_path),
+        shutdown_callback=callback,
+        final_answer_database_path=tmp_path / "runtime-final-answers.sqlite3",
+    )
 
     assert captured[0]["shutdown_callback"] is callback
     assert captured[0]["workflow_service"] is runtime.workflow_service
@@ -1348,10 +1397,17 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     assert captured[0]["workflow_definitions"] is runtime.workflow_definitions
     assert runtime.workflow_definitions is not None
     assert runtime.workflow_definitions._state_root == runtime.workflow_manager.state_root
+    assert runtime.bridge._final_answer_store is not None
+    assert runtime.bridge._final_answer_store.database_path == (
+        tmp_path / "runtime-final-answers.sqlite3"
+    )
+    assert runtime.app_server._on_notification == runtime.bridge.handle_notification_async
 
 
 def test_build_runtime_attaches_inert_workflow_manager(tmp_path) -> None:
-    runtime = build_runtime(config(tmp_path))
+    runtime = build_runtime(
+        config(tmp_path), final_answer_database_path=tmp_path / "runtime-final-answers.sqlite3"
+    )
 
     assert isinstance(runtime.workflow_manager, WorkflowWorkerManager)
     assert runtime.workflow_manager.get_status("run-0123456789abcdef0123456789abcdef") is None
@@ -1366,6 +1422,10 @@ async def test_runtime_shutdown_stops_worker_before_interrupting_other_turns(tmp
     class StubBridge:
         async def interrupt_active_turns(self, *, wait_seconds: float, exclude_turns) -> None:
             calls.append(("interrupt", wait_seconds, exclude_turns))
+
+        async def drain_final_answer_writes(self, *, close: bool = False) -> None:
+            assert close
+            calls.append("drain_final_answer_writes")
 
     class StubResource:
         async def start(self) -> None:
@@ -1405,7 +1465,7 @@ async def test_runtime_shutdown_stops_worker_before_interrupting_other_turns(tmp
         value for value in calls if isinstance(value, tuple) and value[0] == "interrupt"
     )
     assert interrupt[2] == frozenset({("workflow-thread", "workflow-turn")})
-    assert calls[-2:] == ["shutdown", "shutdown"]
+    assert calls[-3:] == ["shutdown", "shutdown", "drain_final_answer_writes"]
 
 
 @pytest.mark.asyncio
@@ -1419,6 +1479,9 @@ async def test_runtime_shutdown_skips_interrupts_when_workflow_turn_ownership_is
     class StubBridge:
         async def interrupt_active_turns(self, **_kwargs) -> None:
             calls.append("interrupt")
+
+        async def drain_final_answer_writes(self, *, close: bool = False) -> None:
+            pass
 
     class StubResource:
         async def shutdown(self, *_args) -> None:
@@ -1458,6 +1521,9 @@ async def test_runtime_shutdown_cleans_worker_and_servers_when_monitor_close_fai
     class StubBridge:
         async def interrupt_active_turns(self, **_kwargs) -> None:
             calls.append("interrupt")
+
+        async def drain_final_answer_writes(self, *, close: bool = False) -> None:
+            pass
 
     class StubResource:
         async def shutdown(self, *_args) -> None:
