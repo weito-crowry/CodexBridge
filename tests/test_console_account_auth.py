@@ -75,7 +75,9 @@ class FakeWindow(QWidget):
 
 def _application() -> QApplication:
     current = QApplication.instance()
-    return current if isinstance(current, QApplication) else QApplication([])
+    if isinstance(current, QApplication):
+        return current
+    return QApplication([])
 
 
 @pytest.fixture(autouse=True)

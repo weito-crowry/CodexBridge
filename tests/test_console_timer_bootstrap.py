@@ -124,9 +124,12 @@ def test_main_window_wrapper_passes_current_exit_timeout_to_timer_and_deadline(
     window._workflow_management_controller = SimpleNamespace(
         shutdown=lambda: exit_calls.append("workflow_shutdown")
     )
+    window._account_auth_controller = SimpleNamespace(close=lambda: None)
     window._bridge_runtime_observer = SimpleNamespace(
         close=lambda: exit_calls.append("observer_close")
     )
+    window._codex_update_probe = SimpleNamespace(abort=lambda: None)
+    window._invalidate_usage_sequence = lambda: None
     window._on_exit_tunnel_stopped = lambda: None
     window._global_stream_retry_timer.start(30_000)
     monkeypatch.setattr(main_window_module, "_EXIT_TIMEOUT_SECONDS", 8.25)

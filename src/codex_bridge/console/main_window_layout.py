@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication,
     QButtonGroup,
     QDialog,
     QFormLayout,
@@ -325,6 +324,3 @@ def build_main_window_ui(window: MainWindow) -> None:
     bottom_bar.addWidget(window.diagnostics_toggle_button)
     layout.addLayout(bottom_bar)
     window.setCentralWidget(root)
-    application = QApplication.instance()
-    if isinstance(application, QApplication):
-        application.setStyle("Fusion")

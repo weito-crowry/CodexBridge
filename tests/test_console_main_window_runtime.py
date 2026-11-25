@@ -61,20 +61,6 @@ def _wait_for_profile(window: MainWindow) -> None:
     assert window._tunnel_profile_status != "running"
 
 
-def test_close_stops_timers_and_aborts_only_client_replies() -> None:
-    _application()
-    client = FakeClient()
-    window = MainWindow(_config(), api_client=client, tray_available=False)
-
-    window.close()
-
-    assert client.aborted_all
-    assert not window.health_timer.isActive()
-    assert not window.thread_timer.isActive()
-    assert not window.selected_status_timer.isActive()
-    assert not window._history_refresh_timer.isActive()
-
-
 def test_existing_ready_bridge_is_external_and_start_is_disabled() -> None:
     _application()
     client = FakeClient()

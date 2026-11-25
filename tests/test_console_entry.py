@@ -39,6 +39,9 @@ def test_entrypoint_constructs_and_runs_gui_after_configuration(monkeypatch) -> 
         def __init__(self, args) -> None:
             calls.append(("application", args))
 
+        def setStyle(self, style: str) -> None:
+            calls.append(("style", style))
+
         def setWindowIcon(self, value) -> None:
             calls.append(("icon", value))
 
@@ -58,8 +61,9 @@ def test_entrypoint_constructs_and_runs_gui_after_configuration(monkeypatch) -> 
     monkeypatch.setattr(entry, "_load_application_icon", lambda: object())
 
     assert entry.main(["--ui-port", "8123"]) == 0
-    assert calls[1][0] == "icon"
-    assert calls[2:] == [("window", 8123), "show", "exec"]
+    assert [call[0] for call in calls[:3]] == ["application", "style", "icon"]
+    assert calls[1] == ("style", "Fusion")
+    assert calls[3:] == [("window", 8123), "show", "exec"]
 
 
 def test_internal_runtime_dispatches_before_gui_and_uses_bridge_main(monkeypatch) -> None:
@@ -159,6 +163,9 @@ def test_entrypoint_sets_application_icon_before_creating_window(monkeypatch) ->
         def __init__(self, args) -> None:
             calls.append(("application", args))
 
+        def setStyle(self, style: str) -> None:
+            calls.append(("style", style))
+
         def setWindowIcon(self, value) -> None:
             calls.append(("icon", value))
 
@@ -186,7 +193,13 @@ def test_entrypoint_sets_application_icon_before_creating_window(monkeypatch) ->
     assert entry.main(["--ui-port", "8123"]) == 0
     assert calls[0] == "app-id"
     assert calls[1][0] == "application"
-    assert calls[2:] == [("icon", icon), ("window", 8123), "show", "exec"]
+    assert calls[2:] == [
+        ("style", "Fusion"),
+        ("icon", icon),
+        ("window", 8123),
+        "show",
+        "exec",
+    ]
 
 
 def test_windows_app_user_model_id_uses_shell32(monkeypatch) -> None:

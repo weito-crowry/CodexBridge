@@ -1409,6 +1409,12 @@ class MainWindow(QMainWindow):
         self._workflow_management_controller.shutdown()
         self._bridge_runtime_observer.close()
         self._global_stream_retry_timer.stop()
+        self.signal_timer.stop()
+        self.codex_update_auto_timer.stop()
+        self._invalidate_usage_sequence()
+        abort_update = getattr(self._codex_update_probe, "abort", None)
+        if callable(abort_update):
+            abort_update()
         self._stop_external_thread_monitor()
         self._composer_controller.set_control_available(False)
         self.health_timer.stop()
@@ -1442,13 +1448,8 @@ class MainWindow(QMainWindow):
         self._exit_finished = True
         self._stop_external_thread_monitor()
         self.exit_timer.stop()
-        self.signal_timer.stop()
         self.diagnostics_timer.stop()
         self.stop_confirmation_timer.stop()
-        self._invalidate_usage_sequence()
-        abort_update = getattr(self._codex_update_probe, "abort", None)
-        if callable(abort_update):
-            abort_update()
         self._client.abort_all()
         self._launcher.close()
         if self._usage_history_window is not None:

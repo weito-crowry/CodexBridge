@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPushButton,
-    QSplitter,
     QWidget,
 )
 
@@ -55,7 +54,6 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
 
     window = MainWindow(_config(), api_client=client, tray_available=False)
 
-    assert len(window.findChildren(QSplitter)) == 1
     assert window.thread_pane is not None
     assert window.history_pane is not None
     assert window.activity_pane is not None
@@ -66,6 +64,11 @@ def test_main_window_constructs_three_panes_and_disconnected_empty_state() -> No
     assert window.bridge_status_label.window() is window.status_dialog
     assert window.splitter.orientation() == Qt.Orientation.Horizontal
     assert window.splitter.count() == 3
+    assert window.splitter.widget(0) is window.thread_pane
+    conversation_pane = window.splitter.widget(1)
+    assert window.history_pane.parentWidget() is conversation_pane
+    assert window.composer_widget.parentWidget() is conversation_pane
+    assert window.splitter.widget(2) is window.activity_pane
     assert isinstance(window.menuBar(), QMenuBar)
     assert not hasattr(window, "settings_button")
     assert not hasattr(window, "appearance_button")
