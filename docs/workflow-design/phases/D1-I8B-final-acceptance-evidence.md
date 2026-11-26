@@ -61,13 +61,21 @@ PD-23の隔離DB testは将来の共有DB運用承認を代替しません。PD-
 
 ## 次段のoperator rollout plan（未実施）
 
-本sliceでは実state rootやproduction/shared DBを照会・変更しません。将来のmigration/enablementは別途ユーザー承認後に行います。
+このcompatibility follow-upでは実state rootやproduction/shared DBへ再アクセスせず、変更もしていません。以下は2026-11-26に得たread-only preflight結果の記録です。将来のmigration/enablementは別途ユーザー承認後に行います。
 
-1. 実state rootを使う前に、SQLite read-only接続（`mode=ro`）で`definitions.sqlite`と`requests.sqlite`の`PRAGMA user_version`、tables/indexes、`integrity_check`、`foreign_key_check`を記録します。停止前は予備preflightに留め、known writers/workersを止めた後に同じread-only inventoryを再確認します。既知schema/version以外は移行せず停止します。
+2026-11-26の実state root preflightで、`definitions.sqlite`は未作成、`requests.sqlite`は`user_version=0`の早期legacy v0（`workflow_requests`のみ、`workflow_request_sources`なし）と確認されました。保存requestは1件でstateが`running`でしたが、同じrunの保存済みworker/DBOS evidenceはworker完了・DBOS `SUCCESS`・job `SUCCEEDED`を示していました。この不一致は運用時に既存evidenceを照合して解決し、SQLでstateを直接変更しません。実DBのschema変更・初期化・再起動は行っていません。read-only観測中に`requests.sqlite-shm`のmtime進行も記録されましたが、原因は特定しておらず、sidecar metadataの不変性は主張しません。
+
+今回のoffline follow-upは、バックアップ/復元/明示migrationが受け入れるv0を、完全legacy（request source tableあり）と、上記のcanonical early-v0（同じcanonical request table/indexesでsource tableだけ欠落）の2種類に限定しました。early-v0のbackup/restoreは欠落状態を保持し、migrationだけがtransaction内で空のsource/binding tablesを追加します。新しい保存sourceやstrict bindingは捏造しません。その他の欠落・不正schema、v0 binding、version不一致は拒否します。この互換修正はproduction DB上では実行していません。
+
+1. すべてのactive task完了後、実state rootを使う前に、SQLite read-only接続（`mode=ro`）で`definitions.sqlite`と`requests.sqlite`の`PRAGMA user_version`、tables/indexes、`integrity_check`、`foreign_key_check`を記録します。停止前は予備preflightに留め、known writers/workersを止めた後に同じread-only inventoryを再確認します。request v0は上記canonical complete/earlyのどちらかを完全照合し、既存`running` rowとterminal evidenceの不一致を解決するまで進めません。既知schema/version以外は移行せず停止します。
 2. Bridge、全Workflow worker、その他known writersの停止を確認します。DB lockや`user_version`だけで旧writer停止の証明とは扱いません。停止中の一組としてdefinitions/requestsのSQLite online backupと関連run manifest metadataを採取し、backup側でschema、integrity/FK、legacy revisions/ETags、request/source identityを照合します。
-3. 承認された場合にのみ既存explicit facilitiesを使います。definitions v1→v2は`StrictWorkflowDefinitionStore.migrate_v1_to_v2(backup_path=...)`、requests legacy v0→v1は`StrictWorkflowRequestStore.migrate_v0_to_v1(backup_path=...)`です。各DB内transactionは独立です。片方だけ成功/失敗した場合はstrict runを許可せず状態を調査し、自動downgradeしません。既にtarget versionのDBは再migrationしません。
+3. 承認された場合にのみ既存explicit facilitiesを使います。`definitions.sqlite`が存在しない場合は明示的な`StrictWorkflowDefinitionStore.initialize_new_database()`でv2を新規初期化し、既存DBのmigrationとは扱いません。既存definitions v1→v2は`StrictWorkflowDefinitionStore.migrate_v1_to_v2(backup_path=...)`、requests legacy v0→v1は`StrictWorkflowRequestStore.migrate_v0_to_v1(backup_path=...)`です（request migrationは検証済みearly-v0を含みます）。各DB内transactionは独立です。片方だけ成功/失敗した場合はstrict runを許可せず状態を調査し、自動downgradeしません。既にtarget versionのDBは再migrationしません。
 4. migration後に両DBのversion/object inventory、integrity/FK、legacy revision/hash/ETagとrequest/source identitiesを再検査します。run-local variables DB/manifest/binding/reader互換も検証します。server wiringおよびstrict enablementは既定OFFを保ち、実施する場合は別途ユーザー承認を受けます。
 5. strict dataを書き込む前のrollback候補は、全writer停止中に対応する検証済みpaired backup setへoffline restoreする手順です。strict writes後に旧schemaへ自動downgradeしません。以後はforward repair、またはdata-loss範囲を明示した別途承認済みoffline restoreを検討します。
+
+現行server compositionにはpublic strict-admission configuration wiringがなく、manager/serviceのisolated opt-inは既定OFFです。DB migration後もそのままstrict public executionを有効化できるとは扱いません。実装wire-up、enablement、isolated smoke、production rolloutは別工程・別承認です。
+
+今回のoffline follow-up focused suiteはrequest storage/migrationとlegacy saved-execution regressionの52件がPASSです。実DB、live Bridge/worker、外部Codex job、full pytestは対象外です。既存のI8 isolated GOとproduction rollout保留は変わりません。
 
 ## Isolated go/no-go
 
@@ -81,3 +89,5 @@ ChatGPT reviewはI8-BおよびI8 isolated acceptanceをACCEPTED with documented 
 - `docs/workflow-design/phases/D1-I7C2-isolated-runtime-evidence.md`
 - `docs/workflow-design/phases/D1-implementation-plan.md`
 - `docs/workflow-design/phases/D1-I8B-final-acceptance-evidence.md`
+- `src/codex_bridge/workflows/strict_requests.py`
+- `tests/test_workflow_d1_i3b_request_storage.py`

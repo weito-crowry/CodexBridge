@@ -68,6 +68,25 @@ def _create_v0(state_root: Path) -> sqlite3.Connection:
     return connection
 
 
+def _create_early_v0(state_root: Path) -> sqlite3.Connection:
+    state_root.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(state_root / "requests.sqlite", timeout=10, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    # Start from the same legacy initializer, then mirror the early deployed schema variant.
+    legacy_service._initialize_write_connection(connection)
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("DROP TABLE workflow_request_sources")
+    row = next(row for row in _legacy_request_rows() if row[4] == "running")
+    connection.execute(
+        "INSERT INTO workflow_requests (client_request_id, workflow_id, run_id, request_digest, "
+        "state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        row,
+    )
+    connection.execute("COMMIT")
+    return connection
+
+
 def _legacy_snapshot(database: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
     with sqlite3.connect(database) as connection:
         requests = tuple(
@@ -77,12 +96,19 @@ def _legacy_snapshot(database: Path) -> tuple[tuple[object, ...], tuple[object, 
                 "state, created_at, updated_at FROM workflow_requests ORDER BY rowid"
             )
         )
-        sources = tuple(
-            tuple(row)
-            for row in connection.execute(
-                "SELECT rowid, run_id, definition_id, revision, source_sha256 "
-                "FROM workflow_request_sources ORDER BY rowid"
+        has_sources = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_request_sources'"
+        ).fetchone()
+        sources = (
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT rowid, run_id, definition_id, revision, source_sha256 "
+                    "FROM workflow_request_sources ORDER BY rowid"
+                )
             )
+            if has_sources
+            else ()
         )
     return requests, sources
 
@@ -228,6 +254,167 @@ def test_wal_online_backup_restore_and_v0_migration_preserve_legacy_identity(
         ).fetchone()
     ) == (0,)
     legacy_connection.close()
+
+
+def test_early_v0_backup_restore_and_migration_preserve_running_request_and_add_empty_tables(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "early-legacy"
+    legacy_connection = _create_early_v0(state_root)
+    database = state_root / "requests.sqlite"
+    before_rows = _legacy_snapshot(database)
+    before_objects = _user_objects(database)
+    assert before_rows[0][0][5] == "running"
+    assert before_rows[1] == ()
+    assert before_objects == {
+        ("table", "workflow_requests", "workflow_requests"),
+        ("index", "workflow_requests_created_idx", "workflow_requests"),
+        ("index", "workflow_requests_state_idx", "workflow_requests"),
+    }
+
+    store = StrictWorkflowRequestStore(state_root)
+    backup = tmp_path / "early-v0.backup"
+    store.create_verified_backup(backup)
+    assert _legacy_snapshot(backup) == before_rows
+    assert _user_objects(backup) == before_objects
+    with sqlite3.connect(backup) as check:
+        assert check.execute("PRAGMA user_version").fetchone() == (0,)
+
+    restored_root = tmp_path / "early-restored"
+    store.restore_verified_backup(backup, destination_state_root=restored_root)
+    restored = restored_root / "requests.sqlite"
+    assert _legacy_snapshot(restored) == before_rows
+    assert _user_objects(restored) == before_objects
+    with sqlite3.connect(restored) as check:
+        assert check.execute("PRAGMA user_version").fetchone() == (0,)
+
+    migration_backup = tmp_path / "early-migration.backup"
+    store.migrate_v0_to_v1(backup_path=migration_backup)
+    assert _legacy_snapshot(database) == before_rows
+    assert _user_objects(database) == before_objects | {
+        ("table", "workflow_request_sources", "workflow_request_sources"),
+        (
+            "table",
+            "workflow_request_contract_bindings",
+            "workflow_request_contract_bindings",
+        ),
+    }
+    with sqlite3.connect(database) as check:
+        assert check.execute("PRAGMA user_version").fetchone() == (1,)
+        assert check.execute("SELECT COUNT(*) FROM workflow_request_sources").fetchone() == (0,)
+        assert check.execute(
+            "SELECT COUNT(*) FROM workflow_request_contract_bindings"
+        ).fetchone() == (0,)
+        assert (
+            check.execute(
+                "SELECT rowid, client_request_id, workflow_id, run_id, request_digest, state, "
+                "created_at, updated_at FROM workflow_requests"
+            ).fetchall()[0][5]
+            == "running"
+        )
+
+    info = store.inspect()
+    assert (
+        info.user_version,
+        info.request_count,
+        info.source_count,
+        info.strict_binding_count,
+    ) == (
+        1,
+        1,
+        0,
+        0,
+    )
+    _reserve(state_root)
+    assert store.inspect().strict_binding_count == 1
+    assert tuple(
+        legacy_connection.execute(
+            "SELECT state FROM workflow_requests WHERE client_request_id='legacy-request-01'"
+        ).fetchone()
+    ) == ("running",)
+    assert migration_backup.is_file()
+    legacy_connection.close()
+
+
+@pytest.mark.parametrize("tamper", ["missing_index", "malformed_source", "strict_binding"])
+def test_early_v0_rejects_any_other_schema_variant(tmp_path: Path, tamper: str) -> None:
+    state_root = tmp_path / tamper
+    connection = _create_early_v0(state_root)
+    if tamper == "missing_index":
+        connection.execute("DROP INDEX workflow_requests_state_idx")
+    elif tamper == "malformed_source":
+        connection.execute("CREATE TABLE workflow_request_sources (run_id TEXT PRIMARY KEY)")
+    else:
+        connection.execute(
+            "CREATE TABLE workflow_request_contract_bindings (run_id TEXT PRIMARY KEY)"
+        )
+
+    with pytest.raises(StrictWorkflowRequestError):
+        StrictWorkflowRequestStore(state_root).migrate_v0_to_v1(
+            backup_path=tmp_path / f"{tamper}.backup"
+        )
+    assert tuple(connection.execute("PRAGMA user_version").fetchone()) == (0,)
+    connection.close()
+
+
+def test_early_v0_migration_checkpoint_after_source_creation_rolls_back(
+    tmp_path: Path, monkeypatch
+):
+    state_root = tmp_path / "early-source-rollback"
+    connection = _create_early_v0(state_root)
+    database = state_root / "requests.sqlite"
+    before_rows = _legacy_snapshot(database)
+    backup = tmp_path / "early-source-rollback.backup"
+
+    def fail_after_sources(stage: str) -> None:
+        if stage == "after_create_sources":
+            raise RuntimeError("private source ddl checkpoint")
+
+    monkeypatch.setattr(strict_module, "_migration_checkpoint", fail_after_sources)
+    with pytest.raises(StrictWorkflowRequestError):
+        StrictWorkflowRequestStore(state_root).migrate_v0_to_v1(backup_path=backup)
+
+    assert backup.is_file()
+    assert _legacy_snapshot(database) == before_rows
+    assert _user_objects(database) == {
+        ("table", "workflow_requests", "workflow_requests"),
+        ("index", "workflow_requests_created_idx", "workflow_requests"),
+        ("index", "workflow_requests_state_idx", "workflow_requests"),
+    }
+    assert tuple(connection.execute("PRAGMA user_version").fetchone()) == (0,)
+    assert tuple(connection.execute("PRAGMA integrity_check").fetchone()) == ("ok",)
+    connection.close()
+
+
+def test_early_v0_migration_rejects_schema_variant_changed_after_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / "early-schema-mismatch"
+    connection = _create_early_v0(state_root)
+    store = StrictWorkflowRequestStore(state_root)
+    original_backup = store.create_verified_backup
+    backup = tmp_path / "early-schema-mismatch.backup"
+
+    def backup_then_add_sources(backup_path: Path) -> None:
+        original_backup(backup_path)
+        connection.execute(strict_module._CREATE_SOURCES)
+
+    monkeypatch.setattr(store, "create_verified_backup", backup_then_add_sources)
+    with pytest.raises(StrictWorkflowRequestError):
+        store.migrate_v0_to_v1(backup_path=backup)
+
+    assert backup.is_file()
+    assert _user_objects(state_root / "requests.sqlite") == _user_objects(backup) | {
+        ("table", "workflow_request_sources", "workflow_request_sources")
+    }
+    assert tuple(connection.execute("PRAGMA user_version").fetchone()) == (0,)
+    assert (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='workflow_request_contract_bindings'"
+        ).fetchone()
+        is None
+    )
+    connection.close()
 
 
 @pytest.mark.parametrize(

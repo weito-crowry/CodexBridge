@@ -156,6 +156,7 @@ I3はI0/I1に依存し、I4はI1/I3、I5はI3/I4、I6はI3/I5、I7はI4/I5/I6、
 - **rollback/go-no-go:** gate未達ならstrict enable、production migration、releaseを行いません。全gate通過後もproduction strict enableには別途ユーザー承認を提案し、自動移行・merge・releaseはしません。
 
 - **I8 isolated acceptance (2026-11-26):** I8-B evidenceにChatGPT ACCEPTED with documented caveats、D1-22 partial test/defer、PD-01..39 crosswalk、isolated GOと未実施operator rollout stepsを記録しました。Current D1 development scope is ACCEPTED / isolated GO. Operational migration and production enablement remain pending explicit user approval; public admission stays OFF. D1詳細設計はDRAFTを維持します。
+- **I8 post-acceptance request migration compatibility follow-up (2026-11-26):** 実state rootのread-only preflightで、definitions DB absentとcanonical early legacy request v0（`workflow_requests`のみ）の組合せが確認されました。隔離DB migration pathがこのknown variantをbackup/restoreで保持し、明示migration時だけempty source/binding tablesを追加するoffline fixを実装しました。focused storage/migrationとlegacy reader regressionは52 passedです。実DB変更・server restart・public enablementはなく、本follow-upはChatGPT review待ちです。詳細は[I8-B evidence](D1-I8B-final-acceptance-evidence.md)。
 
 ## 4. D1受入ケースtraceability（primary slice）
 

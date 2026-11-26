@@ -154,6 +154,12 @@ class _LegacyIdentity:
     source_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedLegacyV0:
+    has_source_table: bool
+    identity: _LegacyIdentity
+
+
 class StrictWorkflowRequestStore:
     """Internal opt-in storage for an explicitly prepared requests v1 DB."""
 
@@ -209,8 +215,7 @@ class StrictWorkflowRequestStore:
         try:
             with _read_connection(database) as source:
                 source.execute("BEGIN")
-                _check_v0_database(source)
-                source_identity = _legacy_identity(source)
+                source_snapshot = _check_v0_database(source)
                 with backup.open("xb"):
                     pass
                 created_by_call = True
@@ -221,8 +226,7 @@ class StrictWorkflowRequestStore:
                     destination.close()
             with _read_connection(backup) as restored:
                 restored.execute("BEGIN")
-                _check_v0_database(restored)
-                if _legacy_identity(restored) != source_identity:
+                if _check_v0_database(restored) != source_snapshot:
                     raise StrictWorkflowRequestError(_UNAVAILABLE)
         except StrictWorkflowRequestError:
             if created_by_call:
@@ -253,8 +257,7 @@ class StrictWorkflowRequestStore:
         try:
             with _read_connection(backup) as source:
                 source.execute("BEGIN")
-                _check_v0_database(source)
-                identity = _legacy_identity(source)
+                backup_snapshot = _check_v0_database(source)
                 with database.open("xb"):
                     pass
                 created_by_call = True
@@ -265,8 +268,7 @@ class StrictWorkflowRequestStore:
                     target.close()
             with _read_connection(database) as restored:
                 restored.execute("BEGIN")
-                _check_v0_database(restored)
-                if _legacy_identity(restored) != identity:
+                if _check_v0_database(restored) != backup_snapshot:
                     raise StrictWorkflowRequestError(_UNAVAILABLE)
         except StrictWorkflowRequestError:
             if created_by_call:
@@ -286,22 +288,23 @@ class StrictWorkflowRequestStore:
         try:
             with _read_connection(backup) as backup_connection:
                 backup_connection.execute("BEGIN")
-                _check_v0_database(backup_connection)
-                backup_identity = _legacy_identity(backup_connection)
+                backup_snapshot = _check_v0_database(backup_connection)
 
             connection = _connect_write(database)
             connection.execute("BEGIN IMMEDIATE")
-            _check_v0_database(connection)
-            before = _legacy_identity(connection)
-            if before != backup_identity:
+            before = _check_v0_database(connection)
+            if before != backup_snapshot:
                 raise StrictWorkflowRequestError(_UNAVAILABLE)
+            if not before.has_source_table:
+                connection.execute(_CREATE_SOURCES)
+                _migration_checkpoint("after_create_sources")
             connection.execute(_CREATE_BINDINGS)
             _migration_checkpoint("after_create")
             connection.execute("PRAGMA user_version=1")
             _migration_checkpoint("after_user_version")
             _check_v1_database(connection)
             after = _legacy_identity(connection)
-            if after != before:
+            if after != before.identity:
                 raise StrictWorkflowRequestError(_UNAVAILABLE)
             if (
                 connection.execute(
@@ -327,7 +330,7 @@ class StrictWorkflowRequestStore:
         with _read_connection(database) as read_connection:
             read_connection.execute("BEGIN")
             _check_v1_database(read_connection)
-            if _legacy_identity(read_connection) != backup_identity:
+            if _legacy_identity(read_connection) != backup_snapshot.identity:
                 raise StrictWorkflowRequestError(_UNAVAILABLE)
 
     def inspect(self) -> StrictWorkflowRequestDatabaseInfo:
@@ -598,10 +601,16 @@ def _read_connection(database: Path) -> sqlite3.Connection:
         raise StrictWorkflowRequestError(_UNAVAILABLE) from None
 
 
-def _check_v0_database(connection: sqlite3.Connection) -> None:
-    _check_schema(connection, version=0, include_bindings=False)
+def _check_v0_database(connection: sqlite3.Connection) -> _VerifiedLegacyV0:
+    has_source_table = _check_schema(
+        connection,
+        version=0,
+        include_bindings=False,
+        allow_missing_sources=True,
+    )
     _check_integrity(connection)
-    _legacy_identity(connection)
+    identity = _legacy_identity(connection, allow_missing_sources=not has_source_table)
+    return _VerifiedLegacyV0(has_source_table, identity)
 
 
 def _check_v1_database(connection: sqlite3.Connection) -> None:
@@ -611,7 +620,15 @@ def _check_v1_database(connection: sqlite3.Connection) -> None:
     _validate_bindings(connection)
 
 
-def _check_schema(connection: sqlite3.Connection, *, version: int, include_bindings: bool) -> None:
+def _check_schema(
+    connection: sqlite3.Connection,
+    *,
+    version: int,
+    include_bindings: bool,
+    allow_missing_sources: bool = False,
+) -> bool:
+    if allow_missing_sources and (version != 0 or include_bindings):
+        raise StrictWorkflowRequestError(_UNAVAILABLE)
     row = connection.execute("PRAGMA user_version").fetchone()
     if row is None or type(row[0]) is not int or row[0] != version:
         raise StrictWorkflowRequestError(_UNAVAILABLE)
@@ -623,10 +640,25 @@ def _check_schema(connection: sqlite3.Connection, *, version: int, include_bindi
             "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
         ).fetchall()
     }
+    has_source_table = any(
+        kind == "table" and name == "workflow_request_sources"
+        for kind, name, _table, _sql in actual
+    )
+    if allow_missing_sources and not has_source_table:
+        expected.discard(
+            (
+                "table",
+                "workflow_request_sources",
+                "workflow_request_sources",
+                _normalize_sql(_CREATE_SOURCES),
+            )
+        )
     if actual != expected:
         raise StrictWorkflowRequestError(_UNAVAILABLE)
 
     expected_info = _expected_table_info(include_bindings=include_bindings)
+    if allow_missing_sources and not has_source_table:
+        expected_info.pop("workflow_request_sources")
     for table_name, expected_rows in expected_info.items():
         rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         actual_rows = tuple(
@@ -644,7 +676,8 @@ def _check_schema(connection: sqlite3.Connection, *, version: int, include_bindi
             raise StrictWorkflowRequestError(_UNAVAILABLE)
 
     _check_foreign_keys(connection, "workflow_requests", ())
-    _check_foreign_keys(connection, "workflow_request_sources", ())
+    if has_source_table:
+        _check_foreign_keys(connection, "workflow_request_sources", ())
     if include_bindings:
         _check_foreign_keys(
             connection,
@@ -652,9 +685,11 @@ def _check_schema(connection: sqlite3.Connection, *, version: int, include_bindi
             ((0, 0, "workflow_requests", "run_id", "run_id", "NO ACTION", "RESTRICT", "NONE"),),
         )
     _check_indexes(connection, "workflow_requests", _REQUEST_INDEXES)
-    _check_indexes(connection, "workflow_request_sources", _SOURCE_INDEXES)
+    if has_source_table:
+        _check_indexes(connection, "workflow_request_sources", _SOURCE_INDEXES)
     if include_bindings:
         _check_indexes(connection, "workflow_request_contract_bindings", _BINDING_INDEXES)
+    return has_source_table
 
 
 def _expected_objects(*, include_bindings: bool) -> set[tuple[str, str, str, str | None]]:
@@ -683,6 +718,7 @@ def _expected_objects(*, include_bindings: bool) -> set[tuple[str, str, str, str
                 _CREATE_BINDINGS,
             )
         )
+
     return {
         (kind, name, table_name, _normalize_sql(sql)) for kind, name, table_name, sql in statements
     }
@@ -787,8 +823,12 @@ def _check_integrity(connection: sqlite3.Connection) -> None:
         raise StrictWorkflowRequestError(_UNAVAILABLE)
 
 
-def _legacy_identity(connection: sqlite3.Connection) -> _LegacyIdentity:
-    requests, sources = _validate_legacy_rows(connection)
+def _legacy_identity(
+    connection: sqlite3.Connection, *, allow_missing_sources: bool = False
+) -> _LegacyIdentity:
+    requests, sources = _validate_legacy_rows(
+        connection, allow_missing_sources=allow_missing_sources
+    )
     digest = hashlib.sha256()
     for table_name, rows in (
         ("workflow_requests", requests),
@@ -810,6 +850,8 @@ def _legacy_identity(connection: sqlite3.Connection) -> _LegacyIdentity:
 
 def _validate_legacy_rows(
     connection: sqlite3.Connection,
+    *,
+    allow_missing_sources: bool = False,
 ) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
     request_rows = connection.execute(
         "SELECT rowid, client_request_id, workflow_id, run_id, request_digest, state, "
@@ -839,10 +881,16 @@ def _validate_legacy_rows(
             raise StrictWorkflowRequestError(_UNAVAILABLE)
         requests_by_run[run_id] = row
 
-    source_rows = connection.execute(
-        "SELECT rowid, run_id, definition_id, revision, source_sha256 "
-        "FROM workflow_request_sources ORDER BY rowid"
-    ).fetchall()
+    source_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflow_request_sources'"
+    ).fetchone()
+    if source_table is None and allow_missing_sources:
+        source_rows = []
+    else:
+        source_rows = connection.execute(
+            "SELECT rowid, run_id, definition_id, revision, source_sha256 "
+            "FROM workflow_request_sources ORDER BY rowid"
+        ).fetchall()
     for row in source_rows:
         run_id = row["run_id"]
         revision = row["revision"]
