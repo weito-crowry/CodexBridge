@@ -114,6 +114,10 @@ ledgerはrun binding、invocation identity、node pointer、iteration vector、p
 
 D1受入は維持する。Issue修正の縦断受入はD4以降。D2だけでIssue専用Workflowの完成を要求しない。
 
-## 12. 未確定事項（I0）
+## 12. I0詳細設計
+
+具体的なwire契約、状態遷移、ledger v1、設定・実装工程は [D2-I0実装契約](D2-I0-agent-runtime-contract.md) に整理した。本書の提案と相違する具体仕様はI0文書を優先する。
+
+### 初期調査時の未確定事項（履歴）
 
 既存UI APIの実際のprompt/response capとstatus取得経路、model capability、usageの取得可能範囲、target identity固定方法、ledgerの物理DDL/初期化/recovery、DBOSの長時間pollの永続量、明示interrupt/observe公開契約、結果schemaの制約、設定flag/公開reason codeを確認・確定する。これらを未検証のまま実装済みと扱わない。
