@@ -1406,6 +1406,40 @@ def evaluate_jq(
     return _normalize_jq_outputs(outputs)
 
 
+def evaluate_jq_single_result(
+    value: str,
+    data: Any,
+    variables: Mapping[str, Any] | None = None,
+    *,
+    strict_contract: CompiledContract | None = None,
+    strict_error_boundary: bool = False,
+) -> Any:
+    """Evaluate an Agent expression only when jq emits exactly one result."""
+    try:
+        expression = _required_expression(value, "agent")
+        args = dict(variables or {})
+        compiled_expression = (
+            _rewrite_strict_cbvars(expression, strict_contract)
+            if strict_contract is not None
+            else expression
+        )
+        # jq's Python API exposes eager all()/first() methods. Wrapping the
+        # filter in limit(2; ...) bounds materialization while distinguishing
+        # zero, one, and multiple results.
+        bounded_expression = f"limit(2; ({compiled_expression}\n))"
+        outputs = jq.compile(bounded_expression, args=args).input_value(data).all()
+    except Exception:
+        message = (
+            "strict workflow jq evaluation failed"
+            if strict_contract is not None or strict_error_boundary
+            else "Agent jq evaluation failed"
+        )
+        raise OwsError(message) from None
+    if len(outputs) != 1:
+        raise OwsError("Agent jq expression must produce exactly one result")
+    return outputs[0]
+
+
 def _evaluate_set_value(
     value: Any,
     data: Any,
