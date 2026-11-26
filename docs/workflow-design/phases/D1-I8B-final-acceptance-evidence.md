@@ -254,6 +254,14 @@ Default-OFF config wiring follow-upの最新検証は、config/server/workflow/s
 
 ChatGPT reviewはI8-BおよびI8 isolated acceptanceをACCEPTED with documented caveatsとし、D1 current development scopeをACCEPTED / isolated GOとしました。full pytest 3,959/24/0、UI server 9/9、D1-22 schema mock 1/1、Ruff、mypy、compileall、diff checkが根拠です。この判定はproduction/public strict admissionの承認ではありません。D1詳細設計はDRAFT、public admission OFF、I2 DEFERREDのままです。PD-23 operator gate、live Bridge/API、real external Codex job、production/shared migration、hard WAL/SHM guarantee、D1-22 parent return routingは未実施または後続sliceです。
 
+## 実機pure-variable dogfood follow-up
+
+Strict runtimeを明示opt-inした実機pure-variable dogfoodは、request `d1-dogfood-run-38fd7ce9ff`のHTTP startがsnapshotファイル作成前に503となりました。保存済みdefinitionと元のrequest IDは未予約のままです。run directoryには初期化済み`variables.sqlite`だけが残りました。この孤立directoryは調査・修正中も保持し、再POSTしていません。
+
+原因はworkspace `D:\CodexBridge`とstate rootの別volume（D: / C:）でした。`strict_manifest._validate_no_overlap`が両pathをresolveした後に`os.path.commonpath`へ渡し、Windowsが別drive anchorに対して送出する`ValueError`をsnapshot拒否へ変換していました。`Path.is_relative_to`によるresolved pathの包含比較に置換し、同一pathおよびparent/child overlapは引き続き拒否しながら、別driveはdisjointとして扱います。resolution errorは引き続きfail-closedです。
+
+回帰testはC:の隔離`tmp_path` state DBと既存D: workspaceを使い、snapshot作成、pre-reservation verification、予約、reserved verificationを通します。同一path、parent/child、Windows case variantの拒否も確認します。実機DB/config/Bridgeと孤立runは変更していません。review・merge後にBridgeを再起動した別工程で、元のrequest IDが未予約であることを確認してから、同じ保存済みdefinitionと同じrequest IDを一度だけ再利用できます。孤立runは削除せず、retry前後の状態確認を行います。この追試は実機runの再開を意味せず、process-death recoveryやreal Codex jobの受入証拠でもありません。
+
 ## 変更path
 
 - `tests/test_ui_server.py`

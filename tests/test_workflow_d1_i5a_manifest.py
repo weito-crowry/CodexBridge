@@ -125,11 +125,15 @@ def _base_fixture(
     variables: bool = True,
     required_input: tuple[str, ...] = (),
     nullable_mode: bool = True,
+    workspace_root: Path | None = None,
 ) -> _Fixture:
     state_root = tmp_path / "state"
-    workspace = tmp_path / "workspace"
     state_root.mkdir(parents=True)
-    workspace.mkdir()
+    if workspace_root is None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+    else:
+        workspace = workspace_root.resolve(strict=True)
 
     # I3-B initializes requests first so I3-A can add definitions.sqlite beside it.
     requests = StrictWorkflowRequestStore(state_root)
@@ -789,6 +793,38 @@ def test_run_id_traversal_workspace_escape_and_state_overlap_are_rejected(tmp_pa
             normalized_input=fixture.normalized_input,
             created_at=_CREATED_AT,
         )
+
+
+def test_snapshot_write_verify_and_reserve_across_windows_volumes(tmp_path: Path) -> None:
+    if not Path.cwd().drive or not tmp_path.resolve(strict=True).drive:
+        pytest.skip("Windows drive paths are unavailable")
+    workspace = Path.cwd().resolve(strict=True)
+    state_root = tmp_path.resolve(strict=True)
+    if workspace.drive.casefold() == state_root.drive.casefold():
+        pytest.skip("pytest temporary directory and workspace share one volume")
+
+    fixture = _base_fixture(tmp_path, workspace_root=workspace)
+    manifest = _prepare(fixture)
+    pre_reservation = fixture.verifier.verify_pre_reservation(_RUN_ID)
+    assert pre_reservation.reservation_verified is False
+    assert pre_reservation.manifest.workspace_root == str(workspace)
+
+    _reserve(fixture, manifest)
+    reserved = fixture.verifier.verify_reserved(_RUN_ID)
+    assert reserved.reservation_verified is True
+    assert reserved.manifest.workspace_root == str(workspace)
+
+
+def test_no_overlap_rejects_same_path_parent_child_and_case_variant(tmp_path: Path) -> None:
+    root = tmp_path.resolve(strict=True)
+    child = tmp_path / "child"
+    child.mkdir()
+    with pytest.raises(StrictWorkflowSnapshotError):
+        manifest_module._validate_no_overlap(root, root)
+    with pytest.raises(StrictWorkflowSnapshotError):
+        manifest_module._validate_no_overlap(root, child)
+    with pytest.raises(StrictWorkflowSnapshotError):
+        manifest_module._validate_no_overlap(root, Path(str(root).swapcase()))
 
 
 def test_run_directory_symlink_is_rejected(tmp_path: Path) -> None:
