@@ -571,15 +571,30 @@ class WorkflowWorkerManager:
                     turns, complete = set(), False
                 else:
                     expected_workflow_id = None
+                    expected_task_identities: tuple[str, ...] | None = None
                     try:
                         persisted_manifest = self._read_manifest(run_dir)
                         if persisted_manifest.get("run_format_version") == 2:
                             expected_workflow_id = str(persisted_manifest["workflow_id"])
+                            verification = self._verify_strict_run(run_dir)
+                            pinned = verification._definition
+                            if pinned is None or pinned.contract is None:
+                                raise WorkflowManagerError(
+                                    "strict workflow definition is unavailable"
+                                )
+                            from .interpreter import _strict_codex_job_task_identities
+
+                            expected_task_identities = _strict_codex_job_task_identities(
+                                pinned.definition,
+                                verification._normalized_input,
+                                pinned.max_live_codex_jobs,
+                            )
                     except WorkflowManagerError:
                         expected_workflow_id = ""
                     turns, complete = CodexJobAdapter.read_shutdown_ownership(
                         database_path,
                         expected_workflow_id=expected_workflow_id,
+                        expected_task_identities=expected_task_identities,
                     )
             except Exception:
                 turns, complete = set(), False

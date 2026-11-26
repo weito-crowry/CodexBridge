@@ -574,19 +574,29 @@ def test_strict_shutdown_ownership_checks_verified_workflow_and_request_key(
     turns, complete = CodexJobAdapter.read_shutdown_ownership(
         database_path,
         expected_workflow_id=workflow_id,
+        expected_task_identities=("do[0].calculate",),
     )
     wrong_turns, wrong_complete = CodexJobAdapter.read_shutdown_ownership(
         database_path,
         expected_workflow_id="7b000000-0000-4000-8000-000000000102",
+        expected_task_identities=("do[0].calculate",),
+    )
+    wrong_identity_turns, wrong_identity_complete = CodexJobAdapter.read_shutdown_ownership(
+        database_path,
+        expected_workflow_id=workflow_id,
+        expected_task_identities=("do[0].unrelated",),
     )
 
     assert turns == {("thread-12345678", "turn-12345678")}
     assert complete
     assert wrong_turns == set()
     assert not wrong_complete
+    assert wrong_identity_turns == set()
+    assert not wrong_identity_complete
 
 
-def test_authorized_strict_codex_job_uses_existing_adapter_with_fake_transport(
+@pytest.mark.asyncio
+async def test_authorized_strict_codex_job_uses_existing_adapter_and_service_reads_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -599,9 +609,15 @@ def test_authorized_strict_codex_job_uses_existing_adapter_with_fake_transport(
 
     tasks = [
         {
-            "calculate": {
-                "call": "codex-job",
-                "with": {"prompt": SAFE_CODEX_JOB_PROMPT},
+            "outer": {
+                "do": [
+                    {
+                        "calculate": {
+                            "call": "codex-job",
+                            "with": {"prompt": SAFE_CODEX_JOB_PROMPT},
+                        }
+                    }
+                ]
             }
         }
     ]
@@ -689,3 +705,71 @@ def test_authorized_strict_codex_job_uses_existing_adapter_with_fake_transport(
     )
     assert turns == set()
     assert complete
+    from codex_bridge.workflows.interpreter import _non_looped_codex_job_task_identities
+
+    with sqlite3.connect(run_dir / "codex_jobs.sqlite") as connection:
+        stored_task_identities = tuple(
+            row[0] for row in connection.execute("SELECT task_identity FROM jobs ORDER BY rowid")
+        )
+    assert stored_task_identities == _non_looped_codex_job_task_identities(
+        adapter.pinned_definition
+    )
+    (run_dir / "strict-terminal.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "status": "succeeded",
+                "reason_code": None,
+                "run_id": run_dir.name,
+                "workflow_id": str(adapter.checkpoint_identity["workflow_id"]),
+                "binding_identity": result["binding"],
+                "result": result["result"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    workflow_id = str(adapter.checkpoint_identity["workflow_id"])
+    (run_dir / "worker-entry-status.json").write_text(
+        json.dumps({"state": "completed", "exit_code": 0, "error_code": None}),
+        encoding="utf-8",
+    )
+    (run_dir / "start-worker.json").write_text(
+        json.dumps(
+            {
+                "mode": "start",
+                "pid": 1234,
+                "run_dir": str(run_dir),
+                "workflow_id": workflow_id,
+                "creation_time_100ns": 1,
+                "image_path": "worker.exe",
+                "timestamp_utc": "2026-11-26T00:00:00+00:00",
+                "argv": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace = run_dir.parent.parent / "workspace"
+    service = WorkflowService(
+        _manager(run_dir.parent, workspace, enabled=True), codex_bridge_port=18001
+    )
+
+    workflow = await service.get_workflow(workflow_id)
+    result_snapshot = await service.get_result(workflow_id)
+
+    assert workflow.status == "succeeded", (
+        workflow.worker_state,
+        workflow.jobs,
+        workflow._strict_metadata.reason_code if workflow._strict_metadata else None,
+    )
+    assert result_snapshot.workflow.status == "succeeded"
+    assert result_snapshot.result == {
+        "workflow_id": workflow_id,
+        "run_id": run_dir.name,
+        "status": "succeeded",
+        "result": {},
+        "run_format_version": 2,
+        "contract_version": 1,
+        "contract_sha256": adapter._verified_manifest.contract_sha256,
+        "binding_digest": adapter._verified_manifest.binding_digest,
+    }

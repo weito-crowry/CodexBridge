@@ -74,3 +74,7 @@ I6 strict admission接続時には、`_snapshot_for_row` の `forced_state` がi
 - coordinatorは既存のlegacy admission/startに接続していません。strict admissionはOFFのままです。
 - valid reserved v2の読取り検証とruntime実行許可は別です。strict runtimeと実job/output成功判定はI7以降です。
 - full pytest、CPP/account-auth回帰、実Worker/DBOS/job、WAL metadataは未検証です。D1全体はDRAFTです。
+
+## I7-C2 / I8-A後続runtime注記
+
+上記の「strict v2候補除外」はB4C時点のreader/reservation scopeを記録したものです。I7-C2でstrict Codex jobのshutdown ownershipをisolated runtimeから扱う経路が追加されたため、現在はreserved strict verifier/pinned definitionとCodex job ledgerを照合します。I8-Aではさらにpinned task identityを照合し、別task identityのturnは所有turnとして返さずownershipをincompleteにします。pure variable-only strict runは引き続きCodex job ownership候補から除外されます。受入と検証の現在値は[I8-A evidence](D1-I8A-integration-acceptance-evidence.md)を参照してください。B4C/I5の受入自体はreader/reservation scopeのままです。

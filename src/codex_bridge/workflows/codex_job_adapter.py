@@ -1354,8 +1354,19 @@ class CodexJobAdapter:
         database_path: Path,
         *,
         expected_workflow_id: str | None = None,
+        expected_task_identities: tuple[str, ...] | None = None,
     ) -> tuple[set[tuple[str, str]], bool]:
         database_path = Path(database_path)
+        if expected_task_identities is not None and (
+            expected_workflow_id is None
+            or not expected_workflow_id
+            or not expected_task_identities
+            or any(
+                not isinstance(identity, str) or not identity
+                for identity in expected_task_identities
+            )
+        ):
+            return set(), False
         if database_path.is_symlink() or not database_path.is_file():
             return set(), False
         database_uri = f"{database_path.resolve(strict=True).as_uri()}?mode=ro"
@@ -1384,6 +1395,10 @@ class CodexJobAdapter:
                     or not isinstance(task_identity, str)
                     or not task_identity
                     or request_key != f"{expected_workflow_id}::{task_identity}"
+                    or (
+                        expected_task_identities is not None
+                        and task_identity not in expected_task_identities
+                    )
                 ):
                     complete = False
                     continue

@@ -43,7 +43,7 @@ _FAKE_RESULT_SENTINEL = "private-fake-runtime-result-b4b"
 
 
 @pytest.mark.asyncio
-async def test_service_verified_strict_status_and_result_ignore_runtime_artifacts(
+async def test_service_verified_strict_status_does_not_trust_legacy_result_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -84,14 +84,12 @@ async def test_service_verified_strict_status_and_result_ignore_runtime_artifact
     original_read_file = workflow_service._read_regular_file
 
     def guarded_read_file(path: Path, *, limit: int) -> bytes:
-        if path.name in {"worker-entry-status.json", "result.json"}:
-            pytest.fail("strict status/result reader opened a legacy runtime artifact")
+        if path.name == "result.json":
+            pytest.fail("strict status/result reader opened a legacy result artifact")
         return original_read_file(path, limit=limit)
 
     monkeypatch.setattr(workflow_service, "_read_regular_file", guarded_read_file)
-    monkeypatch.setattr(workflow_service, "_read_codex_jobs", fail_runtime_read)
     monkeypatch.setattr(workflow_service, "_read_codex_job", fail_runtime_read)
-    monkeypatch.setattr(workflow_service, "_read_dbos_status", fail_runtime_read)
     monkeypatch.setattr(task_projection, "_read_journal", fail_runtime_read)
     monkeypatch.setattr(task_projection, "_read_jobs", fail_runtime_read)
     monkeypatch.setattr(task_projection, "_read_dbos_status", fail_runtime_read)
@@ -104,12 +102,12 @@ async def test_service_verified_strict_status_and_result_ignore_runtime_artifact
     )
 
     assert status.status == "needs_reconciliation"
-    assert status.worker_state == "unknown"
+    assert status.worker_state == "completed"
     assert status.terminal is False
     assert status.job_id is None and status.thread_id is None
     assert status.max_live_codex_jobs == 2
     assert result.workflow.status == "needs_reconciliation"
-    assert result.workflow.worker_state == "unknown"
+    assert result.workflow.worker_state == "completed"
     assert result.workflow.terminal is False
     assert result.workflow.max_live_codex_jobs == 2
     assert result.result is None
@@ -272,10 +270,10 @@ def test_strict_projection_reports_graph_invalid_for_unsupported_nodes(
     assert tasks["nodes"] == [] and tasks["edges"] == []
     assert tasks["contract_version"] == 1
     assert tasks["contract_sha256"] == fixture.manifest["contract_sha256"]
-    assert tasks["reason_code"] == "strict_execution_uncertain"
+    assert tasks["reason_code"] == "workflow_not_confirmed"
     assert events["coverage"] == "partial"
     assert events["coverage_reason"] == "graph_invalid"
     assert events["events"] == []
     assert events["next_after_id"] == 3
     assert events["binding_digest"] == fixture.manifest["binding_digest"]
-    assert events["reason_code"] == "strict_execution_uncertain"
+    assert events["reason_code"] == "workflow_not_confirmed"

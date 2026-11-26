@@ -2451,18 +2451,12 @@ def _inspect_run(
 
 
 def _two_job_task_identities(definition: Any) -> tuple[str, str]:
-    tasks = definition.get("do") if isinstance(definition, dict) else None
-    if not isinstance(tasks, list) or len(tasks) != 2:
+    from .interpreter import _strict_codex_job_task_identities
+
+    identities = _strict_codex_job_task_identities(definition, {}, 2)
+    if len(identities) != 2:
         raise ValueError("two-job workflow task list is invalid")
-    names: list[str] = []
-    for task in tasks:
-        if not isinstance(task, dict) or len(task) != 1:
-            raise ValueError("two-job workflow task is invalid")
-        name = next(iter(task))
-        if not isinstance(name, str) or not name:
-            raise ValueError("two-job workflow task name is invalid")
-        names.append(name)
-    return (f"do[0].{names[0]}", f"do[1].{names[1]}")
+    return identities[0], identities[1]
 
 
 def _strict_binding_identity(verification: Any) -> dict[str, object]:
@@ -2608,19 +2602,10 @@ def _inspect_strict_reserved_run(
                         definition, verification._normalized_input
                     )
                 else:
-                    from .graph import project_workflow_graph
+                    from .interpreter import _strict_codex_job_task_identities
 
-                    graph = project_workflow_graph(
-                        definition,
-                        codex_job_live=True,
-                        max_live_codex_jobs=max_jobs,
-                        strict_contract=definition_revision.contract,
-                    )
-                    expected = tuple(
-                        node["node_id"]
-                        for node in graph["nodes"]
-                        if isinstance(node.get("attributes"), dict)
-                        and node["attributes"].get("call") == "codex-job"
+                    expected = _strict_codex_job_task_identities(
+                        definition, verification._normalized_input, max_jobs
                     )
                 if not expected:
                     raise ValueError
@@ -2759,7 +2744,7 @@ def _inspect_strict_reserved_run(
         if (
             worker_state == "failed"
             and dbos_status in {"ERROR", "CANCELLED", "FAILED"}
-            and (not has_codex_jobs or all(job["state"] == "FAILED" for job in records) or records)
+            and all(job["state"] in {"SUCCEEDED", "FAILED"} for job in records)
         ):
             return _RunInspection(
                 "failed",
@@ -2865,29 +2850,9 @@ def _inspect_strict_reserved_run(
 
 
 def _three_job_task_identities(definition: Any, input_data: Any) -> tuple[str, ...]:
-    from .interpreter import (
-        three_live_codex_job_input_kind,
-        validate_three_live_codex_job_input,
-    )
+    from .interpreter import _strict_codex_job_task_identities
 
-    tasks = definition.get("do") if isinstance(definition, dict) else None
-    if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
-        raise ValueError("three-job workflow task list is invalid")
-    for_name = next(iter(tasks[0]))
-    for_task = tasks[0].get(for_name)
-    body = for_task.get("do") if isinstance(for_task, dict) else None
-    if not isinstance(body, list) or len(body) != 3 or not isinstance(body[1], dict):
-        raise ValueError("three-job workflow loop body is invalid")
-    dispatch_name = next(iter(body[1]))
-    if not isinstance(for_name, str) or not isinstance(dispatch_name, str):
-        raise ValueError("three-job workflow task names are invalid")
-    input_kind = three_live_codex_job_input_kind(definition)
-    items = validate_three_live_codex_job_input(input_data, input_kind=input_kind)
-    return tuple(
-        f"do[0].{for_name}.iteration[{index}].do[1].{dispatch_name}"
-        for index, item in enumerate(items)
-        if item["enabled"]
-    )
+    return _strict_codex_job_task_identities(definition, input_data, 3)
 
 
 def _read_codex_jobs(

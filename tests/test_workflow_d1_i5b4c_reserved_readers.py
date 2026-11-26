@@ -12,6 +12,7 @@ import codex_bridge.workflows.strict_reader_gate as strict_reader_gate
 import codex_bridge.workflows.worker as worker_module
 import codex_bridge.workflows.worker_entry as worker_entry
 from codex_bridge.workflows.codex_job_adapter import CodexJobAdapter
+from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
 from codex_bridge.workflows.manager import WorkflowManagerError, WorkflowWorkerManager
 from codex_bridge.workflows.strict_manifest import StrictWorkflowSnapshotVerifier
 from codex_bridge.workflows.strict_reader_gate import StrictReaderGateError
@@ -233,14 +234,27 @@ def test_direct_worker_main_reads_verified_v2_then_refuses_runtime_before_side_e
 
 
 @pytest.mark.asyncio
-async def test_persisted_shutdown_reader_verifies_v2_but_never_claims_its_job_ownership(
+async def test_persisted_shutdown_reader_requires_pinned_task_identity_for_strict_ownership(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_dir, _manifest = _make_strict_reserved_run(tmp_path)
+    run_dir, manifest = _make_strict_reserved_run(tmp_path)
     workspace = tmp_path / "workspace"
     database = run_dir / "codex_jobs.sqlite"
-    database.write_text("fake-owned-thread-private-b4c", encoding="utf-8")
+    adapter = CodexJobAdapter(database)
+    prepared = adapter.prepare_job(
+        manifest["workflow_id"],
+        "do[0].unrelated",
+        SAFE_CODEX_JOB_PROMPT,
+        workspace,
+        port=18001,
+    )
+    assert adapter.claim_post(prepared["job_id"])
+    adapter.mark_accepted(
+        prepared["job_id"],
+        "thread-private-b4c-1234",
+        "turn-private-b4c-1234",
+        "in_progress",
+    )
     roots = (str(workspace.resolve()),)
     with sqlite3.connect(run_dir.parent / "requests.sqlite") as connection:
         connection.execute(
@@ -252,19 +266,14 @@ async def test_persisted_shutdown_reader_verifies_v2_but_never_claims_its_job_ow
         run_dir.parent, allowed_roots=roots
     )
 
-    assert persisted == ()
-    assert complete is False
+    assert persisted == (run_dir.resolve(),)
+    assert complete is True
 
-    monkeypatch.setattr(
-        CodexJobAdapter,
-        "read_shutdown_ownership",
-        lambda *_args, **_kwargs: pytest.fail("strict v2 job evidence was treated as ownership"),
-    )
     report = await _shutdown_manager(run_dir.parent, roots)
 
     assert report.ownership_complete is False
     assert report.owned_turns == frozenset()
-    assert "fake-owned-thread-private-b4c" not in repr(report)
+    assert "thread-private-b4c-1234" not in repr(report)
 
 
 async def _shutdown_manager(state_root: Path, allowed_roots: tuple[str, ...]) -> Any:

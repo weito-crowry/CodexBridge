@@ -719,6 +719,83 @@ def _task_action(task_name: str, task_spec: dict[str, Any]) -> tuple[str, dict[s
     return operation, action
 
 
+def _non_looped_codex_job_task_identities(definition: Any) -> tuple[str, ...]:
+    """Return job ledger identities using the Interpreter's OWS task paths.
+
+    Strict profile 1 forbids Codex jobs beneath ``for``. Nested ``do`` scopes
+    remain supported, so their identities follow ``_run_scope``'s task path
+    convention exactly.
+    """
+    tasks = definition.get("do") if isinstance(definition, dict) else None
+    if not isinstance(tasks, list):
+        raise ValueError("strict workflow task list is invalid")
+    identities: list[str] = []
+
+    def walk(task_list: list[Any], scope_path: str) -> None:
+        for index, task_item in enumerate(task_list):
+            if not isinstance(task_item, dict) or len(task_item) != 1:
+                raise ValueError("strict workflow task is invalid")
+            task_name, task_spec = next(iter(task_item.items()))
+            if not isinstance(task_name, str) or not isinstance(task_spec, dict):
+                raise ValueError("strict workflow task is invalid")
+            task_path = f"{scope_path}[{index}].{task_name}"
+            operation, _action = _task_action(task_name, task_spec)
+            if operation == "call" and task_spec.get("call") == "codex-job":
+                identities.append(task_path)
+            elif operation == "do":
+                nested = task_spec.get("do")
+                if not isinstance(nested, list):
+                    raise ValueError("strict workflow scope is invalid")
+                walk(nested, f"{task_path}.do")
+
+    walk(tasks, "do")
+    return tuple(identities)
+
+
+def _strict_codex_job_task_identities(
+    definition: Any,
+    input_data: Any,
+    max_live_codex_jobs: int,
+) -> tuple[str, ...]:
+    """Return strict job ledger identities using the Interpreter task paths."""
+    if max_live_codex_jobs == 1:
+        return _non_looped_codex_job_task_identities(definition)
+
+    tasks = definition.get("do") if isinstance(definition, dict) else None
+    if max_live_codex_jobs == 2:
+        if not isinstance(tasks, list) or len(tasks) != 2:
+            raise ValueError("two-job workflow task list is invalid")
+        names: list[str] = []
+        for task in tasks:
+            if not isinstance(task, dict) or len(task) != 1:
+                raise ValueError("two-job workflow task is invalid")
+            name = next(iter(task))
+            if not isinstance(name, str) or not name:
+                raise ValueError("two-job workflow task name is invalid")
+            names.append(name)
+        return (f"do[0].{names[0]}", f"do[1].{names[1]}")
+
+    if max_live_codex_jobs != 3:
+        raise ValueError("strict workflow job limit is invalid")
+    if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
+        raise ValueError("three-job workflow task list is invalid")
+    for_name = next(iter(tasks[0]))
+    for_task = tasks[0].get(for_name)
+    body = for_task.get("do") if isinstance(for_task, dict) else None
+    if not isinstance(body, list) or len(body) != 3 or not isinstance(body[1], dict):
+        raise ValueError("three-job workflow loop body is invalid")
+    dispatch_name = next(iter(body[1]))
+    if not isinstance(for_name, str) or not isinstance(dispatch_name, str):
+        raise ValueError("three-job workflow task names are invalid")
+    input_kind = three_live_codex_job_input_kind(definition)
+    items = validate_three_live_codex_job_input(input_data, input_kind=input_kind)
+    return tuple(
+        f"do[0].{for_name}.iteration[{index}].do[1].{dispatch_name}"
+        for index, item in enumerate(items)
+        if item["enabled"]
+    )
+
+
 def _validate_action(
     operation: str,
     action: dict[str, Any],

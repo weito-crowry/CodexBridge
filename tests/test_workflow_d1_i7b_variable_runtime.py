@@ -111,6 +111,7 @@ def _reserved_adapter(
     *,
     tasks: list[dict[str, Any]] | None = None,
     output: str | None = None,
+    contract: dict[str, Any] | None = None,
     projection_provider=None,
     reserve: bool = True,
 ) -> tuple[StrictWorkflowVariableRuntimeAdapter, Path]:
@@ -126,7 +127,7 @@ def _reserved_adapter(
         mutation_request_id="i7b-definition-create-0001",
         source_yaml=_source(tasks, output=output),
         max_live_codex_jobs=1,
-        contract=_contract(),
+        contract=contract if contract is not None else _contract(),
     )
     normalized = StrictWorkflowBindingVerifier(state_root).normalize_for_definition(
         revision.definition_id,
