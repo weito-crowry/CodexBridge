@@ -159,7 +159,7 @@ filename: agent_invocations.sqlite、user_version=1。D1 requests/definitions/va
 
 Application validator enforces canonical JSON/digest、exact key/schema、UUID/ID形式、pinned node pointer、operation/provider/target整合、run binding、state/receipt整合、owned_handleのinvoke origin。root singleton以外なし。FK ON、短いBEGIN IMMEDIATE transaction、既存D1 SQLite durability/backup policyに合わせる。immutable fields/result/dispatch receiptは一度だけ設定、更新CAS。既存結果があればbyte-equivalent canonical dataを要求。dbos-owned schemaは変更しない。state更新とowned_handlesの初回挿入は同一transaction。read-only inspectionはrow/paging単位で検証、全DBを無制限にAPIへ返さない。技術的SQLiteエラーは実行基盤異常。
 
-invocation_id=SHA256(canonical JSON {namespace:"codexbridge-agent-v1",binding:checkpoint_identity,node_pointer,iteration_vector}) のhex。client_request_idは"cba-"+invocation_id（現行ID制約に適合することをテスト）。同じnode/iterationの異なるrequestはconflictで別送信しない。distinct node/iterationは別論理呼び出し。operationやproviderをidentityへ追加して意図しない別送信を作らない。D2ではAgent loop不可だがidentityはiteration対応。
+invocation_id=SHA256(canonical JSON {namespace:"codexbridge-agent-v1",binding:checkpoint_identity,node_pointer,iteration_vector}) のhex。client_request_idは"cba-"+invocation_id（68文字。ui_control.pyのASCII ID制約8..100文字に適合することを確認済み、回帰テスト対象）。同じnode/iterationの異なるrequestはconflictで別送信しない。distinct node/iterationは別論理呼び出し。operationやproviderをidentityへ追加して意図しない別送信を作らない。D2ではAgent loop不可だがidentityはiteration対応。
 
 prepared request JSON: version, operation, provider, target, target_identity, session/handle, evaluated options, rendered prompt, response, wait, timeout_seconds（不使用fieldはnull）。deadlineはledger列に保存。D1 phase/task input/variables digestと照合するDBOS prepare checkpointにcanonical request digestを含める。secretの永続化禁止（control token、API認証情報を含めない）。
 
@@ -180,11 +180,11 @@ prepared request JSON: version, operation, provider, target, target_identity, se
 
 新設定 [workflow] strict_agent_enabled = false。strict_runtime_enabled=trueを前提とする。旧strict_codex_jobs_enabledは旧経路のまま。新flagを明示enableした場合のみ新Agentの外部操作を許可（既存control token/allowed roots/Provider auth必須）。config.py/config_file.py/sample config/manager/service/worker env・recoveryに一貫配線。flag無効でも保存済みrunのread-only inspectionは可能。無効化後の新しいdispatch/recoveryによる外部操作は拒否し、既存結果を消さない。実DB移行不要。operator enableは運用受入時に別途実施。
 
-worker config version2にauthorized_agent execution_modeを追加し、旧shapeは保持。new pathではworker全体timeoutなし、旧CLIの120秒は旧runにのみ適用。worker entryで検証済みmode/portを渡す。運用shutdownはoperatorによる停止でありWorkflow timeoutではない。remote turnの所有情報を失わず、既存のBridge全体shutdown規則と接続する。既存のmanager._finish_shutdownは終了済みrunも含むpersisted run列挙があるため、Agent分類/ledger検証を追加し、論理終了済みrunでもremote nonterminal所有を収集。MAYBE_SENTでremote不明ならownership_complete=false。既知exact owned turnを別のthread全体に拡張しない。
+worker config version2にauthorized_agent execution_modeを追加し、旧shapeは保持。new pathではworker全体timeoutなし、旧CLIの120秒は旧runにのみ適用。worker entryで検証済みmode/portを渡す。運用shutdownはoperatorによる停止でありWorkflow timeoutではない。remote turnの所有情報を失わず、既存のBridge全体shutdown規則と接続する。既存のmanager._finish_shutdownは現プロセスのrecordに加えpersisted runを列挙するが、_persisted_live_run_directoriesはstarting/running/needs_reconciliationのみに絞り最大101行を読むため、再起動後の論理終了済みrunに残るremoteを取りこぼし得る。旧経路は維持し、新Agent所有権については全reserved strict runを安定順のread-onlyページで列挙し、pinned revisionからAgent分類、binding/ledger検証を行う。論理terminal stateで除外しない。固定100件で切り捨てない。初期版は既存requests DBのschema変更を避けるためこの走査を用い、履歴増加による性能改善は別途検討。読み取り不能・不完全走査はownership_complete=false。論理終了済みrunでもremote nonterminal所有を収集。MAYBE_SENTでremote不明ならownership_complete=false。既知exact owned turnを別のthread全体に拡張しない。
 
 ServiceはAgent ledgerを旧codex_jobs.sqliteと別に読む。各Agent resultのstatusはWorkflow terminal statusではない。正常なWorkflow returnでD1 output contractに合致すれば、扱われたFAILED/UNKNOWN/TIMED_OUTが存在してもWorkflow succeeded可。欠損/破損したledger・不正binding・terminal evidence不一致はneeds_reconciliation。実行されなかった条件分岐nodeは欠損とみなさない。Agent ledgerが必要なrunでは初期空ledgerも正当。
 
-既存run/status/detail/result shapeは変更しない。Agent metadataを必要に応じてoptional summaryとして拡張するが既存jobs欄へ異種結果を偽装しない。新規read-only invocation list/detailはI4で実装する: GET /ui-api/workflows/runs/{run_id}/agent-invocations と /{invocation_id}（既存workflow routeの実際のprefixに整合することをI4着手時に確認）。listはlimit既定50・最大100、opaque cursor（created_ms,invocation_id）順、1ページずつ。metadataはoperation/provider/target/status/handle/remote_state/usage/error code/created_ms/deadline_ms。prompt/raw request/raw answerは通常公開しない。詳細も同じmetadata + result digest。Workflowが明示exportした結果は既存result APIから取得する。新MCP管理・GUI編集はD8で追加。既存strict terminal envelope version1は維持。
+既存run/status/detail/result shapeは変更しない。Agent metadataを必要に応じてoptional summaryとして拡張するが既存jobs欄へ異種結果を偽装しない。新規read-only invocation list/detailはI4で実装する: GET /ui-api/control/workflows/{workflow_id}/agent-invocations と /{invocation_id}（既存workflows/api.pyのworkflow_id経路・control認可に準拠）。listはlimit既定50・最大100、opaque cursor（created_ms,invocation_id）順、1ページずつ。metadataはoperation/provider/target/status/handle/remote_state/usage/error code/created_ms/deadline_ms。prompt/raw request/raw answerは通常公開しない。詳細も同じmetadata + result digest。Workflowが明示exportした結果は既存result APIから取得する。新MCP管理・GUI編集はD8で追加。既存strict terminal envelope version1は維持。
 
 ## 10. 実装分割・テスト
 
@@ -204,4 +204,4 @@ I1開始時はユーザー合意済みの汎用原則と本I0設計を仕様と�
 
 ## 11. 残る検証事項
 
-実行前に確認を要する事項: 実機UI APIでのexact turn history paging/最大応答、同一endpointのidentity限界、exact turn usageの取得可否、DBOS長時間checkpointの増加量、I4の既存routeとのprefix整合、operator shutdown時の未終了remoteの挙動。これらは設計で不明時の挙動を決めているためI1/I2を止めない。実機確認前に対応済みと主張しない。I0で新規の数値予算やIssue特化ノードは追加しない。
+実行前に確認を要する事項: 実機UI APIでのexact turn history paging/最大応答、同一endpointのidentity限界、exact turn usageの取得可否、DBOS長時間checkpointの増加量、I4のroute実装・認可回帰、operator shutdown時の未終了remoteの挙動。これらは設計で不明時の挙動を決めているためI1/I2を止めない。実機確認前に対応済みと主張しない。I0で新規の数値予算やIssue特化ノードは追加しない。
