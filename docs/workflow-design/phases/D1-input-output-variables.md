@@ -1,6 +1,6 @@
 # D1: Workflow共通入出力契約・変数・スコープ
 
-- **文書状態:** DRAFT / Proposed（レビュー待ち）
+- **文書状態:** DRAFT / Proposed（formal design status。現行implementationとcurrent deployed D1 operational scopeの受入記録は[D1 implementation plan](D1-implementation-plan.md)および[I8-B evidence](D1-I8B-final-acceptance-evidence.md)を参照）
 - **基本仕様:** v0.2は合意済み。2026-11-19に合意したD1簡素化方針を本書へ反映しています。本書全体の最終承認、実装完了、本番有効化を意味しません。
 - **関連:** [README](../README.md)、[要件](../requirements.md)、[アーキテクチャ](../architecture.md)、[ADR 0001](../decisions/0001-structured-loops.md)、[ADR 0002](../decisions/0002-contract-storage-and-normalization.md)、[ADR 0003](../decisions/0003-run-local-variable-store-and-manifest-v2.md)、[ADR 0004](../decisions/0004-sqlite-ddl-and-schema-migration.md)、[ADR 0005](../decisions/0005-startup-exclusion-resource-limits-windows-acl.md)
 

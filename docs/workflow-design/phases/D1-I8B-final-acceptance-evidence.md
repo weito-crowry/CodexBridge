@@ -4,7 +4,7 @@
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f` (I8-A accepted with documented caveats)。
 - **範囲:** UI server test-doubleの3 failure修正、D1-22 mock child output contract境界、PD-01..39 traceability、I8 final isolated gateと次段operator rollout計画。
-- **全体境界:** I7-C2/I7、I8-A、I8-BはACCEPTED with documented caveats。D1 current development scopeはACCEPTED / isolated GOです。D1詳細設計の文書状態はformal production approval前のDRAFTを維持します。operational migrationとproduction enablementは別途明示承認待ち、I2はDEFERRED / NON-BLOCKING、public/production strict admissionはOFFです。
+- **現在の全体状態:** I7-C2/I7、I8-A、I8-B、およびChatGPT final D1 operational acceptanceはACCEPTED with documented caveatsです。current D1 scopeには明示migration済みdeploymentと実機pure-variable/single Codex-job smokeを含みます。現在のoperator TOMLは両strict flagを明示opt-inしていますが、config/code defaultはOFFです。D1詳細設計のformal statusはDRAFT、I2はDEFERRED / NON-BLOCKINGです。全設計ケース、一般release、未検証・deferred項目の受入を意味しません。最終記録とfollow-upは本書末尾を参照してください。
 
 ## Review記録
 
@@ -12,7 +12,7 @@ ChatGPT GitHub review of `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f` はI7-C2/I7�
 
 I8-Bではレビュー指定どおりtest doubleだけを修正し、production runtimeを変更していません。この証跡の初版作成時点ではChatGPT review待ちでした。後続のreview結果と現在の受入状態を次項に記録します。
 
-ChatGPT GitHub review of `679df0a42929162f9bc7ee01b0e66e0b6db5ebe5` はI8-BおよびI8 isolated acceptanceをACCEPTED with documented caveatsとしました。D1 current development scopeもACCEPTED / isolated GOです。これはproduction acceptanceではなく、operational migrationとproduction enablementは別途明示的なユーザー承認待ちです。review留保はこの文書の全体suite、D1-22、PD crosswalk、rollout節に整理しています。
+ChatGPT GitHub review of `679df0a42929162f9bc7ee01b0e66e0b6db5ebe5` 時点では、I8-B/I8 isolated acceptanceとD1 current development scopeがACCEPTED with documented caveats / isolated GOとなり、実migration・production opt-inはまだ行われていませんでした。後続のfinal operational acceptanceでcurrent deploymentのmigrationと限定dogfoodも受け入れられました。I8-B review時点の留保と、後続の実機結果は区別して下記に記録します。
 
 ## UI server test-double修正
 
@@ -27,6 +27,8 @@ D1詳細設計の原文は「子Workflow return境界の契約模擬: child outp
 ## PD-01..39 crosswalk
 
 この表は各Proposed Decisionを既存test pathsへ紐づけ、現行実装test、非実施のoperator gate、DEFERRED項目を分けたものです。suite実行は各PDの個別設計承認ではありません。
+
+このcrosswalkのoperator状態はI8-B review時点の記録です。current deploymentのbackup/migration/restoreと限定runtime opt-inは後続で完了し、末尾のfinal operational acceptanceに記録しています。追加state rootや将来のmigrationに対するoperator手順は別途必要です。
 
 | PD IDs | Existing evidence paths / cases | I8-B status |
 | --- | --- | --- |
@@ -59,7 +61,7 @@ PD-23の隔離DB testは将来の共有DB運用承認を代替しません。PD-
 | `python -m compileall -q src/codex_bridge` | PASS |
 | `git diff --check` | PASS |
 
-## 次段のoperator rollout plan（未実施）
+## 当時のoperator rollout plan（2026-11-26 pre-execution時点の記録）
 
 このcompatibility/configuration follow-upでは実state rootやproduction/shared DBへ再アクセスせず、変更もしていません。以下は2026-11-26に得たread-only preflight結果の記録です。将来のmigration/enablementは別途ユーザー承認後に行います。
 
@@ -67,7 +69,7 @@ PD-23の隔離DB testは将来の共有DB運用承認を代替しません。PD-
 
 今回のoffline follow-upは、バックアップ/復元/明示migrationが受け入れるv0を、完全legacy（request source tableあり）と、上記のcanonical early-v0（同じcanonical request table/indexesでsource tableだけ欠落）の2種類に限定しました。early-v0のbackup/restoreは欠落状態を保持し、migrationだけがtransaction内で空のsource/binding tablesを追加します。新しい保存sourceやstrict bindingは捏造しません。その他の欠落・不正schema、v0 binding、version不一致は拒否します。この互換修正はproduction DB上では実行していません。
 
-ChatGPT review of `4d751ee4530b2df1d19f9254116b3e6f0cc3b30f` はearly-v0 migration compatibilityをACCEPTEDとしました。focused request storage/migration regressionは52 passedで、full pytestは再実行していません。PR #195により`origin/dev`のmerge commitは`9f95a698ea2d4e171b13fb201a317464117a8c20`です。
+当時のChatGPT review of `4d751ee4530b2df1d19f9254116b3e6f0cc3b30f` はearly-v0 migration compatibilityをACCEPTEDとしました。focused request storage/migration regressionは52 passedで、full pytestは再実行していません。PR #195により`origin/dev`のmerge commitは`9f95a698ea2d4e171b13fb201a317464117a8c20`です。実deployment migrationはこのcompatibility follow-up時点では未実施で、後続結果は末尾に記録します。
 
 1. すべてのactive taskが完了した後、別途承認を得てBridge、全Workflow worker、その他known writersを停止し、Codex taskも残っていないことを確認します。DB lockや`user_version`だけでwriter停止の証明とは扱いません。
 2. 今回のconfig wiringがChatGPT review後に`origin/dev`へ入ったことを確認し、停止中に`D:\CodexBridge` checkoutをfast-forwardで更新します。実設定は変更せず、migrationと初回再起動は両strict flagをfalseにしたまま進めます。
@@ -229,7 +231,9 @@ $List.workflows | Group-Object status | Select-Object Name, Count
 #     Select-Object status
 ```
 
-### Default-OFF runtime config wiring（本branchの実装、ChatGPT review待ち）
+### Default-OFF runtime config wiring（実装時点の履歴。後続review/merge/opt-inは最終節）
+
+以下はconfig wiring実装・review前の履歴です。PR #196のmerge後にChatGPT review acceptedとなり、operatorが明示的に設定を有効化してcurrent deploymentのdogfoodを完了しました。現状は文書末尾の最終記録を優先します。
 
 `BridgeConfig`と`config.example.toml`に次のTOML設定を追加し、`build_runtime`から既存manager/service opt-inへ渡します。省略時とexample値はfalseです。設定値はTOML booleanのみ受け付け、`strict_codex_jobs_enabled=true`には`strict_runtime_enabled=true`も必要です。Codex jobはさらに既存`control_token`が必要で、job用flagなしでは既存の拒否動作を保ちます。MCP permissionは別設定のままです。新env alias、per-request flag、GUI toggle、managed-config writerは追加していません。
 
@@ -250,11 +254,11 @@ strict_codex_jobs_enabled = false
 
 Default-OFF config wiring follow-upの最新検証は、config/server/workflow/saved-execution focused batch 148 passed（legacy representative 2件を含む）です。別のisolated strict runtime batch 26 passedにはprepared v2/v1 pure variable DBOS run/recoveryが含まれます。これらは重複するtest pathsを含むため合算しません。Ruff check/format、mypy 156 source files、compileall、diff checkもPASSです。full pytestおよびfake Codex transport suiteは今回再実行していません。このconfig follow-upはChatGPT review待ちです。
 
-## Isolated go/no-go
+## I8-B review時点のisolated go/no-go（履歴）
 
-ChatGPT reviewはI8-BおよびI8 isolated acceptanceをACCEPTED with documented caveatsとし、D1 current development scopeをACCEPTED / isolated GOとしました。full pytest 3,959/24/0、UI server 9/9、D1-22 schema mock 1/1、Ruff、mypy、compileall、diff checkが根拠です。この判定はproduction/public strict admissionの承認ではありません。D1詳細設計はDRAFT、public admission OFF、I2 DEFERREDのままです。PD-23 operator gate、live Bridge/API、real external Codex job、production/shared migration、hard WAL/SHM guarantee、D1-22 parent return routingは未実施または後続sliceです。
+ChatGPT reviewはI8-BおよびI8 isolated acceptanceをACCEPTED with documented caveatsとし、D1 current development scopeをACCEPTED / isolated GOとしました。full pytest 3,959/24/0、UI server 9/9、D1-22 schema mock 1/1、Ruff、mypy、compileall、diff checkが根拠です。この段落はそのreview時点の状態記録です。当時はpublic/runtime admission OFF、operator migration、live Bridge/APIおよびreal external Codex job未実施でした。後続にcurrent deployment migrationと明示opt-in、限定実機smokeが行われた結果は末尾に記録します。D1詳細設計はDRAFT、I2はDEFERREDです。
 
-## 実機pure-variable dogfood follow-up
+## 実機pure-variable dogfood follow-up（初回失敗と修正の履歴）
 
 Strict runtimeを明示opt-inした実機pure-variable dogfoodは、request `d1-dogfood-run-38fd7ce9ff`のHTTP startがsnapshotファイル作成前に503となりました。保存済みdefinitionと元のrequest IDは未予約のままです。run directoryには初期化済み`variables.sqlite`だけが残りました。この孤立directoryは調査・修正中も保持し、再POSTしていません。
 
@@ -262,7 +266,7 @@ Strict runtimeを明示opt-inした実機pure-variable dogfoodは、request `d1-
 
 回帰testはC:の隔離`tmp_path` state DBと既存D: workspaceを使い、snapshot作成、pre-reservation verification、予約、reserved verificationを通します。同一path、parent/child、Windows case variantの拒否も確認します。実機DB/config/Bridgeと孤立runは変更していません。review・merge後にBridgeを再起動した別工程で、元のrequest IDが未予約であることを確認してから、同じ保存済みdefinitionと同じrequest IDを一度だけ再利用できます。孤立runは削除せず、retry前後の状態確認を行います。この追試は実機runの再開を意味せず、process-death recoveryやreal Codex jobの受入証拠でもありません。
 
-## 変更path
+## I8-B implementation branch changed paths（履歴）
 
 - `tests/test_ui_server.py`
 - `tests/test_workflow_d1_i1_contract_core.py`
@@ -279,3 +283,60 @@ Strict runtimeを明示opt-inした実機pure-variable dogfoodは、request `d1-
 - `tests/test_workflow_d1_i7c2_isolated_runtime.py`
 - `src/codex_bridge/workflows/strict_requests.py`
 - `tests/test_workflow_d1_i3b_request_storage.py`
+
+## Final D1 operational acceptance（2026-11-26）
+
+ChatGPT final operational reviewは、current D1 scopeをACCEPTEDとし、実機pure-variable runとsingle real Codex-job runをGOとしました。これは今回の記録対象に対する受入であり、全D1 design caseの個別PASS、一般release、追加Workflow/jobの許可ではありません。D1詳細設計のformal statusはDRAFTのままです。次の開発phaseはD2 plannedで、ここでは着手しません。
+
+### Merge、migration、runtime設定
+
+| 内容 | 受入記録 |
+| --- | --- |
+| D1 implementation | PR #194、merge `e0ab53bd27b03bf39fef7515f3bbfe585970c233` |
+| early legacy request v0 compatibility | PR #195、merge `9f95a698ea2d4e171b13fb201a317464117a8c20`。canonical early-v0をbackup/restoreで保持し、明示migration後にrequests schema v1へ更新 |
+| default-OFF runtime config wiring | PR #196、merge `10e05647820dc26a8b1aab6a0e9d916bb8579459`。両config/code defaultはfalse |
+| Windows cross-volume snapshot fix | PR #197、merge/current `dev` `448fed27ce65e1226ebce090e227c133d99da29f`。focused regression 75 passed / 2 Windows symlink-permission skips |
+| current operator DB preparation | user-reported backup/restore verification `20261126-164054`; requests DB v1へ明示migration、definitions DB v2を明示初期化。historical request rowは不変で、quick_check/foreign-key検証pass |
+| current operator config | `strict_runtime_enabled=true`、`strict_codex_jobs_enabled=true`を明示設定し、Bridgeを再起動。application/config defaultsはfalseのまま |
+
+2026-11-26のpreflightではrequest rowが保存上`running`であり、worker/DBOS/job evidenceはterminal successを示していました。migration後のlegacy HTTP status/result smokeでは既存runが`200 / succeeded`へ正しく投影されました。SQLでrow stateを手動修正していません。
+
+### 実機pure-variable smoke
+
+- definition `4fb9c9a0-238d-45d3-a53f-431dbf6270d2` revision 1、client request `d1-dogfood-run-38fd7ce9ff`。
+- workflow `3da6df0f-614c-4416-8d5b-01f9a7ea8b7a`、run `run-1c3208571d3c4ffa93fc1d530823c733`。
+- default normalized input `seed=2`から2 mutation（initialize 2、increment後5）、result `{"total":5}`。同一client requestのreplayはHTTP 202で同じworkflow/run IDを返し、二重実行の証拠はありません。
+- 初回start client requestは15秒でtimeoutし、HTTP statusは記録されていません。server側は完了し、成功status/resultは後のread-only確認で得ています。invalid-input確認はHTTP status未捕捉で、request row/run directoryは作成されませんでした。
+- Cross-volume修正の前に残ったorphan `run-9bcfc40fcba54e89bb4591c4430137da`は保持し、手動修復・削除していません。
+
+### 実機single Codex-job smoke
+
+指定されたprompt「2+2を計算し、外部ツール・コマンド・ファイル操作・Git操作・ネットワーク操作を行わず、回答本文に4の1文字だけを返すこと」を持つdefinition `6ce13e09-002e-4691-8649-b62bd5e65842` revision 1を作成しました。`output.as`は`${ {"final_text": .result.final_text} }`相当のjq mappingで実job resultをoutput contractへ写し、定数結果を捏造していません。
+
+| Evidence | Observed |
+| --- | --- |
+| Definition validate/create/detail | HTTP 200 / 201 / 200 |
+| Client request | `d1-real-codex-job-mwxd0zeevdfs5z` |
+| Workflow/run | `fc538795-33df-48e3-90c5-9aa3b22ceb87` / `run-4f8af9d22b3f4c2495872903d8739bef` |
+| Start, status/detail, result | HTTP 202; detail/status/result HTTP 200; `succeeded`, worker `completed` |
+| Manifest and request binding | run format v2, contract v1; definition/source/request/binding/terminal identities verified |
+| Codex job | one `SUCCEEDED` row, task `do[0].calculate`, request key matched; remote state `completed` |
+| Job/thread/turn | `f58528f7-91aa-43b7-a859-0b7d1adadcd7` / `01a2173a-1861-75f2-a244-6fbb41f29d3a` / `01a2173a-1ac5-7ca2-8a0e-14af6a9450a5` |
+| Job receipt/output | both contained final text `4`; published result `{"final_text":"4"}` passed the output contract |
+| Same-request replay | HTTP 202; same workflow/run/job/thread/turn IDs; job and request row counts, event counts, and worker/terminal artifact hashes unchanged |
+
+Job ledger events had one each for `PREPARED`, `MAYBE_SENT`, `ACCEPTED`, `RUNNING`, and `SUCCEEDED`. No second job/turn or worker artifact change was observed on replay. The verified service projection reported DBOS-backed `succeeded` and worker `completed`. No real job beyond this one was launched.
+
+### Follow-up items and scope limits
+
+| Follow-up | Current evidence / suggested scope |
+| --- | --- |
+| Persisted request lifecycle | This strict request's stored row remained `running` while the verified API projection returned `succeeded`; do not edit stored state manually. Reconcile lifecycle persistence/projection in a focused follow-up. |
+| Ambiguous live responses | Pure-run initial start status and invalid-input HTTP status were not captured. No blind retry occurred. A future diagnostic needs a separately authorized bounded request. |
+| Orphan run | Preserve the named cross-volume orphan; cleanup or adoption is outside this acceptance. |
+| Recovery and job breadth | DBOS process-death recovery passed in isolated I8-A/C1/C2 evidence; production process-death recovery was not retested. Only one live literal-prompt Codex job/profile was exercised. |
+| Task/event projection | Strict task output remains static topology with partial coverage; strict events remain empty. Runtime event projection is not part of this closeout. |
+| D1-22 / D6 | Child output contract validation passed; explicit parent return routing remains deferred to D6. |
+| Deferred hardening | I2 remains DEFERRED / NON-BLOCKING. Physical WAL/SHM hard quota and WAL metadata invariance were not tested. Other documented deferred design/operator items remain follow-up, not blockers for this accepted scope. |
+
+The full Windows-native suite result remains the historical I8-B result: 3,959 passed / 24 skipped / 0 failed (3,983 collected). It was not rerun after the operational dogfoods. The early-v0 focused migration result (52 passed) and cross-volume result (75 passed / 2 symlink-permission skips) are separate runs; they are not summed into a new full-suite claim. No additional tests or production operations were run for this documentation closeout.
