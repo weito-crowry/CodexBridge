@@ -5,7 +5,7 @@
 本書群は、Workflow機能の基本仕様と段階的な詳細設計を管理する場所です。実装済み機能の説明と今後の設計案を区別します。
 
 - **基本仕様 v0.2** はユーザー合意済みの方針です。正式な要件一覧は [requirements.md](requirements.md) に記録します。
-- **D1の詳細設計** はformal production approval前の提案として文書状態 **DRAFT** を維持します。現行D1 implementation scope (I0-I8) はdocumented caveats付きで受入済み、isolated GOですが、これはproduction acceptanceではありません。operational migrationとproduction enablementは別途明示的なユーザー承認待ちです。
+- **D1の詳細設計** はformal design statusとして **DRAFT** を維持します。現行D1 implementationと、今回の明示migration・default-OFF設定のoperator opt-in・実機pure-variable/single Codex-job smokeを含むtested operational scopeは、documented caveats付きで受入済みです。現在のdeploymentでは両strict flagが明示設定で有効ですが、config/codeのdefaultはOFFです。全設計ケースや一般的なproduction rolloutの承認を意味しません。最終証跡は[I8-B evidence](phases/D1-I8B-final-acceptance-evidence.md)を参照してください。
 - **D2〜D8** は後工程の計画です。後から phases/D2-agent-nodes.md などを追加できる構成にし、現時点では未着手の空文書を作りません。
 - 現行実装と将来案の差分は [architecture.md](architecture.md) に記載します。
 
@@ -22,8 +22,8 @@
 | [ADR 0005: 起動排他・resource cap・Windows ACL](decisions/0005-startup-exclusion-resource-limits-windows-acl.md) | Proposed（レビュー待ち） | controller排他、旧版upgrade gate、NTFS ACL/path保護、strict v1上限案 |
 | [ADR 0006: 公開HTTP/MCP契約・ETag v2・エラー互換](decisions/0006-public-api-mcp-etag-error-contract.md) | Proposed（レビュー待ち） | optional contract、legacy/v2 ETag、strict run responseとエラー/status互換の設計案 |
 | [ADR 0007: OWS call adapterによるstrict変数操作](decisions/0007-variable-call-adapter.md) | Proposed（レビュー待ち） | OWS Schemaを変更せずstrict revision内のcodexbridge-variable callを許可する案 |
-| [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（formal production approval未取得。I0-I8 implementation scopeは受入済み） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
-| [D1実装スライス計画](phases/D1-implementation-plan.md) | I0-I8 current implementation scope ACCEPTED with documented caveats / isolated GO。D1詳細設計はDRAFT | 実装証跡とD1受入traceability。operator migration / production enablementは別途明示承認待ち |
+| [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（formal design status。実装と今回tested operational scopeは受入済み） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
+| [D1実装スライス計画](phases/D1-implementation-plan.md) | I0-I8 implementationとcurrent tested operational scope ACCEPTED with documented caveats。D1詳細設計はDRAFT | 実装証跡、運用受入、D1 traceabilityと残件 |
 
 ## Phase一覧
 
@@ -31,7 +31,7 @@
 
 | Phase | 概要 | 状態 |
 | --- | --- | --- |
-| D1 | Workflow共通入出力契約、変数宣言、Workflow・Issue・Attempt相当のスコープ | **DRAFT（formal design status。current implementation I0-I8はdocumented caveats付き受入済み / isolated GO）** |
+| D1 | Workflow共通入出力契約、変数宣言、Workflow・Issue・Attempt相当のスコープ | **DRAFT（formal design status。current implementationと今回tested operational scopeはdocumented caveats付き受入済み）** |
 | D2 | 汎用エージェント呼び出し・埋め込みプロンプト | **PLANNED** |
 | D3 | 機械判定・エージェント判定・レビュー | **PLANNED** |
 | D4 | 1 Issue・1回修正・受入の縦断実証（必要なテスト・検証を含む） | **PLANNED** |
@@ -45,7 +45,8 @@
 - **合意済み**: 基本仕様 v0.2 に記された製品方針。個々の実装詳細まで確定したことを示しません。
 - **Accepted**: ADRが記録する基本方針。ADR 0001は構造化ループを採る方針を示し、既存機能に新しいLoop機能が実装済みであることを意味しません。
 - **DRAFT**: 詳細設計案。レビュー・変更の対象であり、最終承認前です。
-- **Implementation accepted / isolated GO**: 対象実装と隔離検証の受入状態です。production DB migration、運用手順の実行、production/public enablementを承認しません。
+- **Implementation accepted / isolated GO**: 対象実装と隔離検証の受入状態です。この記載単独ではproduction DB migrationやruntime enablementの実施記録を示しません。今回実施済みのcurrent deployment operational acceptanceは次項と[I8-B evidence](phases/D1-I8B-final-acceptance-evidence.md)に分けて記録します。
+- **Current D1 operational acceptance**: 明示移行済みdeploymentと記録済み実機dogfoodを含む、今回の対象範囲の受入です。現在のoperator設定は明示opt-inで有効、他deployment向けのconfig defaultはOFFです。未検証・DEFERRED項目や一般的なrelease判断は[I8-B evidence](phases/D1-I8B-final-acceptance-evidence.md)に残します。
 - **Proposed**: ADRに記録した設計候補。レビュー待ちであり、Acceptedではありません。
 - **PLANNED**: 概要のみの予定。詳細設計・実装・受入は未完了です。
 - **Legacy mode**: 共通contractが結び付いていない既存Workflow定義を、保存済み内容の従来検証・実行挙動のまま扱う互換モード案です。
