@@ -1,0 +1,520 @@
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from codex_bridge.workflows.agent_contracts import (
+    AgentRequest,
+    AgentResult,
+    DispatchReceipt,
+    PreparedProviderRequest,
+    TargetContext,
+)
+from codex_bridge.workflows.contracts import canonical_json
+
+
+def _binding(**changes: object) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "run_id": "run-12345678",
+        "workflow_id": "workflow-12345678",
+        "definition_id": "definition-12345678",
+        "definition_revision": 2,
+        "request_digest": "1" * 64,
+        "source_sha256": "2" * 64,
+        "contract_sha256": "3" * 64,
+        "binding_digest": "4" * 64,
+        "normalized_input_sha256": "5" * 64,
+    }
+    identity.update(changes)
+    return identity
+
+
+def _target_context() -> TargetContext:
+    return TargetContext(
+        "codex",
+        "default",
+        1,
+        endpoint="http://127.0.0.1:8765",
+        workspace="D:\\workspace",
+    )
+
+
+def _request(
+    context: TargetContext | None = None, *, prompt: str = "hello", timeout: int | None = None
+):
+    target = context or _target_context()
+    return AgentRequest(
+        operation="invoke",
+        provider="codex",
+        target="default",
+        target_context=target,
+        session={"mode": "new"},
+        handle=None,
+        options={},
+        prompt=prompt,
+        response={"format": "text"},
+        wait=True,
+        timeout_seconds=timeout,
+    )
+
+
+def _ledger_module():
+    try:
+        from codex_bridge.workflows import agent_ledger
+    except ModuleNotFoundError as exc:
+        pytest.fail(f"Agent ledger is not implemented: {exc.name}")
+    return agent_ledger
+
+
+def test_new_ledger_initializes_only_an_absent_run_local_file(tmp_path: Path) -> None:
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    module = _ledger_module()
+
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory,
+        _binding(),
+        _target_context(),
+    )
+
+    database = run_directory / "agent_invocations.sqlite"
+    assert database.is_file()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA synchronous").fetchone() == (2,)
+        assert connection.execute("SELECT count(*) FROM run_binding").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM invocations").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM owned_handles").fetchone() == (0,)
+    assert ledger.read_binding() == {
+        "binding_identity": _binding(),
+        "target_context": _target_context().to_dict(),
+    }
+
+
+@pytest.mark.parametrize("file_kind", ["missing", "directory", "invalid_sqlite"])
+def test_existing_ledger_open_never_initializes_or_repairs(tmp_path: Path, file_kind: str) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    database = run_directory / "agent_invocations.sqlite"
+    if file_kind == "directory":
+        database.mkdir()
+    elif file_kind == "invalid_sqlite":
+        database.write_bytes(b"not a sqlite database")
+    before = database.read_bytes() if database.is_file() else None
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        module.AgentInvocationLedger.open_existing(run_directory, _binding(), _target_context())
+
+    assert (database.read_bytes() if database.is_file() else None) == before
+
+
+def test_read_only_inspection_is_explicit_and_rejects_binding_or_schema_drift(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+
+    info = module.AgentInvocationLedger.inspect_read_only(
+        run_directory, _binding(), _target_context()
+    )
+    assert info.binding_identity == _binding()
+    assert info.target_context == _target_context().to_dict()
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        module.AgentInvocationLedger.inspect_read_only(
+            run_directory,
+            _binding(run_id="run-other-12345678"),
+            _target_context(),
+        )
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        module.AgentInvocationLedger.inspect_read_only(
+            run_directory,
+            _binding(),
+            TargetContext(
+                "codex", "other", 1, endpoint="http://127.0.0.1:8765", workspace="D:\\workspace"
+            ),
+        )
+
+
+def test_invocation_identity_is_deterministic_and_request_conflicts_do_not_create_rows(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    prepared = PreparedProviderRequest(_request(), _target_context())
+
+    first = ledger.prepare_invoke("/do/0/agent", [2, 4], prepared, created_ms=1_800_000_000_000)
+    replay = ledger.prepare_invoke("/do/0/agent", [2, 4], prepared, created_ms=1_800_000_001_000)
+    other_node = ledger.prepare_invoke(
+        "/do/1/agent", [2, 4], prepared, created_ms=1_800_000_000_000
+    )
+
+    expected_identity = {
+        "namespace": "codexbridge-agent-v1",
+        "binding": _binding(),
+        "node_pointer": "/do/0/agent",
+        "iteration_vector": [2, 4],
+    }
+    expected_id = hashlib.sha256(canonical_json(expected_identity).encode("utf-8")).hexdigest()
+    assert first.invocation_id == expected_id
+    assert first.client_request_id == f"cba-{expected_id}"
+    assert replay.invocation_id == first.invocation_id
+    assert other_node.invocation_id != first.invocation_id
+    assert len(ledger.list_invocations()) == 2
+
+    with pytest.raises(module.AgentLedgerConflictError):
+        ledger.prepare_invoke(
+            "/do/0/agent",
+            [2, 4],
+            PreparedProviderRequest(_request(prompt="changed"), _target_context()),
+            created_ms=1_800_000_000_000,
+        )
+    assert len(ledger.list_invocations()) == 2
+
+
+def test_more_than_four_distinct_nodes_are_kept_and_paged_without_an_execution_cap(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    prepared = PreparedProviderRequest(_request(), _target_context())
+
+    records = [
+        ledger.prepare_invoke(f"/do/{index}/agent", [], prepared, created_ms=index + 1)
+        for index in range(7)
+    ]
+
+    first_page = ledger.list_invocations(limit=3)
+    second_page = ledger.list_invocations(
+        limit=3,
+        after=(first_page[-1].created_ms, first_page[-1].invocation_id),
+    )
+    third_page = ledger.list_invocations(
+        limit=3,
+        after=(second_page[-1].created_ms, second_page[-1].invocation_id),
+    )
+    assert len(records) == 7
+    assert len(first_page + second_page + third_page) == 7
+
+
+def test_deadline_is_pinned_to_first_prepare_and_only_sqlite_integer_overflow_is_rejected(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    request = PreparedProviderRequest(_request(timeout=37), _target_context())
+
+    first = ledger.prepare_invoke("/do/0/agent", [], request, created_ms=1_800_000_000_000)
+    replay = ledger.prepare_invoke("/do/0/agent", [], request, created_ms=1_800_000_001_000)
+    assert first.deadline_ms == 1_800_000_037_000
+    assert replay.deadline_ms == first.deadline_ms
+
+    with pytest.raises(module.AgentLedgerConflictError):
+        ledger.prepare_invoke(
+            "/do/1/agent",
+            [],
+            PreparedProviderRequest(_request(timeout=10**30), _target_context()),
+            created_ms=1_800_000_000_000,
+        )
+
+
+def test_dispatch_claim_has_a_single_winner_and_maybe_sent_cannot_be_reclaimed(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent", [], PreparedProviderRequest(_request(), _target_context()), created_ms=1
+    )
+
+    assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is True
+    assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is False
+    assert ledger.get_invocation(record.invocation_id).dispatch_state == "MAYBE_SENT"
+
+
+def test_concurrent_claimers_have_exactly_one_dispatch_winner(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent", [], PreparedProviderRequest(_request(), _target_context()), created_ms=1
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(
+            executor.map(
+                lambda _index: ledger.claim_dispatch(record.invocation_id, record.request_sha256),
+                (0, 1),
+            )
+        )
+
+    assert sorted(claims) == [False, True]
+    assert ledger.get_invocation(record.invocation_id).dispatch_state == "MAYBE_SENT"
+
+
+def test_accepted_receipt_and_exact_owned_handle_are_atomic_and_immutable(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent", [], PreparedProviderRequest(_request(), _target_context()), created_ms=1
+    )
+    ledger.claim_dispatch(record.invocation_id, record.request_sha256)
+    receipt = DispatchReceipt.accepted(
+        handle={"thread_id": "thread_123456", "turn_id": "turn_123456"},
+        remote_state="in_progress",
+    )
+
+    accepted = ledger.save_dispatch_receipt(record.invocation_id, receipt)
+    assert accepted.dispatch_state == "ACCEPTED"
+    assert accepted.dispatch_receipt_json == receipt.to_json()
+    owned = ledger.get_owned_handle(record.invocation_id)
+    assert owned.handle == receipt.handle
+    assert len(ledger.list_owned_handles()) == 1
+    assert (
+        ledger.save_dispatch_receipt(record.invocation_id, receipt).dispatch_receipt_json
+        == receipt.to_json()
+    )
+    with pytest.raises(module.AgentLedgerConflictError):
+        ledger.save_dispatch_receipt(
+            record.invocation_id,
+            DispatchReceipt.accepted(
+                handle={"thread_id": "thread_876543", "turn_id": "turn_876543"},
+                remote_state="in_progress",
+            ),
+        )
+
+
+def test_receipt_and_result_semantics_are_checked_before_persistence(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent", [], PreparedProviderRequest(_request(), _target_context()), created_ms=1
+    )
+    ledger.claim_dispatch(record.invocation_id, record.request_sha256)
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(record.invocation_id, DispatchReceipt.accepted())
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(
+            record.invocation_id,
+            DispatchReceipt.rejected("dispatch_rejected", handle={"thread_id": "t"}),
+        )
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(
+            record.invocation_id,
+            DispatchReceipt.accepted(
+                handle={"thread_id": "thread_123456", "turn_id": "turn_123456"},
+                remote_state="successful",
+            ),
+        )
+
+    wrong = AgentResult(
+        invocation_id="different",
+        operation="invoke",
+        provider="codex",
+        target="default",
+        status="UNKNOWN",
+    )
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_result(record.invocation_id, wrong)
+    assert ledger.get_invocation(record.invocation_id).result_json is None
+
+
+def test_uncertain_receipt_and_same_handle_from_another_invocation_cannot_be_accepted(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    prepared = PreparedProviderRequest(_request(), _target_context())
+    first = ledger.prepare_invoke("/do/0/agent", [], prepared, created_ms=1)
+    second = ledger.prepare_invoke("/do/1/agent", [], prepared, created_ms=2)
+    ledger.claim_dispatch(first.invocation_id, first.request_sha256)
+    ledger.claim_dispatch(second.invocation_id, second.request_sha256)
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(first.invocation_id, DispatchReceipt.uncertain())
+
+    receipt = DispatchReceipt.accepted(
+        handle={"thread_id": "thread_123456", "turn_id": "turn_123456"},
+        remote_state="in_progress",
+    )
+    ledger.save_dispatch_receipt(first.invocation_id, receipt)
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(second.invocation_id, receipt)
+    assert ledger.get_invocation(second.invocation_id).dispatch_state == "MAYBE_SENT"
+
+
+def test_logical_result_is_immutable_and_remote_observation_is_exactly_owned(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent", [], PreparedProviderRequest(_request(), _target_context()), created_ms=1
+    )
+    ledger.claim_dispatch(record.invocation_id, record.request_sha256)
+    handle = {"thread_id": "thread_123456", "turn_id": "turn_123456"}
+    ledger.save_dispatch_receipt(
+        record.invocation_id,
+        DispatchReceipt.accepted(handle=handle, remote_state="in_progress"),
+    )
+    result = AgentResult(
+        invocation_id=record.invocation_id,
+        operation="invoke",
+        provider="codex",
+        target="default",
+        status="UNKNOWN",
+        handle=handle,
+        remote_state="in_progress",
+        error={"code": "observation_unavailable", "message": "Agent state could not be observed."},
+    )
+
+    assert ledger.save_result(record.invocation_id, result).result_json == result.to_json()
+    assert ledger.save_result(record.invocation_id, result).result_json == result.to_json()
+    with pytest.raises(module.AgentLedgerConflictError):
+        ledger.save_result(
+            record.invocation_id,
+            AgentResult(
+                invocation_id=record.invocation_id,
+                operation="invoke",
+                provider="codex",
+                target="default",
+                status="FAILED",
+                handle=handle,
+                remote_state="failed",
+                error={"code": "remote_failed", "message": "Agent execution failed."},
+            ),
+        )
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.update_remote_state(
+            record.invocation_id,
+            {"thread_id": "thread_other", "turn_id": "turn_other"},
+            _target_context(),
+            remote_state="completed",
+            observed_ms=2,
+            remote_terminal=True,
+        )
+    ledger.update_remote_state(
+        record.invocation_id,
+        handle,
+        _target_context(),
+        remote_state="completed",
+        observed_ms=3,
+        remote_terminal=True,
+    )
+    assert ledger.get_invocation(record.invocation_id).result_json == result.to_json()
+    assert ledger.get_owned_handle(record.invocation_id).remote_state == "completed"
+
+
+def test_row_digest_corruption_is_detected_without_loading_other_invocations(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent",
+        [],
+        module.PreparedProviderRequest(_request(), _target_context()),
+        created_ms=1,
+    )
+    with sqlite3.connect(run_directory / "agent_invocations.sqlite") as connection:
+        connection.execute(
+            "UPDATE invocations SET request_json=? WHERE invocation_id=?",
+            ('{"tampered":true}', record.invocation_id),
+        )
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.get_invocation(record.invocation_id)
+
+
+def test_schema_drift_is_an_integrity_error_and_existing_rows_are_left_in_place(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/0/agent", [], PreparedProviderRequest(_request(), _target_context()), created_ms=1
+    )
+    with sqlite3.connect(run_directory / "agent_invocations.sqlite") as connection:
+        connection.execute(
+            "CREATE TRIGGER extra_trigger AFTER INSERT ON invocations BEGIN SELECT 1; END"
+        )
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        module.AgentInvocationLedger.open_existing(run_directory, _binding(), _target_context())
+
+    with sqlite3.connect(run_directory / "agent_invocations.sqlite") as connection:
+        assert connection.execute(
+            "SELECT dispatch_state FROM invocations WHERE invocation_id=?",
+            (record.invocation_id,),
+        ).fetchone() == ("PREPARED",)
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='extra_trigger'"
+        ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize("binding", [{}, {"run_id": "x"}, {"run_id": "x", "workflow_id": "y"}])
+def test_binding_requires_the_complete_checkpoint_identity(
+    tmp_path: Path, binding: dict[str, object]
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        module.AgentInvocationLedger.initialize_new_database(
+            run_directory, binding, _target_context()
+        )
+
+    assert not (run_directory / "agent_invocations.sqlite").exists()
