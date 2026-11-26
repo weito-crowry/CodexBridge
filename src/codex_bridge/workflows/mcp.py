@@ -115,11 +115,28 @@ def register_workflow_tools(
             if status in {"queued", "starting", "running"}:
                 error_code = "workflow_not_completed"
             elif status == "needs_reconciliation":
-                error_code = "workflow_needs_reconciliation"
+                strict_metadata = strict_run_metadata_json(snapshot)
+                error_code = (
+                    "workflow_execution_uncertain"
+                    if (
+                        strict_metadata.get("reason_code") == "strict_execution_uncertain"
+                        and snapshot.worker_state != "unknown"
+                    )
+                    else "workflow_needs_reconciliation"
+                )
             elif status == "failed_to_start":
                 error_code = "workflow_failed_to_start"
             elif status == "failed":
-                error_code = "workflow_failed"
+                strict_metadata = strict_run_metadata_json(snapshot)
+                reason_code = strict_metadata.get("reason_code")
+                normalized_reason_code = reason_code if isinstance(reason_code, str) else ""
+                error_code = {
+                    "output_contract_violation": "workflow_output_invalid",
+                    "resource_limit_exceeded": "workflow_resource_limit",
+                }.get(
+                    normalized_reason_code,
+                    "workflow_failed",
+                )
             else:
                 error_code = "workflow_state_unknown"
             response: dict[str, Any] = {

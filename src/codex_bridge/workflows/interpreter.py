@@ -1422,6 +1422,7 @@ def compute_codex_job_request(
     variables: Mapping[str, Any] | None = None,
     *,
     max_live_codex_jobs: int = 1,
+    strict_contract: CompiledContract | None = None,
 ) -> dict[str, str]:
     max_live_codex_jobs = _validate_max_live_codex_jobs(max_live_codex_jobs)
     arguments = task_spec.get("with")
@@ -1435,7 +1436,12 @@ def compute_codex_job_request(
     if not isinstance(prefix, str):
         raise OwsError("second codex-job prompt must be a literal string prefix")
     try:
-        evaluated = evaluate_jq(arguments["prompt_from"], input_data, variables)
+        evaluated = evaluate_jq(
+            arguments["prompt_from"],
+            input_data,
+            variables,
+            strict_contract=strict_contract,
+        )
     except Exception:
         raise OwsError("codex-job prompt_from evaluation failed") from None
     if not isinstance(evaluated, str) or not evaluated:

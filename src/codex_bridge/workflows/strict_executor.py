@@ -7,6 +7,7 @@ I7-C2 owns that lifecycle connection.
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Mapping
 from functools import cache
 from pathlib import Path
@@ -19,6 +20,7 @@ from .contracts import (
     ContractResourceLimit,
     canonical_json,
     parse_strict_json,
+    sha256_json,
     validate_output,
 )
 from .interpreter import (
@@ -26,6 +28,7 @@ from .interpreter import (
     OwsError,
     _escape_node_pointer_segment,
     _task_action,
+    compute_codex_job_request,
     compute_task_action,
     validate_workflow,
 )
@@ -113,13 +116,14 @@ def _validate_envelope(
     expected_fields: set[str],
     expected_kind: str,
     expected_identity: Mapping[str, Any],
+    expected_version: int = 1,
 ) -> dict[str, Any]:
     try:
         if type(value) is not dict or set(value) != expected_fields:
             raise StrictWorkflowExecutionError("strict_execution_uncertain")
         if (
             type(value.get("checkpoint_version")) is not int
-            or value["checkpoint_version"] != 1
+            or value["checkpoint_version"] != expected_version
             or value.get("kind") != expected_kind
             or value.get("binding_identity") != dict(expected_identity)
         ):
@@ -313,9 +317,11 @@ def _compute_task_checkpoint_body(
             strict_contract=adapter.compiled_contract,
         )
         return {
-            "checkpoint_version": 1,
+            "checkpoint_version": 2,
             "kind": "pure_task_action",
             "binding_identity": expected_identity,
+            "input_sha256": sha256_json(input_data),
+            "variables_sha256": sha256_json(variables),
             "node_id": node_id,
             "iteration_vector": iteration_vector,
             "task_name": task_name,
@@ -331,11 +337,15 @@ def _task_action_step(step_identity: str) -> Any:
     return DBOS.step(name=_step_name("pure-task", step_identity))(_compute_task_checkpoint_body)
 
 
-def _strict_task_map(definition: dict[str, Any]) -> dict[str, tuple[str, str, dict[str, Any]]]:
+def _strict_task_map(
+    definition: dict[str, Any], *, execution_mode: str = "isolated"
+) -> dict[str, tuple[str, str, dict[str, Any]]]:
     try:
         task_map = _pinned_task_map(definition)
         if any(
-            operation == "call" and task_spec.get("call") != "codexbridge-variable"
+            operation == "call"
+            and task_spec.get("call") != "codexbridge-variable"
+            and not (execution_mode == "authorized_codex" and task_spec.get("call") == "codex-job")
             for _name, operation, task_spec in task_map.values()
         ):
             raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
@@ -359,15 +369,18 @@ def _execute_verified_run(
     state_root: str,
     run_id: str,
     allowed_roots: list[str],
+    execution_mode: str = "isolated",
 ) -> dict[str, Any]:
     try:
         definition = adapter.pinned_definition
         if definition is None:
             raise StrictWorkflowExecutionError("strict_execution_uncertain")
-        _strict_task_map(definition)
+        if execution_mode not in {"isolated", "authorized_codex"}:
+            raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
+        _strict_task_map(definition, execution_mode=execution_mode)
         validate_workflow(
             definition,
-            codex_job_live=False,
+            codex_job_live=execution_mode == "authorized_codex",
             max_live_codex_jobs=adapter.max_live_codex_jobs,
             strict_contract=adapter.compiled_contract,
         )
@@ -502,15 +515,15 @@ def _execute_verified_run(
                     raise StrictWorkflowExecutionError("strict_execution_uncertain")
                 # Re-read the I4 historical execution record even when DBOS returned
                 # an existing checkpoint; this validates it without using latest state.
-                historical = adapter.apply_prepared(prepared)
-                if historical != checkpoint["result"]:
+                historical = adapter.verify_historical_prepared_readonly(prepared)
+                if canonical_json(historical) != canonical_json(checkpoint["result"]):
                     raise StrictWorkflowExecutionError("strict_execution_uncertain")
                 return historical
             except Exception as error:
                 raise _safe_execution_error(error) from None
 
         def task_provider(
-            _identity: str,
+            task_identity: str,
             _task_name: str,
             _operation: str,
             _task_spec: dict[str, Any],
@@ -520,6 +533,47 @@ def _execute_verified_run(
             iteration_vector: tuple[int, ...],
         ) -> Any:
             try:
+                if _operation == "call" and _task_spec.get("call") == "codex-job":
+                    if execution_mode != "authorized_codex":
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    port_text = os.environ.get("CODEXBRIDGE_WORKFLOW_BRIDGE_PORT", "")
+                    if not port_text.isascii() or not port_text.isdigit():
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    port = int(port_text)
+                    if not 1 <= port <= 65535:
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    manifest = adapter._verified_manifest
+                    if manifest is None:
+                        raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                    request = compute_codex_job_request(
+                        _task_spec,
+                        input_data,
+                        variables,
+                        max_live_codex_jobs=adapter.max_live_codex_jobs,
+                        strict_contract=adapter.compiled_contract,
+                    )
+                    from .worker import _run_durable_codex_job
+
+                    return _run_durable_codex_job(
+                        identity=task_identity,
+                        task_name=_task_name,
+                        operation=_operation,
+                        task_input=input_data,
+                        variables=variables,
+                        request=request,
+                        definition_sha256=manifest.source_sha256,
+                        trace_path=str(Path(state_root) / run_id / "task-events.jsonl"),
+                        control={
+                            "max_live_codex_jobs": adapter.max_live_codex_jobs,
+                            "codex_bridge_port": port,
+                            "codex_job_max_polls": 600,
+                            "codex_job_poll_interval_seconds": 0.2,
+                            "workspace_root": manifest.workspace_root,
+                            "allowed_roots": roots,
+                        },
+                    )
+                if _operation == "call" and _task_spec.get("call") != "codexbridge-variable":
+                    raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
                 step_identity = f"{node_id}:{canonical_json(list(iteration_vector))}"
                 checkpoint = _task_action_step(step_identity)(
                     state_root,
@@ -537,6 +591,8 @@ def _execute_verified_run(
                         "checkpoint_version",
                         "kind",
                         "binding_identity",
+                        "input_sha256",
+                        "variables_sha256",
                         "node_id",
                         "iteration_vector",
                         "task_name",
@@ -545,10 +601,16 @@ def _execute_verified_run(
                     },
                     expected_kind="pure_task_action",
                     expected_identity=identity,
+                    expected_version=2,
                 )
-                pinned_task = _strict_task_map(definition).get(node_id)
+                pinned_task = _strict_task_map(definition, execution_mode=execution_mode).get(
+                    node_id
+                )
                 if (
-                    checkpoint["node_id"] != node_id
+                    checkpoint["checkpoint_version"] != 2
+                    or checkpoint["input_sha256"] != sha256_json(input_data)
+                    or checkpoint["variables_sha256"] != sha256_json(variables)
+                    or checkpoint["node_id"] != node_id
                     or checkpoint["iteration_vector"] != list(iteration_vector)
                     or pinned_task is None
                     or checkpoint["task_name"] != pinned_task[0]
@@ -568,6 +630,7 @@ def _execute_verified_run(
         result = Interpreter(
             definition,
             max_tasks=adapter.max_tasks,
+            codex_job_live=execution_mode == "authorized_codex",
             max_live_codex_jobs=adapter.max_live_codex_jobs,
             strict_variable_runtime=adapter,
         ).run(adapter.normalized_input())
@@ -592,11 +655,20 @@ def execute_strict_ows_workflow(
     allowed_roots: list[str],
     execution_mode: str,
 ) -> dict[str, Any]:
-    """Run only an existing reserved strict snapshot in isolated DBOS mode."""
+    """Run only an existing reserved strict snapshot in the selected private mode."""
     try:
-        if execution_mode != "isolated":
+        if execution_mode not in {"isolated", "authorized_codex"}:
             raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
         adapter = _verified_adapter(state_root, run_id, allowed_roots)
+        definition = adapter.pinned_definition
+        if definition is None:
+            raise StrictWorkflowExecutionError("strict_execution_uncertain")
+        has_codex_jobs = any(
+            operation == "call" and task.get("call") == "codex-job"
+            for _name, operation, task in _pinned_task_map(definition).values()
+        )
+        if has_codex_jobs != (execution_mode == "authorized_codex"):
+            raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
         workflow_id = DBOS.workflow_id
         if (
             type(workflow_id) is not str
@@ -608,6 +680,7 @@ def execute_strict_ows_workflow(
             state_root=state_root,
             run_id=run_id,
             allowed_roots=allowed_roots,
+            execution_mode=execution_mode,
         )
     except Exception as error:
         raise _safe_execution_error(error) from None

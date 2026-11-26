@@ -1,6 +1,6 @@
 # D1-I7-C1 legacy reader repair and isolated durable strict executor evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats; I7-C1 scope)。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I7-B commit `ee3bd96749db6e37ad260297ed6b55e0036d450c` (ChatGPT ACCEPTED with documented caveats)。
 - **範囲:** legacy v0 optional request-source reader regression fixと、予約済みstrict v2専用のisolated DBOS executor/checkpoint path。
@@ -9,6 +9,10 @@
 ## I7-B reviewと既知regression
 
 ChatGPT GitHub review of `ee3bd96749db6e37ad260297ed6b55e0036d450c` はI7-B direct variable runtimeをACCEPTED (with documented caveats)としました。review時のI4〜I7B/graph/saved execution/service/manager/codex-job focused aggregateは580 passed / 8 skipped / 1 failedと報告され、all-greenではありません。既知failureは`test_legacy_request_database_reads_without_creating_source_table`です。I7-C1はこのreader境界を修正し、strict claimや不正schemaをlegacyとして扱わないテストを追加しました。
+
+## I7-C1 ChatGPT review
+
+ChatGPT GitHub review of `50d7e54e369301e70492768cac58090bbdebd746` はI7-C1をACCEPTED (with documented caveats)としました。review時focused aggregateは706 passed / 10 skipped / 0 failedです。受入範囲はlegacy reader regression修正とisolated strict DBOS executor/checkpointです。real isolated DBOS launch/run/retrieveと、I4 commit後・DBOS checkpoint前のinjected exceptionは検証済みです。実worker processの停止中recovery、full pytest、live worker、CPP/account-auth、実Codex job、WAL metadataは未検証です。I7-Bの580 / 8 / 1はreview時報告のまま履歴として残し、C1の706 / 10 / 0と合算・置換していません。
 
 ## 実装
 
@@ -40,7 +44,7 @@ outputは既存`validate_output`で検証してからのみ`status=succeeded` en
 ## 残件とI7-C2境界
 
 - testでは、I4 mutation commitの直後、DBOS checkpoint記録の前に例外を注入し、後続のvariable mutation後も同じprepared payloadのapply step body再実行がhistorical after値を返し、最新値を巻き戻さず二重適用もしないことを確認しました。これは実worker processの突然停止・再起動を用いたin-flight DBOS recovery testではありません。completed workflowのdestroy/relaunch後readbackと分けて記録し、実in-flight recoveryはI8 acceptanceで検証します。
-- I7-C2でmanager/worker_entry/worker.mainからisolated runに限ったstrict lifecycle接続、request preparation/reservation順序とidempotent replay、verified status/result/lifecycle/ownership、既存codex-job durable adapter、isolated end-to-end executionを実装・検証します。
+- I7-C2でmanager/worker_entry/worker.mainからisolated runに限ったstrict lifecycle接続、request preparation/reservation順序とidempotent replay、verified status/result/lifecycle/ownership、既存codex-job durable adapter、isolated end-to-end executionを実装しました。詳細とC2の未検証範囲は[D1-I7C2証跡](D1-I7C2-isolated-runtime-evidence.md)を参照してください。
 - I7-C1ではstrict public admissionを有効化せず、productionや外部Codex jobを実行しません。strict admissionはI8受入までOFFです。
 - full pytest、CPP/account-auth regression、live API、live/real worker、external job、WAL metadata、およびactual in-flight DBOS crash/recoveryは未検証です。
 - I6-Cのcorrupt request-source ledger replayがID保持前にunavailableとなり得るreview caveatは、C2のadmission integration時に再確認します。

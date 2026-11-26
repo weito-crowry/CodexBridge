@@ -459,6 +459,42 @@ class StrictWorkflowVariableRuntimeAdapter:
         except Exception:
             raise StrictVariableRuntimeError("strict_variable_invalid") from None
 
+    def verify_historical_prepared_readonly(
+        self, prepared: PreparedStrictVariableMutation
+    ) -> dict[str, Any]:
+        """Require and verify the I4 historical record without applying it."""
+        try:
+            if not isinstance(prepared, PreparedStrictVariableMutation):
+                raise StrictVariableRuntimeError("strict_variable_invalid")
+            arguments = parse_strict_json(prepared._operation_args_json)
+            result = self._store.verify_existing_prepared(
+                prepared.context,
+                prepared.declaration_id,
+                prepared.operation,
+                expected_before_version=prepared.expected_before_version,
+                expected_before_digest=prepared.expected_before_digest,
+                **arguments,
+            )
+            if result.after_present:
+                return {"present": True, "value": copy.deepcopy(result.after_value)}
+            return {"present": False}
+        except StrictVariableRuntimeError:
+            raise
+        except StrictWorkflowVariableNeedsReconciliation:
+            raise StrictVariableRuntimeError("strict_variable_needs_reconciliation") from None
+        except StrictWorkflowVariableStorageUnavailable:
+            raise StrictVariableRuntimeError("strict_variable_storage_unavailable") from None
+        except StrictWorkflowVariableInvalidMetadata:
+            raise StrictVariableRuntimeError("strict_variable_invalid") from None
+        except StrictWorkflowVariableError:
+            raise StrictVariableRuntimeError("strict_variable_needs_reconciliation") from None
+        except StrictVariableLogicResourceLimit:
+            raise StrictVariableRuntimeError("strict_variable_resource_limit") from None
+        except StrictVariableLogicError:
+            raise StrictVariableRuntimeError("strict_variable_invalid") from None
+        except Exception:
+            raise StrictVariableRuntimeError("strict_variable_invalid") from None
+
     def serialize_prepared_mutation(
         self, prepared: PreparedStrictVariableMutation
     ) -> dict[str, Any]:

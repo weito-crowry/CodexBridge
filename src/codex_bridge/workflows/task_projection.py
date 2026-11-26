@@ -174,7 +174,18 @@ def project_workflow_tasks(
 
     strict_v2 = strict_verification is not None
     if strict_verification is not None:
-        base.update(strict_verification_metadata_json(strict_verification))
+        projection_reason = (
+            inspection._strict_metadata.reason_code
+            if inspection._strict_metadata is not None
+            and inspection._strict_metadata.reason_code is not None
+            else "workflow_not_confirmed"
+        )
+        base.update(
+            strict_verification_metadata_json(
+                strict_verification,
+                reason_code=projection_reason,
+            )
+        )
         pinned_definition = strict_verification._definition
         if pinned_definition is None or pinned_definition.contract is None:
             base["coverage"] = "unavailable"
@@ -580,7 +591,18 @@ def project_workflow_task_events(
             state_root, row, allowed_roots=allowed_roots
         )
         if strict_verification is not None:
-            base.update(strict_verification_metadata_json(strict_verification))
+            projection_reason = (
+                inspection._strict_metadata.reason_code
+                if inspection._strict_metadata is not None
+                and inspection._strict_metadata.reason_code is not None
+                else "workflow_not_confirmed"
+            )
+            base.update(
+                strict_verification_metadata_json(
+                    strict_verification,
+                    reason_code=projection_reason,
+                )
+            )
             pinned_definition = strict_verification._definition
             if pinned_definition is None or pinned_definition.contract is None:
                 raise _ProjectionIssue("run_integrity_invalid")

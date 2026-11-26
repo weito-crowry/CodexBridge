@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,7 @@ import pytest
 
 from codex_bridge.workflows import strict_executor
 from codex_bridge.workflows.strict_variable_runtime import (
+    StrictVariableRuntimeError,
     StrictWorkflowVariableRuntimeAdapter,
 )
 from tests.test_workflow_d1_i7b_variable_runtime import (
@@ -167,6 +169,89 @@ def test_prepared_apply_step_replay_after_commit_returns_historical_result(
     assert checkpoint["result"] == {"present": True, "value": 8}
     assert adapter.projection_for_phase("after-replay", "/final")["workflow"]["count"] == 9
     assert adapter._store.inspect_ledger().mutation_count == 2
+
+
+def test_historical_checkpoint_verification_is_read_only_and_requires_ledger_row(
+    tmp_path: Path,
+) -> None:
+    adapter, run_directory = _reserved_adapter(tmp_path, output="${ {} }")
+    prepared = adapter.prepare_mutation(
+        _call("initialize", "count", value=8), node_id="/do/0/initialize_count"
+    )
+    payload = adapter.serialize_prepared_mutation(prepared)
+    assert adapter.apply_prepared(prepared) == {"present": True, "value": 8}
+    assert adapter.verify_historical_prepared_readonly(prepared) == {
+        "present": True,
+        "value": 8,
+    }
+
+    database = run_directory / "variables.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "DELETE FROM variable_mutations WHERE execution_key = ?",
+            (payload["execution_key"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    after_external_delete = database.read_bytes()
+
+    with pytest.raises(StrictVariableRuntimeError) as error:
+        adapter.verify_historical_prepared_readonly(prepared)
+
+    assert error.value.reason_code in {
+        "strict_variable_storage_unavailable",
+        "strict_variable_needs_reconciliation",
+    }
+    assert database.read_bytes() == after_external_delete
+
+
+def test_pure_task_checkpoint_binds_input_and_variable_projection(tmp_path: Path) -> None:
+    from codex_bridge.workflows.contracts import sha256_json
+
+    adapter, run_directory = _reserved_adapter(tmp_path, output="${ {} }")
+    checkpoint = strict_executor._compute_task_checkpoint_body(
+        str(run_directory.parent),
+        run_directory.name,
+        [str(run_directory.parent.parent / "workspace")],
+        adapter.checkpoint_identity,
+        "/do/0/pass",
+        [],
+        {"from_input": 1},
+        {"from_variable": None},
+    )
+
+    assert checkpoint["checkpoint_version"] == 2
+    assert checkpoint["input_sha256"] == sha256_json({"from_input": 1})
+    assert checkpoint["variables_sha256"] == sha256_json({"from_variable": None})
+
+
+def test_dbos_retrieval_preserves_safe_strict_reason_code(tmp_path: Path) -> None:
+    from dbos import DBOS, SetWorkflowID
+
+    from codex_bridge.workflows.worker import _dbos_config
+
+    _adapter, run_directory = _reserved_adapter(tmp_path, output="${ 7 }")
+    dbos_config = _dbos_config(run_directory / "dbos.sqlite")
+    DBOS(config=dbos_config)
+    DBOS.launch()
+    try:
+        with SetWorkflowID(_WORKFLOW_ID):
+            handle = DBOS.start_workflow(
+                strict_executor.execute_strict_ows_workflow,
+                run_directory.name,
+                str(run_directory.parent),
+                [str(run_directory.parent.parent / "workspace")],
+                "isolated",
+            )
+        with pytest.raises(strict_executor.StrictWorkflowExecutionError) as error:
+            handle.get_result()
+    finally:
+        DBOS.destroy()
+
+    assert error.value.reason_code == "output_contract_violation"
+    assert "7" not in str(error.value)
 
 
 def test_tampered_prepared_arguments_stop_before_the_i4_apply(tmp_path: Path) -> None:

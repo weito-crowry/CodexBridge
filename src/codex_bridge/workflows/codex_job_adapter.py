@@ -1352,6 +1352,8 @@ class CodexJobAdapter:
     def read_shutdown_ownership(
         cls,
         database_path: Path,
+        *,
+        expected_workflow_id: str | None = None,
     ) -> tuple[set[tuple[str, str]], bool]:
         database_path = Path(database_path)
         if database_path.is_symlink() or not database_path.is_file():
@@ -1364,10 +1366,27 @@ class CodexJobAdapter:
             }
             if "jobs" not in tables:
                 return set(), False
-            rows = connection.execute("SELECT state, thread_id, turn_id FROM jobs").fetchall()
+            if expected_workflow_id is None:
+                rows = connection.execute("SELECT state, thread_id, turn_id FROM jobs").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT state, thread_id, turn_id, workflow_id, request_key, task_identity "
+                    "FROM jobs"
+                ).fetchall()
         owned: set[tuple[str, str]] = set()
         complete = True
-        for state, thread_id, turn_id in rows:
+        for row in rows:
+            state, thread_id, turn_id = row[:3]
+            if expected_workflow_id is not None:
+                workflow_id, request_key, task_identity = row[3:]
+                if (
+                    workflow_id != expected_workflow_id
+                    or not isinstance(task_identity, str)
+                    or not task_identity
+                    or request_key != f"{expected_workflow_id}::{task_identity}"
+                ):
+                    complete = False
+                    continue
             if state == "MAYBE_SENT":
                 complete = False
             elif state in {"ACCEPTED", "RUNNING"}:

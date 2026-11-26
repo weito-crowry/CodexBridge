@@ -471,6 +471,48 @@ class StrictWorkflowRequestStore:
         except Exception:
             raise StrictWorkflowRequestError(_UNAVAILABLE) from None
 
+    def update_state(self, run_id: str, state: str) -> StrictWorkflowRequestReservation:
+        """Update lifecycle state in an existing v1 store without schema setup."""
+        if (
+            not isinstance(run_id, str)
+            or _RUN_ID.fullmatch(run_id) is None
+            or type(state) is not str
+            or state not in _WORKFLOW_STATES
+        ):
+            raise StrictWorkflowRequestError(_INVALID_REQUEST)
+        database = self._database_path(required=True)
+        connection: sqlite3.Connection | None = None
+        try:
+            from .strict_variables import _format_utc_timestamp
+
+            connection = _connect_write(database)
+            connection.execute("BEGIN IMMEDIATE")
+            _check_v1_database(connection)
+            reservation = _reservation_for_run(connection, run_id)
+            if reservation is None:
+                raise StrictWorkflowRequestError(_UNAVAILABLE)
+            connection.execute(
+                "UPDATE workflow_requests SET state = ?, updated_at = ? WHERE run_id = ?",
+                (state, _format_utc_timestamp(datetime.now(UTC)), run_id),
+            )
+            _check_v1_database(connection)
+            updated = _reservation_for_run(connection, run_id)
+            if updated is None:
+                raise StrictWorkflowRequestError(_UNAVAILABLE)
+            connection.execute("COMMIT")
+            return updated
+        except StrictWorkflowRequestError:
+            if connection is not None and connection.in_transaction:
+                _rollback(connection)
+            raise
+        except Exception:
+            if connection is not None and connection.in_transaction:
+                _rollback(connection)
+            raise StrictWorkflowRequestError(_UNAVAILABLE) from None
+        finally:
+            if connection is not None:
+                connection.close()
+
     def _resolve_state_root(self, *, create: bool) -> Path:
         candidate = self._state_root.expanduser()
         if candidate.is_symlink():

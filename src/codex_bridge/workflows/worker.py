@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dbos import DBOS, DBOSConfig, SetWorkflowID
 from sqlalchemy.engine import URL
@@ -27,8 +27,9 @@ from .codex_job_adapter import (
     CodexJobReconciliationRequiredError,
     CodexJobTimeoutError,
 )
+from .contracts import ContractOutputInvalid, validate_output
 from .diagnostic_log import append_lifecycle_event
-from .http_client import CodexHTTPClient
+from .http_client import CONTROL_TOKEN_ENV, CodexHTTPClient
 from .interpreter import (
     Interpreter,
     OwsError,
@@ -47,6 +48,7 @@ from .job_adapter import (
 )
 from .node_events import NodeEventWriter
 from .process_identity import get_process_identity
+from .strict_executor import execute_strict_ows_workflow
 from .strict_manifest import _is_symlink_or_junction
 from .strict_reader_gate import (
     RunFormatVersion,
@@ -55,6 +57,7 @@ from .strict_reader_gate import (
     classify_readonly,
     verify_strict_reserved_readonly,
 )
+from .strict_variable_runtime import StrictWorkflowVariableRuntimeAdapter
 
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
 APPLICATION_VERSION = "1.0.3-subset"
@@ -1122,18 +1125,197 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workspace-root", type=Path)
     parser.add_argument("--allowed-root", action="append", default=[])
     parser.add_argument("--shutdown-file", type=Path)
+    parser.add_argument(
+        "--strict-runtime-mode",
+        choices=("isolated", "authorized_codex"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--codex-bridge-port", type=int, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
+
+
+_STRICT_REASON_CODES = frozenset(
+    {
+        "strict_execution_uncertain",
+        "strict_execution_invalid",
+        "strict_execution_mode_invalid",
+        "strict_execution_target_unavailable",
+        "strict_operation_invalid",
+        "resource_limit_exceeded",
+        "output_contract_violation",
+    }
+)
+
+
+def _strict_worker_adapter(
+    args: argparse.Namespace, run_dir: Path
+) -> StrictWorkflowVariableRuntimeAdapter:
+    mode = args.strict_runtime_mode
+    if mode not in {"isolated", "authorized_codex"}:
+        raise OwsError("strict workflow runtime is not supported")
+    try:
+        adapter = StrictWorkflowVariableRuntimeAdapter.from_manifest_claim(
+            run_dir.parent,
+            run_dir.name,
+            allowed_roots=tuple(args.allowed_root),
+        )
+        manifest = adapter._verified_manifest
+        definition = adapter.pinned_definition
+        if manifest is None or definition is None:
+            raise ValueError
+        has_codex_jobs = _definition_contains_codex_job(definition)
+        expected_mode = "authorized_codex" if has_codex_jobs else "isolated"
+        if mode != expected_mode:
+            raise ValueError
+        if args.workspace_root is None:
+            raise ValueError
+        workspace_text = AllowedPathPolicy(tuple(args.allowed_root)).validate_cwd(
+            str(args.workspace_root)
+        )
+        if os.path.normcase(workspace_text) != os.path.normcase(manifest.workspace_root):
+            raise ValueError
+        workspace = Path(workspace_text)
+        state_root = run_dir.parent.resolve(strict=True)
+        if not os.access(workspace, os.W_OK) or (
+            workspace == state_root
+            or workspace.is_relative_to(state_root)
+            or state_root.is_relative_to(workspace)
+        ):
+            raise ValueError
+        if mode == "authorized_codex" and (
+            type(args.codex_bridge_port) is not int
+            or not 1 <= args.codex_bridge_port <= 65535
+            or not os.environ.get(CONTROL_TOKEN_ENV, "").strip()
+        ):
+            raise ValueError
+        if mode == "isolated" and args.codex_bridge_port is not None:
+            raise ValueError
+        return adapter
+    except OwsError:
+        raise
+    except Exception:
+        raise OwsError("strict workflow request binding is invalid") from None
+
+
+def _definition_contains_codex_job(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("call") == "codex-job":
+            return True
+        return any(_definition_contains_codex_job(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_definition_contains_codex_job(child) for child in value)
+    return False
+
+
+def _strict_failure_reason(error: BaseException) -> str:
+    reason_code = getattr(error, "reason_code", None)
+    if type(reason_code) is str and reason_code in _STRICT_REASON_CODES:
+        return reason_code
+    return "strict_execution_uncertain"
+
+
+def _strict_terminal_envelope(
+    adapter: StrictWorkflowVariableRuntimeAdapter,
+    *,
+    run_id: str,
+    status: str,
+    reason_code: str | None,
+    result: Any = None,
+) -> dict[str, Any]:
+    if status not in {"succeeded", "failed", "needs_reconciliation"}:
+        raise OwsError("strict terminal status is invalid")
+    identity = adapter.checkpoint_identity
+    envelope: dict[str, Any] = {
+        "format_version": 1,
+        "status": status,
+        "reason_code": reason_code,
+        "run_id": run_id,
+        "workflow_id": identity["workflow_id"],
+        "binding_identity": identity,
+    }
+    if status == "succeeded":
+        if reason_code is not None:
+            raise OwsError("strict terminal result is invalid")
+        contract = adapter.compiled_contract
+        try:
+            envelope["result"] = validate_output(contract, result)
+        except ContractOutputInvalid:
+            raise
+        except Exception:
+            raise ContractOutputInvalid() from None
+    elif result is not None:
+        raise OwsError("strict failure result is invalid")
+    return envelope
+
+
+def _write_strict_terminal(run_dir: Path, envelope: dict[str, Any]) -> None:
+    path = run_dir / "strict-terminal.json"
+    if path.is_symlink():
+        raise OwsError("strict terminal evidence is unavailable")
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raise OwsError("strict terminal evidence is unavailable") from None
+        if canonical_json(existing) != canonical_json(envelope):
+            raise OwsError("strict terminal evidence conflicts with the DBOS result")
+        return
+    _write_json(path, envelope)
+
+
+def _wait_for_strict_result(
+    database_path: Path,
+    workflow_id: str,
+    timeout: float,
+    shutdown_file: Path | None,
+) -> tuple[Any | None, str | None]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if shutdown_file is not None and shutdown_file.is_file():
+            raise WorkerShutdownRequested("workflow worker shutdown was requested")
+        status = _read_workflow_status(database_path, workflow_id)
+        if status in {"SUCCESS", "SUCCEEDED"}:
+            try:
+                handle: Any = DBOS.retrieve_workflow(workflow_id)
+                return handle.get_result(), None
+            except Exception as error:
+                return None, _strict_failure_reason(error)
+        if status in {"ERROR", "CANCELLED"}:
+            try:
+                handle = DBOS.retrieve_workflow(workflow_id)
+                handle.get_result()
+            except Exception as error:
+                return None, _strict_failure_reason(error)
+            return None, "strict_execution_uncertain"
+        time.sleep(0.05)
+    raise TimeoutError("strict workflow completion was not confirmed")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     run_dir = args.run_dir.resolve()
-    manifest, definition_text, input_data = load_run_request(
-        run_dir,
-        allowed_roots=tuple(args.allowed_root),
-    )
-    if manifest.get("run_format_version") == 2:
-        raise OwsError("strict workflow runtime is not supported")
+    strict_adapter: StrictWorkflowVariableRuntimeAdapter | None = None
+    strict_execution_mode = args.strict_runtime_mode
+    manifest: dict[str, Any]
+    definition_text: str
+    input_data: Any
+    if strict_execution_mode is not None:
+        strict_adapter = _strict_worker_adapter(args, run_dir)
+        if strict_execution_mode == "authorized_codex":
+            os.environ["CODEXBRIDGE_WORKFLOW_BRIDGE_PORT"] = str(args.codex_bridge_port)
+        verified_manifest = strict_adapter._verified_manifest
+        if verified_manifest is None:
+            raise OwsError("strict workflow request binding is invalid")
+        manifest = verified_manifest.to_dict()
+        definition_text = ""
+        input_data = strict_adapter.normalized_input()
+    else:
+        manifest, definition_text, input_data = load_run_request(
+            run_dir,
+            allowed_roots=tuple(args.allowed_root),
+        )
+        if manifest.get("run_format_version") == 2:
+            raise OwsError("strict workflow runtime is not supported")
     startup_override = args.startup_file.resolve() if args.startup_file is not None else None
     if startup_override is not None:
         try:
@@ -1141,21 +1323,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ValueError as error:
             raise OwsError("--startup-file must be inside the run directory") from error
     database_path = run_dir / "dbos.sqlite"
-    control = manifest.get("control", {})
+    control = manifest.get("control", {}) if strict_adapter is None else {}
     if not isinstance(control, dict):
         raise OwsError("manifest control must be an object")
-    codex_job_live = control.get("codex_job_live", False)
-    if not isinstance(codex_job_live, bool):
-        raise OwsError("manifest codex_job_live must be a boolean")
-    if codex_job_live and manifest.get("mode") != "codex-job-live":
-        raise OwsError("codex-job live mode does not match the run manifest")
-    if manifest.get("mode") == "codex-job-live" and not codex_job_live:
-        raise OwsError("codex-job live mode is missing from manifest control")
-    manifest_workflow_id = manifest.get("workflow_id")
-    workflow_id: str | None = (
-        manifest_workflow_id if isinstance(manifest_workflow_id, str) else None
-    )
-    if codex_job_live:
+    if strict_adapter is not None:
+        codex_job_live = strict_execution_mode == "authorized_codex"
+        manifest_workflow_id = strict_adapter.checkpoint_identity.get("workflow_id")
+        workflow_id: str | None = (
+            manifest_workflow_id if isinstance(manifest_workflow_id, str) else None
+        )
+    else:
+        codex_job_live = control.get("codex_job_live", False)
+        if not isinstance(codex_job_live, bool):
+            raise OwsError("manifest codex_job_live must be a boolean")
+        if codex_job_live and manifest.get("mode") != "codex-job-live":
+            raise OwsError("codex-job live mode does not match the run manifest")
+        if manifest.get("mode") == "codex-job-live" and not codex_job_live:
+            raise OwsError("codex-job live mode is missing from manifest control")
+        manifest_workflow_id = manifest.get("workflow_id")
+        workflow_id = manifest_workflow_id if isinstance(manifest_workflow_id, str) else None
+    if codex_job_live and strict_adapter is None:
         if not isinstance(workflow_id, str) or not workflow_id:
             raise OwsError("codex-job live mode requires a pre-generated workflow_id")
         if args.workspace_root is not None:
@@ -1177,6 +1364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "workspace_root": str(workspace_root),
                 "allowed_roots": list(args.allowed_root),
             }
+    elif strict_adapter is not None and not isinstance(workflow_id, str):
+        raise OwsError("strict workflow requires a verified workflow ID")
 
     shutdown_file: Path | None = None
     if args.shutdown_file is not None:
@@ -1246,6 +1435,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         stage = "worker_setup"
         if args.mode == "start":
+            handle: Any
             heartbeat_stop = threading.Event()
             heartbeat_thread = threading.Thread(
                 target=_heartbeat,
@@ -1254,31 +1444,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 daemon=True,
             )
             heartbeat_thread.start()
-            workflow_arguments = (
-                definition_text,
-                manifest["definition_sha256"],
-                input_data,
-                manifest["input_sha256"],
-                str(run_dir / "task-events.jsonl"),
-                control,
-                int(manifest.get("max_tasks", 10_000)),
-                True,
-            )
             stage = "workflow_start"
-            if codex_job_live:
-                requested_workflow_id = str(manifest["workflow_id"])
+            if strict_adapter is not None:
+                requested_workflow_id = str(workflow_id)
                 with SetWorkflowID(requested_workflow_id):
                     handle = DBOS.start_workflow(
-                        execute_ows_workflow,
-                        *workflow_arguments,
+                        execute_strict_ows_workflow,
+                        run_dir.name,
+                        str(run_dir.parent),
+                        list(args.allowed_root),
+                        str(strict_execution_mode),
                     )
                 if handle.workflow_id != requested_workflow_id:
-                    raise OwsError("DBOS workflow_id differs from the pre-generated manifest ID")
+                    raise OwsError("DBOS workflow_id differs from the strict manifest ID")
             else:
-                handle = DBOS.start_workflow(execute_ows_workflow, *workflow_arguments)
+                workflow_arguments = (
+                    definition_text,
+                    cast(Any, manifest["definition_sha256"]),
+                    input_data,
+                    cast(Any, manifest["input_sha256"]),
+                    str(run_dir / "task-events.jsonl"),
+                    control,
+                    int(cast(Any, manifest.get("max_tasks", 10_000))),
+                    True,
+                )
+                if codex_job_live:
+                    requested_workflow_id = str(manifest["workflow_id"])
+                    with SetWorkflowID(requested_workflow_id):
+                        handle = DBOS.start_workflow(
+                            execute_ows_workflow,
+                            *workflow_arguments,
+                        )
+                    if handle.workflow_id != requested_workflow_id:
+                        raise OwsError(
+                            "DBOS workflow_id differs from the pre-generated manifest ID"
+                        )
+                else:
+                    handle = DBOS.start_workflow(execute_ows_workflow, *workflow_arguments)
             workflow_id = handle.workflow_id
             stage = "workflow_metadata_persist"
-            _persist_workflow_id(run_dir, manifest, workflow_id)
+            if strict_adapter is None:
+                _persist_workflow_id(run_dir, manifest, workflow_id)
             startup_path = run_dir / "start-worker.json"
         else:
             stage = "workflow_recovery"
@@ -1308,11 +1514,77 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         stage = "workflow_wait"
         try:
+            if strict_adapter is not None:
+                strict_result, failure_reason = _wait_for_strict_result(
+                    database_path,
+                    workflow_id,
+                    args.timeout_seconds,
+                    shutdown_file,
+                )
+                if failure_reason is None:
+                    expected_binding = strict_adapter.checkpoint_identity
+                    if (
+                        type(strict_result) is not dict
+                        or set(strict_result)
+                        != {
+                            "format_version",
+                            "status",
+                            "reason_code",
+                            "run_id",
+                            "workflow_id",
+                            "binding",
+                            "result",
+                        }
+                        or strict_result.get("format_version") != 1
+                        or strict_result.get("status") != "succeeded"
+                        or strict_result.get("reason_code") is not None
+                        or strict_result.get("run_id") != run_dir.name
+                        or strict_result.get("workflow_id") != workflow_id
+                        or strict_result.get("binding") != expected_binding
+                        or _read_workflow_status(database_path, workflow_id)
+                        not in {"SUCCESS", "SUCCEEDED"}
+                    ):
+                        failure_reason = "strict_execution_uncertain"
+                if failure_reason is None:
+                    try:
+                        assert isinstance(strict_result, dict)
+                        terminal = _strict_terminal_envelope(
+                            strict_adapter,
+                            run_id=run_dir.name,
+                            status="succeeded",
+                            reason_code=None,
+                            result=strict_result["result"],
+                        )
+                    except ContractOutputInvalid:
+                        failure_reason = "output_contract_violation"
+                if failure_reason is not None:
+                    terminal_status = (
+                        "needs_reconciliation"
+                        if failure_reason == "strict_execution_uncertain"
+                        else "failed"
+                    )
+                    terminal = _strict_terminal_envelope(
+                        strict_adapter,
+                        run_id=run_dir.name,
+                        status=terminal_status,
+                        reason_code=failure_reason,
+                    )
+                _write_strict_terminal(run_dir, terminal)
+                append_lifecycle_event(
+                    run_dir,
+                    source="worker",
+                    event="strict_terminal_persisted",
+                    run_id=run_dir.name,
+                    workflow_id=workflow_id,
+                    launch_id=launch_id,
+                    mode=args.mode,
+                    pid=worker_identity["pid"],
+                    state=terminal["status"],
+                    reason_code=terminal.get("reason_code"),
+                )
+                return 0 if terminal["status"] == "succeeded" else 1
             result = _wait_for_result(
-                database_path,
-                workflow_id,
-                args.timeout_seconds,
-                shutdown_file,
+                database_path, workflow_id, args.timeout_seconds, shutdown_file
             )
         except WorkerShutdownRequested:
             append_lifecycle_event(
