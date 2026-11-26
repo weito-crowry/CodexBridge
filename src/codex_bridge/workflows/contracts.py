@@ -557,6 +557,38 @@ def _validate_contract(
     return canonical, input_schema, output_schema, variables
 
 
+def validate_schema_definition(schema: object) -> dict[str, Any]:
+    """Validate and detach a schema using the existing Workflow subset.
+
+    Unlike input/output contracts, this entry point permits any JSON root
+    schema. It deliberately performs no default insertion.
+    """
+    if type(schema) is not dict:
+        _raise(ContractInvalid)
+    canonical = _serialize_json(schema, max_bytes=MAX_CONTRACT_BYTES)
+    isolated = parse_strict_json(canonical)
+    root = _validate_root_schema(isolated, require_object_root=False)
+    budget = _SchemaBudget()
+    _validate_schema_shape(root, budget=budget, depth=1)
+    _validate_references(root)
+    _check_schema_and_defaults(root)
+    return deepcopy(root)
+
+
+def validate_json_value_schema(schema: object, value: Any) -> None:
+    """Validate one JSON value against a detached, bounded Workflow schema."""
+    isolated_schema = validate_schema_definition(schema)
+    _check_json_tree(
+        value,
+        invalid_error=ContractOutputInvalid,
+        max_depth=MAX_VALUE_DEPTH,
+        max_object_properties=MAX_OBJECT_PROPERTIES,
+        max_array_length=MAX_ARRAY_LENGTH,
+    )
+    if not _validator_accepts(isolated_schema, value):
+        _raise(ContractOutputInvalid)
+
+
 @dataclass(frozen=True, slots=True)
 class CompiledContract:
     """Immutable canonical snapshot; properties return newly parsed copies."""
@@ -757,4 +789,6 @@ __all__ = [
     "parse_strict_json",
     "sha256_json",
     "validate_output",
+    "validate_json_value_schema",
+    "validate_schema_definition",
 ]
