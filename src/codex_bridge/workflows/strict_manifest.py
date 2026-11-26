@@ -849,14 +849,11 @@ def _resolve_run_directory(state_root: Path, run_id: str, *, create: bool) -> Pa
 
 def _validate_no_overlap(first: Path, second: Path) -> None:
     try:
-        left = os.path.normcase(os.fspath(first.resolve(strict=True)))
-        right = os.path.normcase(os.fspath(second.resolve(strict=True)))
-        common = os.path.commonpath((left, right))
-        if common in {left, right}:
-            _raise_snapshot_error()
-    except StrictWorkflowSnapshotError:
-        raise
-    except Exception:
+        left = first.resolve(strict=True)
+        right = second.resolve(strict=True)
+    except (OSError, RuntimeError):
+        _raise_snapshot_error()
+    if left == right or left.is_relative_to(right) or right.is_relative_to(left):
         _raise_snapshot_error()
 
 
