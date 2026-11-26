@@ -1,10 +1,10 @@
 # D1-I7-C2 isolated strict runtime evidence
 
-- **実装状態:** C2 core ACCEPTED with documented caveats by ChatGPT review of `98ec2f85e71f28d6eda5c79856bf345193b9f8b5`; concrete follow-up implemented in I8-A and PENDING_CHATGPT_REVIEW。I7 final acceptance remains pending。
+- **実装状態:** I7-C2 / I7 ACCEPTED with documented caveats by ChatGPT review of `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f`。I8-Aも同reviewでACCEPTED with documented caveats。I8-B final cleanup is IMPLEMENTED / PENDING_CHATGPT_REVIEW。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I7-C1 commit `50d7e54e369301e70492768cac58090bbdebd746` (ChatGPT ACCEPTED with documented caveats)。
 - **範囲:** reserved strict v2のinternal isolated admission、manager/worker/DBOS lifecycle、verified status/result/ownership、既存Codex job durable adapter接続。
-- **全体境界:** I7はIN_PROGRESS、I2はDEFERRED / NON-BLOCKING、D1はDRAFT。server default/public strict admissionはOFFです。isolated strict実行は明示的なinternal constructor opt-inに限ります。
+- **全体境界:** I7はACCEPTED with documented caveats、I8-Bはreview待ち、I8全体acceptance/go-no-goは未完了です。I2はDEFERRED / NON-BLOCKING、D1はDRAFT。server default/public strict admissionはOFFです。isolated strict実行は明示的なinternal constructor opt-inに限ります。
 
 ## I7-C1 review受入
 
@@ -48,6 +48,8 @@ task/event projectionはstrict runtimeのnode journalがないため静的pinned
 
 ChatGPT GitHub review of `98ec2f85e71f28d6eda5c79856bf345193b9f8b5` accepted the I7-C2 isolated admission/worker/DBOS core with a remaining concrete fix and kept final I7 acceptance pending that fix. I8-A completed the follow-up; this does not itself record ChatGPT acceptance of the fix.
 
+ChatGPT GitHub review of `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f` subsequently accepted I7-C2/I7 with documented caveats and accepted the I8-A workflow integration, including the profile-1 identity fix, pending-job reconciliation, ownership verification, and isolated worker process-death recovery. The reported full suite was 3,955 passed / 24 skipped / 3 failed, so it was not all-green. I8-B records the test-double repair and final suite; I8 overall acceptance remains pending.
+
 レビュー時に報告した`333 passed / 2 skipped`は、C2専用12、I4-C/I7-B 39、I5/I6-C/I7-C1 52、manager/entry/Codex job/service 122/1、HTTP/MCP/task/saved-run 108/1の複数group合算です。単一aggregate rerunではありません。C1 reviewの706 passed / 10 skipped / 0 failedとは別の結果です。
 
 I8-Aでは次を修正・確認しました。
@@ -59,7 +61,9 @@ I8-Aでは次を修正・確認しました。
 
 I8-A専用integration suiteは7 passed、status/graph/ownership/identity repair targeted casesは9 passedです。Full `uv run --no-sync pytest`は3,955 passed / 24 skipped / 3 failed (3,982 collected)でした。3 failureは未変更`server.py` shutdown/start cleanupが`tests/test_ui_server.py`内の`FakeBridge`にない`drain_final_answer_writes`を呼ぶものです。failureは今回変更外ですが、clean baselineは再実行しておらず、既存baseline failureとは確定していません。CPP/account-auth suitesはfull runでpassしました。Ruff check/format、mypy (156 source files)、compileall、diff checkもpassです。
 
-I8-A full test executionにより、C2時点でNOT_RUNだったfull pytest/CPP/account-authとisolated in-flight process-death recoveryは更新済みです。live Bridge/API、real external Codex job、production/shared DB/migration、WAL metadataは引き続きNOT_RUNです。public admissionはOFF、I7 final acceptanceとD1はreview待ちです。
+I8-A full test executionにより、C2時点でNOT_RUNだったfull pytest/CPP/account-authとisolated in-flight process-death recoveryは更新済みです。live Bridge/API、real external Codex job、production/shared DB/migration、WAL metadataは引き続きNOT_RUNです。I7はACCEPTED with documented caveats、I8-B/I8 final acceptanceはreview待ちです。public admissionはOFF、D1はDRAFTです。
+
+I8-Bでは上記3件の`tests/test_ui_server.py` test-double failureを、production codeに触れず修正しました。更新後のWindows native full `uv run --no-sync pytest`は3,959 passed / 24 skipped / 0 failed (3,983 collected)です。I8-A当時の3,955/24/3は当時の結果として保持し、I8-Bの最終値と混同しません。詳細なskip、D1/PD traceability、operator gate、isolated go/no-goは[D1-I8-B evidence](D1-I8B-final-acceptance-evidence.md)に記録しています。I8-BはChatGPT review待ち、I8全体とD1のfinal acceptanceは未確定です。
 
 ## 変更path
 

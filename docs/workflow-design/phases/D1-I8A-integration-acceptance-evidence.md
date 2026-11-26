@@ -1,14 +1,16 @@
 # D1-I8-A integration verification and targeted repair evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED with documented caveats by ChatGPT review of `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f`。後続のI8-B cleanupは別証跡でreview待ちです。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **開始HEAD:** `98ec2f85e71f28d6eda5c79856bf345193b9f8b5`。
 - **範囲:** I7-C2 review follow-up、strict profile task identity/terminal mapping、pinned task identityによるshutdown ownership、isolated HTTP/MCP/DBOS統合、in-flight worker process-death recovery。
-- **全体境界:** I7最終受入はChatGPT review待ち、I8-Aは本証跡のreview待ちです。I8全体とD1は未承認、D1はDRAFT、I2はDEFERRED / NON-BLOCKING、public strict admissionはOFFです。
+- **全体境界:** I7-C2/I7とI8-AはChatGPT reviewでACCEPTED with documented caveatsです。I8-BとI8全体acceptance/go-no-goは未完了です。D1はDRAFT、I2はDEFERRED / NON-BLOCKING、public strict admissionはOFFです。
 
 ## Review記録と対象修正
 
 ChatGPT GitHub review of `98ec2f85e71f28d6eda5c79856bf345193b9f8b5` はI7-C2のisolated admission/worker/DBOS coreを受け入れ、具体修正を残してI7最終受入を保留しました。指摘のprofile-1 ledger identity不一致を修正し、同時に未確定Codex job状態をterminal failureと誤認しないことを確認しました。
+
+ChatGPT GitHub review of `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f` はI7-C2/I7とI8-A workflow integrationをACCEPTED with documented caveatsとしました。profile-1 identity fix、pending job reconciliation、pinned task ownership、実isolated worker process-death recoveryを含みます。full suiteは3,955 passed / 24 skipped / 3 failedでありall-greenではありませんでした。I8-Bでは指定されたUI server test-double mismatchをtest-onlyで修正しました。修正後の最終suiteは[I8-B evidence](D1-I8B-final-acceptance-evidence.md)に記録し、I8全体の最終受入はpendingです。
 
 profile-1のstatus readerはgraphのJSON Pointer node IDではなくInterpreterと同じ`do[0].scope.do[0].task` identityを期待します。profile-2/3も実行側のtask pathと、profile-3のnormalized OWS input上のenabled item順に一致するshared helperを使います。Codex shutdown ownership readerも、strict reservation/pinned definitionから計算したtask identityをworkflow ID/request keyと合わせて照合します。pinned taskにないledger rowはturn ownershipへ追加せず、ownershipをincompleteとして報告します。legacy reader呼出しは従来引数のままです。
 
@@ -39,7 +41,7 @@ I7-C2の過去の集約値は **333 passed / 2 skippedを複数suiteの合計と
 | 09..10 | `test_workflow_d1_i0_baseline.py`, `test_workflow_definitions.py`, `test_workflow_d1_i6a_definition_repository_http.py` — legacy golden/immutable revision | Full suite実行。旧responseの個別再承認ではない |
 | 11..16 | `test_workflow_d1_i4b_variable_logic.py`, `test_workflow_d1_i4c_mutations.py`, `test_workflow_d1_i7a_variable_call_validation.py`, `test_workflow_d1_i7b_variable_runtime.py` — declarations/operations/execution key | Full suite実行 |
 | 17..21 | `test_workflow_d1_i4c_mutations.py`, `test_workflow_d1_i7c1_durable_execution.py`, `test_workflow_d1_i8a_integration.py::test_strict_worker_recovers_post_commit_process_death_before_dbos_checkpoint` — CAS/replay/crash | isolated DBOS process-death recovery確認。cross-database atomicityは主張しない |
-| 22 | I8-Aでは対応test pathなし。`test_workflow_d1_i5b4c_reserved_readers.py`はprepared coordinator orderingのtestであり、subflow return contract testではない | D1-22 mock return-contract caseは本sliceで再検証していない。D6実subflowは今回の対象外 |
+| 22 | `test_workflow_d1_i1_contract_core.py::test_d1_22_mock_child_output_is_validated_at_contract_boundary` — mock child outputを既存`validate_output`で検証 | child output schema境界のみを検証。parentへのexplicit return routingはsubflow primitiveがないためD6へdeferし、D1-22全体をPASSとはしない |
 | 23 | `test_workflow_d1_i6c_saved_run_contract.py`, `test_workflow_d1_i7c1_durable_execution.py`, `test_workflow_d1_i7c2_isolated_runtime.py`, `test_workflow_d1_i8a_integration.py` — output validation/result | valid resultとinvalid outputのHTTP/MCP 409を確認 |
 | 24..26 | `test_workflow_d1_i1_contract_core.py`, `test_workflow_d1_i6a_definition_repository_http.py`, `test_workflow_d1_i6b_mcp_repository_selection.py` — secret/ref/resource caps | Full suite実行。hard WAL quotaは115で別扱い |
 | 27 | `test_workflow_d1_i7b_variable_runtime.py`, `test_workflows_api.py`, `test_workflows_multi_api.py`, `test_workflow_saved_execution.py` — OWS/legacy behavior | Full suite実行 |
@@ -74,16 +76,22 @@ I7-C2の過去の集約値は **333 passed / 2 skippedを複数suiteの合計と
 | `python -m compileall -q src/codex_bridge` | PASS |
 | `git diff --check` | PASS |
 
-Full pytestの3 failureはI8-AのD1 workflow/API/manager変更と関係する証拠はなく、別のUI shutdown test-double契約に限定されます。一方でこのrun全体をall-greenとは記録しません。I8-AのChatGPT reviewとI7 final acceptanceは保留です。
+このfull pytestの3 failureは未変更production `server.py`のdrain呼出しとtest-only `FakeBridge`の不一致でした。このrun自体はall-greenではありません。I8-Bでtest doubleとshutdown event順序を修正し、その後のfull runはI8-B証跡に記録しました。
 
 ## 残件と明示的defer
 
 - D1-93..107のI2 protectionsはDEFERRED / NON-BLOCKINGのままです。
 - D1-115のhard WAL/SHM byte quota、WAL metadata不変性は検査していません。既存のoperator migration/backup/compatibility/legacy identity gateはpytestで置換せず、共有/production DBに触れていません。
-- D1-22 subflow return-contract mock caseはこのsuiteでは対応testを確認できず、未再検証として残します。実subflow/D6接続は対象外です。
+- D1-22のchild output schema境界はI8-B mock testで確認します。explicit parent return routingと実subflowは現行runtimeにprimitiveがないためD6へdeferします。
 - Static task projectionはpinned topologyのみ、task/event coverageはpartial、event listは空のままです。新しいruntime UI/event schemaは実装していません。
 - Public strict admission OFF、server既定composition変更なし。production migration/enablement、live Bridge/API、real external Codex job、real DBOS remote behaviorは未実施です。
-- D1全体の最終受入/go-no-goは未実施です。次の段階はこのI8-A証跡のChatGPT reviewとUI server test-double失敗の担当境界整理を含む全体gate確認です。
+- D1全体の最終受入/go-no-goは未実施です。I8-B cleanupのreview後に残存gateを別途判断します。
+
+## I8-B後続記録
+
+I8-Bで`tests/test_ui_server.py`の`FakeBridge`に`drain_final_answer_writes(*, close: bool)`の記録を追加し、通常shutdownとUI startup failureの両方で`app.shutdown`後に`close=True`のdrainが呼ばれる順序をassertしました。production `server.py`は変更していません。3件はI8-A full run時の結果として保持し、baseline実行済みとは扱いません。
+
+I8-B追加後の全体pytest・PD crosswalk・operator rollout/go-no-goは[D1-I8-B evidence](D1-I8B-final-acceptance-evidence.md)に記録します。
 
 ## 変更path
 
