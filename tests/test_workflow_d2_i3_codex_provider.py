@@ -239,6 +239,135 @@ def test_provider_preflight_and_dispatch_use_only_fake_local_bridge(
     assert CONTROL_TOKEN.encode() not in post["body"]
 
 
+@pytest.mark.parametrize(
+    "title_assignment",
+    [
+        {"status": "assigned", "name": "Task title"},
+        {"status": "failed"},
+    ],
+)
+def test_title_assignment_metadata_does_not_affect_dispatch_receipt(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+    title_assignment: dict[str, str],
+) -> None:
+    fake_api.state.create_body = {
+        "thread_id": THREAD_ID,
+        "turn_id": TURN_ID,
+        "state": "in_progress",
+        "title_assignment": title_assignment,
+        "future_metadata": {"ignored": True},
+    }
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = provider.prepare(_invoke(context), context)
+
+    receipt = provider.dispatch(prepared, "cba-" + "f" * 64)
+
+    assert receipt.disposition == "ACCEPTED"
+    assert receipt.handle == {"thread_id": THREAD_ID, "turn_id": TURN_ID}
+    assert receipt.remote_state == "in_progress"
+    assert receipt.error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("assignment_status", ["assigned", "failed"])
+async def test_existing_ui_control_route_response_is_accepted_by_agent_provider(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+    assignment_status: str,
+) -> None:
+    from codex_bridge.activity import ActivityStore
+    from codex_bridge.ui_api import create_ui_app
+    from tests.test_ui_control import (
+        FakeBridge as UiFakeBridge,
+    )
+    from tests.test_ui_control import (
+        config as ui_config,
+    )
+    from tests.test_ui_control import (
+        request as ui_request,
+    )
+    from tests.test_ui_control import (
+        route as ui_route,
+    )
+
+    if assignment_status == "failed":
+
+        class FailedTitleBridge(UiFakeBridge):
+            async def start(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                result = await super().start(*args, **kwargs)
+                result["title_assignment"] = {"status": "failed"}
+                result["title_warning"] = "Thread name could not be set"
+                return result
+
+        bridge = FailedTitleBridge()
+    else:
+        bridge = UiFakeBridge()
+    app = create_ui_app(bridge, ActivityStore(), ui_config(tmp_path))
+    request_id = "cba-" + "7" * 64
+    body = json.dumps(
+        {
+            "client_request_id": request_id,
+            "cwd": str(tmp_path.resolve()),
+            "prompt": "Start an isolated workflow task.",
+            "model": "model-a",
+            "reasoning_effort": "high",
+            "sandbox_mode": "inherit",
+            "title": "  Task title  ",
+        }
+    ).encode("utf-8")
+    route_response = await ui_route(app, "/ui-api/control/threads").endpoint(
+        ui_request(
+            "/ui-api/control/threads",
+            body=body,
+            authorization="Bearer local-control-token",
+        )
+    )
+    api_response = json.loads(route_response.body)
+    assert route_response.status_code == 200
+    if assignment_status == "assigned":
+        assert api_response["title_assignment"] == {"status": "assigned", "name": "Task title"}
+    else:
+        assert api_response["title_assignment"] == {"status": "failed"}
+
+    fake_api.state.create_body = api_response
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = provider.prepare(_invoke(context), context)
+
+    receipt = provider.dispatch(prepared, request_id)
+
+    assert receipt.disposition == "ACCEPTED"
+    assert receipt.handle == {
+        "thread_id": "native-thread-1",
+        "turn_id": "native-turn-1",
+    }
+    assert receipt.remote_state == "in_progress"
+
+
+@pytest.mark.parametrize(
+    "required_response",
+    [
+        {"thread_id": "invalid id", "turn_id": TURN_ID, "state": "in_progress"},
+        {"thread_id": THREAD_ID, "turn_id": TURN_ID, "state": "not_loaded"},
+    ],
+)
+def test_invalid_required_post_receipt_fields_remain_uncertain(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+    required_response: dict[str, str],
+) -> None:
+    fake_api.state.create_body = required_response
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = provider.prepare(_invoke(context), context)
+
+    receipt = provider.dispatch(prepared, "cba-" + "8" * 64)
+
+    assert receipt.disposition == "UNCERTAIN"
+
+
 def test_agent_http_body_limit_is_independent_of_legacy_16k_prompt_limit(
     fake_api: _FakeHTTPServer,
     tmp_path: Path,

@@ -254,6 +254,10 @@ def test_registered_provider_can_reject_an_operation_through_capabilities() -> N
     assert error.value.code == "unsupported_operation"
 
 
+def test_codex_static_capabilities_report_usage_unavailable() -> None:
+    assert codex_agent_capabilities().usage_supported is False
+
+
 @pytest.mark.parametrize(
     "session",
     [

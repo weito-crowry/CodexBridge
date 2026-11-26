@@ -195,7 +195,7 @@ class CodexAgentProvider:
             return DispatchReceipt.uncertain()
         if (
             type(response) is not dict
-            or set(response) != {"thread_id", "turn_id", "state"}
+            or not {"thread_id", "turn_id", "state"}.issubset(response)
             or type(response.get("thread_id")) is not str
             or type(response.get("turn_id")) is not str
             or _CODEX_ID.fullmatch(response["thread_id"]) is None
