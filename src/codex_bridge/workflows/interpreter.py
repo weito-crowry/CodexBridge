@@ -1311,6 +1311,7 @@ def evaluate_jq(
     variables: Mapping[str, Any] | None = None,
     *,
     strict_contract: CompiledContract | None = None,
+    strict_error_boundary: bool = False,
 ) -> Any:
     expression = _required_expression(value, "runtime")
     args = dict(variables or {})
@@ -1322,6 +1323,8 @@ def evaluate_jq(
         )
         outputs = jq.compile(compiled_expression, args=args).input_value(data).all()
     except Exception as error:
+        if strict_contract is not None or strict_error_boundary:
+            raise OwsError("strict workflow jq evaluation failed") from None
         raise OwsError(f"jq evaluation failed for {value!r}: {error}") from error
     return _normalize_jq_outputs(outputs)
 
@@ -1486,7 +1489,11 @@ class Interpreter:
         workflow_input = input_data
         workflow_input_config = self.definition.get("input", {})
         if "from" in workflow_input_config:
-            workflow_input = evaluate_jq(workflow_input_config["from"], input_data)
+            workflow_input = evaluate_jq(
+                workflow_input_config["from"],
+                input_data,
+                strict_error_boundary=self.strict_variable_runtime is not None,
+            )
         context = _WorkflowContext(workflow_input)
         result = self._run_scope(
             self.definition["do"], workflow_input, {}, context, "do", "/do", ()
@@ -1861,6 +1868,20 @@ class Interpreter:
                 evaluated_arguments,
                 node_id=node_id,
                 iteration_vector=iteration_vector,
+            )
+        if (
+            self.strict_variable_runtime is not None
+            and self.strict_variable_runtime.has_durable_task_provider
+        ):
+            return self.strict_variable_runtime.run_durable_task(
+                identity,
+                task_name,
+                operation,
+                task_spec,
+                input_data,
+                variables,
+                node_id,
+                iteration_vector,
             )
         if self.step_runner is not None:
             return self.step_runner(

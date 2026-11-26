@@ -2856,7 +2856,7 @@ def _strict_binding_claim(state_root: Path, run_id: str) -> bool:
         if user_version[0] == 0:
             from .strict_reader_gate import _check_legacy_v0_metadata
 
-            _check_legacy_v0_metadata(connection)
+            _check_legacy_v0_metadata(connection, allow_missing_request_sources=True)
             return False
         if user_version[0] != 1:
             return True

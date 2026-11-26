@@ -1,6 +1,6 @@
 # D1-I7-B strict variable adapter and direct Interpreter evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED (with documented caveats) by ChatGPT GitHub review of `ee3bd96749db6e37ad260297ed6b55e0036d450c`。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** I7-A commit `8dc2399dcd443de13f6d60119a08ef343ba01d09` (ChatGPT ACCEPTED with documented caveats)。
 - **範囲:** 予約済みstrict v2の検証済みpinned contract/sourceからI4 variable ledgerへの内部adapter、root variable projection、strict direct Interpreter integration。
@@ -9,6 +9,10 @@
 ## 先行review記録
 
 ChatGPT GitHub review of `8dc2399dcd443de13f6d60119a08ef343ba01d09` はI7-AをACCEPTED (with documented caveats)としました。review時は947 passed / 11 skipped、専用suite 29 passedです。static validator/definition-reader接続を受け入れ、runtime semantic mismatchesをI7-Bへ繰り越しました。full pytest、CPP/account-auth、live API、実Worker/DBOS/job、WAL metadataは未検証です。I6-C/I6もaccepted with caveatsで、419 passed / 6 skipped、専用11 passedです。corrupt request-source ledgerがあるreplayでID保持前にunavailableとなり得る点はI7-C admission integration時に再確認します。
+
+ChatGPTのGitHub reviewはI7-B direct variable runtimeをACCEPTED (with documented caveats)としました。対象sliceのaggregate結果は580 passed / 8 skipped / 1 failedで、all-greenではありません。唯一のfailureはlegacy `workflow_request_sources` optional table欠落時のreader分類であり、I7-C1で狭く修正して回帰確認しています。I7-B受入は直接Interpreter/variable adapterまでで、DBOS durable recoveryやworker lifecycleの受入を意味しません。
+
+I7-C1 follow-upではlegacy regression testと strict claim/missing manifest/forced-state/malformed schemaのfocused checksを含むsaved execution suiteがC1 executor suiteと合わせて25 passedとなり、I4〜I7C1 / graph / task / service / manager / codex-job focused aggregateは706 passed / 10 skipped / 0 failedでした。I7-B review時の580/8/1は当時の報告として保持し、後続修正で遡及的にall-greenへ書き換えていません。strict jq errorsはsource/error textを含まないsafe messageへ統一し、legacy jq error pathは維持しました。
 
 ## 実装
 
@@ -42,11 +46,11 @@ aggregateの8 skipはWindows symlink privilegeがないhostでの隔離caseで�
 
 ## 残件と境界
 
-- I7-CではDBOS recovery向けに各evaluation phaseのprojectionとprepared mutation argumentsをdurable checkpointへ保存し、recovery時にfuture variable stateからjq payloadやcontrol flowを再計算しない必要があります。I7-Bの直接fresh Interpreter rerunは、既にmutated DBを使ったrecoveryの証明ではありません。
-- I7-Cではworker/runtime adapter、output schema validation、safe reason mapping、isolated admissionを接続します。manager/worker/worker_entryの現在のstrict runtime拒否は維持されています。
-- I6-C caveatのcorrupt/missing request-source ledger replayはI7-Cで境界を再確認します。
+- I7-C1では各evaluation phase projectionとprepared mutation argumentsをdurable checkpointへ保存するinternal DBOS executorを追加しました。I7-Bの直接fresh Interpreter rerunは、既にmutated DBを使ったrecoveryの証明ではなく、actual in-flight process crash/recoveryはI8で検証します。
+- I7-C2ではmanager/worker lifecycle、output/result/status mapping、isolated admissionを接続します。manager/worker/worker_entryの現在のstrict runtime拒否はC2まで維持します。
+- I6-C caveatのcorrupt/missing request-source ledger replayはI7-C2 admission integration時に境界を再確認します。
 - strict run admissionはOFFです。DB migration、public API/MCP契約変更、external Codex実行、output success判定、I8 acceptanceは未実施です。
-- I7-BはChatGPT review待ちです。D1はDRAFT、ADR 0007全体はProposedのままです。
+- I7-BはChatGPT GitHub reviewでACCEPTED (with documented caveats)です。580/8/1のreview時aggregateとC1 regression follow-upはそれぞれ記録どおり保持します。D1はDRAFT、ADR 0007全体はProposedのままです。
 
 ## 変更path
 

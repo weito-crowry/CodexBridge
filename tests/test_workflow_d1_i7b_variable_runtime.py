@@ -370,8 +370,9 @@ def test_cbvars_missing_is_an_error_but_present_null_and_quoted_text_are_preserv
 ) -> None:
     missing_tasks = [{"read_count": {"set": "${ $cbvars.workflow.count }"}}]
     adapter, _run_directory = _reserved_adapter(tmp_path, tasks=missing_tasks)
-    with pytest.raises(OwsError, match="strict workflow variable is missing"):
+    with pytest.raises(OwsError, match="strict workflow jq evaluation failed") as error:
         Interpreter(adapter.pinned_definition, strict_variable_runtime=adapter).run({})
+    assert "$cbvars.workflow.count" not in str(error.value)
 
     null_tasks = [
         {

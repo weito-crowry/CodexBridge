@@ -394,14 +394,21 @@ def _user_version(connection: sqlite3.Connection) -> int:
     return row[0]
 
 
-def _check_legacy_v0_metadata(connection: sqlite3.Connection) -> None:
+def _check_legacy_v0_metadata(
+    connection: sqlite3.Connection,
+    *,
+    allow_missing_request_sources: bool = False,
+) -> None:
     tables = frozenset(
         str(row[0])
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     )
-    if tables != _LEGACY_TABLES:
+    expected_tables = _LEGACY_TABLES
+    if allow_missing_request_sources and tables == _LEGACY_TABLES - {"workflow_request_sources"}:
+        expected_tables = tables
+    if tables != expected_tables:
         _fail()
     if (
         connection.execute(
@@ -411,6 +418,8 @@ def _check_legacy_v0_metadata(connection: sqlite3.Connection) -> None:
     ):
         _fail()
     for table, expected_columns in _LEGACY_COLUMNS.items():
+        if table not in tables:
+            continue
         actual = tuple(
             (str(row["name"]), str(row["type"]).upper())
             for row in connection.execute(f"PRAGMA table_info({table})").fetchall()

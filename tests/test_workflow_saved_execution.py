@@ -17,6 +17,10 @@ from codex_bridge.workflows.service import (
     WorkflowService,
     WorkflowServiceUnavailable,
 )
+from codex_bridge.workflows.strict_requests import (
+    StrictWorkflowRequestInput,
+    StrictWorkflowRequestStore,
+)
 from tests.test_workflows_service import FakeWorkerManager, _workflow_yaml
 
 
@@ -333,6 +337,9 @@ async def test_legacy_request_database_reads_without_creating_source_table(
     with sqlite3.connect(manager.state_root / "requests.sqlite") as connection:
         connection.execute("DROP TABLE workflow_request_sources")
 
+    database = manager.state_root / "requests.sqlite"
+    database_before_read = database.read_bytes()
+    assert not workflow_service_module._strict_binding_claim(manager.state_root, accepted.run_id)
     assert (await service.get_workflow(accepted.workflow_id)).workflow_id == accepted.workflow_id
     replayed = await service.start_workflow(
         client_request_id="legacy-inline-request",
@@ -347,7 +354,91 @@ async def test_legacy_request_database_reads_without_creating_source_table(
             "AND name = 'workflow_request_sources'"
         ).fetchone()
     assert source_table is None
+    assert database.read_bytes() == database_before_read
     assert len(manager.start_calls) == 1
+
+
+def test_actual_strict_binding_remains_a_candidate_without_manifest(tmp_path: Path) -> None:
+    state_root = tmp_path / "strict-state"
+    store = StrictWorkflowRequestStore(state_root)
+    store.initialize_new_database()
+    request = StrictWorkflowRequestInput(
+        client_request_id="strict-binding-claim-0001",
+        workflow_id="22222222-2222-4222-8222-222222222222",
+        run_id="run-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        request_digest="a" * 64,
+        definition_id="11111111-1111-4111-8111-111111111111",
+        definition_revision=1,
+        source_sha256="b" * 64,
+        contract_sha256="c" * 64,
+        binding_digest="d" * 64,
+        normalized_input_sha256="e" * 64,
+        created_at="2026-11-26T00:00:00+00:00",
+    )
+    store.reserve_strict(request)
+
+    assert workflow_service_module._strict_request_candidate(state_root, request.run_id)
+
+
+@pytest.mark.asyncio
+async def test_forced_state_does_not_mask_strict_binding_when_manifest_is_missing(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "strict-state"
+    workspace = tmp_path / "workspace"
+    state_root.mkdir()
+    workspace.mkdir()
+    store = StrictWorkflowRequestStore(state_root)
+    store.initialize_new_database()
+    request = StrictWorkflowRequestInput(
+        client_request_id="strict-binding-forced-state-0001",
+        workflow_id="22222222-2222-4222-8222-222222222222",
+        run_id="run-cccccccccccccccccccccccccccccccc",
+        request_digest="a" * 64,
+        definition_id="11111111-1111-4111-8111-111111111111",
+        definition_revision=1,
+        source_sha256="b" * 64,
+        contract_sha256="c" * 64,
+        binding_digest="d" * 64,
+        normalized_input_sha256="e" * 64,
+        created_at="2026-11-26T00:00:00+00:00",
+    )
+    store.reserve_strict(request)
+    row = workflow_service_module._find_request(state_root, request.client_request_id)
+    assert row is not None
+    service = WorkflowService(
+        FakeWorkerManager(state_root, workspace, allowed_roots=(tmp_path,)),
+        codex_bridge_port=18001,
+    )
+
+    snapshot = await service._snapshot_for_row(row, forced_state="failed_to_start")
+
+    assert snapshot.status == "needs_reconciliation"
+    assert snapshot._strict_metadata is not None
+
+
+def test_malformed_legacy_schema_remains_a_strict_candidate(tmp_path: Path) -> None:
+    state_root = tmp_path / "malformed-state"
+    state_root.mkdir()
+    with sqlite3.connect(state_root / "requests.sqlite") as connection:
+        connection.execute("CREATE TABLE workflow_requests (unexpected TEXT)")
+        connection.execute("PRAGMA user_version=0")
+
+    assert workflow_service_module._strict_binding_claim(
+        state_root, "run-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+
+
+def test_malformed_manifest_with_strict_version_claim_is_never_legacy(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "malformed-manifest-state"
+    run_id = "run-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    run_directory = state_root / run_id
+    run_directory.mkdir(parents=True)
+    (run_directory / "manifest.json").write_text('{"run_format_version":2,', encoding="utf-8")
+
+    assert workflow_service_module._strict_request_candidate(state_root, run_id)
 
 
 @pytest.mark.asyncio
