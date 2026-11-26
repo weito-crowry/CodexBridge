@@ -36,12 +36,13 @@ _BRIDGE_STATES = frozenset(
         "completed",
         "failed",
         "interrupted",
+        "timed_out",
         "not_loaded",
         "unknown",
     }
 )
 _ACTIVE_STATES = frozenset({"in_progress", "needs_approval", "needs_input"})
-_TERMINAL_STATES = frozenset({"completed", "failed", "interrupted"})
+_TERMINAL_STATES = frozenset({"completed", "failed", "interrupted", "timed_out"})
 _CODEX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _MAX_PROMPT_CHARS = 32_000
 _MAX_REQUEST_BYTES = 65_536
@@ -49,7 +50,7 @@ _MAX_RESPONSE_BYTES = 1_048_576
 
 
 class CodexAgentProvider:
-    """A local Bridge provider with wait=true invoke and internal exact-turn observe."""
+    """A local Bridge provider for invoke and read-only exact-turn operations."""
 
     def __init__(
         self,
@@ -88,7 +89,7 @@ class CodexAgentProvider:
         return ProviderCapabilities(
             provider="codex",
             target=_TARGET,
-            operations=("invoke", "observe"),
+            operations=("invoke", "observe", "wait"),
             session_modes=("new",),
             option_rules=(
                 OptionCapability("title", ("new",), ("string",)),
@@ -125,35 +126,41 @@ class CodexAgentProvider:
             raise AgentContractError("unsupported_target")
         if type(request) is not AgentRequest or request.target_context != self._context:
             raise AgentContractError("unsupported_target")
-        if request.operation != "invoke":
+        if request.operation == "invoke":
+            if request.session is None or request.session.get("mode") != "new":
+                raise AgentContractError("unsupported_operation")
+            if type(request.wait) is not bool:
+                raise AgentContractError("invalid_request")
+            prompt = request.prompt
+            if type(prompt) is not str or not prompt.strip() or len(prompt) > _MAX_PROMPT_CHARS:
+                raise AgentContractError("invalid_request")
+            try:
+                prompt.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                raise AgentContractError("invalid_request") from None
+            options = request.options or {}
+            if set(options) - {"title", "sandbox_mode", "confirm_full_access"}:
+                raise AgentContractError("unsupported_option")
+            if "title" in options and (
+                type(options["title"]) is not str or not options["title"].strip()
+            ):
+                raise AgentContractError("invalid_request")
+            if options.get("sandbox_mode", "inherit") != "inherit":
+                raise AgentContractError("unsupported_option")
+            if options.get("confirm_full_access", False) is not False:
+                raise AgentContractError("unsupported_option")
+        elif request.operation in {"observe", "wait"}:
+            if _validate_handle(request.handle) is None:
+                raise AgentContractError("invalid_request")
+        else:
             raise AgentContractError("unsupported_operation")
-        if request.session is None or request.session.get("mode") != "new":
-            raise AgentContractError("unsupported_operation")
-        if request.wait is not True:
-            raise AgentContractError("unsupported_operation")
-        prompt = request.prompt
-        if type(prompt) is not str or not prompt.strip() or len(prompt) > _MAX_PROMPT_CHARS:
-            raise AgentContractError("invalid_request")
-        try:
-            prompt.encode("utf-8", errors="strict")
-        except UnicodeEncodeError:
-            raise AgentContractError("invalid_request") from None
-        options = request.options or {}
-        if set(options) - {"title", "sandbox_mode", "confirm_full_access"}:
-            raise AgentContractError("unsupported_option")
-        if "title" in options and (
-            type(options["title"]) is not str or not options["title"].strip()
-        ):
-            raise AgentContractError("invalid_request")
-        if options.get("sandbox_mode", "inherit") != "inherit":
-            raise AgentContractError("unsupported_option")
-        if options.get("confirm_full_access", False) is not False:
-            raise AgentContractError("unsupported_option")
         prepared = PreparedProviderRequest(request, self._context)
         self._validate_prepared(prepared)
         return prepared
 
     def preflight(self, prepared: PreparedProviderRequest) -> None:
+        if type(prepared) is not PreparedProviderRequest or prepared.operation != "invoke":
+            raise AgentContractError("unsupported_operation")
         self._validate_prepared(prepared)
         try:
             self._client.preflight()
@@ -169,6 +176,8 @@ class CodexAgentProvider:
         prepared: PreparedProviderRequest,
         client_request_id: str,
     ) -> DispatchReceipt:
+        if type(prepared) is not PreparedProviderRequest or prepared.operation != "invoke":
+            raise AgentContractError("unsupported_operation")
         try:
             self._validate_prepared(prepared)
             if (
@@ -243,6 +252,16 @@ class CodexAgentProvider:
                 return _unknown_observation(parsed_handle)
             if status_state in _TERMINAL_STATES and exact_state != status_state:
                 return _unknown_observation(parsed_handle)
+            if exact_state == "unknown":
+                return Observation(
+                    "UNKNOWN",
+                    handle=parsed_handle,
+                    remote_state="unknown",
+                    error={
+                        "code": "observation_unavailable",
+                        "message": _safe_message("observation_unavailable"),
+                    },
+                )
             if exact_state == "in_progress":
                 return Observation("RUNNING", handle=parsed_handle, remote_state=exact_state)
             if exact_state in {"needs_approval", "needs_input"}:
@@ -268,6 +287,13 @@ class CodexAgentProvider:
                         "code": "remote_interrupted",
                         "message": _safe_message("remote_interrupted"),
                     },
+                )
+            if exact_state == "timed_out":
+                return Observation(
+                    "TIMED_OUT",
+                    handle=parsed_handle,
+                    remote_state=exact_state,
+                    error={"code": "timeout", "message": _safe_message("timeout")},
                 )
             if exact_state == "completed":
                 final_text = self._final_answer(thread_id, turn_id)
@@ -308,16 +334,30 @@ class CodexAgentProvider:
         except Exception:
             raise AgentContractError("invalid_request") from None
         if (
-            normalized.operation != "invoke"
-            or normalized.provider != "codex"
+            normalized.provider != "codex"
             or normalized.target != _TARGET
             or normalized.target_identity != self._context.to_dict()
-            or normalized.wait is not True
-            or normalized.session is None
-            or normalized.session.get("mode") != "new"
         ):
             raise AgentContractError("unsupported_operation")
         request = _request_from_prepared(normalized)
+        if normalized.operation in {"observe", "wait"}:
+            if (
+                request.session is not None
+                or request.options is not None
+                or request.prompt is not None
+                or request.wait is not None
+                or _validate_handle(request.handle) is None
+                or (normalized.operation == "observe" and request.timeout_seconds is not None)
+            ):
+                raise AgentContractError("invalid_request")
+            return
+        if (
+            normalized.operation != "invoke"
+            or request.session is None
+            or request.session.get("mode") != "new"
+            or type(normalized.wait) is not bool
+        ):
+            raise AgentContractError("unsupported_operation")
         prompt = request.prompt
         options = request.options or {}
         if (
@@ -494,6 +534,7 @@ def _safe_message(code: str) -> str:
         "needs_input": "Agent execution requires input.",
         "remote_failed": "Agent execution failed.",
         "remote_interrupted": "Agent execution was interrupted.",
+        "timeout": "Agent wait deadline was reached.",
         "response_unavailable": "Agent final response is unavailable.",
         "observation_unavailable": "Agent state could not be observed.",
     }

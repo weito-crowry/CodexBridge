@@ -21,6 +21,7 @@ from .agent_contracts import (
     PreparedProviderRequest,
     ProviderProtocol,
     TargetContext,
+    result_from_dispatch_receipt,
     result_from_observation,
 )
 from .agent_ledger import (
@@ -54,6 +55,7 @@ _CODEX_REMOTE_STATES = frozenset(
         "failed",
         "interrupted",
         "timed_out",
+        "unknown",
     }
 )
 _CODEX_TERMINAL_REMOTE_STATES = frozenset({"completed", "failed", "interrupted", "timed_out"})
@@ -108,11 +110,7 @@ class AgentInvocationExecutor:
         binding_identity = binding["binding_identity"]
         target_context = TargetContext.from_dict(binding["target_context"])
         capabilities = self._provider.capabilities(target_context.target)
-        if (
-            capabilities.target_context != target_context
-            or "invoke" not in capabilities.operations
-            or "observe" not in capabilities.operations
-        ):
+        if capabilities.target_context != target_context:
             raise AgentContractError("unsupported_target")
 
         execution_digests = {
@@ -143,6 +141,20 @@ class AgentInvocationExecutor:
             prepared = record.request
             created_ms = record.created_ms
             deadline_ms = record.deadline_ms
+
+        if (
+            prepared.operation not in capabilities.operations
+            or (
+                prepared.operation in {"observe", "wait"}
+                and "observe" not in capabilities.operations
+            )
+            or (
+                prepared.operation == "invoke"
+                and prepared.wait is True
+                and "observe" not in capabilities.operations
+            )
+        ):
+            raise AgentContractError("unsupported_operation")
 
         request_sha256 = _sha256(prepared.to_json())
         expected_prepare = self._prepare_metadata(
@@ -208,12 +220,18 @@ class AgentInvocationExecutor:
             ),
         )
 
+        if record.operation in {"observe", "wait"}:
+            return self._execute_read_only(record, request_sha256)
+
         def dispatch_step() -> dict[str, Any]:
             current = self._ledger.get_invocation(invocation_id)
             if current.result_json is not None:
                 return self._dispatch_metadata(current)
             if current.dispatch_state in {"ACCEPTED", "REJECTED"}:
-                if current.dispatch_state == "REJECTED":
+                if current.dispatch_state == "ACCEPTED" and current.request.wait is False:
+                    self._save_dispatch_only_result(current)
+                    current = self._ledger.get_invocation(invocation_id)
+                elif current.dispatch_state == "REJECTED":
                     self._save_rejected_result(current)
                     current = self._ledger.get_invocation(invocation_id)
                 return self._dispatch_metadata(current)
@@ -291,6 +309,11 @@ class AgentInvocationExecutor:
             if receipt.disposition == "REJECTED":
                 self._save_rejected_result(current)
                 current = self._ledger.get_invocation(invocation_id)
+            elif receipt.disposition == "ACCEPTED" and current.request.wait is False:
+                self._inject_fault("after_receipt_before_dispatch_checkpoint")
+                self._save_dispatch_only_result(current)
+                current = self._ledger.get_invocation(invocation_id)
+                return self._dispatch_metadata(current)
             self._inject_fault("after_receipt_before_dispatch_checkpoint")
             return self._dispatch_metadata(current)
 
@@ -301,6 +324,11 @@ class AgentInvocationExecutor:
             return self._result_from_record(current)
         if current.dispatch_state != "ACCEPTED":
             raise AgentLedgerIntegrityError("Agent dispatch checkpoint has no confirmed receipt")
+        if current.request.wait is False:
+            if current.result_json is None:
+                self._save_dispatch_only_result(current)
+                current = self._ledger.get_invocation(invocation_id)
+            return self._result_from_record(current)
 
         request_model = _request_from_prepared(current.request)
         context = TargetContext.from_dict(current.request.target_identity)
@@ -384,6 +412,230 @@ class AgentInvocationExecutor:
             self._sleep()
             poll_index += 1
 
+    def _execute_read_only(
+        self,
+        record: AgentInvocationRecord,
+        request_sha256: str,
+    ) -> AgentResult:
+        if record.operation not in {"observe", "wait"} or record.dispatch_state != "NONE":
+            raise AgentLedgerIntegrityError("read-only Agent invocation identity is invalid")
+        request = _request_from_prepared(record.request)
+        handle = request.handle
+        if handle is None:
+            raise AgentLedgerIntegrityError("read-only Agent invocation has no explicit handle")
+        handle_sha256 = _sha256(canonical_json(handle))
+        context = TargetContext.from_dict(record.request.target_identity)
+        if record.result_json is not None:
+            return self._replay_read_only_result(
+                record,
+                request_sha256,
+                handle_sha256,
+            )
+        poll_index = 0
+        last_remote_state: str | None = None
+
+        while True:
+            current = self._ledger.get_invocation(record.invocation_id)
+            if current.request_sha256 != request_sha256 or current.dispatch_state != "NONE":
+                raise AgentLedgerIntegrityError("read-only Agent invocation changed identity")
+            if current.result_json is not None:
+                return self._replay_read_only_result(
+                    current,
+                    request_sha256,
+                    handle_sha256,
+                )
+
+            checkpoint_remote_state = last_remote_state
+
+            def observation_step(
+                poll_index: int = poll_index,
+                prior_remote_state: str | None = checkpoint_remote_state,
+            ) -> dict[str, Any]:
+                latest = self._ledger.get_invocation(record.invocation_id)
+                if latest.request_sha256 != request_sha256 or latest.dispatch_state != "NONE":
+                    raise AgentLedgerIntegrityError("read-only Agent invocation changed identity")
+                owned: AgentOwnedHandle | None = None
+                if latest.result_json is not None:
+                    result = self._result_from_record(latest)
+                    return _read_only_poll_metadata(
+                        latest,
+                        handle_sha256,
+                        poll_index,
+                        observed_ms=None,
+                        remote_state=result.remote_state,
+                        result_status=result.status,
+                    )
+
+                if self._deadline_reached(latest):
+                    owned = self._ledger.find_owned_handle(handle, context)
+                    remote_state = (
+                        owned.remote_state
+                        if owned is not None and owned.remote_state is not None
+                        else prior_remote_state
+                    )
+                    self._save_timeout(
+                        latest,
+                        owned,
+                        handle=handle,
+                        remote_state=remote_state,
+                    )
+                    latest = self._ledger.get_invocation(record.invocation_id)
+                    result = self._result_from_record(latest)
+                    return _read_only_poll_metadata(
+                        latest,
+                        handle_sha256,
+                        poll_index,
+                        observed_ms=None,
+                        remote_state=result.remote_state,
+                        result_status=result.status,
+                    )
+
+                try:
+                    observation = self._provider.observe(handle, context)
+                except Exception:
+                    observation = _unknown_observation(handle)
+                observed_ms = self._clock_ms()
+                if (
+                    type(observation) is not Observation
+                    or observation.handle != handle
+                    or not _observation_semantics_match(observation)
+                ):
+                    observation = _unknown_observation(handle)
+
+                if observation.remote_state is not None:
+                    terminal = observation.remote_state in _CODEX_TERMINAL_REMOTE_STATES
+                    owned = self._ledger.update_remote_state_for_handle(
+                        handle,
+                        context,
+                        remote_state=observation.remote_state,
+                        observed_ms=observed_ms,
+                        remote_terminal=terminal,
+                    )
+                    self._inject_fault("after_remote_state_before_result")
+                else:
+                    owned = self._ledger.find_owned_handle(handle, context)
+
+                if latest.deadline_ms is not None and observed_ms >= latest.deadline_ms:
+                    remote_state = (
+                        owned.remote_state
+                        if owned is not None and owned.remote_state is not None
+                        else (observation.remote_state or prior_remote_state)
+                    )
+                    self._save_timeout(
+                        latest,
+                        owned,
+                        handle=handle,
+                        remote_state=remote_state,
+                    )
+                elif latest.operation == "observe" or observation.state != "RUNNING":
+                    result = result_from_observation(record.invocation_id, request, observation)
+                    if result.status not in _RESULT_TERMINAL and not (
+                        latest.operation == "observe" and result.status == "RUNNING"
+                    ):
+                        result = _unknown_result(record.invocation_id, request, handle)
+                    latest = self._ledger.save_result(record.invocation_id, result)
+                    self._inject_fault("after_result_before_poll_checkpoint")
+
+                latest = self._ledger.get_invocation(record.invocation_id)
+                saved_result = (
+                    None if latest.result_json is None else self._result_from_record(latest)
+                )
+                remote_state = (
+                    saved_result.remote_state
+                    if saved_result is not None
+                    else observation.remote_state
+                )
+                return _read_only_poll_metadata(
+                    latest,
+                    handle_sha256,
+                    poll_index,
+                    observed_ms=observed_ms,
+                    remote_state=remote_state,
+                    result_status="RUNNING" if saved_result is None else saved_result.status,
+                )
+
+            checkpoint = self._run_step(
+                _step_name("observe", record.invocation_id, poll_index), observation_step
+            )
+            latest = self._ledger.get_invocation(record.invocation_id)
+            _validate_read_only_checkpoint(
+                checkpoint,
+                invocation_id=record.invocation_id,
+                request_sha256=request_sha256,
+                handle_sha256=handle_sha256,
+                poll_index=poll_index,
+                record=latest,
+            )
+            if checkpoint["remote_state"] is not None:
+                last_remote_state = checkpoint["remote_state"]
+            if latest.result_json is not None:
+                result = self._result_from_record(latest)
+                if record.operation == "observe" or result.status != "RUNNING":
+                    return result
+            elif record.operation == "observe":
+                raise AgentLedgerIntegrityError("observe checkpoint has no immutable result")
+            self._sleep()
+            poll_index += 1
+
+    def _replay_read_only_result(
+        self,
+        record: AgentInvocationRecord,
+        request_sha256: str,
+        handle_sha256: str,
+    ) -> AgentResult:
+        """Validate checkpointed read-only polls while replaying the immutable ledger result."""
+        if record.result_json is None or record.operation not in {"observe", "wait"}:
+            raise AgentLedgerIntegrityError("read-only Agent result is missing")
+        poll_index = 0
+        while True:
+            current = self._ledger.get_invocation(record.invocation_id)
+            if (
+                current.result_json is None
+                or current.request_sha256 != request_sha256
+                or current.dispatch_state != "NONE"
+            ):
+                raise AgentLedgerIntegrityError("read-only Agent replay identity is invalid")
+            result = self._result_from_record(current)
+
+            def replay_step(poll_index: int = poll_index) -> dict[str, Any]:
+                latest = self._ledger.get_invocation(record.invocation_id)
+                if (
+                    latest.result_json is None
+                    or latest.request_sha256 != request_sha256
+                    or latest.dispatch_state != "NONE"
+                ):
+                    raise AgentLedgerIntegrityError("read-only Agent replay identity is invalid")
+                saved = self._result_from_record(latest)
+                return _read_only_poll_metadata(
+                    latest,
+                    handle_sha256,
+                    poll_index,
+                    observed_ms=None,
+                    remote_state=saved.remote_state,
+                    result_status=saved.status,
+                )
+
+            checkpoint = self._run_step(
+                _step_name("observe", record.invocation_id, poll_index), replay_step
+            )
+            current = self._ledger.get_invocation(record.invocation_id)
+            _validate_read_only_checkpoint(
+                checkpoint,
+                invocation_id=record.invocation_id,
+                request_sha256=request_sha256,
+                handle_sha256=handle_sha256,
+                poll_index=poll_index,
+                record=current,
+            )
+            if record.operation == "observe" or checkpoint["result_status"] != "RUNNING":
+                if result.status != checkpoint["result_status"]:
+                    raise AgentLedgerIntegrityError(
+                        "read-only Agent terminal checkpoint disagrees with its result"
+                    )
+                return result
+            self._sleep()
+            poll_index += 1
+
     def _prepare_request(
         self,
         request: AgentRequest,
@@ -391,7 +643,7 @@ class AgentInvocationExecutor:
     ) -> PreparedProviderRequest:
         if type(request) is not AgentRequest:
             raise AgentContractError("invalid_request")
-        if request.operation != "invoke" or request.wait is not True:
+        if request.operation not in {"invoke", "observe", "wait"}:
             raise AgentContractError("unsupported_operation")
         try:
             prepared = self._provider.prepare(request, target_context)
@@ -401,11 +653,16 @@ class AgentInvocationExecutor:
             raise AgentContractError("invalid_request") from None
         if (
             type(prepared) is not PreparedProviderRequest
-            or prepared.operation != "invoke"
-            or prepared.wait is not True
+            or prepared.operation != request.operation
             or prepared.provider != target_context.provider
             or prepared.target != target_context.target
             or prepared.target_identity != target_context.to_dict()
+        ):
+            raise AgentContractError("unsupported_operation")
+        if prepared.operation == "invoke" and type(prepared.wait) is not bool:
+            raise AgentContractError("unsupported_operation")
+        if prepared.operation in {"observe", "wait"} and (
+            prepared.wait is not None or prepared.handle != request.handle
         ):
             raise AgentContractError("unsupported_operation")
         return PreparedProviderRequest.from_json(prepared.to_json())
@@ -442,6 +699,22 @@ class AgentInvocationExecutor:
             "dispatch_state": record.dispatch_state,
             "receipt_sha256": record.dispatch_receipt_sha256,
         }
+
+    def _save_dispatch_only_result(self, record: AgentInvocationRecord) -> None:
+        if (
+            record.operation != "invoke"
+            or record.request.wait is not False
+            or record.dispatch_state != "ACCEPTED"
+            or record.dispatch_receipt_json is None
+        ):
+            raise AgentLedgerIntegrityError("dispatch-only Agent receipt is missing")
+        receipt = DispatchReceipt.from_json(record.dispatch_receipt_json)
+        result = result_from_dispatch_receipt(
+            record.invocation_id,
+            _request_from_prepared(record.request),
+            receipt,
+        )
+        self._ledger.save_result(record.invocation_id, result)
 
     def _poll_metadata(
         self,
@@ -509,9 +782,14 @@ class AgentInvocationExecutor:
         self,
         record: AgentInvocationRecord,
         owned: AgentOwnedHandle | None,
+        *,
+        handle: dict[str, Any] | None = None,
+        remote_state: str | None = None,
     ) -> None:
-        handle = None if owned is None else owned.handle
-        remote_state = None if owned is None else owned.remote_state
+        if owned is not None:
+            handle = owned.handle
+            if remote_state is None:
+                remote_state = owned.remote_state
         result = AgentResult(
             invocation_id=record.invocation_id,
             operation=record.operation,
@@ -659,6 +937,99 @@ def _validate_poll_checkpoint(
     result = AgentResult.from_json(record.result_json)
     if status != result.status or result_sha256 != record.result_sha256:
         raise AgentLedgerIntegrityError("Agent poll checkpoint disagrees with its result")
+
+
+def _read_only_poll_metadata(
+    record: AgentInvocationRecord,
+    handle_sha256: str,
+    poll_index: int,
+    *,
+    observed_ms: int | None,
+    remote_state: str | None,
+    result_status: str,
+) -> dict[str, Any]:
+    return {
+        "kind": "agent_observation",
+        "invocation_id": record.invocation_id,
+        "request_sha256": record.request_sha256,
+        "expected_handle_sha256": handle_sha256,
+        "poll_index": poll_index,
+        "observed_ms": observed_ms,
+        "remote_state": remote_state,
+        "result_status": result_status,
+        "result_sha256": record.result_sha256,
+    }
+
+
+def _validate_read_only_checkpoint(
+    checkpoint: Any,
+    *,
+    invocation_id: str,
+    request_sha256: str,
+    handle_sha256: str,
+    poll_index: int,
+    record: AgentInvocationRecord,
+) -> None:
+    expected_keys = {
+        "kind",
+        "invocation_id",
+        "request_sha256",
+        "expected_handle_sha256",
+        "poll_index",
+        "observed_ms",
+        "remote_state",
+        "result_status",
+        "result_sha256",
+    }
+    if type(checkpoint) is not dict or set(checkpoint) != expected_keys:
+        raise AgentLedgerIntegrityError("read-only Agent checkpoint is invalid")
+    observed_ms = checkpoint["observed_ms"]
+    remote_state = checkpoint["remote_state"]
+    status = checkpoint["result_status"]
+    if (
+        checkpoint["kind"] != "agent_observation"
+        or checkpoint["invocation_id"] != invocation_id
+        or checkpoint["request_sha256"] != request_sha256
+        or checkpoint["expected_handle_sha256"] != handle_sha256
+        or checkpoint["poll_index"] != poll_index
+        or (
+            observed_ms is not None
+            and (type(observed_ms) is not int or not 0 <= observed_ms <= 9_223_372_036_854_775_807)
+        )
+        or (
+            remote_state is not None
+            and (type(remote_state) is not str or remote_state not in _CODEX_REMOTE_STATES)
+        )
+        or (type(status) is not str or status not in _RESULT_TERMINAL | {"RUNNING"})
+        or record.operation not in {"observe", "wait"}
+        or record.dispatch_state != "NONE"
+    ):
+        raise AgentLedgerIntegrityError("read-only Agent checkpoint disagrees with its identity")
+    if record.result_json is None:
+        if (
+            record.operation != "wait"
+            or status != "RUNNING"
+            or checkpoint["result_sha256"] is not None
+            or remote_state != "in_progress"
+            or observed_ms is None
+        ):
+            raise AgentLedgerIntegrityError("read-only Agent checkpoint has no matching result")
+        return
+    result = AgentResult.from_json(record.result_json)
+    if record.operation == "wait" and status == "RUNNING":
+        if (
+            checkpoint["result_sha256"] is not None
+            or remote_state != "in_progress"
+            or observed_ms is None
+        ):
+            raise AgentLedgerIntegrityError("historical running Agent checkpoint is invalid")
+        return
+    if (
+        status != result.status
+        or checkpoint["result_sha256"] != record.result_sha256
+        or remote_state != result.remote_state
+    ):
+        raise AgentLedgerIntegrityError("read-only Agent checkpoint disagrees with its result")
 
 
 def _step_name(stage: str, invocation_id: str, poll_index: int | None = None) -> str:

@@ -44,7 +44,11 @@ def _target_context() -> TargetContext:
 
 
 def _request(
-    context: TargetContext | None = None, *, prompt: str = "hello", timeout: int | None = None
+    context: TargetContext | None = None,
+    *,
+    prompt: str = "hello",
+    timeout: int | None = None,
+    wait: bool = True,
 ):
     target = context or _target_context()
     return AgentRequest(
@@ -57,7 +61,30 @@ def _request(
         options={},
         prompt=prompt,
         response={"format": "text"},
-        wait=True,
+        wait=wait,
+        timeout_seconds=timeout,
+    )
+
+
+def _read_only_request(
+    operation: str,
+    handle: dict[str, str],
+    context: TargetContext | None = None,
+    *,
+    timeout: int | None = None,
+) -> AgentRequest:
+    target = context or _target_context()
+    return AgentRequest(
+        operation=operation,
+        provider="codex",
+        target="default",
+        target_context=target,
+        session=None,
+        handle=handle,
+        options=None,
+        prompt=None,
+        response={"format": "text"},
+        wait=None,
         timeout_seconds=timeout,
     )
 
@@ -447,6 +474,217 @@ def test_logical_result_is_immutable_and_remote_observation_is_exactly_owned(
     )
     assert ledger.get_invocation(record.invocation_id).result_json == result.to_json()
     assert ledger.get_owned_handle(record.invocation_id).remote_state == "completed"
+
+
+def test_read_only_invocations_use_none_dispatch_and_are_never_claimable(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    handle = {"thread_id": "thread_123456", "turn_id": "turn_123456"}
+
+    for index, request in enumerate(
+        (
+            _request(wait=False),
+            _read_only_request("observe", handle),
+            _read_only_request("wait", handle, timeout=4),
+        )
+    ):
+        record = ledger.prepare_invoke(
+            f"/do/{index}/agent",
+            [],
+            PreparedProviderRequest(request, _target_context()),
+            created_ms=10 + index,
+        )
+        if request.operation == "invoke":
+            assert record.dispatch_state == "PREPARED"
+            assert record.client_request_id == f"cba-{record.invocation_id}"
+            assert record.deadline_ms is None
+        else:
+            assert record.dispatch_state == "NONE"
+            assert record.client_request_id is None
+            assert record.deadline_ms == (None if request.operation == "observe" else 4_012)
+            assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is False
+
+    records = ledger.list_invocations(limit=10)
+    assert [record.dispatch_state for record in records] == ["PREPARED", "NONE", "NONE"]
+    assert [record.operation for record in records] == ["invoke", "observe", "wait"]
+    assert ledger.list_owned_handles() == ()
+
+
+def test_read_only_owned_handle_lookup_updates_only_exact_prior_owner(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    handle = {"thread_id": "thread_123456", "turn_id": "turn_123456"}
+    invoke = ledger.prepare_invoke(
+        "/do/0/invoke",
+        [],
+        PreparedProviderRequest(_request(), _target_context()),
+        created_ms=1,
+    )
+    ledger.claim_dispatch(invoke.invocation_id, invoke.request_sha256)
+    receipt = DispatchReceipt.accepted(handle=handle, remote_state="in_progress")
+    ledger.save_dispatch_receipt(invoke.invocation_id, receipt)
+    observe = ledger.prepare_invoke(
+        "/do/1/observe",
+        [],
+        PreparedProviderRequest(_read_only_request("observe", handle), _target_context()),
+        created_ms=2,
+    )
+
+    owner = ledger.find_owned_handle(handle, _target_context())
+    assert owner is not None and owner.invocation_id == invoke.invocation_id
+    assert observe.dispatch_state == "NONE"
+    assert (
+        ledger.find_owned_handle(
+            {"thread_id": "thread_other", "turn_id": "turn_other"}, _target_context()
+        )
+        is None
+    )
+    ledger.update_remote_state_for_handle(
+        handle,
+        _target_context(),
+        remote_state="completed",
+        observed_ms=3,
+        remote_terminal=True,
+    )
+    with pytest.raises(module.AgentLedgerConflictError):
+        ledger.update_remote_state_for_handle(
+            handle,
+            _target_context(),
+            remote_state="unknown",
+            observed_ms=3,
+            remote_terminal=False,
+        )
+    ledger.update_remote_state_for_handle(
+        handle,
+        _target_context(),
+        remote_state="unknown",
+        observed_ms=4,
+        remote_terminal=False,
+    )
+    assert ledger.get_owned_handle(invoke.invocation_id).remote_state == "completed"
+    assert ledger.get_owned_handle(invoke.invocation_id).observed_ms == 3
+    assert ledger.get_invocation(invoke.invocation_id).result_json is None
+    assert ledger.get_invocation(observe.invocation_id).dispatch_state == "NONE"
+    assert len(ledger.list_owned_handles()) == 1
+
+
+def test_none_rows_detect_dispatch_receipt_owner_result_and_digest_corruption(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    handle = {"thread_id": "thread_123456", "turn_id": "turn_123456"}
+    records = [
+        ledger.prepare_invoke(
+            f"/do/{index}/observe",
+            [],
+            PreparedProviderRequest(_read_only_request("observe", handle), _target_context()),
+            created_ms=10 + index,
+        )
+        for index in range(6)
+    ]
+    target_json = canonical_json(_target_context().to_dict())
+    handle_json = canonical_json(handle)
+    with sqlite3.connect(run_directory / "agent_invocations.sqlite") as connection:
+        connection.execute("PRAGMA ignore_check_constraints=ON")
+        connection.execute(
+            "UPDATE invocations SET client_request_id=? WHERE invocation_id=?",
+            ("cba-" + "a" * 64, records[0].invocation_id),
+        )
+        connection.execute(
+            "UPDATE invocations SET dispatch_state='MAYBE_SENT' WHERE invocation_id=?",
+            (records[1].invocation_id,),
+        )
+        receipt_json = DispatchReceipt.uncertain().to_json()
+        connection.execute(
+            "UPDATE invocations SET dispatch_receipt_json=?,dispatch_receipt_sha256=? "
+            "WHERE invocation_id=?",
+            (
+                receipt_json,
+                hashlib.sha256(receipt_json.encode()).hexdigest(),
+                records[2].invocation_id,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO owned_handles VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                records[3].invocation_id,
+                "codex",
+                hashlib.sha256(target_json.encode()).hexdigest(),
+                handle_json,
+                hashlib.sha256(handle_json.encode()).hexdigest(),
+                None,
+                None,
+                0,
+            ),
+        )
+        wrong_result = AgentResult(
+            invocation_id=records[4].invocation_id,
+            operation="invoke",
+            provider="codex",
+            target="default",
+            status="UNKNOWN",
+            handle=handle,
+        ).to_json()
+        connection.execute(
+            "UPDATE invocations SET result_json=?,result_sha256=? WHERE invocation_id=?",
+            (
+                wrong_result,
+                hashlib.sha256(wrong_result.encode()).hexdigest(),
+                records[4].invocation_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE invocations SET request_sha256=? WHERE invocation_id=?",
+            ("f" * 64, records[5].invocation_id),
+        )
+
+    for record in records:
+        with pytest.raises(module.AgentLedgerIntegrityError):
+            ledger.get_invocation(record.invocation_id)
+
+
+def test_wait_result_cannot_commit_a_running_observation(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    handle = {"thread_id": "thread_123456", "turn_id": "turn_123456"}
+    record = ledger.prepare_invoke(
+        "/do/0/wait",
+        [],
+        PreparedProviderRequest(
+            _read_only_request("wait", handle),
+            _target_context(),
+        ),
+        created_ms=10,
+    )
+    running = AgentResult(
+        invocation_id=record.invocation_id,
+        operation="wait",
+        provider="codex",
+        target="default",
+        status="RUNNING",
+        handle=handle,
+        remote_state="in_progress",
+    )
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_result(record.invocation_id, running)
 
 
 def test_row_digest_corruption_is_detected_without_loading_other_invocations(
