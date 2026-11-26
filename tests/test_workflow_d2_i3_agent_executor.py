@@ -733,6 +733,52 @@ def test_explicit_unknown_remote_state_does_not_clear_terminal_owner_state(
     assert ledger.get_owned_handle(accepted.invocation_id).remote_state == "completed"
 
 
+def test_late_unknown_observation_timeout_checkpoint_keeps_owned_terminal_state(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        observations=[
+            Observation(
+                "UNKNOWN",
+                handle=_HANDLE,
+                remote_state="unknown",
+                error=AgentError("observation_unavailable"),
+            )
+        ]
+    )
+    clock_values = iter((500, 1_000, 1_001, 2_000))
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        clock=lambda: next(clock_values),
+    )
+    accepted = _execute(
+        executor,
+        _request(wait=False),
+        node_pointer="/do/0/invoke",
+    )
+    ledger.update_remote_state(
+        accepted.invocation_id,
+        _HANDLE,
+        _CONTEXT,
+        remote_state="completed",
+        observed_ms=900,
+        remote_terminal=True,
+    )
+
+    timed_out = _execute(
+        executor,
+        _read_only_request("wait", timeout=1),
+        node_pointer="/do/1/wait",
+    )
+
+    assert timed_out.status == "TIMED_OUT"
+    assert timed_out.handle == _HANDLE
+    assert timed_out.remote_state == "completed"
+    assert provider.observe_count == 1
+    assert ledger.get_owned_handle(accepted.invocation_id).remote_state == "completed"
+
+
 def test_read_only_result_checkpoint_replay_does_not_reobserve(tmp_path: Path) -> None:
     provider = _Provider(
         observations=[
@@ -1229,3 +1275,89 @@ def test_actual_dbos_rewind_does_not_repeat_saved_read_only_result(tmp_path: Pat
     assert result.final_text == "done"
     assert provider.dispatch_count == 0
     assert provider.observe_count == 1
+
+
+def test_actual_dbos_rewind_replays_wait_sleeps_before_saved_terminal_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dbos import SetWorkflowID
+
+    from codex_bridge.workflows.worker import _dbos_config
+
+    provider = _Provider(
+        observations=[
+            Observation("RUNNING", handle=_HANDLE, remote_state="in_progress"),
+            Observation("RUNNING", handle=_HANDLE, remote_state="in_progress"),
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done"),
+            Observation(
+                "FAILED", handle=_HANDLE, remote_state="failed", error=AgentError("remote_failed")
+            ),
+        ]
+    )
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = AgentInvocationLedger.initialize_new_database(run_directory, _binding(), _CONTEXT)
+    from codex_bridge.workflows.agent_executor import AgentInvocationExecutor
+
+    replay_calls = 0
+    original_replay = AgentInvocationExecutor._replay_read_only_result
+
+    def counted_replay(
+        self: Any,
+        record: Any,
+        request_sha256: str,
+        handle_sha256: str,
+    ) -> Any:
+        nonlocal replay_calls
+        replay_calls += 1
+        return original_replay(self, record, request_sha256, handle_sha256)
+
+    monkeypatch.setattr(AgentInvocationExecutor, "_replay_read_only_result", counted_replay)
+
+    sleep_calls: list[float] = []
+
+    def durable_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        DBOS.sleep(seconds)
+
+    executor = AgentInvocationExecutor(
+        ledger,
+        provider,
+        clock_ms=lambda: 1_800_000_000_000,
+        durable_sleep=durable_sleep,
+        poll_interval_seconds=0.01,
+        fault_injector=_crash_once("after_result_before_poll_checkpoint"),
+    )
+    execution_key = f"i4a-{uuid4()}"
+    workflow_id = f"workflow-{uuid4()}"
+    request = _read_only_request("wait")
+    _DBOS_EXECUTION_REGISTRY[execution_key] = (executor, request)
+    DBOS(config=_dbos_config(run_directory / "dbos.sqlite"))
+    DBOS.launch()
+    try:
+        with SetWorkflowID(workflow_id):
+            handle = DBOS.start_workflow(_run_actual_agent_executor, execution_key)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            handle.get_result()
+
+        record = ledger.get_invocation_for_node("/do/0/agent", [2])
+        assert record is not None and record.result_json is not None
+        saved_result_json = record.result_json
+        # Keep prepare, both RUNNING polls, and their sleeps; the terminal poll is step six.
+        resumed = DBOS.rewind_workflow(workflow_id, start_step=6)
+        result_json = resumed.get_result()
+    finally:
+        DBOS.destroy()
+        _DBOS_EXECUTION_REGISTRY.pop(execution_key, None)
+
+    from codex_bridge.workflows.agent_contracts import AgentResult
+
+    result = AgentResult.from_json(result_json)
+    assert result.status == "SUCCEEDED"
+    assert result.final_text == "done"
+    assert result.to_json() == saved_result_json
+    assert provider.dispatch_count == 0
+    assert provider.observe_count == 3
+    assert replay_calls == 1
+    assert sleep_calls == [0.01, 0.01, 0.01, 0.01]

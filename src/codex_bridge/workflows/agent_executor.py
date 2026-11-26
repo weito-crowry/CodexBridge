@@ -541,9 +541,9 @@ class AgentInvocationExecutor:
                     None if latest.result_json is None else self._result_from_record(latest)
                 )
                 remote_state = (
-                    observation.remote_state
-                    if observation.remote_state is not None
-                    else (None if saved_result is None else saved_result.remote_state)
+                    saved_result.remote_state
+                    if saved_result is not None
+                    else observation.remote_state
                 )
                 return _read_only_poll_metadata(
                     latest,
@@ -633,6 +633,7 @@ class AgentInvocationExecutor:
                         "read-only Agent terminal checkpoint disagrees with its result"
                     )
                 return result
+            self._sleep()
             poll_index += 1
 
     def _prepare_request(
