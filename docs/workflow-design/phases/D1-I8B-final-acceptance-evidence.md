@@ -1,16 +1,18 @@
 # D1-I8-B final isolated acceptance cleanup and go/no-go evidence
 
-- **実装状態:** IMPLEMENTED / PENDING_CHATGPT_REVIEW。
+- **実装状態:** ACCEPTED with documented caveats by ChatGPT review of `679df0a42929162f9bc7ee01b0e66e0b6db5ebe5`。
 - **対象branch:** `codex/workflow-d1-i5-b4-verified-readers`。
 - **base:** `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f` (I8-A accepted with documented caveats)。
 - **範囲:** UI server test-doubleの3 failure修正、D1-22 mock child output contract境界、PD-01..39 traceability、I8 final isolated gateと次段operator rollout計画。
-- **全体境界:** I7-C2/I7とI8-AはACCEPTED with documented caveats。I8-BとI8全体final acceptanceはChatGPT review待ちです。D1はDRAFT、I2はDEFERRED / NON-BLOCKING、public/production strict admissionはOFFです。
+- **全体境界:** I7-C2/I7、I8-A、I8-BはACCEPTED with documented caveats。D1 current development scopeはACCEPTED / isolated GOです。D1詳細設計の文書状態はformal production approval前のDRAFTを維持します。operational migrationとproduction enablementは別途明示承認待ち、I2はDEFERRED / NON-BLOCKING、public/production strict admissionはOFFです。
 
 ## Review記録
 
 ChatGPT GitHub review of `afda1d9d05ee126ec1ceb5d81bab9b6a5879ac7f` はI7-C2/I7をACCEPTED with documented caveatsとし、profile-1 identity、pending Codex job reconciliation、ownership照合、およびisolated worker process-death recoveryを含むI8-A integrationも受け入れました。Full suiteは3,955 passed / 24 skipped / 3 failedであり、all-greenではありませんでした。3件は未変更production `server.py`の`drain_final_answer_writes(close=True)`呼出しと`tests/test_ui_server.py`のFakeBridgeの欠落によるtest-only mismatchでした。baselineを実行して同じfailureだったとは主張しません。
 
-I8-Bではレビュー指定どおりtest doubleだけを修正し、production runtimeを変更していません。I8-Bの完了状態はこの証跡の最終検査結果を記録した後もChatGPT review待ちであり、D1/I8全体の承認ではありません。
+I8-Bではレビュー指定どおりtest doubleだけを修正し、production runtimeを変更していません。この証跡の初版作成時点ではChatGPT review待ちでした。後続のreview結果と現在の受入状態を次項に記録します。
+
+ChatGPT GitHub review of `679df0a42929162f9bc7ee01b0e66e0b6db5ebe5` はI8-BおよびI8 isolated acceptanceをACCEPTED with documented caveatsとしました。D1 current development scopeもACCEPTED / isolated GOです。これはproduction acceptanceではなく、operational migrationとproduction enablementは別途明示的なユーザー承認待ちです。review留保はこの文書の全体suite、D1-22、PD crosswalk、rollout節に整理しています。
 
 ## UI server test-double修正
 
@@ -69,7 +71,7 @@ PD-23の隔離DB testは将来の共有DB運用承認を代替しません。PD-
 
 ## Isolated go/no-go
 
-I8-Bのisolated gateはGOとしてChatGPT reviewへ提出します。根拠はfull pytest 3,959/24/0、UI server 9/9、D1-22 schema mock 1/1、Ruff、mypy、compileall、diff checkのpassです。これはisolated I8-B sliceのgoで、production/public strict admissionのgoではありません。D1全体はDRAFT、public admission OFF、I2 DEFERREDのままです。PD-23 operator gate、live Bridge/API、real external Codex job、production/shared migration、hard WAL/SHM guarantee、D1-22 parent return routingは未実施または後続sliceです。
+ChatGPT reviewはI8-BおよびI8 isolated acceptanceをACCEPTED with documented caveatsとし、D1 current development scopeをACCEPTED / isolated GOとしました。full pytest 3,959/24/0、UI server 9/9、D1-22 schema mock 1/1、Ruff、mypy、compileall、diff checkが根拠です。この判定はproduction/public strict admissionの承認ではありません。D1詳細設計はDRAFT、public admission OFF、I2 DEFERREDのままです。PD-23 operator gate、live Bridge/API、real external Codex job、production/shared migration、hard WAL/SHM guarantee、D1-22 parent return routingは未実施または後続sliceです。
 
 ## 変更path
 
