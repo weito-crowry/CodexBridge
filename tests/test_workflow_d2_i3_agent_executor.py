@@ -54,15 +54,18 @@ class _Provider:
         *,
         observations: list[Observation] | None = None,
         dispatch_receipt: DispatchReceipt | None = None,
+        dispatch_receipts: list[DispatchReceipt] | None = None,
         preflight_error: str | None = None,
     ) -> None:
         self._observations = list(observations or [])
         self._receipt = dispatch_receipt or DispatchReceipt.accepted(
             handle=_HANDLE, remote_state="in_progress"
         )
+        self._receipt_sequence = list(dispatch_receipts or [])
         self.preflight_error = preflight_error
         self.dispatch_count = 0
         self.observe_count = 0
+        self.observed_handles: list[dict[str, Any]] = []
         self.prepare_count = 0
         self.preflight_count = 0
 
@@ -71,7 +74,7 @@ class _Provider:
         return ProviderCapabilities(
             provider="codex",
             target="default",
-            operations=("invoke", "observe"),
+            operations=("invoke", "observe", "wait"),
             session_modes=("new",),
             usage_supported=False,
             endpoint=_CONTEXT.endpoint,
@@ -97,17 +100,20 @@ class _Provider:
         assert prepared.operation == "invoke"
         assert client_request_id.startswith("cba-")
         self.dispatch_count += 1
+        if self.dispatch_count <= len(self._receipt_sequence):
+            return self._receipt_sequence[self.dispatch_count - 1]
         return self._receipt
 
     def observe(self, handle: object, target_context: TargetContext) -> Observation:
-        assert handle == _HANDLE
+        assert type(handle) is dict
         assert target_context == _CONTEXT
         self.observe_count += 1
+        self.observed_handles.append(dict(handle))
         if self._observations:
             return self._observations.pop(0)
         return Observation(
             "UNKNOWN",
-            handle=_HANDLE,
+            handle=handle,
             error=AgentError("observation_unavailable").to_dict(),
         )
 
@@ -177,7 +183,12 @@ def _executor(
     return executor, ledger, steps
 
 
-def _request(prompt: str = "hello", *, timeout: int | None = None) -> AgentRequest:
+def _request(
+    prompt: str = "hello",
+    *,
+    timeout: int | None = None,
+    wait: bool = True,
+) -> AgentRequest:
     return AgentRequest(
         operation="invoke",
         provider="codex",
@@ -188,18 +199,44 @@ def _request(prompt: str = "hello", *, timeout: int | None = None) -> AgentReque
         options={},
         prompt=prompt,
         response={"format": "text"},
-        wait=True,
+        wait=wait,
+        timeout_seconds=timeout,
+    )
+
+
+def _read_only_request(
+    operation: str,
+    *,
+    timeout: int | None = None,
+    handle: dict[str, str] | None = None,
+    response: dict[str, Any] | None = None,
+) -> AgentRequest:
+    return AgentRequest(
+        operation=operation,
+        provider="codex",
+        target="default",
+        target_context=_CONTEXT,
+        session=None,
+        handle=handle or dict(_HANDLE),
+        options=None,
+        prompt=None,
+        response=response or {"format": "text"},
+        wait=None,
         timeout_seconds=timeout,
     )
 
 
 def _execute(
-    executor: Any, request: AgentRequest | Callable[[], AgentRequest] | None = None
+    executor: Any,
+    request: AgentRequest | Callable[[], AgentRequest] | None = None,
+    *,
+    node_pointer: str = "/do/0/agent",
+    iteration_vector: list[int] | None = None,
 ) -> Any:
     return executor.execute(
         request or _request(),
-        node_pointer="/do/0/agent",
-        iteration_vector=[2],
+        node_pointer=node_pointer,
+        iteration_vector=[2] if iteration_vector is None else iteration_vector,
         definition_sha256="a" * 64,
         task_input={"question": "hello"},
         variables={"region": "west"},
@@ -242,6 +279,537 @@ def test_executor_polls_without_a_fixed_count_and_persists_only_small_checkpoint
     assert ledger.get_invocation(result.invocation_id).result_json == result.to_json()
     assert len(harness.checkpoints) >= 9
     assert all("final_text" not in canonical_json(value) for value in harness.checkpoints.values())
+
+
+def test_wait_false_returns_accepted_receipt_without_remote_observation(tmp_path: Path) -> None:
+    provider = _Provider(
+        dispatch_receipt=DispatchReceipt.accepted(handle=_HANDLE, remote_state="completed")
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    result = _execute(executor, _request(wait=False))
+
+    assert result.status == "ACCEPTED"
+    assert result.handle == _HANDLE
+    assert result.remote_state == "completed"
+    assert provider.dispatch_count == 1
+    assert provider.observe_count == 0
+    assert ledger.get_invocation(result.invocation_id).dispatch_state == "ACCEPTED"
+    assert ledger.get_owned_handle(result.invocation_id).remote_terminal is True
+
+
+def test_wait_false_replays_saved_receipt_after_checkpoint_fault_without_posting_again(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider()
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        fault=_crash_once("after_receipt_before_dispatch_checkpoint"),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _execute(executor, _request(wait=False))
+    saved = ledger.get_invocation_for_node("/do/0/agent", [2])
+    assert saved is not None
+    assert saved.dispatch_state == "ACCEPTED" and saved.dispatch_receipt_json is not None
+    assert saved.result_json is None
+    result = _execute(executor, _request(wait=False))
+
+    assert result.status == "ACCEPTED"
+    assert provider.dispatch_count == 1
+    assert provider.observe_count == 0
+
+
+def test_observe_running_is_immutable_and_a_later_wait_uses_a_new_invocation(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        observations=[
+            Observation("RUNNING", handle=_HANDLE, remote_state="in_progress"),
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done"),
+        ]
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    observed = _execute(executor, _read_only_request("observe"), node_pointer="/do/0/observe")
+    replayed = _execute(executor, _read_only_request("observe"), node_pointer="/do/0/observe")
+    waited = _execute(executor, _read_only_request("wait"), node_pointer="/do/1/wait")
+
+    assert observed.status == replayed.status == "RUNNING"
+    assert observed.to_json() == replayed.to_json()
+    assert waited.status == "SUCCEEDED" and waited.final_text == "done"
+    assert provider.dispatch_count == 0
+    assert provider.observe_count == 2
+    assert ledger.get_invocation(observed.invocation_id).dispatch_state == "NONE"
+    assert ledger.get_invocation(waited.invocation_id).dispatch_state == "NONE"
+    assert ledger.list_owned_handles() == ()
+
+
+def test_wait_polls_without_a_fixed_120_second_limit(tmp_path: Path) -> None:
+    now = [1_800_000_000_000]
+    observations = [
+        Observation("RUNNING", handle=_HANDLE, remote_state="in_progress") for _ in range(22)
+    ]
+    observations.append(
+        Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done")
+    )
+    provider = _Provider(observations=observations)
+    executor, _ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        clock=lambda: now[0],
+        sleeper=lambda seconds: now.__setitem__(0, now[0] + int(seconds * 1000) + 1_000),
+    )
+
+    result = _execute(executor, _read_only_request("wait"))
+
+    assert result.status == "SUCCEEDED"
+    assert provider.observe_count == 23
+    assert now[0] - 1_800_000_000_000 > 120_000
+    assert provider.dispatch_count == 0
+
+
+def test_wait_false_maybe_sent_is_unknown_and_never_reposted(tmp_path: Path) -> None:
+    provider = _Provider()
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        fault=_crash_once("after_claim_before_post"),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _execute(executor, _request(wait=False))
+    result = _execute(executor, _request(wait=False))
+
+    assert result.status == "UNKNOWN"
+    assert result.error is not None and result.error["code"] == "dispatch_uncertain"
+    assert provider.dispatch_count == 0
+    assert provider.observe_count == 0
+    assert ledger.get_invocation(result.invocation_id).dispatch_state == "MAYBE_SENT"
+
+
+@pytest.mark.parametrize(
+    ("observation", "expected_status"),
+    [
+        (
+            Observation(
+                "BLOCKED",
+                handle=_HANDLE,
+                remote_state="needs_approval",
+                error=AgentError("needs_approval"),
+            ),
+            "BLOCKED",
+        ),
+        (
+            Observation(
+                "FAILED",
+                handle=_HANDLE,
+                remote_state="failed",
+                error=AgentError("remote_failed"),
+            ),
+            "FAILED",
+        ),
+        (
+            Observation("UNKNOWN", handle=_HANDLE, error=AgentError("observation_unavailable")),
+            "UNKNOWN",
+        ),
+        (
+            Observation(
+                "INTERRUPTED",
+                handle=_HANDLE,
+                remote_state="interrupted",
+                error=AgentError("remote_interrupted"),
+            ),
+            "INTERRUPTED",
+        ),
+    ],
+)
+def test_wait_returns_nonrunning_observation_states_to_workflow(
+    tmp_path: Path,
+    observation: Observation,
+    expected_status: str,
+) -> None:
+    provider = _Provider(observations=[observation])
+    executor, _ledger, _harness = _executor(tmp_path, provider)
+
+    result = _execute(executor, _read_only_request("wait"))
+
+    assert result.status == expected_status
+    assert provider.observe_count == 1
+    assert provider.dispatch_count == 0
+
+
+def test_observe_json_result_validation_preserves_invalid_raw_text(tmp_path: Path) -> None:
+    good_provider = _Provider(
+        observations=[
+            Observation(
+                "COMPLETED", handle=_HANDLE, remote_state="completed", final_text='{"ok":true}'
+            )
+        ]
+    )
+    (tmp_path / "good").mkdir()
+    good_executor, _good_ledger, _harness = _executor(tmp_path / "good", good_provider)
+    good_result = _execute(
+        good_executor,
+        _read_only_request("observe", response={"format": "json"}),
+        node_pointer="/do/0/good",
+    )
+
+    bad_provider = _Provider(
+        observations=[
+            Observation(
+                "COMPLETED", handle=_HANDLE, remote_state="completed", final_text="not json"
+            )
+        ]
+    )
+    (tmp_path / "bad").mkdir()
+    bad_executor, _bad_ledger, _harness = _executor(tmp_path / "bad", bad_provider)
+    bad_result = _execute(
+        bad_executor,
+        _read_only_request("observe", response={"format": "json"}),
+        node_pointer="/do/0/bad",
+    )
+
+    assert good_result.status == "SUCCEEDED" and good_result.data == {"ok": True}
+    assert bad_result.status == "FAILED"
+    assert bad_result.final_text == "not json"
+    assert bad_result.error is not None and bad_result.error["code"] == "output_invalid"
+    assert good_provider.dispatch_count == bad_provider.dispatch_count == 0
+
+
+def test_read_only_observation_handle_mismatch_is_unknown_and_foreign_handle_stays_unowned(
+    tmp_path: Path,
+) -> None:
+    foreign = {"thread_id": "thread_external", "turn_id": "turn_external"}
+    provider = _Provider(
+        observations=[
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="wrong"),
+            Observation(
+                "COMPLETED",
+                handle={"thread_id": "thread_other", "turn_id": "turn_other"},
+                remote_state="completed",
+                final_text="mismatch",
+            ),
+        ]
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    accepted = _execute(
+        executor,
+        _read_only_request("observe", handle=foreign),
+        node_pointer="/do/0/external",
+    )
+
+    assert accepted.status == "UNKNOWN"
+    assert accepted.handle == foreign
+    assert accepted.error is not None and accepted.error["code"] == "observation_unavailable"
+    assert provider.observed_handles == [foreign]
+    assert ledger.list_owned_handles() == ()
+
+
+def test_wait_timeout_keeps_handle_remote_state_and_never_interrupts(tmp_path: Path) -> None:
+    now = [1_000]
+    provider = _Provider(
+        observations=[Observation("RUNNING", handle=_HANDLE, remote_state="in_progress")]
+    )
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        clock=lambda: now[0],
+        sleeper=lambda _seconds: now.__setitem__(0, 2_500),
+    )
+
+    result = _execute(executor, _read_only_request("wait", timeout=1))
+
+    assert result.status == "TIMED_OUT"
+    assert result.handle == _HANDLE
+    assert result.remote_state == "in_progress"
+    assert provider.observe_count == 1
+    assert provider.dispatch_count == 0
+    assert ledger.get_invocation(result.invocation_id).deadline_ms == 2_000
+    assert ledger.list_owned_handles() == ()
+
+
+def test_timeout_uses_latest_owned_state_instead_of_an_older_poll_checkpoint(
+    tmp_path: Path,
+) -> None:
+    now = [1_000]
+    ledger_box: list[AgentInvocationLedger] = []
+    provider = _Provider(
+        observations=[Observation("RUNNING", handle=_HANDLE, remote_state="in_progress")]
+    )
+
+    def sleep_then_complete(_seconds: float) -> None:
+        ledger = ledger_box[0]
+        invoke = ledger.get_invocation_for_node("/do/0/invoke", [2])
+        assert invoke is not None
+        now[0] = 2_500
+        ledger.update_remote_state(
+            invoke.invocation_id,
+            _HANDLE,
+            _CONTEXT,
+            remote_state="completed",
+            observed_ms=1_500,
+            remote_terminal=True,
+        )
+
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        clock=lambda: now[0],
+        sleeper=sleep_then_complete,
+    )
+    ledger_box.append(ledger)
+    accepted = _execute(
+        executor,
+        _request(wait=False),
+        node_pointer="/do/0/invoke",
+    )
+
+    result = _execute(
+        executor,
+        _read_only_request("wait", timeout=1),
+        node_pointer="/do/1/wait",
+    )
+
+    assert accepted.status == "ACCEPTED"
+    assert result.status == "TIMED_OUT"
+    assert result.remote_state == "completed"
+    assert provider.observe_count == 1
+    assert ledger.get_owned_handle(accepted.invocation_id).remote_terminal is True
+
+
+def test_late_terminal_wait_observation_returns_timeout_and_keeps_remote_terminal_state(
+    tmp_path: Path,
+) -> None:
+    ticks = iter([1_000, 1_000, 3_000])
+    provider = _Provider(
+        observations=[
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="late")
+        ]
+    )
+    executor, _ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        clock=lambda: next(ticks),
+    )
+
+    result = _execute(executor, _read_only_request("wait", timeout=1))
+
+    assert result.status == "TIMED_OUT"
+    assert result.handle == _HANDLE
+    assert result.remote_state == "completed"
+    assert provider.observe_count == 1
+    assert provider.dispatch_count == 0
+
+
+def test_wait_deadline_is_not_extended_when_prepare_checkpoint_recovers(tmp_path: Path) -> None:
+    now = [1_000]
+    provider = _Provider()
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        clock=lambda: now[0],
+        fault=_crash_once("after_prepare_before_checkpoint"),
+    )
+    request = _read_only_request("wait", timeout=1)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _execute(executor, request)
+    initial = ledger.get_invocation_for_node("/do/0/agent", [2])
+    assert initial is not None and initial.deadline_ms == 2_000
+    now[0] = 2_500
+    result = _execute(executor, request)
+
+    assert result.status == "TIMED_OUT"
+    assert result.handle == _HANDLE
+    assert provider.observe_count == 0
+    assert provider.dispatch_count == 0
+    assert ledger.get_invocation(result.invocation_id).deadline_ms == 2_000
+
+
+def test_read_only_remote_state_update_can_replay_before_result_but_result_stays_immutable(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        observations=[
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done"),
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done"),
+        ]
+    )
+    executor, ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        fault=_crash_once("after_remote_state_before_result"),
+    )
+    accepted = _execute(executor, _request(wait=False), node_pointer="/do/0/invoke")
+    observe_request = _read_only_request("observe")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _execute(executor, observe_request, node_pointer="/do/1/observe")
+    observed = _execute(executor, observe_request, node_pointer="/do/1/observe")
+
+    assert observed.status == "SUCCEEDED"
+    assert observed.final_text == "done"
+    assert provider.observe_count == 2
+    assert provider.dispatch_count == 1
+    assert ledger.get_invocation(accepted.invocation_id).result_json == accepted.to_json()
+    assert ledger.get_owned_handle(accepted.invocation_id).remote_state == "completed"
+    assert ledger.get_invocation(observed.invocation_id).dispatch_state == "NONE"
+
+
+def test_unknown_observation_does_not_clear_previously_confirmed_terminal_state(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        observations=[
+            Observation("UNKNOWN", handle=_HANDLE, error=AgentError("observation_unavailable"))
+        ]
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+    accepted = _execute(
+        executor,
+        _request(wait=False),
+        node_pointer="/do/0/invoke",
+    )
+    ledger.update_remote_state(
+        accepted.invocation_id,
+        _HANDLE,
+        _CONTEXT,
+        remote_state="completed",
+        observed_ms=1_800_000_000_010,
+        remote_terminal=True,
+    )
+
+    observed = _execute(
+        executor,
+        _read_only_request("observe"),
+        node_pointer="/do/1/observe",
+    )
+
+    assert observed.status == "UNKNOWN"
+    assert provider.observe_count == 1
+    assert ledger.get_owned_handle(accepted.invocation_id).remote_state == "completed"
+
+
+def test_explicit_unknown_remote_state_does_not_clear_terminal_owner_state(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        observations=[
+            Observation(
+                "UNKNOWN",
+                handle=_HANDLE,
+                remote_state="unknown",
+                error=AgentError("observation_unavailable"),
+            )
+        ]
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+    accepted = _execute(
+        executor,
+        _request(wait=False),
+        node_pointer="/do/0/invoke",
+    )
+    ledger.update_remote_state(
+        accepted.invocation_id,
+        _HANDLE,
+        _CONTEXT,
+        remote_state="completed",
+        observed_ms=1_800_000_000_010,
+        remote_terminal=True,
+    )
+
+    observed = _execute(
+        executor,
+        _read_only_request("observe"),
+        node_pointer="/do/1/observe",
+    )
+
+    assert observed.status == "UNKNOWN"
+    assert observed.remote_state == "unknown"
+    assert provider.observe_count == 1
+    assert ledger.get_owned_handle(accepted.invocation_id).remote_state == "completed"
+
+
+def test_read_only_result_checkpoint_replay_does_not_reobserve(tmp_path: Path) -> None:
+    provider = _Provider(
+        observations=[
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done")
+        ]
+    )
+    executor, _ledger, _harness = _executor(
+        tmp_path,
+        provider,
+        fault=_crash_once("after_result_before_poll_checkpoint"),
+    )
+    request = _read_only_request("observe")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _execute(executor, request)
+    result = _execute(executor, request)
+
+    assert result.status == "SUCCEEDED"
+    assert provider.observe_count == 1
+    assert provider.dispatch_count == 0
+
+
+def test_saved_read_only_result_replay_validates_terminal_dbos_checkpoint(tmp_path: Path) -> None:
+    provider = _Provider(
+        observations=[
+            Observation("RUNNING", handle=_HANDLE, remote_state="in_progress"),
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done"),
+        ]
+    )
+    executor, _ledger, harness = _executor(tmp_path, provider)
+    request = _read_only_request("wait")
+
+    result = _execute(executor, request)
+    terminal_step = next(
+        name
+        for name, checkpoint in harness.checkpoints.items()
+        if type(checkpoint) is dict
+        and checkpoint.get("kind") == "agent_observation"
+        and checkpoint.get("result_status") == "SUCCEEDED"
+    )
+    harness.checkpoints[terminal_step] = {
+        **harness.checkpoints[terminal_step],
+        "request_sha256": "f" * 64,
+    }
+
+    with pytest.raises(AgentLedgerIntegrityError):
+        _execute(executor, request)
+
+    assert result.status == "SUCCEEDED"
+    assert provider.observe_count == 2
+
+
+def test_five_wait_false_nodes_are_not_limited_by_legacy_job_caps(tmp_path: Path) -> None:
+    handles = [
+        {"thread_id": f"thread_{index:08}", "turn_id": f"turn_{index:08}"} for index in range(5)
+    ]
+    provider = _Provider(
+        dispatch_receipts=[
+            DispatchReceipt.accepted(handle=handle, remote_state="in_progress")
+            for handle in handles
+        ]
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    results = [
+        _execute(
+            executor, _request(f"request {index}", wait=False), node_pointer=f"/do/{index}/agent"
+        )
+        for index in range(5)
+    ]
+
+    assert len(results) == 5
+    assert all(result.status == "ACCEPTED" for result in results)
+    assert provider.dispatch_count == 5
+    assert provider.observe_count == 0
+    assert len(ledger.list_invocations(limit=10)) == 5
+    assert len(ledger.list_owned_handles(limit=10)) == 5
 
 
 @pytest.mark.parametrize(
@@ -564,4 +1132,100 @@ def test_actual_dbos_rewind_after_receipt_crash_does_not_repeat_post(tmp_path: P
     assert result.status == "SUCCEEDED"
     assert result.final_text == "done"
     assert provider.dispatch_count == 1
+    assert provider.observe_count == 1
+
+
+def test_actual_dbos_rewind_recovers_wait_false_receipt_without_observing(tmp_path: Path) -> None:
+    from dbos import SetWorkflowID
+
+    from codex_bridge.workflows.worker import _dbos_config
+
+    provider = _Provider(
+        dispatch_receipt=DispatchReceipt.accepted(handle=_HANDLE, remote_state="completed")
+    )
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = AgentInvocationLedger.initialize_new_database(run_directory, _binding(), _CONTEXT)
+    from codex_bridge.workflows.agent_executor import AgentInvocationExecutor
+
+    executor = AgentInvocationExecutor(
+        ledger,
+        provider,
+        clock_ms=lambda: 1_800_000_000_000,
+        fault_injector=_crash_once("after_receipt_before_dispatch_checkpoint"),
+    )
+    execution_key = f"i4a-{uuid4()}"
+    workflow_id = f"workflow-{uuid4()}"
+    _DBOS_EXECUTION_REGISTRY[execution_key] = (executor, _request(wait=False))
+    DBOS(config=_dbos_config(run_directory / "dbos.sqlite"))
+    DBOS.launch()
+    try:
+        with SetWorkflowID(workflow_id):
+            handle = DBOS.start_workflow(_run_actual_agent_executor, execution_key)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            handle.get_result()
+
+        resumed = DBOS.rewind_workflow(workflow_id)
+        result_json = resumed.get_result()
+    finally:
+        DBOS.destroy()
+        _DBOS_EXECUTION_REGISTRY.pop(execution_key, None)
+
+    from codex_bridge.workflows.agent_contracts import AgentResult
+
+    result = AgentResult.from_json(result_json)
+    assert result.status == "ACCEPTED"
+    assert result.remote_state == "completed"
+    assert provider.dispatch_count == 1
+    assert provider.observe_count == 0
+
+
+def test_actual_dbos_rewind_does_not_repeat_saved_read_only_result(tmp_path: Path) -> None:
+    from dbos import SetWorkflowID
+
+    from codex_bridge.workflows.worker import _dbos_config
+
+    provider = _Provider(
+        observations=[
+            Observation("COMPLETED", handle=_HANDLE, remote_state="completed", final_text="done"),
+            Observation(
+                "FAILED", handle=_HANDLE, remote_state="failed", error=AgentError("remote_failed")
+            ),
+        ]
+    )
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = AgentInvocationLedger.initialize_new_database(run_directory, _binding(), _CONTEXT)
+    from codex_bridge.workflows.agent_executor import AgentInvocationExecutor
+
+    executor = AgentInvocationExecutor(
+        ledger,
+        provider,
+        clock_ms=lambda: 1_800_000_000_000,
+        fault_injector=_crash_once("after_result_before_poll_checkpoint"),
+    )
+    execution_key = f"i4a-{uuid4()}"
+    workflow_id = f"workflow-{uuid4()}"
+    request = _read_only_request("observe")
+    _DBOS_EXECUTION_REGISTRY[execution_key] = (executor, request)
+    DBOS(config=_dbos_config(run_directory / "dbos.sqlite"))
+    DBOS.launch()
+    try:
+        with SetWorkflowID(workflow_id):
+            handle = DBOS.start_workflow(_run_actual_agent_executor, execution_key)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            handle.get_result()
+
+        resumed = DBOS.rewind_workflow(workflow_id)
+        result_json = resumed.get_result()
+    finally:
+        DBOS.destroy()
+        _DBOS_EXECUTION_REGISTRY.pop(execution_key, None)
+
+    from codex_bridge.workflows.agent_contracts import AgentResult
+
+    result = AgentResult.from_json(result_json)
+    assert result.status == "SUCCEEDED"
+    assert result.final_text == "done"
+    assert provider.dispatch_count == 0
     assert provider.observe_count == 1

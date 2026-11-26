@@ -12,6 +12,7 @@ import pytest
 from codex_bridge.workflows.agent_contracts import (
     AgentContractError,
     AgentRequest,
+    PreparedProviderRequest,
     ProviderRegistry,
     TargetContext,
 )
@@ -175,6 +176,28 @@ def _invoke(context: TargetContext, **changes: Any) -> AgentRequest:
     return AgentRequest(**values)
 
 
+def _read_only(
+    context: TargetContext,
+    operation: str,
+    *,
+    handle: dict[str, str] | None = None,
+    timeout: int | None = None,
+) -> AgentRequest:
+    return AgentRequest(
+        operation=operation,
+        provider="codex",
+        target="default",
+        target_context=context,
+        session=None,
+        handle=handle or {"thread_id": THREAD_ID, "turn_id": TURN_ID},
+        options=None,
+        prompt=None,
+        response={"format": "text"},
+        wait=None,
+        timeout_seconds=timeout,
+    )
+
+
 def test_codex_provider_advertises_only_implemented_operations_and_usage_is_unknown(
     fake_api: _FakeHTTPServer,
     tmp_path: Path,
@@ -183,7 +206,7 @@ def test_codex_provider_advertises_only_implemented_operations_and_usage_is_unkn
 
     capabilities = provider.capabilities("default")
 
-    assert capabilities.operations == ("invoke", "observe")
+    assert capabilities.operations == ("invoke", "observe", "wait")
     assert capabilities.session_modes == ("new",)
     assert capabilities.usage_supported is False
     registry = ProviderRegistry({"codex": provider})
@@ -207,6 +230,41 @@ def test_prepare_is_read_only_and_validates_unicode_prompt_limits_and_options(
     prepared = provider.prepare(request, context)
 
     assert prepared.prompt == "x" * 20_000
+    assert fake_api.state.requests == []
+
+
+def test_prepare_supports_dispatch_only_and_explicit_read_only_operations(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+
+    dispatch_only = provider.prepare(_invoke(context, wait=False), context)
+    observe = provider.prepare(_read_only(context, "observe"), context)
+    wait = provider.prepare(_read_only(context, "wait", timeout=3), context)
+
+    assert dispatch_only.operation == "invoke" and dispatch_only.wait is False
+    assert observe.operation == "observe" and observe.handle == {
+        "thread_id": THREAD_ID,
+        "turn_id": TURN_ID,
+    }
+    assert wait.operation == "wait" and wait.timeout_seconds == 3
+    assert fake_api.state.requests == []
+
+
+def test_dispatch_rejects_prepared_read_only_operation_without_post(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = PreparedProviderRequest(_read_only(context, "observe"), context)
+
+    with pytest.raises(AgentContractError) as error:
+        provider.dispatch(prepared, "cba-" + "a" * 64)
+
+    assert error.value.code == "unsupported_operation"
     assert fake_api.state.requests == []
 
 
@@ -525,6 +583,59 @@ def test_terminal_failure_states_require_an_exact_history_turn(
     assert observation.state == expected
     assert observation.handle == {"thread_id": THREAD_ID, "turn_id": TURN_ID}
     assert observation.error is not None and observation.error["code"] == error_code
+
+
+def test_remote_timed_out_state_requires_exact_history_turn(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+) -> None:
+    provider, _http_module = _modules()
+    fake_api.state.status_body = {
+        "thread_id": THREAD_ID,
+        "turn_id": TURN_ID,
+        "state": "timed_out",
+    }
+    fake_api.state.turn_pages[""] = {
+        "thread_id": THREAD_ID,
+        "turns": [{"id": TURN_ID, "status": "timed_out"}],
+        "next_cursor": None,
+        "truncated": False,
+    }
+    instance = _provider(fake_api, tmp_path)
+    context = instance.capabilities("default").target_context
+
+    observation = instance.observe({"thread_id": THREAD_ID, "turn_id": TURN_ID}, context)
+
+    assert observation.state == "TIMED_OUT"
+    assert observation.remote_state == "timed_out"
+    assert observation.error is not None and observation.error["code"] == "timeout"
+
+
+def test_unknown_state_requires_exact_history_turn_and_preserves_remote_state(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+) -> None:
+    provider, _http_module = _modules()
+    fake_api.state.status_body = {
+        "thread_id": THREAD_ID,
+        "turn_id": TURN_ID,
+        "state": "unknown",
+    }
+    fake_api.state.turn_pages[""] = {
+        "thread_id": THREAD_ID,
+        "turns": [{"id": TURN_ID, "status": "unknown"}],
+        "next_cursor": None,
+        "truncated": False,
+    }
+    instance = _provider(fake_api, tmp_path)
+    context = instance.capabilities("default").target_context
+
+    observation = instance.observe({"thread_id": THREAD_ID, "turn_id": TURN_ID}, context)
+
+    assert observation.state == "UNKNOWN"
+    assert observation.handle == {"thread_id": THREAD_ID, "turn_id": TURN_ID}
+    assert observation.remote_state == "unknown"
+    assert observation.error is not None and observation.error["code"] == "observation_unavailable"
 
 
 def test_completed_turn_and_final_answer_are_found_across_history_pages(

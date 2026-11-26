@@ -17,10 +17,13 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from .agent_contracts import (
+    AgentRequest,
     AgentResult,
     DispatchReceipt,
+    Observation,
     PreparedProviderRequest,
     TargetContext,
+    result_from_observation,
 )
 from .contracts import canonical_json, parse_strict_json
 from .strict_variables import _is_symlink_or_junction
@@ -39,6 +42,7 @@ _CODEX_REMOTE_STATES = frozenset(
         "failed",
         "interrupted",
         "timed_out",
+        "unknown",
     }
 )
 _CODEX_TERMINAL_REMOTE_STATES = frozenset({"completed", "failed", "interrupted", "timed_out"})
@@ -314,13 +318,14 @@ class AgentInvocationLedger:
             raise AgentLedgerIntegrityError("prepared Agent request is invalid") from None
         target_context = TargetContext.from_dict(normalized.target_identity)
         if (
-            normalized.operation != "invoke"
-            or normalized.wait is not True
+            normalized.operation not in {"invoke", "observe", "wait"}
             or normalized.provider != target_context.provider
             or normalized.target != target_context.target
             or canonical_json(target_context.to_dict()) != self._target_context_json
         ):
             raise AgentLedgerIntegrityError("prepared Agent request does not match the run")
+        if normalized.operation in {"observe", "wait"}:
+            _canonical_handle(normalized.handle, self._target_context_json)
         pointer = _validate_node_pointer(node_pointer)
         iteration_json = _canonical_iteration(iteration_vector)
         timestamp = _utc_epoch_ms() if created_ms is None else _sqlite_timestamp(created_ms)
@@ -339,7 +344,8 @@ class AgentInvocationLedger:
             "iteration_vector": cast(list[int], _load_canonical(iteration_json)),
         }
         invocation_id = _sha256(canonical_json(identity))
-        client_request_id = f"cba-{invocation_id}"
+        client_request_id = f"cba-{invocation_id}" if normalized.operation == "invoke" else None
+        dispatch_state = "NONE" if normalized.operation in {"observe", "wait"} else "PREPARED"
         request_json = normalized.to_json()
         request_sha256 = _sha256(request_json)
 
@@ -368,15 +374,16 @@ class AgentInvocationLedger:
                     invocation_id,node_pointer,iteration_json,operation,request_json,
                     request_sha256,client_request_id,dispatch_state,dispatch_receipt_json,
                     dispatch_receipt_sha256,created_ms,deadline_ms,result_json,result_sha256
-                ) VALUES (?,?,?,?,?,?,?,'PREPARED',NULL,NULL,?,?,NULL,NULL)""",
+                ) VALUES (?,?,?,?,?,?,?,?,NULL,NULL,?,?,NULL,NULL)""",
                 (
                     invocation_id,
                     pointer,
                     iteration_json,
-                    "invoke",
+                    normalized.operation,
                     request_json,
                     request_sha256,
                     client_request_id,
+                    dispatch_state,
                     timestamp,
                     deadline,
                 ),
@@ -656,6 +663,74 @@ class AgentInvocationLedger:
             if row is None:
                 raise AgentLedgerIntegrityError("owned Agent handle is missing")
             return _validate_owned_row(row, record, self._target_context_json)
+
+    def find_owned_handle(
+        self,
+        handle: object,
+        target_context: TargetContext,
+    ) -> AgentOwnedHandle | None:
+        """Find a previously accepted handle by its complete provider/target/handle identity."""
+        if (
+            type(target_context) is not TargetContext
+            or canonical_json(target_context.to_dict()) != self._target_context_json
+        ):
+            raise AgentLedgerIntegrityError("remote observation identity is invalid")
+        handle_json = _canonical_handle(handle, self._target_context_json)
+        handle_digest = _sha256(handle_json)
+        target_digest = _sha256(self._target_context_json)
+        with self._read_connection() as connection:
+            _check_schema(connection)
+            _validate_run_binding(connection, self._binding_json, self._target_context_json)
+            rows = connection.execute(
+                """SELECT * FROM owned_handles WHERE provider=?
+                   AND target_identity_sha256=? AND handle_sha256=?""",
+                (target_context.provider, target_digest, handle_digest),
+            ).fetchall()
+            if len(rows) > 1:
+                raise AgentLedgerIntegrityError("owned Agent handle identity is ambiguous")
+            if not rows:
+                return None
+            row = rows[0]
+            if row["handle_json"] != handle_json:
+                raise AgentLedgerIntegrityError("owned Agent handle digest collides")
+            record = _validate_invocation_row(
+                _get_invocation_row(connection, row["invocation_id"]),
+                self._binding_json,
+                self._target_context_json,
+            )
+            if record.dispatch_state != "ACCEPTED":
+                raise AgentLedgerIntegrityError("owned Agent handle has no accepted invoke")
+            _validate_row_relationships(connection, record, self._target_context_json)
+            return _validate_owned_row(row, record, self._target_context_json)
+
+    def update_remote_state_for_handle(
+        self,
+        handle: object,
+        target_context: TargetContext,
+        *,
+        remote_state: str,
+        observed_ms: int,
+        remote_terminal: bool,
+    ) -> AgentOwnedHandle | None:
+        """Update an existing exact owner row; foreign handles are never adopted."""
+        owned = self.find_owned_handle(handle, target_context)
+        if owned is None:
+            return None
+        if target_context.provider == "codex":
+            _validate_codex_remote_state(remote_state, remote_terminal)
+            if remote_state == "unknown" and owned.remote_terminal:
+                timestamp = _sqlite_timestamp(observed_ms)
+                if owned.observed_ms is not None and timestamp == owned.observed_ms:
+                    raise AgentLedgerConflictError("remote observation timestamp conflicts")
+                return owned
+        return self.update_remote_state(
+            owned.invocation_id,
+            handle,
+            target_context,
+            remote_state=remote_state,
+            observed_ms=observed_ms,
+            remote_terminal=remote_terminal,
+        )
 
     def list_invocations(
         self,
@@ -988,6 +1063,71 @@ def _validate_result_for_record(
         or result.target != request.target
     ):
         raise AgentLedgerIntegrityError("Agent result identity does not match its request")
+    if record.operation in {"observe", "wait"}:
+        if record.dispatch_state != "NONE" or owned is not None:
+            raise AgentLedgerIntegrityError("read-only Agent invocation has dispatch ownership")
+        if result.handle != request.handle:
+            raise AgentLedgerIntegrityError("read-only Agent result handle changed")
+        if record.operation == "wait" and result.status == "RUNNING":
+            raise AgentLedgerIntegrityError("wait Agent result is still running")
+        if result.status == "TIMED_OUT":
+            if (
+                result.error is None
+                or result.error.get("code") != "timeout"
+                or result.final_text is not None
+                or result.data is not None
+                or (
+                    result.remote_state is not None
+                    and result.remote_state not in _CODEX_REMOTE_STATES
+                )
+            ):
+                raise AgentLedgerIntegrityError("timed out read-only Agent result is invalid")
+            return
+        if result.status == "SUCCEEDED" or (
+            result.status == "FAILED" and result.remote_state == "completed"
+        ):
+            observation_state = "COMPLETED"
+        else:
+            observation_state = result.status
+        if observation_state not in {
+            "RUNNING",
+            "COMPLETED",
+            "FAILED",
+            "UNKNOWN",
+            "BLOCKED",
+            "INTERRUPTED",
+        }:
+            raise AgentLedgerIntegrityError("read-only Agent result status is invalid")
+        try:
+            request_model = AgentRequest(
+                operation=request.operation,
+                provider=request.provider,
+                target=request.target,
+                target_context=TargetContext.from_dict(request.target_identity),
+                session=request.session,
+                handle=request.handle,
+                options=request.options,
+                prompt=request.prompt,
+                response=request.response,
+                wait=request.wait,
+                timeout_seconds=request.timeout_seconds,
+            )
+            observation = Observation(
+                observation_state,
+                handle=result.handle,
+                remote_state=result.remote_state,
+                final_text=result.final_text,
+                usage=result.usage,
+                error=result.error,
+            )
+            expected = result_from_observation(record.invocation_id, request_model, observation)
+        except Exception:
+            raise AgentLedgerIntegrityError(
+                "read-only Agent result semantics are invalid"
+            ) from None
+        if expected.to_json() != result.to_json():
+            raise AgentLedgerIntegrityError("read-only Agent result semantics are invalid")
+        return
     if record.dispatch_state == "PREPARED":
         timed_out_before_claim = (
             result.status == "TIMED_OUT"
@@ -1035,6 +1175,22 @@ def _validate_result_for_record(
     elif record.dispatch_state == "ACCEPTED":
         if owned is None or result.handle != owned.handle:
             raise AgentLedgerIntegrityError("Agent result handle is not exactly owned")
+        if request.wait is False:
+            receipt = DispatchReceipt.from_json(cast(str, record.dispatch_receipt_json))
+            expected = AgentResult(
+                invocation_id=record.invocation_id,
+                operation=record.operation,
+                provider=request.provider,
+                target=request.target,
+                status="ACCEPTED",
+                handle=receipt.handle,
+                remote_state=receipt.remote_state,
+            )
+            if result.to_json() != expected.to_json():
+                raise AgentLedgerIntegrityError("dispatch-only Agent result disagrees with receipt")
+            return
+        if result.status == "ACCEPTED":
+            raise AgentLedgerIntegrityError("waited Agent result is dispatch-only")
         if result.status == "SUCCEEDED" and (
             result.remote_state != "completed"
             or result.final_text is None
@@ -1153,8 +1309,13 @@ def _validate_invocation_row(
                 raise ValueError
         elif client_request_id is not None or dispatch_state != "NONE":
             raise ValueError
-        if operation == "invoke" and request.wait is not True:
-            raise ValueError
+        if operation == "invoke":
+            if type(request.wait) is not bool:
+                raise ValueError
+        elif operation in {"observe", "wait"}:
+            _canonical_handle(request.handle, target_context_json)
+            if request.wait is not None:
+                raise ValueError
         receipt_json = row["dispatch_receipt_json"]
         receipt_digest = row["dispatch_receipt_sha256"]
         if (receipt_json is None) != (receipt_digest is None):
