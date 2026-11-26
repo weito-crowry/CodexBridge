@@ -6,7 +6,7 @@
 
 - **基本仕様 v0.2** はユーザー合意済みの方針です。正式な要件一覧は [requirements.md](requirements.md) に記録します。
 - **D1の詳細設計** はformal design statusとして **DRAFT** を維持します。現行D1 implementationと、今回の明示migration・default-OFF設定のoperator opt-in・実機pure-variable/single Codex-job smokeを含むtested operational scopeは、documented caveats付きで受入済みです。現在のdeploymentでは両strict flagが明示設定で有効ですが、config/codeのdefaultはOFFです。全設計ケースや一般的なproduction rolloutの承認を意味しません。最終証跡は[I8-B evidence](phases/D1-I8B-final-acceptance-evidence.md)を参照してください。
-- **D2〜D8** は後工程の計画です。後から phases/D2-agent-nodes.md などを追加できる構成にし、現時点では未着手の空文書を作りません。
+- **D2** は詳細設計DRAFTに着手しました。[D2 Agentノード設計](phases/D2-agent-nodes.md)を参照してください。実装未着手です。D3〜D8は後工程の計画です。
 - 現行実装と将来案の差分は [architecture.md](architecture.md) に記載します。
 
 ## 文書目次
@@ -24,6 +24,7 @@
 | [ADR 0007: OWS call adapterによるstrict変数操作](decisions/0007-variable-call-adapter.md) | Proposed（レビュー待ち） | OWS Schemaを変更せずstrict revision内のcodexbridge-variable callを許可する案 |
 | [D1: 共通入出力契約・変数・スコープ](phases/D1-input-output-variables.md) | DRAFT（formal design status。実装と今回tested operational scopeは受入済み） | contract、変数スコープ、永続化、DBOS回復、検証と受入条件の詳細設計案 |
 | [D1実装スライス計画](phases/D1-implementation-plan.md) | I0-I8 implementationとcurrent tested operational scope ACCEPTED with documented caveats。D1詳細設計はDRAFT | 実装証跡、運用受入、D1 traceabilityと残件 |
+| [D2: 汎用Agent呼び出し・埋め込みプロンプト](phases/D2-agent-nodes.md) | DRAFT | 汎用実行方針、Provider契約、永続実行、互換境界、実装工程案 |
 
 ## Phase一覧
 
@@ -32,7 +33,7 @@
 | Phase | 概要 | 状態 |
 | --- | --- | --- |
 | D1 | Workflow共通入出力契約、変数宣言、Workflow・Issue・Attempt相当のスコープ | **DRAFT（formal design status。current implementationと今回tested operational scopeはdocumented caveats付き受入済み）** |
-| D2 | 汎用エージェント呼び出し・埋め込みプロンプト | **PLANNED** |
+| D2 | 汎用エージェント呼び出し・埋め込みプロンプト | **DRAFT（設計中・実装未着手）** |
 | D3 | 機械判定・エージェント判定・レビュー | **PLANNED** |
 | D4 | 1 Issue・1回修正・受入の縦断実証（必要なテスト・検証を含む） | **PLANNED** |
 | D5 | While / Repeat-Until / Break / Continue、有界反復 | **PLANNED** |
