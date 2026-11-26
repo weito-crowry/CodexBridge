@@ -336,7 +336,7 @@ def _assert_direct_main_rejected(
 
 
 @pytest.mark.parametrize("surface", ["entry", "load", "main"])
-@pytest.mark.parametrize("version", [2, 1, 3, True, None, _SECRET])
+@pytest.mark.parametrize("version", [1, 3, True, None, _SECRET])
 def test_every_worker_ingress_rejects_explicit_run_format_before_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -585,13 +585,13 @@ def test_v2_without_request_binding_is_still_rejected_before_worker_actions(
         )
         assert result == 2
         assert states == ["failed"]
-        assert "unsupported" in stderr
+        assert "workflow request binding is invalid" in stderr
         assert _SECRET not in stderr
     elif surface == "load":
-        with pytest.raises(OwsError, match="workflow run format is unsupported"):
+        with pytest.raises(OwsError, match="workflow request binding is invalid"):
             worker_module.load_run_request(run_dir)
     else:
-        _assert_direct_main_rejected(run_dir, monkeypatch, "workflow run format is unsupported")
+        _assert_direct_main_rejected(run_dir, monkeypatch, "workflow request binding is invalid")
     assert _main_files(run_dir) == before
 
 

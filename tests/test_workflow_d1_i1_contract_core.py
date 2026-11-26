@@ -382,6 +382,30 @@ def test_output_is_strictly_validated_without_defaults_and_returned_as_copy() ->
     assert validate_output(compiled, {"result": "ok"}) == {"result": "ok"}
 
 
+def test_d1_22_mock_child_output_is_validated_at_contract_boundary() -> None:
+    """Cover contract validation for a mock child; D6 owns parent return routing."""
+    compiled = compile_contract(
+        _contract(
+            output_schema=_schema(
+                properties={
+                    "return_payload": _schema(
+                        properties={"answer": {"type": "string"}},
+                        required=["answer"],
+                    )
+                },
+                required=["return_payload"],
+            )
+        )
+    )
+
+    mock_child_output = {"return_payload": {"answer": "verified child output"}}
+    assert validate_output(compiled, mock_child_output) == mock_child_output
+
+    invalid_mock_child_output = {"return_payload": {"answer": 42}}
+    with pytest.raises(ContractOutputInvalid):
+        validate_output(compiled, invalid_mock_child_output)
+
+
 def test_normalized_default_and_explicit_value_have_same_canonical_hash() -> None:
     compiled = compile_contract(
         _contract(input_schema=_schema(properties={"mode": {"type": "string", "default": "safe"}}))

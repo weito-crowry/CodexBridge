@@ -20,7 +20,13 @@ from .startup_diagnostics import (
     WorkflowStartupStage,
     current_startup_diagnostic,
 )
-from .strict_reader_gate import RunFormatVersion, classify_readonly
+from .strict_manifest import StrictWorkflowSnapshotVerification
+from .strict_reader_gate import (
+    RunFormatVersion,
+    StrictReaderGateError,
+    classify_readonly,
+    verify_strict_reserved_readonly,
+)
 
 WorkerMode = Literal["start", "recover"]
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
@@ -114,6 +120,8 @@ class WorkflowWorkerManager:
         python_executable: str | None = None,
         frozen: bool | None = None,
         graceful_shutdown_seconds: float = 2.0,
+        enable_isolated_strict_runtime: bool = False,
+        enable_isolated_strict_codex_jobs: bool = False,
     ) -> None:
         if not 0.05 <= graceful_shutdown_seconds <= 30:
             raise ValueError("workflow worker shutdown wait must be from 0.05 to 30 seconds")
@@ -125,6 +133,8 @@ class WorkflowWorkerManager:
         self._python_executable = python_executable or sys.executable
         self._frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
         self._graceful_shutdown_seconds = graceful_shutdown_seconds
+        self.enable_isolated_strict_runtime = bool(enable_isolated_strict_runtime)
+        self._enable_isolated_strict_codex_jobs = bool(enable_isolated_strict_codex_jobs)
         self._accepting = True
         self._lifecycle_lock = asyncio.Lock()
         self._shutdown_report: WorkflowShutdownReport | None = None
@@ -163,6 +173,8 @@ class WorkflowWorkerManager:
         mode: WorkerMode,
         workspace_root: Path | None = None,
         max_live_codex_jobs: int = 1,
+        strict_runtime: bool = False,
+        codex_bridge_port: int | None = None,
     ) -> WorkflowWorkerHandle:
         diagnostic = current_startup_diagnostic()
         if diagnostic is not None:
@@ -179,13 +191,55 @@ class WorkflowWorkerManager:
                 if current is not None and current.state == "running":
                     raise WorkflowManagerError("a worker is already running for this workflow run")
                 manifest = self._read_manifest(canonical_run_dir)
-                live = _codex_job_live(
-                    manifest,
-                    max_live_codex_jobs=max_live_codex_jobs,
-                )
+                strict_verification: StrictWorkflowSnapshotVerification | None = None
+                strict_execution_mode: str | None = None
+                if manifest.get("run_format_version") == 2:
+                    if not strict_runtime or not self.enable_isolated_strict_runtime:
+                        raise WorkflowManagerError("strict workflow runtime is not supported")
+                    strict_verification = self._verify_strict_run(canonical_run_dir)
+                    definition_revision = strict_verification._definition
+                    if (
+                        definition_revision is None
+                        or type(definition_revision.definition) is not dict
+                    ):
+                        raise WorkflowManagerError("strict workflow definition is invalid")
+                    has_codex_jobs = _definition_contains_codex_job(definition_revision.definition)
+                    declared_jobs = manifest.get("max_live_codex_jobs")
+                    if type(declared_jobs) is not int or declared_jobs not in {1, 2, 3}:
+                        raise WorkflowManagerError("strict workflow job limit is invalid")
+                    if max_live_codex_jobs != declared_jobs:
+                        raise WorkflowManagerError("worker job limit does not match the manifest")
+                    if has_codex_jobs:
+                        if (
+                            not self._enable_isolated_strict_codex_jobs
+                            or not self._control_token
+                            or type(codex_bridge_port) is not int
+                            or not 1 <= codex_bridge_port <= 65535
+                        ):
+                            raise WorkflowManagerError("strict codex-job runtime is not available")
+                        live = True
+                        strict_execution_mode = "authorized_codex"
+                    else:
+                        live = False
+                        strict_execution_mode = "isolated"
+                else:
+                    if strict_runtime:
+                        raise WorkflowManagerError("strict runtime option requires a v2 run")
+                    live = _codex_job_live(
+                        manifest,
+                        max_live_codex_jobs=max_live_codex_jobs,
+                    )
                 canonical_workspace = self._validate_workspace(
                     canonical_run_dir, workspace_root, live
                 )
+                if strict_verification is not None:
+                    expected_workspace = Path(strict_verification.manifest.workspace_root)
+                    if canonical_workspace is None or os.path.normcase(
+                        os.fspath(canonical_workspace)
+                    ) != os.path.normcase(os.fspath(expected_workspace)):
+                        raise WorkflowManagerError(
+                            "strict workspace does not match the verified manifest"
+                        )
                 if live and not self._control_token:
                     raise WorkflowManagerError("live codex-job requires the Bridge control token")
                 if diagnostic is not None:
@@ -195,7 +249,7 @@ class WorkflowWorkerManager:
                 launch_id = uuid.uuid4().hex
                 config_path = canonical_run_dir / f"worker-config-{launch_id}.json"
                 shutdown_file = canonical_run_dir / f"worker-shutdown-{launch_id}.request"
-                worker_config = {
+                worker_config: dict[str, object] = {
                     "version": 1,
                     "mode": mode,
                     "workspace_root": (
@@ -204,6 +258,19 @@ class WorkflowWorkerManager:
                     "allowed_roots": list(self.allowed_roots),
                     "shutdown_file": shutdown_file.name,
                 }
+                if strict_execution_mode is not None:
+                    worker_config = {
+                        "version": 2,
+                        "mode": mode,
+                        "workspace_root": (
+                            None if canonical_workspace is None else str(canonical_workspace)
+                        ),
+                        "allowed_roots": list(self.allowed_roots),
+                        "shutdown_file": shutdown_file.name,
+                        "strict_runtime": True,
+                        "execution_mode": strict_execution_mode,
+                        "codex_bridge_port": codex_bridge_port if live else None,
+                    }
                 _write_private_json(config_path, worker_config)
                 if diagnostic is not None:
                     diagnostic.complete_if_active(WorkflowStartupStage.WORKER_CONFIG_WRITE)
@@ -226,6 +293,8 @@ class WorkflowWorkerManager:
                     os.environ,
                     control_token=self._control_token if live else None,
                 )
+                if strict_execution_mode == "authorized_codex":
+                    environment["CODEXBRIDGE_WORKFLOW_BRIDGE_PORT"] = str(codex_bridge_port)
                 if diagnostic is not None:
                     diagnostic.mark_worker_spawned(None)
                 append_lifecycle_event(
@@ -480,7 +549,10 @@ class WorkflowWorkerManager:
         ownership_complete = True
         errors: list[str] = []
         ownership_runs: dict[Path, bool] = {record.run_dir: record.live for record in records}
-        persisted_runs, persisted_complete = _persisted_live_run_directories(self.state_root)
+        persisted_runs, persisted_complete = _persisted_live_run_directories(
+            self.state_root,
+            allowed_roots=self.allowed_roots,
+        )
         if not persisted_complete:
             ownership_complete = False
             errors.append("persisted workflow run list is incomplete")
@@ -498,7 +570,32 @@ class WorkflowWorkerManager:
                 if database_path.is_symlink() or not database_path.is_file():
                     turns, complete = set(), False
                 else:
-                    turns, complete = CodexJobAdapter.read_shutdown_ownership(database_path)
+                    expected_workflow_id = None
+                    expected_task_identities: tuple[str, ...] | None = None
+                    try:
+                        persisted_manifest = self._read_manifest(run_dir)
+                        if persisted_manifest.get("run_format_version") == 2:
+                            expected_workflow_id = str(persisted_manifest["workflow_id"])
+                            verification = self._verify_strict_run(run_dir)
+                            pinned = verification._definition
+                            if pinned is None or pinned.contract is None:
+                                raise WorkflowManagerError(
+                                    "strict workflow definition is unavailable"
+                                )
+                            from .interpreter import _strict_codex_job_task_identities
+
+                            expected_task_identities = _strict_codex_job_task_identities(
+                                pinned.definition,
+                                verification._normalized_input,
+                                pinned.max_live_codex_jobs,
+                            )
+                    except WorkflowManagerError:
+                        expected_workflow_id = ""
+                    turns, complete = CodexJobAdapter.read_shutdown_ownership(
+                        database_path,
+                        expected_workflow_id=expected_workflow_id,
+                        expected_task_identities=expected_task_identities,
+                    )
             except Exception:
                 turns, complete = set(), False
             owned_turns.update(turns)
@@ -577,7 +674,26 @@ class WorkflowWorkerManager:
         if not isinstance(value, dict):
             raise WorkflowManagerError("workflow run manifest must be an object")
         if "run_format_version" in value:
-            raise WorkflowManagerError("workflow run format is unsupported")
+            if type(value.get("run_format_version")) is not int or value["run_format_version"] != 2:
+                raise WorkflowManagerError("workflow run format is unsupported")
+            workflow_id = value.get("workflow_id")
+            request_digest = value.get("request_digest")
+            if type(workflow_id) is not str or type(request_digest) is not str:
+                raise WorkflowManagerError("workflow request binding is invalid")
+            try:
+                verification = verify_strict_reserved_readonly(
+                    run_dir.parent,
+                    run_dir.name,
+                    manifest_bytes,
+                    expected_workflow_id=workflow_id,
+                    expected_request_digest=request_digest,
+                    allowed_roots=self.allowed_roots,
+                )
+            except StrictReaderGateError:
+                raise WorkflowManagerError("workflow request binding is invalid") from None
+            if verification is None:
+                raise WorkflowManagerError("workflow request binding is invalid")
+            return verification.manifest.to_dict()
 
         request_database = run_dir.parent / "requests.sqlite"
         try:
@@ -604,6 +720,31 @@ class WorkflowWorkerManager:
         except Exception:
             raise WorkflowManagerError("workflow request binding is invalid") from None
         return value
+
+    def _verify_strict_run(self, run_dir: Path) -> StrictWorkflowSnapshotVerification:
+        manifest_path = run_dir / "manifest.json"
+        try:
+            manifest_bytes = manifest_path.read_bytes()
+            value = json.loads(manifest_bytes, object_pairs_hook=_unique_json_object)
+            if not isinstance(value, dict):
+                raise ValueError
+            workflow_id = value.get("workflow_id")
+            request_digest = value.get("request_digest")
+            if type(workflow_id) is not str or type(request_digest) is not str:
+                raise ValueError
+            verification = verify_strict_reserved_readonly(
+                run_dir.parent,
+                run_dir.name,
+                manifest_bytes,
+                expected_workflow_id=workflow_id,
+                expected_request_digest=request_digest,
+                allowed_roots=self.allowed_roots,
+            )
+            if verification is None or verification.reservation_verified is not True:
+                raise ValueError
+            return verification
+        except Exception:
+            raise WorkflowManagerError("workflow request binding is invalid") from None
 
     def _validate_workspace(
         self,
@@ -659,7 +800,11 @@ def default_workflow_state_root() -> Path:
     return Path(local_app_data) / "CodexBridge" / "workflows"
 
 
-def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...], bool]:
+def _persisted_live_run_directories(
+    state_root: Path,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> tuple[tuple[Path, ...], bool]:
     root = Path(state_root)
     if root.is_symlink():
         return (), False
@@ -742,15 +887,35 @@ def _persisted_live_run_directories(state_root: Path) -> tuple[tuple[Path, ...],
                 complete = False
                 continue
             manifest_bytes = manifest_path.read_bytes()
-            run_format = classify_readonly(
+            verification = verify_strict_reserved_readonly(
                 canonical_root,
                 run_id,
                 manifest_bytes,
                 expected_workflow_id=workflow_id,
                 expected_request_digest=request_digest,
+                allowed_roots=allowed_roots,
             )
-            if run_format is not RunFormatVersion.LEGACY_V1:
-                complete = False
+            if verification is not None:
+                pinned = verification._definition
+                if pinned is None or type(pinned.definition) is not dict:
+                    complete = False
+                    continue
+                has_codex_jobs = _definition_contains_codex_job(pinned.definition)
+                jobs_path = resolved / "codex_jobs.sqlite"
+                if not has_codex_jobs:
+                    if jobs_path.exists() or jobs_path.is_symlink():
+                        complete = False
+                    continue
+                if type(
+                    pinned.max_live_codex_jobs
+                ) is not int or pinned.max_live_codex_jobs not in {
+                    1,
+                    2,
+                    3,
+                }:
+                    complete = False
+                    continue
+                persisted.append(resolved)
                 continue
             manifest = json.loads(
                 manifest_bytes,
@@ -861,6 +1026,16 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError("workflow manifest contains a duplicate key")
         result[key] = value
     return result
+
+
+def _definition_contains_codex_job(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("call") == "codex-job":
+            return True
+        return any(_definition_contains_codex_job(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_definition_contains_codex_job(child) for child in value)
+    return False
 
 
 def _write_private_json(path: Path, value: Mapping[str, object]) -> None:

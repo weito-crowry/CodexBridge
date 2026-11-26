@@ -21,6 +21,7 @@ from codex_bridge.workflows.service import (
     WorkflowService,
     WorkflowServiceUnavailable,
     WorkflowSnapshot,
+    _StrictRunMetadata,
 )
 from tests.test_workflows_api import FakeWorkerManager, _workflow_yaml
 
@@ -403,6 +404,56 @@ async def test_workflow_result_preserves_non_success_status(
         "workflow_id": _WORKFLOW_ID,
         "status": status,
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "worker_state", "reason_code", "expected_error"),
+    [
+        ("running", "running", None, "workflow_not_completed"),
+        (
+            "needs_reconciliation",
+            "running",
+            "strict_execution_uncertain",
+            "workflow_execution_uncertain",
+        ),
+        ("failed", "failed", "output_contract_violation", "workflow_output_invalid"),
+        ("failed", "failed", "resource_limit_exceeded", "workflow_resource_limit"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_strict_workflow_result_uses_allowlisted_metadata_and_safe_errors(
+    tmp_path,
+    status: str,
+    worker_state: str,
+    reason_code: str | None,
+    expected_error: str,
+) -> None:
+    snapshot = replace(
+        _snapshot(_WORKFLOW_ID, status),
+        worker_state=worker_state,
+        _strict_metadata=_StrictRunMetadata(
+            run_format_version=2,
+            contract_version=1,
+            contract_sha256="a" * 64,
+            binding_digest="b" * 64,
+            reason_code=reason_code,
+        ),
+    )
+    service = FakeWorkflowService((snapshot,))
+    app = create_app(_config(tmp_path, ("read",)), runtime_factory=lambda _: FakeRuntime(service))
+
+    async with _mcp_client(app) as client:
+        response = await client.call_tool("workflow_run_result", {"workflow_id": _WORKFLOW_ID})
+
+    payload = response.structured_content
+    assert payload["error"] == expected_error
+    assert payload["workflow_id"] == _WORKFLOW_ID
+    assert payload["run_id"] == snapshot.run_id
+    assert payload["status"] == status
+    assert payload["run_format_version"] == 2
+    assert payload["contract_version"] == 1
+    assert payload["contract_sha256"] == "a" * 64
+    assert payload["binding_digest"] == "b" * 64
 
 
 @pytest.mark.asyncio

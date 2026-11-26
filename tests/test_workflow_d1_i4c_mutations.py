@@ -369,6 +369,27 @@ def test_initialize_without_initial_is_a_noop_and_is_never_persisted(tmp_path: P
     assert _counts(tmp_path / "run-no-initial") == (0, 0)
 
 
+def test_root_mutation_execution_key_includes_actual_loop_iteration_vector(
+    tmp_path: Path,
+) -> None:
+    _, _, store = _initialize(tmp_path / "run-root-loop-context")
+    first_context = _context(node="/do/1/for/do/0/update", vector=(0, 2))
+    second_context = _context(node="/do/1/for/do/0/update", vector=(1, 2))
+
+    first_key = store.execution_key_for(first_context)
+    second_key = store.execution_key_for(second_context)
+    result = store.apply(
+        first_context,
+        "counter",
+        "initialize",
+        expected_before_version=0,
+        expected_before_digest=None,
+    )
+
+    assert first_key != second_key
+    assert result.after_value == 10
+
+
 def test_tombstone_can_be_assigned_again_without_losing_history(tmp_path: Path) -> None:
     _, _, store = _initialize(tmp_path / "run-tombstone-reassign")
     initialized = _apply(store, "gone", "initialize", node="/gone/init")

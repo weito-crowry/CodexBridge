@@ -19,6 +19,7 @@ from .service import (
     WorkflowServiceUnavailable,
     WorkflowSnapshot,
     WorkflowStartFailed,
+    strict_run_metadata_json,
 )
 
 _MAX_BODY_BYTES = 128 * 1024
@@ -162,15 +163,71 @@ def create_workflow_routes(
             if status == "succeeded" and result.result is not None:
                 return JSONResponse(result.result)
             if status in {"queued", "starting", "running"}:
-                return JSONResponse(
-                    {"workflow_id": result.workflow.workflow_id, "status": status},
-                    status_code=202,
-                )
+                pending_response: dict[str, object] = {
+                    "workflow_id": result.workflow.workflow_id,
+                    "status": status,
+                }
+                strict_metadata = strict_run_metadata_json(result.workflow)
+                if strict_metadata:
+                    pending_response["run_id"] = result.workflow.run_id
+                    pending_response.update(strict_metadata)
+                return JSONResponse(pending_response, status_code=202)
             if status == "needs_reconciliation":
-                return JSONResponse({"error": "workflow_needs_reconciliation"}, status_code=409)
+                strict_metadata = strict_run_metadata_json(result.workflow)
+                error_code = (
+                    "workflow_execution_uncertain"
+                    if (
+                        strict_metadata.get("reason_code") == "strict_execution_uncertain"
+                        and result.workflow.worker_state != "unknown"
+                    )
+                    else "workflow_needs_reconciliation"
+                )
+                reconciliation_response: dict[str, object] = {"error": error_code}
+                if strict_metadata:
+                    reconciliation_response.update(
+                        {
+                            "workflow_id": result.workflow.workflow_id,
+                            "run_id": result.workflow.run_id,
+                            "status": status,
+                            **strict_metadata,
+                        }
+                    )
+                return JSONResponse(reconciliation_response, status_code=409)
             if status == "failed_to_start":
+                strict_metadata = strict_run_metadata_json(result.workflow)
+                if strict_metadata:
+                    return JSONResponse(
+                        {
+                            "error": "workflow_failed_to_start",
+                            "workflow_id": result.workflow.workflow_id,
+                            "run_id": result.workflow.run_id,
+                            "status": status,
+                            **strict_metadata,
+                        },
+                        status_code=409,
+                    )
                 return JSONResponse({"error": "workflow_failed_to_start"}, status_code=409)
             if status == "failed":
+                strict_metadata = strict_run_metadata_json(result.workflow)
+                if strict_metadata:
+                    reason_code = strict_metadata.get("reason_code")
+                    strict_error = {
+                        "output_contract_violation": "workflow_output_invalid",
+                        "resource_limit_exceeded": "workflow_resource_limit",
+                    }.get(
+                        reason_code if isinstance(reason_code, str) else "",
+                        "workflow_failed",
+                    )
+                    return JSONResponse(
+                        {
+                            "error": strict_error,
+                            "workflow_id": result.workflow.workflow_id,
+                            "run_id": result.workflow.run_id,
+                            "status": status,
+                            **strict_metadata,
+                        },
+                        status_code=409,
+                    )
                 return JSONResponse({"error": "workflow_failed"}, status_code=409)
             return JSONResponse({"error": "workflow_state_unknown"}, status_code=409)
         except ValueError:
@@ -371,6 +428,7 @@ def _snapshot_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
             }
             for job in snapshot.jobs
         ]
+    result.update(strict_run_metadata_json(snapshot))
     return result
 
 
@@ -385,4 +443,5 @@ def _list_item_json(snapshot: WorkflowSnapshot) -> dict[str, object]:
         result["job_id"] = snapshot.job_id
     if snapshot.thread_id is not None:
         result["thread_id"] = snapshot.thread_id
+    result.update(strict_run_metadata_json(snapshot))
     return result

@@ -242,6 +242,18 @@ async def test_legacy_v0_and_migrated_v1_keep_service_status_and_response(tmp_pa
             "SELECT request_digest FROM workflow_requests WHERE run_id = ?",
             (accepted_v0.run_id,),
         ).fetchone()[0]
+    row_v0 = _RequestRow(
+        f"i5b1-legacy-v0-{accepted_v0.run_id[-4:]}",
+        accepted_v0.workflow_id,
+        accepted_v0.run_id,
+        digest_v0,
+        "running",
+        accepted_v0.created_at,
+        accepted_v0.updated_at,
+    )
+    assert (
+        _verified_active_workspace(state_v0, row_v0, (str(workspace_v0),)) == workspace_v0.resolve()
+    )
     snapshot_v0 = await service_v0.get_workflow(accepted_v0.workflow_id)
     result_v0 = await service_v0.get_result(accepted_v0.workflow_id)
     assert snapshot_v0.workflow_id == accepted_v0.workflow_id
@@ -279,6 +291,18 @@ async def test_legacy_v0_and_migrated_v1_keep_service_status_and_response(tmp_pa
     StrictWorkflowRequestStore(state_v1).migrate_v0_to_v1(
         backup_path=state_v1 / "requests-before-v1.sqlite"
     )
+    row_v1 = _RequestRow(
+        f"i5b1-legacy-v1-{accepted_v1.run_id[-4:]}",
+        accepted_v1.workflow_id,
+        accepted_v1.run_id,
+        digest_v1,
+        "running",
+        accepted_v1.created_at,
+        accepted_v1.updated_at,
+    )
+    assert (
+        _verified_active_workspace(state_v1, row_v1, (str(workspace_v1),)) == workspace_v1.resolve()
+    )
     snapshot_v1 = await service_v1.get_workflow(accepted_v1.workflow_id)
     result_v1 = await service_v1.get_result(accepted_v1.workflow_id)
     assert snapshot_v1.workflow_id == accepted_v1.workflow_id
@@ -312,7 +336,7 @@ async def test_legacy_v0_and_migrated_v1_keep_service_status_and_response(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_strict_v2_service_status_and_active_workspace_fail_closed(tmp_path: Path) -> None:
+async def test_strict_v2_service_status_and_verified_active_workspace(tmp_path: Path) -> None:
     fixture = _strict_fixture(tmp_path)
     database = fixture.state_root / "requests.sqlite"
     main_bytes = database.read_bytes()
@@ -336,8 +360,10 @@ async def test_strict_v2_service_status_and_active_workspace_fail_closed(tmp_pat
     assert inspection.worker_state == "unknown"
     assert inspection.job_id is None
     assert inspection.result is None
-    with pytest.raises(WorkflowConcurrencyConflict):
+    assert (
         _verified_active_workspace(fixture.state_root, row, (str(fixture.workspace),))
+        == fixture.workspace.resolve()
+    )
 
     manager = _WorkerManager(fixture.state_root, fixture.workspace)
     service = WorkflowService(manager, codex_bridge_port=18001)
@@ -362,6 +388,22 @@ async def test_strict_v2_service_status_and_active_workspace_fail_closed(tmp_pat
             workspace_root=str(fixture.workspace),
         )
     assert manager.start_calls == []
+
+
+def test_inconsistent_strict_snapshot_keeps_workspace_conflict(tmp_path: Path) -> None:
+    fixture = _strict_fixture(tmp_path)
+    with sqlite3.connect(fixture.run_directory / "variables.sqlite") as connection:
+        connection.execute(
+            "UPDATE run_binding SET normalized_input_sha256 = ? WHERE run_id = ?",
+            ("f" * 64, _RUN_ID),
+        )
+
+    with pytest.raises(WorkflowConcurrencyConflict):
+        _verified_active_workspace(
+            fixture.state_root,
+            _strict_row(fixture),
+            (str(fixture.workspace),),
+        )
 
 
 @pytest.mark.parametrize(

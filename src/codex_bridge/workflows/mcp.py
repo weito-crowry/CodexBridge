@@ -14,6 +14,7 @@ from .service import (
     WorkflowResultSnapshot,
     WorkflowServiceUnavailable,
     WorkflowSnapshot,
+    strict_run_metadata_json,
 )
 
 _MAX_MCP_RESPONSE_BYTES = 64 * 1024
@@ -114,20 +115,40 @@ def register_workflow_tools(
             if status in {"queued", "starting", "running"}:
                 error_code = "workflow_not_completed"
             elif status == "needs_reconciliation":
-                error_code = "workflow_needs_reconciliation"
+                strict_metadata = strict_run_metadata_json(snapshot)
+                error_code = (
+                    "workflow_execution_uncertain"
+                    if (
+                        strict_metadata.get("reason_code") == "strict_execution_uncertain"
+                        and snapshot.worker_state != "unknown"
+                    )
+                    else "workflow_needs_reconciliation"
+                )
             elif status == "failed_to_start":
                 error_code = "workflow_failed_to_start"
             elif status == "failed":
-                error_code = "workflow_failed"
+                strict_metadata = strict_run_metadata_json(snapshot)
+                reason_code = strict_metadata.get("reason_code")
+                normalized_reason_code = reason_code if isinstance(reason_code, str) else ""
+                error_code = {
+                    "output_contract_violation": "workflow_output_invalid",
+                    "resource_limit_exceeded": "workflow_resource_limit",
+                }.get(
+                    normalized_reason_code,
+                    "workflow_failed",
+                )
             else:
                 error_code = "workflow_state_unknown"
-            return _bounded_response(
-                {
-                    "error": error_code,
-                    "workflow_id": snapshot.workflow_id,
-                    "status": status,
-                }
-            )
+            response: dict[str, Any] = {
+                "error": error_code,
+                "workflow_id": snapshot.workflow_id,
+                "status": status,
+            }
+            strict_metadata = strict_run_metadata_json(snapshot)
+            if strict_metadata:
+                response["run_id"] = snapshot.run_id
+                response.update(strict_metadata)
+            return _bounded_response(response)
         except ValueError:
             return {"error": "invalid_workflow_id"}
         except WorkflowNotFoundError:

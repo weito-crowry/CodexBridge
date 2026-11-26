@@ -12,12 +12,13 @@ from pathlib import Path
 from ..paths import AllowedPathPolicy, PathPolicyError
 from .http_client import CONTROL_TOKEN_ENV
 from .manager import missing_workflow_dependencies
-from .strict_manifest import _is_symlink_or_junction
+from .strict_manifest import StrictWorkflowSnapshotVerification, _is_symlink_or_junction
 from .strict_reader_gate import (
     RunFormatVersion,
     StrictReaderGateError,
     _decode_manifest,
     classify_readonly,
+    verify_strict_reserved_readonly,
 )
 
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
@@ -50,19 +51,71 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run_dir = _validate_run_directory(args.run_dir)
         config = _read_config(args.config, run_dir, args.mode)
-        manifest = _read_manifest(run_dir)
+        raw_roots = config.get("allowed_roots")
+        allowed_roots = (
+            tuple(root for root in raw_roots if type(root) is str)
+            if isinstance(raw_roots, list) and all(type(root) is str for root in raw_roots)
+            else ()
+        )
+        manifest = _read_manifest(run_dir, allowed_roots=allowed_roots)
+        strict_execution_mode: str | None = None
+        codex_bridge_port: int | None = None
+        if manifest.get("run_format_version") == 2:
+            if config.get("version") != 2 or config.get("strict_runtime") is not True:
+                raise WorkflowWorkerEntryError("strict workflow runtime is not supported")
+            verification = _verify_strict_reserved(run_dir, allowed_roots)
+            definition_revision = verification._definition
+            if definition_revision is None:
+                raise WorkflowWorkerEntryError("workflow request binding is invalid")
+            has_codex_jobs = _definition_contains_codex_job(definition_revision.definition)
+            strict_execution_mode = "authorized_codex" if has_codex_jobs else "isolated"
+            if config.get("execution_mode") != strict_execution_mode:
+                raise WorkflowWorkerEntryError("strict execution mode is invalid")
+            raw_workspace = config.get("workspace_root")
+            if not isinstance(raw_workspace, str) or os.path.normcase(
+                os.path.abspath(raw_workspace)
+            ) != os.path.normcase(os.path.abspath(verification.manifest.workspace_root)):
+                raise WorkflowWorkerEntryError("workflow workspace does not match its manifest")
+            if has_codex_jobs:
+                raw_codex_bridge_port = config.get("codex_bridge_port")
+                if (
+                    type(raw_codex_bridge_port) is not int
+                    or not 1 <= raw_codex_bridge_port <= 65535
+                ):
+                    raise WorkflowWorkerEntryError("strict codex-job configuration is invalid")
+                codex_bridge_port = raw_codex_bridge_port
+            elif config.get("codex_bridge_port") is not None:
+                raise WorkflowWorkerEntryError("strict worker config has unexpected job settings")
+        elif config.get("version") != 1:
+            raise WorkflowWorkerEntryError("legacy workflow config version is unsupported")
         control = manifest.get("control", {})
-        if not isinstance(control, dict):
+        if strict_execution_mode is None and not isinstance(control, dict):
             raise WorkflowWorkerEntryError("workflow manifest control must be an object")
-        live = control.get("codex_job_live", False)
-        if not isinstance(live, bool):
-            raise WorkflowWorkerEntryError("workflow manifest codex_job_live must be a boolean")
-        max_live_codex_jobs = _max_live_codex_jobs(control)
-        if max_live_codex_jobs in {2, 3} and not live:
-            raise WorkflowWorkerEntryError(
-                f"manifest max_live_codex_jobs={max_live_codex_jobs} requires codex_job_live"
-            )
+        if strict_execution_mode is None:
+            assert isinstance(control, dict)
+            live = control.get("codex_job_live", False)
+            if not isinstance(live, bool):
+                raise WorkflowWorkerEntryError("workflow manifest codex_job_live must be a boolean")
+            max_live_codex_jobs = _max_live_codex_jobs(control)
+            if max_live_codex_jobs in {2, 3} and not live:
+                raise WorkflowWorkerEntryError(
+                    f"manifest max_live_codex_jobs={max_live_codex_jobs} requires codex_job_live"
+                )
+        else:
+            live = strict_execution_mode == "authorized_codex"
+            raw_max_live_codex_jobs = manifest.get("max_live_codex_jobs")
+            if type(raw_max_live_codex_jobs) is not int or raw_max_live_codex_jobs not in {
+                1,
+                2,
+                3,
+            }:
+                raise WorkflowWorkerEntryError("strict codex-job limit is invalid")
+            max_live_codex_jobs = raw_max_live_codex_jobs
         worker_args = _validate_worker_configuration(run_dir, args.mode, config, live)
+        if strict_execution_mode is not None:
+            worker_args.extend(("--strict-runtime-mode", strict_execution_mode))
+            if codex_bridge_port is not None:
+                worker_args.extend(("--codex-bridge-port", str(codex_bridge_port)))
     except WorkflowWorkerEntryError as error:
         _write_status(args.run_dir, state="failed", exit_code=2, error_code="invalid_config")
         print(str(error), file=sys.stderr, flush=True)
@@ -124,7 +177,11 @@ def _validate_run_directory(value: Path) -> Path:
     return run_dir
 
 
-def _read_manifest(run_dir: Path) -> dict[str, object]:
+def _read_manifest(
+    run_dir: Path,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> dict[str, object]:
     path = run_dir / "manifest.json"
     if _is_symlink_or_junction(path):
         raise WorkflowWorkerEntryError("workflow run manifest is unavailable")
@@ -137,7 +194,26 @@ def _read_manifest(run_dir: Path) -> dict[str, object]:
     except Exception:
         raise WorkflowWorkerEntryError("workflow run manifest is invalid") from None
     if "run_format_version" in value:
-        raise WorkflowWorkerEntryError("workflow run format is unsupported")
+        if type(value.get("run_format_version")) is not int or value["run_format_version"] != 2:
+            raise WorkflowWorkerEntryError("workflow run format is unsupported")
+        workflow_id = value.get("workflow_id")
+        request_digest = value.get("request_digest")
+        if type(workflow_id) is not str or type(request_digest) is not str:
+            raise WorkflowWorkerEntryError("workflow request binding is invalid")
+        try:
+            verification = verify_strict_reserved_readonly(
+                run_dir.parent,
+                run_dir.name,
+                manifest_bytes,
+                expected_workflow_id=workflow_id,
+                expected_request_digest=request_digest,
+                allowed_roots=allowed_roots,
+            )
+        except StrictReaderGateError:
+            raise WorkflowWorkerEntryError("workflow request binding is invalid") from None
+        if verification is None:
+            raise WorkflowWorkerEntryError("workflow request binding is invalid")
+        return verification.manifest.to_dict()
     _validate_managed_legacy_manifest(run_dir, value, manifest_bytes)
     return value
 
@@ -194,10 +270,35 @@ def _read_config(config_path: Path, run_dir: Path, mode: str) -> dict[str, objec
         value = json.loads(resolved.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         raise WorkflowWorkerEntryError("workflow worker config is invalid") from None
-    expected_keys = {"version", "mode", "workspace_root", "allowed_roots", "shutdown_file"}
-    if not isinstance(value, dict) or set(value) != expected_keys:
+    legacy_keys = {"version", "mode", "workspace_root", "allowed_roots", "shutdown_file"}
+    strict_keys = legacy_keys | {
+        "strict_runtime",
+        "execution_mode",
+        "codex_bridge_port",
+    }
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(legacy_keys),
+        frozenset(strict_keys),
+    }:
         raise WorkflowWorkerEntryError("workflow worker config has an invalid shape")
-    if type(value.get("version")) is not int or value["version"] != 1:
+    if type(value.get("version")) is not int or value["version"] not in {1, 2}:
+        raise WorkflowWorkerEntryError("workflow worker config version is unsupported")
+    if (value["version"] == 1 and set(value) != legacy_keys) or (
+        value["version"] == 2
+        and (
+            set(value) != strict_keys
+            or value.get("strict_runtime") is not True
+            or type(value.get("execution_mode")) is not str
+            or value.get("execution_mode") not in {"isolated", "authorized_codex"}
+            or (
+                value.get("codex_bridge_port") is not None
+                and (
+                    type(value.get("codex_bridge_port")) is not int
+                    or not 1 <= value["codex_bridge_port"] <= 65535
+                )
+            )
+        )
+    ):
         raise WorkflowWorkerEntryError("workflow worker config version is unsupported")
     if value.get("mode") != mode:
         raise WorkflowWorkerEntryError("workflow worker mode does not match its config")
@@ -248,6 +349,40 @@ def _validate_worker_configuration(
         arguments.extend(("--allowed-root", root))
     arguments.extend(("--shutdown-file", str(shutdown_file)))
     return arguments
+
+
+def _verify_strict_reserved(
+    run_dir: Path, allowed_roots: tuple[str, ...]
+) -> StrictWorkflowSnapshotVerification:
+    try:
+        manifest_path = run_dir / "manifest.json"
+        if _is_symlink_or_junction(manifest_path):
+            raise ValueError
+        manifest_bytes = manifest_path.read_bytes()
+        value, _ = _decode_manifest(manifest_bytes)
+        verification = verify_strict_reserved_readonly(
+            run_dir.parent,
+            run_dir.name,
+            manifest_bytes,
+            expected_workflow_id=str(value["workflow_id"]),
+            expected_request_digest=str(value["request_digest"]),
+            allowed_roots=allowed_roots,
+        )
+        if verification is None or verification.reservation_verified is not True:
+            raise ValueError
+        return verification
+    except Exception:
+        raise WorkflowWorkerEntryError("workflow request binding is invalid") from None
+
+
+def _definition_contains_codex_job(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("call") == "codex-job":
+            return True
+        return any(_definition_contains_codex_job(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_definition_contains_codex_job(child) for child in value)
+    return False
 
 
 def _control_token_configured() -> bool:

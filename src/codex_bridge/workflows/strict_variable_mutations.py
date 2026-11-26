@@ -253,7 +253,14 @@ class StrictWorkflowVariableMutationStore:
             frame = frames.get(context.frame_id)
             if frame is None:
                 raise StrictWorkflowVariableConflict()
-            if _frames._decode_iteration_vector(frame["iteration_vector_json"]) != vector:
+            stored_vector = _frames._decode_iteration_vector(frame["iteration_vector_json"])
+            is_root_frame = (
+                context.frame_id == "workflow-root"
+                and frame["parent_frame_id"] is None
+                and frame["scope_path"] == "workflow"
+                and not stored_vector
+            )
+            if not is_root_frame and stored_vector != vector:
                 raise StrictWorkflowVariableInvalidMetadata()
             declaration = resolve_variable_declaration(
                 self._compiled_contract, declaration_id, frame["scope_path"]
@@ -499,6 +506,42 @@ class StrictWorkflowVariableMutationStore:
         finally:
             self._close_read_connection(connection)
 
+    def read_root_projection(self) -> dict[str, Any]:
+        """Read all present workflow variables from one audited root snapshot."""
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._open_read_connection()
+            connection.execute("BEGIN")
+            frames = self._validate_database(connection)
+            root = frames.get("workflow-root")
+            if (
+                root is None
+                or root["parent_frame_id"] is not None
+                or root["scope_path"] != "workflow"
+                or root["status"] != "ACTIVE"
+                or _frames._decode_iteration_vector(root["iteration_vector_json"])
+            ):
+                raise StrictWorkflowVariableConflict()
+            _mutations, _state_count, current_bytes = self._audit_all(connection, frames)
+            if current_bytes > _MAX_STATE_BYTES:
+                raise StrictWorkflowVariableStorageUnavailable()
+            projection: dict[str, Any] = {}
+            for declaration in self._declarations.values():
+                if declaration.owner_scope != "workflow":
+                    continue
+                history = self._load_history(connection, root, declaration)
+                latest = history.states[max(history.states)]
+                if history.state_row is None or not latest.present or latest.value_json is None:
+                    continue
+                projection[declaration.declaration_id] = parse_strict_json(latest.value_json)
+            return projection
+        except (StrictWorkflowVariableError, StrictVariableLogicError):
+            raise
+        except Exception:
+            raise StrictWorkflowVariableStorageUnavailable() from None
+        finally:
+            self._close_read_connection(connection)
+
     def get_mutation(self, execution_key: str) -> StrictWorkflowVariableMutation | None:
         """Read one historical result after validating its variable chain."""
         if type(execution_key) is not str or _EXECUTION_KEY.fullmatch(execution_key) is None:
@@ -527,6 +570,96 @@ class StrictWorkflowVariableMutationStore:
         except (StrictWorkflowVariableError, StrictVariableLogicError):
             raise
         except Exception:
+            raise StrictWorkflowVariableStorageUnavailable() from None
+        finally:
+            self._close_read_connection(connection)
+
+    def verify_existing_prepared(
+        self,
+        context: MutationContext,
+        declaration_id: str,
+        operation: str,
+        *,
+        expected_before_version: int,
+        expected_before_digest: str | None,
+        **operation_args: object,
+    ) -> StrictWorkflowVariableMutation:
+        """Verify an already committed prepared mutation without writing.
+
+        This is used after a DBOS step checkpoint is returned. Unlike ``apply``,
+        a missing execution row is uncertainty and never causes a new mutation.
+        """
+        context_identity, vector = self._validate_context(context)
+        self._validate_cas_metadata(expected_before_version, expected_before_digest)
+        if (
+            type(declaration_id) is not str
+            or type(operation) is not str
+            or operation not in _OPERATIONS
+            or "operation" in operation_args
+        ):
+            raise StrictWorkflowVariableInvalidMetadata()
+        try:
+            stable_payload = parse_strict_json(
+                _snapshot_operation_payload({"operation": operation, **operation_args})
+            )
+            if type(stable_payload) is not dict or stable_payload.get("operation") != operation:
+                raise StrictVariableLogicError()
+            stable_operation_args = {
+                name: value for name, value in stable_payload.items() if name != "operation"
+            }
+        except StrictWorkflowVariableError:
+            raise
+        except Exception:
+            raise StrictVariableLogicError() from None
+
+        execution_key = self._execution_key(context_identity)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._open_read_connection()
+            connection.execute("BEGIN")
+            frames = self._validate_database(connection)
+            _self_audit, _state_count, _current_bytes = self._audit_all(connection, frames)
+            frame = frames.get(context.frame_id)
+            if frame is None or frame["status"] != "ACTIVE":
+                raise StrictWorkflowVariableNeedsReconciliation()
+            stored_vector = _frames._decode_iteration_vector(frame["iteration_vector_json"])
+            is_root_frame = (
+                context.frame_id == "workflow-root"
+                and frame["parent_frame_id"] is None
+                and frame["scope_path"] == "workflow"
+                and not stored_vector
+            )
+            if not is_root_frame and stored_vector != vector:
+                raise StrictWorkflowVariableNeedsReconciliation()
+            declaration = resolve_variable_declaration(
+                self._compiled_contract, declaration_id, frame["scope_path"]
+            )
+            history = self._load_history(connection, frame, declaration)
+            existing = connection.execute(
+                "SELECT * FROM variable_mutations WHERE execution_key=?", (execution_key,)
+            ).fetchone()
+            if existing is None:
+                raise StrictWorkflowVariableNeedsReconciliation()
+            result = self._replay_existing(
+                existing,
+                history,
+                frame,
+                declaration,
+                context,
+                context_identity,
+                operation,
+                expected_before_version,
+                expected_before_digest,
+                stable_operation_args,
+                execution_key,
+            )
+            connection.execute("COMMIT")
+            return result
+        except (StrictWorkflowVariableError, StrictVariableLogicError):
+            _rollback(connection)
+            raise
+        except Exception:
+            _rollback(connection)
             raise StrictWorkflowVariableStorageUnavailable() from None
         finally:
             self._close_read_connection(connection)
@@ -768,6 +901,11 @@ class StrictWorkflowVariableMutationStore:
             "mutation_context": context_identity,
         }
         return "mutation-" + sha256_json(identity)
+
+    def execution_key_for(self, context: MutationContext) -> str:
+        """Derive the established key for one validated execution context."""
+        context_identity, _vector = self._validate_context(context)
+        return self._execution_key(context_identity)
 
     def _payload_digest(
         self,

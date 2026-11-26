@@ -13,7 +13,12 @@ from codex_bridge.activity import ActivityStore
 from codex_bridge.config import BridgeConfig
 from codex_bridge.ui_api import create_ui_app
 from codex_bridge.workflows.interpreter import SAFE_CODEX_JOB_PROMPT
-from codex_bridge.workflows.service import WorkflowService
+from codex_bridge.workflows.service import (
+    WorkflowResultSnapshot,
+    WorkflowService,
+    WorkflowSnapshot,
+    _StrictRunMetadata,
+)
 
 _TOKEN = "phase5c-test-bearer-token"
 _PATH = "/ui-api/control/workflows"
@@ -390,6 +395,88 @@ async def test_result_route_covers_running_reconciliation_success_and_missing(
     assert succeeded.status_code == 200
     assert succeeded.json() == stored_result
     assert len(manager.start_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "worker_state", "reason_code", "http_status", "error_code"),
+    [
+        ("running", "running", None, 202, None),
+        ("succeeded", "completed", None, 200, None),
+        (
+            "needs_reconciliation",
+            "running",
+            "strict_execution_uncertain",
+            409,
+            "workflow_execution_uncertain",
+        ),
+        ("failed", "failed", "output_contract_violation", 409, "workflow_output_invalid"),
+    ],
+)
+async def test_strict_result_route_projects_bound_metadata_and_safe_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    worker_state: str,
+    reason_code: str | None,
+    http_status: int,
+    error_code: str | None,
+) -> None:
+    workflow_id = "00000000-0000-4000-8000-000000000001"
+    run_id = "run-0123456789abcdef0123456789abcdef"
+    snapshot = WorkflowSnapshot(
+        workflow_id=workflow_id,
+        run_id=run_id,
+        status=status,
+        created_at="2026-11-26T00:00:00Z",
+        updated_at="2026-11-26T00:00:01Z",
+        worker_state=worker_state,
+        terminal=status in {"failed", "succeeded"},
+        _strict_metadata=_StrictRunMetadata(
+            run_format_version=2,
+            contract_version=1,
+            contract_sha256="a" * 64,
+            binding_digest="b" * 64,
+            reason_code=reason_code,
+        ),
+    )
+    strict_result = {
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "status": "succeeded",
+        "result": {},
+        "run_format_version": 2,
+        "contract_version": 1,
+        "contract_sha256": "a" * 64,
+        "binding_digest": "b" * 64,
+    }
+
+    async def get_result(_service: WorkflowService, requested_id: str) -> WorkflowResultSnapshot:
+        assert requested_id == workflow_id
+        return WorkflowResultSnapshot(
+            snapshot,
+            strict_result if status == "succeeded" else None,
+        )
+
+    monkeypatch.setattr(WorkflowService, "get_result", get_result)
+    app, _manager, _workspace = _app(tmp_path)
+    async with httpx.AsyncClient(transport=_transport(app), base_url="http://localhost") as client:
+        response = await client.get(
+            f"{_PATH}/{workflow_id}/result",
+            headers={"authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert response.status_code == http_status
+    payload = response.json()
+    if error_code is not None:
+        assert payload["error"] == error_code
+        assert payload["workflow_id"] == workflow_id
+        assert payload["run_id"] == run_id
+        assert payload["status"] == status
+    else:
+        assert payload["run_format_version"] == 2
+        assert payload["contract_sha256"] == "a" * 64
+        assert payload["binding_digest"] == "b" * 64
 
 
 @pytest.mark.asyncio

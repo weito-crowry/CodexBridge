@@ -86,9 +86,16 @@ class _StrictFixture:
     state_root: Path
     run_dir: Path
     manifest: dict[str, Any]
+    workspace: Path
 
 
-def _strict_fixture(tmp_path: Path) -> _StrictFixture:
+def _strict_fixture(
+    tmp_path: Path,
+    *,
+    max_live_codex_jobs: int = 1,
+    source_yaml: str = _STRICT_YAML,
+    input_default: str | None = None,
+) -> _StrictFixture:
     state_root = tmp_path / "state"
     state_root.mkdir()
     workspace = tmp_path / "workspace"
@@ -103,11 +110,14 @@ def _strict_fixture(tmp_path: Path) -> _StrictFixture:
         "type": "object",
         "additionalProperties": False,
     }
+    input_properties: dict[str, object] = {"secret": {"type": "string"}}
+    if input_default is not None:
+        input_properties["mode"] = {"type": "string", "default": input_default}
     contract = {
         "contract_version": 1,
         "input_schema": {
             **schema,
-            "properties": {"secret": {"type": "string"}},
+            "properties": input_properties,
         },
         "output_schema": schema,
         "variables": [
@@ -123,8 +133,8 @@ def _strict_fixture(tmp_path: Path) -> _StrictFixture:
     }
     definition = definitions.create(
         mutation_request_id="i5b2-definition-create-0001",
-        source_yaml=_STRICT_YAML,
-        max_live_codex_jobs=1,
+        source_yaml=source_yaml,
+        max_live_codex_jobs=max_live_codex_jobs,
         contract=contract,
     )
     normalized = StrictWorkflowBindingVerifier(state_root).normalize_for_definition(
@@ -188,7 +198,7 @@ def _strict_fixture(tmp_path: Path) -> _StrictFixture:
         .verify_reserved(_RUN_ID)
         .reservation_verified
     )
-    return _StrictFixture(state_root, run_dir, manifest_value.to_dict())
+    return _StrictFixture(state_root, run_dir, manifest_value.to_dict(), workspace)
 
 
 def _request_row(manifest: dict[str, Any], *, state: str = "running") -> _RequestRow:
@@ -303,7 +313,12 @@ async def test_manager_rejects_every_explicit_run_format_before_config_or_spawn(
     monkeypatch.setattr("codex_bridge.workflows.manager.asyncio.create_subprocess_exec", fake_spawn)
     manager = WorkflowWorkerManager(state_root=state_root, frozen=False)
 
-    with pytest.raises(WorkflowManagerError, match="^workflow run format is unsupported$"):
+    expected_error = (
+        "workflow request binding is invalid"
+        if type(version) is int and version == 2
+        else "workflow run format is unsupported"
+    )
+    with pytest.raises(WorkflowManagerError, match=f"^{expected_error}$"):
         await manager.start_worker(run_dir, mode=mode)  # type: ignore[arg-type]
 
     assert spawned == []
@@ -554,7 +569,6 @@ def test_persisted_reader_keeps_other_verified_legacy_runs_when_one_is_invalid(
 @pytest.mark.parametrize(
     "invalid_case",
     [
-        "valid-strict",
         "unversioned-bound",
         "unknown-version",
         "missing-binding",
@@ -596,9 +610,17 @@ def test_task_and_event_projection_reject_strict_or_invalid_run_sources_without_
     )
     before = {path: path.read_bytes() for path in tracked_files}
 
-    projection = project_workflow_tasks(fixture.state_root, row, _inspection())
+    allowed_roots = (str(fixture.workspace),)
+    projection = project_workflow_tasks(
+        fixture.state_root, row, _inspection(), allowed_roots=allowed_roots
+    )
     event_page = project_workflow_task_events(
-        fixture.state_root, row, _inspection(), after_id=0, limit=10
+        fixture.state_root,
+        row,
+        _inspection(),
+        after_id=0,
+        limit=10,
+        allowed_roots=allowed_roots,
     )
     combined = json.dumps((projection, event_page), ensure_ascii=False)
 
@@ -616,7 +638,7 @@ def test_task_and_event_projection_reject_strict_or_invalid_run_sources_without_
 
 
 @pytest.mark.asyncio
-async def test_service_keeps_strict_run_in_reconciliation_and_projection_unavailable(
+async def test_service_keeps_strict_run_in_reconciliation_with_static_projection(
     tmp_path: Path,
 ) -> None:
     fixture = _strict_fixture(tmp_path)
@@ -634,16 +656,28 @@ async def test_service_keeps_strict_run_in_reconciliation_and_projection_unavail
     snapshot_bytes_before = {path: path.read_bytes() for path in snapshot_files}
 
     status = await service.get_workflow(_WORKFLOW_ID)
+    result = await service.get_result(_WORKFLOW_ID)
     tasks = await service.get_workflow_tasks(_WORKFLOW_ID)
     events = await service.get_workflow_task_events(_WORKFLOW_ID, after_id=0, limit=10)
 
     assert status.status == "needs_reconciliation"
-    assert tasks["coverage"] == "unavailable"
-    assert tasks["coverage_reason"] == "run_integrity_invalid"
-    assert tasks["nodes"] == [] and tasks["edges"] == []
-    assert events["coverage"] == "unavailable"
-    assert events["coverage_reason"] == "run_integrity_invalid"
+    assert status.worker_state == "unknown"
+    assert status.terminal is False
+    assert result.workflow.status == "needs_reconciliation"
+    assert result.workflow.worker_state == "unknown"
+    assert result.workflow.terminal is False
+    assert result.result is None
+    assert tasks["coverage"] == "partial"
+    assert tasks["coverage_reason"] == "workflow_not_confirmed"
+    assert tasks["nodes"][0]["node_id"] == "/do/0/first"
+    assert tasks["nodes"][0]["state"] == "unknown"
+    assert tasks["nodes"][0]["completion_observed"] is False
+    assert tasks["nodes"][0]["executions"] == []
+    assert tasks["counts"]["executions"] == 0
+    assert events["coverage"] == "partial"
+    assert events["coverage_reason"] == "workflow_not_confirmed"
     assert events["events"] == []
+    assert events["latest_event_id"] == 0
     assert (fixture.state_root / "requests.sqlite").read_bytes() == db_bytes_before
     assert {path: path.read_bytes() for path in snapshot_files} == snapshot_bytes_before
     output = json.dumps((tasks, events), ensure_ascii=False)

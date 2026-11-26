@@ -50,7 +50,7 @@ _OPERATIONS = frozenset(
     }
 )
 _OPERATION_ARGUMENTS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "initialize": (frozenset(), frozenset()),
+    "initialize": (frozenset(), frozenset({"value"})),
     "assign": (frozenset({"value"}), frozenset()),
     "increment": (frozenset(), frozenset({"by"})),
     "decrement": (frozenset(), frozenset({"by"})),
@@ -267,6 +267,10 @@ def calculate_variable_candidate(
         if operation == "initialize":
             if previous_exists is True:
                 raise StrictVariableLogicConflict()
+            if "value" in arguments:
+                return _build_candidate(
+                    declaration, state_exists=True, present=True, value=arguments["value"]
+                )
             if not declaration.has_initial:
                 return _build_candidate(declaration, state_exists=False, present=False)
             value = declaration.initial

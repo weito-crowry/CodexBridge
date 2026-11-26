@@ -159,9 +159,14 @@ class FakeAppServer:
 class FakeBridge:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.final_answer_drain_calls: list[bool] = []
 
     async def interrupt_active_turns(self, wait_seconds: float) -> None:
         self.events.append("bridge.interrupt")
+
+    async def drain_final_answer_writes(self, *, close: bool) -> None:
+        self.final_answer_drain_calls.append(close)
+        self.events.append("bridge.drain")
 
 
 class FakeUiServer:
@@ -212,8 +217,9 @@ async def test_control_shutdown_closes_live_sse_without_uvicorn_errors(tmp_path,
     port = _free_loopback_port()
     ui_server = LocalUiServer(app, port, graceful_shutdown_timeout=settings.shutdown_grace_seconds)
     events: list[str] = []
+    bridge = FakeBridge(events)
     runtime = BridgeRuntime(
-        bridge=FakeBridge(events),  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
         app_server=FakeAppServer(events),  # type: ignore[arg-type]
         activity_store=activities,
         config=settings,
@@ -256,7 +262,8 @@ async def test_control_shutdown_closes_live_sse_without_uvicorn_errors(tmp_path,
         await asyncio.wait_for(sse_reader.read(), timeout=0.5)
 
         assert not activities._subscribers
-        assert events == ["bridge.interrupt", "app.shutdown"]
+        assert events == ["bridge.interrupt", "app.shutdown", "bridge.drain"]
+        assert bridge.final_answer_drain_calls == [True]
         assert not [record for record in caplog.records if record.name.startswith("uvicorn")]
     finally:
         sse_writer.close()
@@ -273,8 +280,9 @@ async def test_runtime_starts_ui_after_app_server_and_stops_it_before_app_server
     tmp_path,
 ) -> None:
     events: list[str] = []
+    bridge = FakeBridge(events)
     runtime = BridgeRuntime(
-        bridge=FakeBridge(events),  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
         app_server=FakeAppServer(events),  # type: ignore[arg-type]
         activity_store=ActivityStore(),
         config=_config(tmp_path),
@@ -290,15 +298,18 @@ async def test_runtime_starts_ui_after_app_server_and_stops_it_before_app_server
         "bridge.interrupt",
         "ui.shutdown",
         "app.shutdown",
+        "bridge.drain",
     ]
+    assert bridge.final_answer_drain_calls == [True]
     assert runtime.ui_server.shutdown_timeouts == [3.0]  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_runtime_cleans_up_app_server_when_ui_start_fails(tmp_path) -> None:
     events: list[str] = []
+    bridge = FakeBridge(events)
     runtime = BridgeRuntime(
-        bridge=FakeBridge(events),  # type: ignore[arg-type]
+        bridge=bridge,  # type: ignore[arg-type]
         app_server=FakeAppServer(events),  # type: ignore[arg-type]
         activity_store=ActivityStore(),
         config=_config(tmp_path),
@@ -308,4 +319,5 @@ async def test_runtime_cleans_up_app_server_when_ui_start_fails(tmp_path) -> Non
     with pytest.raises(RuntimeError, match="ui bind"):
         await runtime.start()
 
-    assert events == ["app.start", "ui.start", "app.shutdown"]
+    assert events == ["app.start", "ui.start", "app.shutdown", "bridge.drain"]
+    assert bridge.final_answer_drain_calls == [True]

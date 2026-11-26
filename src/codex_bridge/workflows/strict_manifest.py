@@ -145,6 +145,8 @@ class StrictWorkflowSnapshotVerification:
     manifest: StrictWorkflowManifestV2 = field(repr=False)
     reservation_verified: bool = field(repr=False)
     mutation_count: int = field(repr=False)
+    _definition: StrictDefinitionRevision | None = field(default=None, repr=False, compare=False)
+    _normalized_input: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def __repr__(self) -> str:
         return "StrictWorkflowSnapshotVerification(<verified>)"
@@ -420,6 +422,8 @@ class StrictWorkflowSnapshotVerifier:
                 manifest=checked.manifest,
                 reservation_verified=False,
                 mutation_count=0,
+                _definition=checked.definition,
+                _normalized_input=normalized.normalized_input,
             )
         except StrictWorkflowSnapshotError:
             raise
@@ -477,6 +481,8 @@ class StrictWorkflowSnapshotVerifier:
                 manifest=manifest,
                 reservation_verified=True,
                 mutation_count=ledger.mutation_count,
+                _definition=checked.definition,
+                _normalized_input=checked.input_value,
             )
         except StrictWorkflowSnapshotError:
             raise

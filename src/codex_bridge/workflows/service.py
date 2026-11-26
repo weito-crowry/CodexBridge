@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -8,13 +9,23 @@ import re
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..paths import AllowedPathPolicy, PathPolicyError
-from .definitions import WorkflowDefinitionRepository
+from .contracts import (
+    CompiledContract,
+    ContractInputInvalid,
+    ContractOutputInvalid,
+    ContractResourceLimit,
+    compile_contract,
+    normalize_input,
+    sha256_json,
+    validate_output,
+)
+from .definitions import DefinitionRepositoryUnavailable, WorkflowDefinitionRepository
 from .diagnostic_log import append_lifecycle_event
 from .manager import WorkflowManagerError, missing_workflow_dependencies
 from .startup_diagnostics import (
@@ -24,7 +35,19 @@ from .startup_diagnostics import (
     current_startup_diagnostic,
     startup_diagnostic_scope,
 )
-from .strict_reader_gate import RunFormatVersion, StrictReaderGateError, classify_readonly
+from .strict_binding import StrictWorkflowInputNormalization
+from .strict_manifest import (
+    StrictWorkflowSnapshotError,
+    StrictWorkflowSnapshotWriter,
+    strict_request_digest_v2,
+)
+from .strict_reader_gate import (
+    StrictReaderGateError,
+    _reserve_prepared_strict_run,
+    verify_strict_reserved_readonly,
+)
+from .strict_requests import StrictWorkflowRequestError, StrictWorkflowRequestStore
+from .strict_variables import StrictWorkflowRunBindingInput, StrictWorkflowVariableStore
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -53,6 +76,18 @@ _SQLITE_INITIALIZATION_TIMEOUT_SECONDS = 5.0
 _SQLITE_INITIALIZATION_RETRY_INTERVAL_SECONDS = 0.025
 _SQLITE_INITIALIZATION_BUSY_TIMEOUT_MS = 100
 _SQLITE_REQUEST_BUSY_TIMEOUT_MS = 5000
+_SAVED_RUN_INPUT_MISSING = object()
+_STRICT_TERMINAL_REASON_CODES = frozenset(
+    {
+        "strict_execution_uncertain",
+        "strict_execution_invalid",
+        "strict_execution_mode_invalid",
+        "strict_execution_target_unavailable",
+        "strict_operation_invalid",
+        "resource_limit_exceeded",
+        "output_contract_violation",
+    }
+)
 
 
 class WorkflowWorkerStarter(Protocol):
@@ -68,11 +103,31 @@ class WorkflowWorkerStarter(Protocol):
         mode: Literal["start", "recover"],
         workspace_root: Path | None = None,
         max_live_codex_jobs: int = 1,
+        strict_runtime: bool = False,
+        codex_bridge_port: int | None = None,
     ) -> object: ...
 
 
 class WorkflowRequestError(ValueError):
     """A request does not match the fixed live codex-job contract."""
+
+
+class WorkflowInputInvalid(WorkflowRequestError):
+    """Strict saved-run input failed contract validation."""
+
+    error_code = "workflow_input_invalid"
+
+    def __init__(self) -> None:
+        super().__init__(self.error_code)
+
+
+class WorkflowResourceLimit(WorkflowRequestError):
+    """Strict saved-run input exceeded a contract resource bound."""
+
+    error_code = "workflow_resource_limit"
+
+    def __init__(self) -> None:
+        super().__init__(self.error_code)
 
 
 class WorkflowRequestConflict(RuntimeError):
@@ -89,6 +144,15 @@ class WorkflowNotFoundError(LookupError):
 
 class WorkflowServiceUnavailable(RuntimeError):
     """The durable service or worker manager cannot accept the request."""
+
+
+class WorkflowContractUnavailable(WorkflowServiceUnavailable):
+    """The saved strict contract cannot be verified or executed in this slice."""
+
+    error_code = "workflow_contract_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.error_code)
 
 
 class WorkflowReconciliationRequired(RuntimeError):
@@ -129,6 +193,16 @@ class WorkflowSnapshot:
     thread_id: str | None = None
     max_live_codex_jobs: int = 1
     jobs: tuple[WorkflowJobSnapshot, ...] = ()
+    _strict_metadata: _StrictRunMetadata | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _StrictRunMetadata:
+    run_format_version: int | None = None
+    contract_version: int | None = None
+    contract_sha256: str | None = None
+    binding_digest: str | None = None
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +215,26 @@ class _SavedWorkflowReference:
     @property
     def identity(self) -> tuple[str, int, str]:
         return (self.definition_id, self.revision, self.source_sha256)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedStrictSavedRun:
+    request_digest: str
+    workspace_root: str
+    definition_id: str
+    revision: int
+    source_sha256: str
+    contract_version: int
+    contract_sha256: str
+    binding_digest: str
+    normalized_input_sha256: str
+    max_live_codex_jobs: int
+    source_yaml: str = field(repr=False)
+    definition: dict[str, Any] = field(repr=False)
+    normalized_input: dict[str, Any] = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "_PreparedStrictSavedRun(<redacted>)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +279,9 @@ class _RunInspection:
     updated_at: str
     max_live_codex_jobs: int = 1
     jobs: tuple[WorkflowJobSnapshot, ...] = ()
+    _strict_verified: bool = False
+    _strict_candidate: bool = False
+    _strict_metadata: _StrictRunMetadata | None = None
 
 
 class WorkflowService:
@@ -195,6 +292,8 @@ class WorkflowService:
         worker_manager: WorkflowWorkerStarter,
         *,
         codex_bridge_port: int,
+        enable_isolated_strict_runtime: bool = False,
+        enable_isolated_strict_codex_jobs: bool = False,
     ) -> None:
         if type(codex_bridge_port) is not int or not 1 <= codex_bridge_port <= 65535:
             raise ValueError("workflow CodexBridge port is invalid")
@@ -202,6 +301,14 @@ class WorkflowService:
         self._state_root = Path(worker_manager.state_root)
         self._allowed_roots = tuple(worker_manager.allowed_roots)
         self._codex_bridge_port = codex_bridge_port
+        self._enable_isolated_strict_runtime = bool(
+            enable_isolated_strict_runtime
+            and getattr(worker_manager, "enable_isolated_strict_runtime", False)
+        )
+        self._enable_isolated_strict_codex_jobs = bool(
+            enable_isolated_strict_codex_jobs
+            and getattr(worker_manager, "_enable_isolated_strict_codex_jobs", False)
+        )
         self._start_lock = asyncio.Lock()
 
     async def start_workflow(
@@ -245,6 +352,12 @@ class WorkflowService:
             except (OSError, sqlite3.Error, ValueError):
                 raise WorkflowServiceUnavailable("workflow request ledger is unavailable") from None
             if existing is not None:
+                if await asyncio.to_thread(
+                    _strict_request_candidate, self._state_root, existing.run_id
+                ):
+                    raise WorkflowRequestConflict(
+                        "request ID is already bound to a strict workflow"
+                    )
                 if existing.request_digest != prepared.request_digest or _saved_reference_identity(
                     existing.saved_reference
                 ) != _saved_reference_identity(prepared.saved_reference):
@@ -332,9 +445,104 @@ class WorkflowService:
         client_request_id: str,
         input_data: Any,
         workspace_root: str,
+        legacy_null_input_as_empty: bool = False,
     ) -> WorkflowSnapshot:
         """Start one explicitly selected immutable definition revision."""
-        saved = await asyncio.to_thread(repository.get, definition_id, revision)
+        try:
+            saved = await asyncio.to_thread(repository.get, definition_id, revision)
+        except DefinitionRepositoryUnavailable:
+            if bool(getattr(repository, "supports_contracts", False)):
+                raise WorkflowContractUnavailable() from None
+            raise
+        strict_claim = (
+            getattr(saved, "contract_version", None) is not None
+            or getattr(saved, "is_strict", False)
+            or getattr(saved, "contract", None) is not None
+        )
+        if strict_claim:
+            prepared = await asyncio.to_thread(
+                self._prepare_strict_saved_run,
+                saved,
+                client_request_id,
+                input_data,
+                workspace_root,
+            )
+            async with self._start_lock:
+                try:
+                    existing = await asyncio.to_thread(
+                        _find_request_base, self._state_root, client_request_id
+                    )
+                except (OSError, sqlite3.Error, ValueError, WorkflowServiceUnavailable):
+                    raise WorkflowServiceUnavailable(
+                        "workflow request ledger is unavailable"
+                    ) from None
+                if existing is not None:
+                    if not await asyncio.to_thread(
+                        _strict_request_candidate, self._state_root, existing.run_id
+                    ):
+                        raise WorkflowRequestConflict(
+                            "request ID is already bound to a different workflow mode"
+                        )
+                    if existing.request_digest != prepared.request_digest:
+                        raise WorkflowRequestConflict(
+                            "request ID is already bound to different workflow content"
+                        )
+                    if (
+                        existing.saved_reference is not None
+                        and existing.saved_reference.identity
+                        != (
+                            prepared.definition_id,
+                            prepared.revision,
+                            prepared.source_sha256,
+                        )
+                    ):
+                        raise WorkflowRequestConflict(
+                            "request ID is already bound to a different saved revision"
+                        )
+                    try:
+                        verification = await asyncio.to_thread(
+                            _verify_existing_strict_request,
+                            self._state_root,
+                            existing,
+                            prepared,
+                            self._allowed_roots,
+                        )
+                    except (OSError, StrictReaderGateError, ValueError, WorkflowServiceUnavailable):
+                        raise WorkflowReconciliationRequired(
+                            _invalid_strict_snapshot(existing)
+                        ) from None
+                    if verification is None or not _verification_matches_prepared(
+                        verification, prepared, existing
+                    ):
+                        raise WorkflowReconciliationRequired(
+                            _invalid_strict_snapshot(existing)
+                        ) from None
+                    inspection = await asyncio.to_thread(
+                        _inspect_run,
+                        self._state_root,
+                        existing,
+                        allowed_roots=self._allowed_roots,
+                    )
+                    snapshot = _snapshot_from_inspection(existing, inspection)
+                    if inspection.status == "needs_reconciliation":
+                        raise WorkflowReconciliationRequired(snapshot) from None
+                    return snapshot
+
+                if not self._enable_isolated_strict_runtime:
+                    raise WorkflowServiceUnavailable("strict workflow execution is not available")
+                if _definition_contains_codex_job(prepared.definition) and (
+                    not self._enable_isolated_strict_codex_jobs
+                ):
+                    raise WorkflowServiceUnavailable("strict codex-job execution is not available")
+                return await self._admit_strict_saved_run(
+                    prepared,
+                    client_request_id=client_request_id,
+                )
+
+        if input_data is _SAVED_RUN_INPUT_MISSING:
+            input_data = {}
+        elif legacy_null_input_as_empty and input_data is None:
+            input_data = {}
         try:
             source_sha256 = hashlib.sha256(
                 saved.source_yaml.encode("utf-8", errors="strict")
@@ -356,6 +564,338 @@ class WorkflowService:
             workspace_root=workspace_root,
             max_live_codex_jobs=saved.max_live_codex_jobs,
             saved_reference=reference,
+        )
+
+    def _prepare_strict_saved_run(
+        self,
+        saved: Any,
+        client_request_id: str,
+        input_data: Any,
+        workspace_root: str,
+    ) -> _PreparedStrictSavedRun:
+        if (
+            not isinstance(client_request_id, str)
+            or _REQUEST_ID.fullmatch(client_request_id) is None
+        ):
+            raise WorkflowRequestError("client_request_id is invalid")
+        try:
+            source_bytes = saved.source_yaml.encode("utf-8", errors="strict")
+        except (AttributeError, UnicodeEncodeError):
+            raise WorkflowContractUnavailable() from None
+        if not source_bytes or len(source_bytes) > _MAX_WORKFLOW_YAML_BYTES:
+            raise WorkflowContractUnavailable() from None
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        if (
+            source_sha256 != getattr(saved, "source_sha256", None)
+            or type(getattr(saved, "definition_id", None)) is not str
+            or type(getattr(saved, "revision", None)) is not int
+            or type(getattr(saved, "definition", None)) is not dict
+            or type(getattr(saved, "max_live_codex_jobs", None)) is not int
+        ):
+            raise WorkflowContractUnavailable() from None
+        if (
+            getattr(saved, "contract_version", None) != 1
+            or type(getattr(saved, "contract_version", None)) is not int
+            or type(getattr(saved, "contract_sha256", None)) is not str
+            or type(getattr(saved, "binding_digest", None)) is not str
+            or getattr(saved, "contract", None) is None
+            or type(getattr(saved, "max_live_codex_jobs", None)) is not int
+            or saved.max_live_codex_jobs not in {1, 2, 3}
+        ):
+            raise WorkflowContractUnavailable() from None
+        try:
+            contract: CompiledContract = compile_contract(saved.contract)
+        except Exception:
+            raise WorkflowContractUnavailable() from None
+        if contract.contract_sha256 != saved.contract_sha256:
+            raise WorkflowContractUnavailable() from None
+        try:
+            normalized = normalize_input(
+                contract,
+                {} if input_data is _SAVED_RUN_INPUT_MISSING else input_data,
+            )
+        except ContractResourceLimit:
+            raise WorkflowResourceLimit() from None
+        except ContractInputInvalid:
+            raise WorkflowInputInvalid() from None
+        normalized_input_sha256 = sha256_json(normalized)
+        if not isinstance(workspace_root, str):
+            raise WorkflowRequestError("workspace_root must be an absolute allowed directory")
+        try:
+            policy = AllowedPathPolicy(self._allowed_roots)
+            canonical_workspace = policy.validate_cwd(workspace_root)
+        except (PathPolicyError, OSError):
+            raise WorkflowRequestError("workspace_root is outside allowed roots") from None
+        state_root = self._state_root.resolve(strict=False)
+        workspace_path = Path(canonical_workspace)
+        if (
+            state_root == workspace_path
+            or state_root.is_relative_to(workspace_path)
+            or workspace_path.is_relative_to(state_root)
+        ):
+            raise WorkflowRequestError("workflow state and workspace must be separate")
+        try:
+            request_digest = strict_request_digest_v2(
+                workflow=saved.definition,
+                workspace_root=canonical_workspace,
+                max_live_codex_jobs=saved.max_live_codex_jobs,
+                definition_id=saved.definition_id,
+                definition_revision=saved.revision,
+                source_sha256=source_sha256,
+                contract_version=contract.contract_version,
+                contract_sha256=contract.contract_sha256,
+                binding_digest=saved.binding_digest,
+                normalized_input_sha256=normalized_input_sha256,
+            )
+        except StrictWorkflowSnapshotError:
+            raise WorkflowContractUnavailable() from None
+        return _PreparedStrictSavedRun(
+            request_digest=request_digest,
+            workspace_root=canonical_workspace,
+            definition_id=saved.definition_id,
+            revision=saved.revision,
+            source_sha256=source_sha256,
+            contract_version=contract.contract_version,
+            contract_sha256=contract.contract_sha256,
+            binding_digest=saved.binding_digest,
+            normalized_input_sha256=normalized_input_sha256,
+            max_live_codex_jobs=saved.max_live_codex_jobs,
+            source_yaml=saved.source_yaml,
+            definition=copy.deepcopy(saved.definition),
+            normalized_input=copy.deepcopy(normalized),
+        )
+
+    async def _admit_strict_saved_run(
+        self,
+        prepared: _PreparedStrictSavedRun,
+        *,
+        client_request_id: str,
+    ) -> WorkflowSnapshot:
+        missing = await asyncio.to_thread(missing_workflow_dependencies)
+        if missing:
+            raise WorkflowServiceUnavailable("workflow dependencies are unavailable")
+        try:
+            await asyncio.to_thread(StrictWorkflowRequestStore(self._state_root).inspect)
+        except (StrictWorkflowRequestError, OSError, sqlite3.Error, ValueError):
+            raise WorkflowServiceUnavailable("workflow request ledger is unavailable") from None
+
+        await asyncio.to_thread(
+            _assert_strict_admission_capacity,
+            self._state_root,
+            prepared.workspace_root,
+            self._allowed_roots,
+        )
+        try:
+            run_dir = Path(await asyncio.to_thread(self._worker_manager.create_run_directory))
+            canonical_run_dir = _validated_run_directory(self._state_root, run_dir.name)
+            if canonical_run_dir != run_dir.resolve(strict=True):
+                raise WorkflowServiceUnavailable(
+                    "workflow manager returned an invalid run directory"
+                )
+        except (OSError, WorkflowManagerError, WorkflowServiceUnavailable, ValueError):
+            raise WorkflowServiceUnavailable(
+                "workflow run directory could not be allocated"
+            ) from None
+
+        run_id = canonical_run_dir.name
+        workflow_id = str(uuid.uuid4())
+        created_at = datetime.now(UTC)
+        normalized = StrictWorkflowInputNormalization(
+            definition_id=prepared.definition_id,
+            definition_revision=prepared.revision,
+            normalized_input=copy.deepcopy(prepared.normalized_input),
+            normalized_input_sha256=prepared.normalized_input_sha256,
+        )
+        binding = StrictWorkflowRunBindingInput(
+            run_id=run_id,
+            workflow_id=workflow_id,
+            definition_id=prepared.definition_id,
+            definition_revision=prepared.revision,
+            contract_sha256=prepared.contract_sha256,
+            binding_digest=prepared.binding_digest,
+            normalized_input_sha256=prepared.normalized_input_sha256,
+            created_at=created_at,
+        )
+
+        try:
+            await asyncio.to_thread(
+                StrictWorkflowVariableStore(canonical_run_dir).initialize_new_database,
+                binding,
+            )
+            await asyncio.to_thread(
+                StrictWorkflowSnapshotWriter(
+                    self._state_root, self._allowed_roots
+                ).prepare_snapshot,
+                workflow_id=workflow_id,
+                run_id=run_id,
+                definition_id=prepared.definition_id,
+                definition_revision=prepared.revision,
+                workspace_root=prepared.workspace_root,
+                normalized_input=normalized,
+                created_at=created_at,
+            )
+            reserved = await asyncio.to_thread(
+                _reserve_prepared_strict_run,
+                self._state_root,
+                run_id,
+                client_request_id=client_request_id,
+                allowed_roots=self._allowed_roots,
+            )
+        except Exception:
+            try:
+                existing = await asyncio.to_thread(
+                    _find_request_base, self._state_root, client_request_id
+                )
+            except Exception:
+                existing = None
+            if existing is not None:
+                if not await asyncio.to_thread(
+                    _strict_request_candidate, self._state_root, existing.run_id
+                ):
+                    raise WorkflowRequestConflict(
+                        "request ID is already bound to a different workflow mode"
+                    ) from None
+                if existing.request_digest != prepared.request_digest:
+                    raise WorkflowRequestConflict(
+                        "request ID is already bound to different workflow content"
+                    ) from None
+                try:
+                    existing_verification = await asyncio.to_thread(
+                        _verify_existing_strict_request,
+                        self._state_root,
+                        existing,
+                        prepared,
+                        self._allowed_roots,
+                    )
+                except (OSError, StrictReaderGateError, ValueError, WorkflowServiceUnavailable):
+                    raise WorkflowReconciliationRequired(
+                        _invalid_strict_snapshot(existing)
+                    ) from None
+                if existing_verification is None or not _verification_matches_prepared(
+                    existing_verification, prepared, existing
+                ):
+                    raise WorkflowReconciliationRequired(
+                        _invalid_strict_snapshot(existing)
+                    ) from None
+                existing_inspection = await asyncio.to_thread(
+                    _inspect_run,
+                    self._state_root,
+                    existing,
+                    allowed_roots=self._allowed_roots,
+                )
+                existing_snapshot = _snapshot_from_inspection(existing, existing_inspection)
+                if existing_snapshot.status == "needs_reconciliation":
+                    raise WorkflowReconciliationRequired(existing_snapshot) from None
+                return existing_snapshot
+            raise WorkflowServiceUnavailable(
+                "strict workflow snapshot could not be reserved"
+            ) from None
+
+        reservation = reserved.reservation
+        row = _RequestRow(
+            client_request_id=reservation.client_request_id,
+            workflow_id=reservation.workflow_id,
+            run_id=reservation.run_id,
+            request_digest=reservation.request_digest,
+            state=reservation.state,
+            created_at=reservation.created_at,
+            updated_at=reservation.created_at,
+            saved_reference=_SavedWorkflowReference(
+                definition_id=reservation.definition_id,
+                revision=reservation.definition_revision,
+                source_sha256=reservation.source_sha256,
+                canonical_sha256="",
+            ),
+        )
+        if not _verification_matches_prepared(reserved.verification, prepared, row):
+            raise WorkflowReconciliationRequired(
+                _strict_reconciliation_snapshot(row, reserved.verification)
+            ) from None
+
+        append_lifecycle_event(
+            canonical_run_dir,
+            source="bridge",
+            event="request_reserved",
+            run_id=row.run_id,
+            workflow_id=row.workflow_id,
+            request_digest=row.request_digest,
+        )
+        try:
+            await self._transition_strict_state(
+                row,
+                "starting",
+                verification=reserved.verification,
+            )
+            await self._worker_manager.start_worker(
+                canonical_run_dir,
+                mode="start",
+                workspace_root=Path(prepared.workspace_root),
+                max_live_codex_jobs=prepared.max_live_codex_jobs,
+                strict_runtime=True,
+                codex_bridge_port=(
+                    self._codex_bridge_port
+                    if _definition_contains_codex_job(prepared.definition)
+                    else None
+                ),
+            )
+            startup_state = await self._wait_for_worker_start(row)
+            if startup_state in {"running", "succeeded", "failed", "failed_to_start"}:
+                await self._transition_strict_state(
+                    row,
+                    startup_state,
+                    verification=reserved.verification,
+                )
+                return await self._snapshot_for_row(row)
+            await self._transition_strict_state(
+                row,
+                "needs_reconciliation",
+                verification=reserved.verification,
+            )
+            raise WorkflowReconciliationRequired(await self._snapshot_for_row(row))
+        except WorkflowReconciliationRequired:
+            raise
+        except BaseException as error:
+            try:
+                await asyncio.shield(
+                    self._transition_strict_state(
+                        row,
+                        "needs_reconciliation",
+                        verification=reserved.verification,
+                    )
+                )
+            except Exception:
+                pass
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise WorkflowReconciliationRequired(
+                _strict_reconciliation_snapshot(row, reserved.verification)
+            ) from None
+
+    async def _transition_strict_state(
+        self,
+        row: _RequestRow,
+        state: str,
+        *,
+        verification: Any,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                StrictWorkflowRequestStore(self._state_root).update_state,
+                row.run_id,
+                state,
+            )
+        except (StrictWorkflowRequestError, OSError, sqlite3.Error, ValueError):
+            raise WorkflowServiceUnavailable(
+                "strict workflow lifecycle state is unavailable"
+            ) from None
+        append_lifecycle_event(
+            self._run_directory(row.run_id),
+            source="bridge",
+            event="workflow_state_changed",
+            run_id=row.run_id,
+            workflow_id=row.workflow_id,
+            state=state,
+            reason_code=("strict_execution_uncertain" if state == "needs_reconciliation" else None),
         )
 
     async def _start_reserved_workflow(
@@ -550,7 +1090,9 @@ class WorkflowService:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise WorkflowRequestError("workflow list limit must be between 1 and 100")
         try:
-            return await asyncio.to_thread(_list_workflows, self._state_root, limit)
+            return await asyncio.to_thread(
+                _list_workflows, self._state_root, limit, allowed_roots=self._allowed_roots
+            )
         except WorkflowServiceUnavailable:
             raise
         except (OSError, sqlite3.Error, ValueError):
@@ -562,7 +1104,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            return await asyncio.to_thread(_snapshot, self._state_root, row)
+            return await asyncio.to_thread(
+                _snapshot, self._state_root, row, allowed_roots=self._allowed_roots
+            )
         except WorkflowNotFoundError:
             raise
         except WorkflowServiceUnavailable:
@@ -576,7 +1120,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
             snapshot = _snapshot_from_inspection(row, inspection)
             return WorkflowResultSnapshot(snapshot, inspection.result)
         except WorkflowNotFoundError:
@@ -592,7 +1138,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
             from .task_projection import project_workflow_tasks
 
             return await asyncio.to_thread(
@@ -600,6 +1148,7 @@ class WorkflowService:
                 self._state_root,
                 row,
                 inspection,
+                allowed_roots=self._allowed_roots,
             )
         except (WorkflowNotFoundError, WorkflowServiceUnavailable):
             raise
@@ -622,7 +1171,9 @@ class WorkflowService:
             row = await asyncio.to_thread(_find_workflow, self._state_root, normalized)
             if row is None:
                 raise WorkflowNotFoundError("workflow was not found")
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
             from .task_projection import project_workflow_task_events
 
             return await asyncio.to_thread(
@@ -632,6 +1183,7 @@ class WorkflowService:
                 inspection,
                 after_id=after_id,
                 limit=limit,
+                allowed_roots=self._allowed_roots,
             )
         except (WorkflowNotFoundError, WorkflowServiceUnavailable):
             raise
@@ -672,7 +1224,9 @@ class WorkflowService:
         deadline = time.monotonic() + _WORKER_START_TIMEOUT_SECONDS
         while True:
             try:
-                inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+                inspection = await asyncio.to_thread(
+                    _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+                )
             except (OSError, sqlite3.Error, ValueError) as error:
                 if diagnostic is not None:
                     diagnostic.fail(
@@ -699,12 +1253,14 @@ class WorkflowService:
         forced_state: str | None = None,
     ) -> WorkflowSnapshot:
         try:
-            inspection = await asyncio.to_thread(_inspect_run, self._state_root, row)
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
         except (OSError, sqlite3.Error, ValueError):
             inspection = _RunInspection(
                 "needs_reconciliation", "unknown", None, None, None, row.updated_at
             )
-        if forced_state is not None:
+        if forced_state is not None and not inspection._strict_candidate:
             inspection = _RunInspection(
                 forced_state,
                 inspection.worker_state,
@@ -714,6 +1270,9 @@ class WorkflowService:
                 inspection.updated_at,
                 inspection.max_live_codex_jobs,
                 inspection.jobs,
+                inspection._strict_verified,
+                inspection._strict_candidate,
+                inspection._strict_metadata,
             )
         return _snapshot_from_inspection(row, inspection)
 
@@ -1099,6 +1658,79 @@ def _find_request(state_root: Path, client_request_id: str) -> _RequestRow | Non
         connection.close()
 
 
+def _find_request_base(state_root: Path, client_request_id: str) -> _RequestRow | None:
+    """Read the authoritative request identity without resolving optional source rows."""
+    root = _ensure_state_root(state_root, create=False)
+    if root is None:
+        return None
+    database = root / "requests.sqlite"
+    if database.is_symlink():
+        raise WorkflowServiceUnavailable("workflow request ledger is invalid")
+    if not database.exists():
+        return None
+    connection = _connect_read(database)
+    try:
+        row = connection.execute(
+            "SELECT client_request_id, workflow_id, run_id, request_digest, state, "
+            "created_at, updated_at FROM workflow_requests WHERE client_request_id = ?",
+            (client_request_id,),
+        ).fetchone()
+        return None if row is None else _row_from_sql(row)
+    finally:
+        connection.close()
+
+
+def _assert_strict_admission_capacity(
+    state_root: Path,
+    workspace_root: str,
+    allowed_roots: tuple[str, ...],
+) -> None:
+    root = _ensure_state_root(state_root, create=False)
+    if root is None:
+        raise WorkflowServiceUnavailable("workflow request ledger is unavailable")
+    database = root / "requests.sqlite"
+    connection = _connect_read(database)
+    try:
+        candidates = connection.execute(
+            "SELECT client_request_id, workflow_id, run_id, request_digest, state, "
+            "created_at, updated_at FROM workflow_requests "
+            "WHERE state IN ('queued','starting','running','needs_reconciliation','unknown') "
+            "ORDER BY created_at DESC LIMIT ?",
+            (_MAX_ACTIVE_CHECKS + 1,),
+        ).fetchall()
+    finally:
+        connection.close()
+    if len(candidates) > _MAX_ACTIVE_CHECKS:
+        raise WorkflowConcurrencyConflict("workflow capacity is occupied")
+
+    requested_workspace = Path(workspace_root)
+    active_workspaces: list[Path] = []
+    for candidate_sql in candidates:
+        candidate = _row_from_sql(candidate_sql)
+        inspection = _inspect_run(state_root, candidate, allowed_roots=allowed_roots)
+        if inspection.status in _TERMINAL_STATES:
+            continue
+        if inspection.status not in _ACTIVE_STATES:
+            raise WorkflowConcurrencyConflict("workflow capacity is occupied")
+        try:
+            active_workspace = _verified_active_workspace(
+                state_root,
+                candidate,
+                allowed_roots,
+            )
+        except WorkflowServiceUnavailable:
+            raise WorkflowConcurrencyConflict(
+                "active workflow workspace cannot be verified"
+            ) from None
+        if any(_paths_overlap(active_workspace, active) for active in active_workspaces):
+            raise WorkflowConcurrencyConflict("workflow workspace is already occupied")
+        if _paths_overlap(active_workspace, requested_workspace):
+            raise WorkflowConcurrencyConflict("workflow workspace is already occupied")
+        active_workspaces.append(active_workspace)
+    if len(active_workspaces) >= _MAX_ACTIVE_WORKFLOWS:
+        raise WorkflowConcurrencyConflict("workflow capacity is occupied")
+
+
 def _find_workflow(state_root: Path, workflow_id: str) -> _RequestRow | None:
     root = _ensure_state_root(state_root, create=False)
     if root is None:
@@ -1120,7 +1752,12 @@ def _find_workflow(state_root: Path, workflow_id: str) -> _RequestRow | None:
     return None if row is None else _row_from_sql(row)
 
 
-def _list_workflows(state_root: Path, limit: int) -> list[WorkflowSnapshot]:
+def _list_workflows(
+    state_root: Path,
+    limit: int,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> list[WorkflowSnapshot]:
     root = _ensure_state_root(state_root, create=False)
     if root is None:
         return []
@@ -1142,7 +1779,7 @@ def _list_workflows(state_root: Path, limit: int) -> list[WorkflowSnapshot]:
     snapshots: list[WorkflowSnapshot] = []
     for raw in rows:
         row = _row_from_sql(raw)
-        snapshots.append(_snapshot(state_root, row))
+        snapshots.append(_snapshot(state_root, row, allowed_roots=allowed_roots))
     return snapshots
 
 
@@ -1188,7 +1825,9 @@ def _reserve_request(
         active_workspaces: list[Path] = []
         for candidate_sql in candidates:
             candidate = _row_from_sql(candidate_sql)
-            inspection = _inspect_run(state_root, candidate)
+            inspection = _inspect_run(
+                state_root, candidate, allowed_roots=tuple(worker_manager.allowed_roots)
+            )
             if inspection.status in _TERMINAL_STATES:
                 connection.execute(
                     "UPDATE workflow_requests SET state = ?, updated_at = ? WHERE run_id = ?",
@@ -1300,15 +1939,16 @@ def _verified_active_workspace(
     try:
         run_dir = _validated_run_directory(state_root, row.run_id)
         manifest_bytes = _read_regular_file(run_dir / "manifest.json", limit=32 * 1024)
-        run_format = classify_readonly(
+        strict_verification = verify_strict_reserved_readonly(
             state_root,
             row.run_id,
             manifest_bytes,
             expected_workflow_id=row.workflow_id,
             expected_request_digest=row.request_digest,
+            allowed_roots=allowed_roots,
         )
-        if run_format is not RunFormatVersion.LEGACY_V1:
-            raise ValueError("strict workflow workspace reader is not connected")
+        if strict_verification is not None:
+            return Path(strict_verification.manifest.workspace_root)
         manifest = _strict_json(manifest_bytes)
         if not isinstance(manifest, dict):
             raise ValueError("workflow manifest is invalid")
@@ -1488,20 +2128,39 @@ def _strict_json(payload: bytes) -> Any:
     return json.loads(payload, parse_constant=reject_constant, object_pairs_hook=unique_object)
 
 
-def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
+def _inspect_run(
+    state_root: Path,
+    row: _RequestRow,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> _RunInspection:
     base_updated = row.updated_at
+    strict_candidate = False
     try:
         run_dir = _validated_run_directory(state_root, row.run_id)
         manifest_bytes = _read_regular_file(run_dir / "manifest.json", limit=32 * 1024)
-        run_format = classify_readonly(
+        try:
+            manifest_claim = _strict_json(manifest_bytes)
+        except Exception:
+            manifest_claim = None
+        strict_candidate = b'"run_format_version"' in manifest_bytes or (
+            isinstance(manifest_claim, dict) and "run_format_version" in manifest_claim
+        )
+        strict_verification = verify_strict_reserved_readonly(
             state_root,
             row.run_id,
             manifest_bytes,
             expected_workflow_id=row.workflow_id,
             expected_request_digest=row.request_digest,
+            allowed_roots=allowed_roots,
         )
-        if run_format is RunFormatVersion.STRICT_V2:
-            return _RunInspection("needs_reconciliation", "unknown", None, None, None, base_updated)
+        if strict_verification is not None:
+            return _inspect_strict_reserved_run(
+                run_dir,
+                row,
+                strict_verification,
+                updated_at=base_updated,
+            )
         manifest_value = _strict_json(manifest_bytes)
         if not isinstance(manifest_value, dict):
             raise ValueError("manifest is invalid")
@@ -1603,7 +2262,21 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
         StrictReaderGateError,
         WorkflowServiceUnavailable,
     ):
-        return _RunInspection("needs_reconciliation", "unknown", None, None, None, base_updated)
+        strict_candidate = strict_candidate or _strict_binding_claim(state_root, row.run_id)
+        return _RunInspection(
+            "needs_reconciliation",
+            "unknown",
+            None,
+            None,
+            None,
+            base_updated,
+            _strict_candidate=strict_candidate,
+            _strict_metadata=(
+                _StrictRunMetadata(reason_code="run_integrity_invalid")
+                if strict_candidate
+                else None
+            ),
+        )
 
     worker_state = "not_started"
     worker_status_path = run_dir / "worker-entry-status.json"
@@ -1778,44 +2451,408 @@ def _inspect_run(state_root: Path, row: _RequestRow) -> _RunInspection:
 
 
 def _two_job_task_identities(definition: Any) -> tuple[str, str]:
-    tasks = definition.get("do") if isinstance(definition, dict) else None
-    if not isinstance(tasks, list) or len(tasks) != 2:
+    from .interpreter import _strict_codex_job_task_identities
+
+    identities = _strict_codex_job_task_identities(definition, {}, 2)
+    if len(identities) != 2:
         raise ValueError("two-job workflow task list is invalid")
-    names: list[str] = []
-    for task in tasks:
-        if not isinstance(task, dict) or len(task) != 1:
-            raise ValueError("two-job workflow task is invalid")
-        name = next(iter(task))
-        if not isinstance(name, str) or not name:
-            raise ValueError("two-job workflow task name is invalid")
-        names.append(name)
-    return (f"do[0].{names[0]}", f"do[1].{names[1]}")
+    return identities[0], identities[1]
+
+
+def _strict_binding_identity(verification: Any) -> dict[str, object]:
+    manifest = verification.manifest
+    return {
+        "run_id": manifest.run_id,
+        "workflow_id": manifest.workflow_id,
+        "definition_id": manifest.definition_id,
+        "definition_revision": manifest.definition_revision,
+        "request_digest": manifest.request_digest,
+        "source_sha256": manifest.source_sha256,
+        "contract_sha256": manifest.contract_sha256,
+        "binding_digest": manifest.binding_digest,
+        "normalized_input_sha256": manifest.normalized_input_sha256,
+    }
+
+
+def _inspect_strict_reserved_run(
+    run_dir: Path,
+    row: _RequestRow,
+    verification: Any,
+    *,
+    updated_at: str,
+) -> _RunInspection:
+    """Project only reserved strict evidence and the worker's bound terminal file."""
+    manifest = verification.manifest
+    definition_revision = verification._definition
+    metadata = _strict_metadata_from_verification(
+        verification, reason_code="strict_execution_uncertain"
+    )
+    max_jobs = manifest.max_live_codex_jobs
+
+    def reconciliation(
+        worker_state: str = "unknown",
+        *,
+        reason_code: str = "strict_execution_uncertain",
+        jobs: tuple[WorkflowJobSnapshot, ...] = (),
+        job_id: str | None = None,
+        thread_id: str | None = None,
+        timestamp: str = updated_at,
+    ) -> _RunInspection:
+        return _RunInspection(
+            "needs_reconciliation",
+            worker_state,
+            job_id,
+            thread_id,
+            None,
+            timestamp,
+            max_live_codex_jobs=max_jobs,
+            jobs=jobs,
+            _strict_verified=True,
+            _strict_candidate=True,
+            _strict_metadata=replace(metadata, reason_code=reason_code),
+        )
+
+    if (
+        definition_revision is None
+        or definition_revision.contract is None
+        or verification.reservation_verified is not True
+    ):
+        return reconciliation(reason_code="run_integrity_invalid")
+
+    timestamp = updated_at
+    worker_state = "not_started"
+    entry_status: dict[str, Any] | None = None
+    status_path = run_dir / "worker-entry-status.json"
+    if status_path.exists() or status_path.is_symlink():
+        try:
+            raw_status = _strict_json(_read_regular_file(status_path, limit=4096))
+            if (
+                not isinstance(raw_status, dict)
+                or set(raw_status) != {"state", "exit_code", "error_code"}
+                or raw_status.get("state") not in {"running", "completed", "failed"}
+                or (
+                    raw_status.get("exit_code") is not None
+                    and type(raw_status.get("exit_code")) is not int
+                )
+                or (
+                    raw_status.get("error_code") is not None
+                    and type(raw_status.get("error_code")) is not str
+                )
+            ):
+                raise ValueError
+            entry_status = raw_status
+            worker_state = str(raw_status["state"])
+            timestamp = _latest_file_time(timestamp, status_path)
+        except (OSError, ValueError, TypeError):
+            return reconciliation()
+
+    startup_seen = False
+    for startup_name in ("start-worker.json", "recovery-worker.json"):
+        startup_path = run_dir / startup_name
+        if not startup_path.exists() and not startup_path.is_symlink():
+            continue
+        try:
+            startup = _strict_json(_read_regular_file(startup_path, limit=32 * 1024))
+            if (
+                not isinstance(startup, dict)
+                or startup.get("workflow_id") != row.workflow_id
+                or startup.get("run_dir") != str(run_dir)
+                or startup.get("mode")
+                != ("start" if startup_name.startswith("start") else "recover")
+                or type(startup.get("pid")) is not int
+                or startup["pid"] <= 0
+                or type(startup.get("creation_time_100ns")) is not int
+                or type(startup.get("image_path")) is not str
+            ):
+                raise ValueError
+            startup_seen = True
+            timestamp = _latest_file_time(timestamp, startup_path)
+        except (OSError, ValueError, TypeError):
+            return reconciliation(worker_state)
+
+    dbos_path = run_dir / "dbos.sqlite"
+    try:
+        dbos_status = (
+            _read_dbos_status(dbos_path, row.workflow_id)
+            if dbos_path.exists() or dbos_path.is_symlink()
+            else None
+        )
+    except (OSError, sqlite3.Error, ValueError, WorkflowServiceUnavailable):
+        return reconciliation(worker_state)
+
+    jobs: tuple[WorkflowJobSnapshot, ...] = ()
+    records: tuple[dict[str, Any], ...] = ()
+    expected: tuple[str, ...] = ()
+    job_reconciliation = False
+    job_id: str | None = None
+    thread_id: str | None = None
+    definition = definition_revision.definition
+    has_codex_jobs = _definition_contains_codex_job(definition)
+    jobs_path = run_dir / "codex_jobs.sqlite"
+    if has_codex_jobs:
+        if not (jobs_path.exists() or jobs_path.is_symlink()):
+            if dbos_status in {"SUCCESS", "SUCCEEDED", "ERROR", "CANCELLED", "FAILED"}:
+                return reconciliation(worker_state)
+        else:
+            try:
+                if max_jobs == 2:
+                    expected = _two_job_task_identities(definition)
+                elif max_jobs == 3:
+                    expected = _three_job_task_identities(
+                        definition, verification._normalized_input
+                    )
+                else:
+                    from .interpreter import _strict_codex_job_task_identities
+
+                    expected = _strict_codex_job_task_identities(
+                        definition, verification._normalized_input, max_jobs
+                    )
+                if not expected:
+                    raise ValueError
+                records, job_reconciliation = _read_codex_jobs(
+                    jobs_path,
+                    row.workflow_id,
+                    expected,
+                    max_jobs=max_jobs,
+                )
+                jobs = tuple(
+                    WorkflowJobSnapshot(
+                        job_id=str(job["job_id"]),
+                        task_identity=str(job["task_identity"]),
+                        state=str(job["state"]),
+                        thread_id=_optional_string(job.get("thread_id")),
+                        turn_id=_optional_string(job.get("turn_id")),
+                    )
+                    for job in records
+                )
+                if jobs:
+                    job_id = jobs[-1].job_id
+                    thread_id = jobs[-1].thread_id
+            except (OSError, sqlite3.Error, ValueError, TypeError, WorkflowServiceUnavailable):
+                return reconciliation(worker_state)
+    elif jobs_path.exists() or jobs_path.is_symlink():
+        return reconciliation(worker_state, reason_code="run_integrity_invalid")
+
+    if job_reconciliation or any(job["state"] == "MAYBE_SENT" for job in records):
+        return reconciliation(worker_state, jobs=jobs, job_id=job_id, thread_id=thread_id)
+
+    terminal_path = run_dir / "strict-terminal.json"
+    terminal: dict[str, Any] | None = None
+    if terminal_path.exists() or terminal_path.is_symlink():
+        try:
+            terminal = _strict_json(_read_regular_file(terminal_path, limit=_MAX_RESULT_BYTES))
+            if not isinstance(terminal, dict):
+                raise ValueError
+            common_fields = {
+                "format_version",
+                "status",
+                "reason_code",
+                "run_id",
+                "workflow_id",
+                "binding_identity",
+            }
+            terminal_status = terminal.get("status")
+            expected_fields = common_fields | (
+                {"result"} if terminal_status == "succeeded" else set()
+            )
+            if (
+                set(terminal) != expected_fields
+                or type(terminal.get("format_version")) is not int
+                or terminal["format_version"] != 1
+                or terminal_status not in {"succeeded", "failed", "needs_reconciliation"}
+                or terminal.get("run_id") != row.run_id
+                or terminal.get("workflow_id") != row.workflow_id
+                or _canonical_json(terminal.get("binding_identity"))
+                != _canonical_json(_strict_binding_identity(verification))
+            ):
+                raise ValueError
+            if terminal_status == "succeeded":
+                if terminal.get("reason_code") is not None:
+                    raise ValueError
+            elif (
+                type(terminal.get("reason_code")) is not str
+                or terminal["reason_code"] not in _STRICT_TERMINAL_REASON_CODES
+            ):
+                raise ValueError
+            timestamp = _latest_file_time(timestamp, terminal_path)
+        except (OSError, ValueError, TypeError):
+            return reconciliation(worker_state, jobs=jobs, job_id=job_id, thread_id=thread_id)
+
+    if terminal is not None:
+        terminal_status = terminal["status"]
+        if terminal_status == "succeeded":
+            if (
+                worker_state != "completed"
+                or not startup_seen
+                or dbos_status not in {"SUCCESS", "SUCCEEDED"}
+                or (has_codex_jobs and len(records) != len(expected))
+                or any(job["state"] != "SUCCEEDED" for job in records)
+            ):
+                return reconciliation(worker_state, jobs=jobs, job_id=job_id, thread_id=thread_id)
+            try:
+                result_value = validate_output(
+                    definition_revision.contract,
+                    terminal["result"],
+                )
+            except (ContractOutputInvalid, ContractResourceLimit, ValueError, TypeError):
+                return _RunInspection(
+                    "failed",
+                    worker_state,
+                    job_id,
+                    thread_id,
+                    None,
+                    timestamp,
+                    max_live_codex_jobs=max_jobs,
+                    jobs=jobs,
+                    _strict_verified=True,
+                    _strict_candidate=True,
+                    _strict_metadata=replace(metadata, reason_code="output_contract_violation"),
+                )
+            result_envelope: dict[str, Any] = {
+                "workflow_id": row.workflow_id,
+                "run_id": row.run_id,
+                "status": "succeeded",
+                "result": result_value,
+                "run_format_version": manifest.run_format_version,
+                "contract_version": manifest.contract_version,
+                "contract_sha256": manifest.contract_sha256,
+                "binding_digest": manifest.binding_digest,
+            }
+            return _RunInspection(
+                "succeeded",
+                worker_state,
+                job_id,
+                thread_id,
+                result_envelope,
+                timestamp,
+                max_live_codex_jobs=max_jobs,
+                jobs=jobs,
+                _strict_verified=True,
+                _strict_candidate=True,
+                _strict_metadata=replace(metadata, reason_code=None),
+            )
+        reason_code = terminal["reason_code"]
+        if terminal_status == "needs_reconciliation" or reason_code == "strict_execution_uncertain":
+            return reconciliation(
+                worker_state,
+                reason_code="strict_execution_uncertain",
+                jobs=jobs,
+                job_id=job_id,
+                thread_id=thread_id,
+                timestamp=timestamp,
+            )
+        if (
+            worker_state == "failed"
+            and dbos_status in {"ERROR", "CANCELLED", "FAILED"}
+            and all(job["state"] in {"SUCCEEDED", "FAILED"} for job in records)
+        ):
+            return _RunInspection(
+                "failed",
+                worker_state,
+                job_id,
+                thread_id,
+                None,
+                timestamp,
+                max_live_codex_jobs=max_jobs,
+                jobs=jobs,
+                _strict_verified=True,
+                _strict_candidate=True,
+                _strict_metadata=replace(metadata, reason_code=reason_code),
+            )
+        return reconciliation(worker_state, jobs=jobs, job_id=job_id, thread_id=thread_id)
+
+    if worker_state == "failed" and entry_status is not None and not startup_seen:
+        if (
+            entry_status.get("error_code")
+            in {
+                "invalid_config",
+                "missing_workflows_extra",
+                "missing_control_token",
+            }
+            and dbos_status is None
+        ):
+            return _RunInspection(
+                "failed_to_start",
+                "failed",
+                None,
+                None,
+                None,
+                timestamp,
+                max_live_codex_jobs=max_jobs,
+                _strict_verified=True,
+                _strict_candidate=True,
+                _strict_metadata=replace(metadata, reason_code="strict_execution_invalid"),
+            )
+        return reconciliation(worker_state, timestamp=timestamp)
+
+    if dbos_status in {"ERROR", "CANCELLED", "FAILED", "RETRIES_EXCEEDED"}:
+        return reconciliation(worker_state, jobs=jobs, job_id=job_id, thread_id=thread_id)
+    if dbos_status in {"PENDING", "ENQUEUED", "RUNNING"}:
+        return _RunInspection(
+            "running" if startup_seen else "starting",
+            worker_state,
+            job_id,
+            thread_id,
+            None,
+            timestamp,
+            max_live_codex_jobs=max_jobs,
+            jobs=jobs,
+            _strict_verified=True,
+            _strict_candidate=True,
+            _strict_metadata=replace(metadata, reason_code=None),
+        )
+    if startup_seen and worker_state == "running":
+        return _RunInspection(
+            "starting",
+            worker_state,
+            job_id,
+            thread_id,
+            None,
+            timestamp,
+            max_live_codex_jobs=max_jobs,
+            jobs=jobs,
+            _strict_verified=True,
+            _strict_candidate=True,
+            _strict_metadata=replace(metadata, reason_code=None),
+        )
+    if row.state == "starting" and worker_state == "not_started":
+        return _RunInspection(
+            "starting",
+            worker_state,
+            None,
+            None,
+            None,
+            timestamp,
+            max_live_codex_jobs=max_jobs,
+            _strict_verified=True,
+            _strict_candidate=True,
+            _strict_metadata=replace(metadata, reason_code=None),
+        )
+    if row.state == "failed_to_start":
+        return _RunInspection(
+            "failed_to_start",
+            worker_state,
+            None,
+            None,
+            None,
+            timestamp,
+            max_live_codex_jobs=max_jobs,
+            _strict_verified=True,
+            _strict_candidate=True,
+            _strict_metadata=replace(metadata, reason_code="strict_execution_invalid"),
+        )
+    return reconciliation(
+        "unknown" if worker_state == "not_started" else worker_state,
+        jobs=jobs,
+        job_id=job_id,
+        thread_id=thread_id,
+    )
 
 
 def _three_job_task_identities(definition: Any, input_data: Any) -> tuple[str, ...]:
-    from .interpreter import (
-        three_live_codex_job_input_kind,
-        validate_three_live_codex_job_input,
-    )
+    from .interpreter import _strict_codex_job_task_identities
 
-    tasks = definition.get("do") if isinstance(definition, dict) else None
-    if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
-        raise ValueError("three-job workflow task list is invalid")
-    for_name = next(iter(tasks[0]))
-    for_task = tasks[0].get(for_name)
-    body = for_task.get("do") if isinstance(for_task, dict) else None
-    if not isinstance(body, list) or len(body) != 3 or not isinstance(body[1], dict):
-        raise ValueError("three-job workflow loop body is invalid")
-    dispatch_name = next(iter(body[1]))
-    if not isinstance(for_name, str) or not isinstance(dispatch_name, str):
-        raise ValueError("three-job workflow task names are invalid")
-    input_kind = three_live_codex_job_input_kind(definition)
-    items = validate_three_live_codex_job_input(input_data, input_kind=input_kind)
-    return tuple(
-        f"do[0].{for_name}.iteration[{index}].do[1].{dispatch_name}"
-        for index, item in enumerate(items)
-        if item["enabled"]
-    )
+    return _strict_codex_job_task_identities(definition, input_data, 3)
 
 
 def _read_codex_jobs(
@@ -1825,9 +2862,9 @@ def _read_codex_jobs(
     *,
     max_jobs: int = 2,
 ) -> tuple[tuple[dict[str, Any], ...], bool]:
-    if type(max_jobs) is not int or max_jobs not in {2, 3}:
-        raise ValueError("multi-job ledger limit is invalid")
-    mode_name = "three-job" if max_jobs == 3 else "two-job"
+    if type(max_jobs) is not int or max_jobs not in {1, 2, 3}:
+        raise ValueError("strict job ledger limit is invalid")
+    mode_name = {1: "single-job", 2: "two-job", 3: "three-job"}[max_jobs]
     if (
         database.is_symlink()
         or not database.is_file()
@@ -1854,9 +2891,9 @@ def _read_codex_jobs(
             )
             unique_indexes.add(columns)
         if ("workflow_id", "task_identity") not in unique_indexes:
-            raise ValueError("two-job ledger must use the V2 workflow/task uniqueness")
+            raise ValueError("strict job ledger must use the V2 workflow/task uniqueness")
         rows = connection.execute(
-            "SELECT job_id, workflow_id, task_identity, state, thread_id, turn_id, "
+            "SELECT job_id, request_key, workflow_id, task_identity, state, thread_id, turn_id, "
             "remote_state, receipt_json FROM jobs "
             "ORDER BY created_at ASC, rowid ASC LIMIT ?",
             (max_jobs + 1,),
@@ -1882,6 +2919,7 @@ def _read_codex_jobs(
             or _CODEX_JOB_ID.fullmatch(job_id) is None
             or job_id in job_ids
             or task_identity != expected_task_identities[index]
+            or row["request_key"] != f"{workflow_id}::{task_identity}"
             or state not in {"PREPARED", "MAYBE_SENT", "ACCEPTED", "RUNNING", "SUCCEEDED", "FAILED"}
         ):
             raise ValueError(f"{mode_name} ledger identity or order is invalid")
@@ -2359,8 +3397,15 @@ def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _snapshot(state_root: Path, row: _RequestRow) -> WorkflowSnapshot:
-    return _snapshot_from_inspection(row, _inspect_run(state_root, row))
+def _snapshot(
+    state_root: Path,
+    row: _RequestRow,
+    *,
+    allowed_roots: tuple[str, ...] = (),
+) -> WorkflowSnapshot:
+    return _snapshot_from_inspection(
+        row, _inspect_run(state_root, row, allowed_roots=allowed_roots)
+    )
 
 
 def _snapshot_from_inspection(row: _RequestRow, inspection: _RunInspection) -> WorkflowSnapshot:
@@ -2377,4 +3422,215 @@ def _snapshot_from_inspection(row: _RequestRow, inspection: _RunInspection) -> W
         thread_id=inspection.thread_id,
         max_live_codex_jobs=inspection.max_live_codex_jobs,
         jobs=inspection.jobs,
+        _strict_metadata=inspection._strict_metadata,
     )
+
+
+def strict_run_metadata_json(
+    snapshot: WorkflowSnapshot,
+    *,
+    reason_only: bool = False,
+    reason_code: str | None = None,
+) -> dict[str, object]:
+    """Return only the allowlisted, verified strict run metadata."""
+    return _strict_metadata_json(
+        snapshot._strict_metadata,
+        reason_only=reason_only,
+        reason_code=reason_code,
+    )
+
+
+def strict_verification_metadata_json(
+    verification: Any,
+    *,
+    reason_code: str = "strict_execution_uncertain",
+) -> dict[str, object]:
+    """Project metadata from a fresh reserved verifier result."""
+    return _strict_metadata_json(
+        _strict_metadata_from_verification(verification, reason_code=reason_code)
+    )
+
+
+def _strict_metadata_json(
+    metadata: _StrictRunMetadata | None,
+    *,
+    reason_only: bool = False,
+    reason_code: str | None = None,
+) -> dict[str, object]:
+    if metadata is None:
+        return {}
+    if reason_only:
+        value = reason_code if reason_code is not None else metadata.reason_code
+        return {"reason_code": value} if value is not None else {}
+    result: dict[str, object] = {}
+    for key in (
+        "run_format_version",
+        "contract_version",
+        "contract_sha256",
+        "binding_digest",
+        "reason_code",
+    ):
+        value = getattr(metadata, key)
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _strict_metadata_from_verification(
+    verification: Any,
+    *,
+    reason_code: str,
+) -> _StrictRunMetadata:
+    manifest = verification.manifest
+    return _StrictRunMetadata(
+        run_format_version=manifest.run_format_version,
+        contract_version=manifest.contract_version,
+        contract_sha256=manifest.contract_sha256,
+        binding_digest=manifest.binding_digest,
+        reason_code=reason_code,
+    )
+
+
+def _strict_reconciliation_snapshot(
+    row: _RequestRow,
+    verification: Any,
+) -> WorkflowSnapshot:
+    manifest = verification.manifest
+    return WorkflowSnapshot(
+        workflow_id=row.workflow_id,
+        run_id=row.run_id,
+        status="needs_reconciliation",
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        worker_state="unknown",
+        terminal=False,
+        max_live_codex_jobs=manifest.max_live_codex_jobs,
+        _strict_metadata=_strict_metadata_from_verification(
+            verification, reason_code="strict_execution_uncertain"
+        ),
+    )
+
+
+def _invalid_strict_snapshot(row: _RequestRow) -> WorkflowSnapshot:
+    return WorkflowSnapshot(
+        workflow_id=row.workflow_id,
+        run_id=row.run_id,
+        status="needs_reconciliation",
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        worker_state="unknown",
+        terminal=False,
+        _strict_metadata=_StrictRunMetadata(reason_code="run_integrity_invalid"),
+    )
+
+
+def _verify_existing_strict_request(
+    state_root: Path,
+    row: _RequestRow,
+    prepared: _PreparedStrictSavedRun,
+    allowed_roots: tuple[str, ...],
+) -> Any:
+    manifest_bytes = _read_regular_file(
+        _validated_run_directory(state_root, row.run_id) / "manifest.json",
+        limit=32 * 1024,
+    )
+    verification = verify_strict_reserved_readonly(
+        state_root,
+        row.run_id,
+        manifest_bytes,
+        expected_workflow_id=row.workflow_id,
+        expected_request_digest=row.request_digest,
+        allowed_roots=allowed_roots,
+    )
+    if verification is None or not _verification_matches_prepared(verification, prepared, row):
+        raise StrictReaderGateError()
+    return verification
+
+
+def _verification_matches_prepared(
+    verification: Any,
+    prepared: _PreparedStrictSavedRun,
+    row: _RequestRow,
+) -> bool:
+    if verification.reservation_verified is not True:
+        return False
+    manifest = verification.manifest
+    definition = verification._definition
+    return (
+        definition is not None
+        and manifest.workflow_id == row.workflow_id
+        and manifest.run_id == row.run_id
+        and manifest.request_digest == prepared.request_digest == row.request_digest
+        and manifest.definition_id == prepared.definition_id
+        and manifest.definition_revision == prepared.revision
+        and manifest.source_sha256 == prepared.source_sha256
+        and manifest.contract_version == prepared.contract_version
+        and manifest.contract_sha256 == prepared.contract_sha256
+        and manifest.binding_digest == prepared.binding_digest
+        and manifest.normalized_input_sha256 == prepared.normalized_input_sha256
+        and manifest.workspace_root == prepared.workspace_root
+        and manifest.max_live_codex_jobs == prepared.max_live_codex_jobs
+        and definition.definition_id == prepared.definition_id
+        and definition.revision == prepared.revision
+        and definition.source_sha256 == prepared.source_sha256
+        and definition.contract_sha256 == prepared.contract_sha256
+        and definition.binding_digest == prepared.binding_digest
+    )
+
+
+def _strict_binding_claim(state_root: Path, run_id: str) -> bool:
+    """Distinguish a healthy legacy ledger from an unknown/corrupt one."""
+    connection: sqlite3.Connection | None = None
+    try:
+        database = Path(state_root) / "requests.sqlite"
+        if not database.exists() and not database.is_symlink():
+            return False
+        if database.is_symlink():
+            return True
+        connection = _connect_read(database)
+        user_version = connection.execute("PRAGMA user_version").fetchone()
+        if user_version is None or type(user_version[0]) is not int:
+            return True
+        if user_version[0] == 0:
+            from .strict_reader_gate import _check_legacy_v0_metadata
+
+            _check_legacy_v0_metadata(connection, allow_missing_request_sources=True)
+            return False
+        if user_version[0] != 1:
+            return True
+        from .strict_requests import _check_v1_database
+
+        _check_v1_database(connection)
+        binding = connection.execute(
+            "SELECT 1 FROM workflow_request_contract_bindings WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return binding is not None
+    except Exception:
+        return True
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _strict_request_candidate(state_root: Path, run_id: str) -> bool:
+    try:
+        manifest = _read_regular_file(
+            _validated_run_directory(state_root, run_id) / "manifest.json",
+            limit=32 * 1024,
+        )
+    except Exception:
+        manifest = b""
+    if b'"run_format_version"' in manifest:
+        return True
+    return _strict_binding_claim(state_root, run_id)
+
+
+def _definition_contains_codex_job(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("call") == "codex-job":
+            return True
+        return any(_definition_contains_codex_job(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_definition_contains_codex_job(child) for child in value)
+    return False

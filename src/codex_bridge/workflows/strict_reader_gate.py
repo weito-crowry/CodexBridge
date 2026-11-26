@@ -1,8 +1,8 @@
-"""Read-only run format classification for service reader entry points.
+"""Read-only run classification and reserved verification for reader entry points.
 
-Classification only selects the legacy reader or the strict-v2 reconciliation
-path. A strict-v2 result does not verify the complete snapshot or authorize
-execution; a later reader must call the reserved snapshot verifier.
+Classification checks format and request binding only. The shared strict
+reader helper also verifies a reserved v2 snapshot, but does not authorize
+runtime execution.
 """
 
 from __future__ import annotations
@@ -11,12 +11,23 @@ import json
 import re
 import sqlite3
 from contextlib import closing
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
 
-from .strict_manifest import StrictWorkflowManifestV2, parse_strict_manifest_v2
-from .strict_requests import StrictWorkflowRequestStore
+from .strict_manifest import (
+    StrictWorkflowManifestV2,
+    StrictWorkflowSnapshotVerification,
+    StrictWorkflowSnapshotVerifier,
+    parse_strict_manifest_v2,
+)
+from .strict_requests import (
+    StrictWorkflowRequestInput,
+    StrictWorkflowRequestReservation,
+    StrictWorkflowRequestStore,
+    _same_request,
+)
 
 _REASON_CODE = "NEEDS_RECONCILIATION"
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -155,6 +166,154 @@ def classify_readonly(
         _fail()
 
 
+def verify_strict_reserved_readonly(
+    state_root: Path,
+    run_id: str,
+    manifest_bytes: bytes,
+    *,
+    expected_workflow_id: str,
+    expected_request_digest: str,
+    allowed_roots: tuple[str, ...],
+) -> StrictWorkflowSnapshotVerification | None:
+    """Verify a strict reserved snapshot, returning ``None`` for valid legacy runs.
+
+    The supplied manifest bytes are the caller's original read. The reserved
+    verifier independently reads the snapshot again; its parsed manifest must
+    match that original value before the verification result is trusted.
+    """
+    try:
+        if type(manifest_bytes) is not bytes:
+            _fail()
+        run_format = classify_readonly(
+            state_root,
+            run_id,
+            manifest_bytes,
+            expected_workflow_id=expected_workflow_id,
+            expected_request_digest=expected_request_digest,
+        )
+        if run_format is RunFormatVersion.LEGACY_V1:
+            return None
+        if run_format is not RunFormatVersion.STRICT_V2:
+            _fail()
+
+        original_manifest = parse_strict_manifest_v2(manifest_bytes)
+        verification = StrictWorkflowSnapshotVerifier(state_root, allowed_roots).verify_reserved(
+            run_id
+        )
+        if (
+            verification.reservation_verified is not True
+            or verification.manifest != original_manifest
+            or verification.manifest.run_id != run_id
+            or verification.manifest.workflow_id != expected_workflow_id
+            or verification.manifest.request_digest != expected_request_digest
+        ):
+            _fail()
+        return verification
+    except Exception:
+        raise StrictReaderGateError() from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _VerifiedStrictReservation:
+    reservation: StrictWorkflowRequestReservation = field(repr=False)
+    verification: StrictWorkflowSnapshotVerification = field(repr=False)
+
+    def __repr__(self) -> str:
+        return "_VerifiedStrictReservation(<verified>)"
+
+
+def _reserve_prepared_strict_run(
+    state_root: Path,
+    run_id: str,
+    *,
+    client_request_id: str,
+    allowed_roots: tuple[str, ...],
+) -> _VerifiedStrictReservation:
+    """Reserve one verified prepared snapshot or read its existing replay.
+
+    This internal coordinator is intentionally not used by legacy admission.
+    The request database keeps its own transaction boundary; if the follow-up
+    snapshot verification fails, the committed row remains available for a
+    later reconciliation attempt.
+    """
+    try:
+        store = StrictWorkflowRequestStore(state_root)
+        verifier = StrictWorkflowSnapshotVerifier(state_root, allowed_roots)
+        existing = store.read_binding(run_id)
+        if existing is None:
+            prepared = verifier.verify_pre_reservation(run_id)
+            request = _request_input_from_manifest(prepared.manifest, client_request_id)
+            reservation = store.reserve_strict(request)
+        else:
+            manifest_bytes = _read_manifest_bytes(state_root, run_id)
+            manifest = parse_strict_manifest_v2(manifest_bytes)
+            request = _request_input_from_manifest(manifest, client_request_id)
+            if not _same_request(request, existing):
+                _fail()
+            reservation = existing
+
+        if not _same_request(request, reservation):
+            _fail()
+        manifest_bytes = _read_manifest_bytes(state_root, run_id)
+        verification = verify_strict_reserved_readonly(
+            state_root,
+            run_id,
+            manifest_bytes,
+            expected_workflow_id=request.workflow_id,
+            expected_request_digest=request.request_digest,
+            allowed_roots=allowed_roots,
+        )
+        if verification is None or verification.manifest != parse_strict_manifest_v2(
+            manifest_bytes
+        ):
+            _fail()
+        return _VerifiedStrictReservation(reservation, verification)
+    except Exception:
+        raise StrictReaderGateError() from None
+
+
+def _request_input_from_manifest(
+    manifest: StrictWorkflowManifestV2,
+    client_request_id: str,
+) -> StrictWorkflowRequestInput:
+    return StrictWorkflowRequestInput(
+        client_request_id=client_request_id,
+        workflow_id=manifest.workflow_id,
+        run_id=manifest.run_id,
+        request_digest=manifest.request_digest,
+        definition_id=manifest.definition_id,
+        definition_revision=manifest.definition_revision,
+        source_sha256=manifest.source_sha256,
+        contract_sha256=manifest.contract_sha256,
+        binding_digest=manifest.binding_digest,
+        normalized_input_sha256=manifest.normalized_input_sha256,
+        created_at=manifest.created_at,
+        run_format_version=manifest.run_format_version,
+        contract_version=manifest.contract_version,
+    )
+
+
+def _read_manifest_bytes(state_root: Path, run_id: str) -> bytes:
+    if type(run_id) is not str or _RUN_ID.fullmatch(run_id) is None:
+        _fail()
+    root = _resolve_state_root(Path(state_root))
+    run_directory = root / run_id
+    if run_directory.is_symlink() or not run_directory.is_dir():
+        _fail()
+    resolved_run_directory = run_directory.resolve(strict=True)
+    if resolved_run_directory.parent != root:
+        _fail()
+    path = resolved_run_directory / "manifest.json"
+    if path.is_symlink() or not path.is_file():
+        _fail()
+    resolved_path = path.resolve(strict=True)
+    if resolved_path.parent != resolved_run_directory:
+        _fail()
+    payload = resolved_path.read_bytes()
+    parse_strict_manifest_v2(payload)
+    return payload
+
+
 def _decode_manifest(manifest: bytes | dict[str, Any]) -> tuple[dict[str, Any], bytes]:
     if type(manifest) is bytes:
         payload = manifest
@@ -235,14 +394,21 @@ def _user_version(connection: sqlite3.Connection) -> int:
     return row[0]
 
 
-def _check_legacy_v0_metadata(connection: sqlite3.Connection) -> None:
+def _check_legacy_v0_metadata(
+    connection: sqlite3.Connection,
+    *,
+    allow_missing_request_sources: bool = False,
+) -> None:
     tables = frozenset(
         str(row[0])
         for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     )
-    if tables != _LEGACY_TABLES:
+    expected_tables = _LEGACY_TABLES
+    if allow_missing_request_sources and tables == _LEGACY_TABLES - {"workflow_request_sources"}:
+        expected_tables = tables
+    if tables != expected_tables:
         _fail()
     if (
         connection.execute(
@@ -252,6 +418,8 @@ def _check_legacy_v0_metadata(connection: sqlite3.Connection) -> None:
     ):
         _fail()
     for table, expected_columns in _LEGACY_COLUMNS.items():
+        if table not in tables:
+            continue
         actual = tuple(
             (str(row["name"]), str(row["type"]).upper())
             for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
