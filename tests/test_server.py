@@ -1428,6 +1428,11 @@ def test_mcp_app_does_not_register_ui_routes(tmp_path) -> None:
 
 def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch) -> None:
     import codex_bridge.server as server_module
+    import codex_bridge.workflows.manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module, "default_workflow_state_root", lambda: tmp_path / "workflow-state"
+    )
 
     captured: list[dict[str, object]] = []
 
@@ -1465,13 +1470,67 @@ def test_build_runtime_passes_shutdown_callback_to_ui_app(tmp_path, monkeypatch)
     assert runtime.app_server._on_notification == runtime.bridge.handle_notification_async
 
 
-def test_build_runtime_attaches_inert_workflow_manager(tmp_path) -> None:
+def test_build_runtime_attaches_inert_workflow_manager(tmp_path, monkeypatch) -> None:
+    import codex_bridge.workflows.manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module, "default_workflow_state_root", lambda: tmp_path / "workflow-state"
+    )
     runtime = build_runtime(
         config(tmp_path), final_answer_database_path=tmp_path / "runtime-final-answers.sqlite3"
     )
 
     assert isinstance(runtime.workflow_manager, WorkflowWorkerManager)
+    assert runtime.workflow_manager.enable_isolated_strict_runtime is False
+    assert runtime.workflow_manager._enable_isolated_strict_codex_jobs is False
+    assert runtime.workflow_service is not None
+    assert runtime.workflow_service._enable_isolated_strict_runtime is False
+    assert runtime.workflow_service._enable_isolated_strict_codex_jobs is False
     assert runtime.workflow_manager.get_status("run-0123456789abcdef0123456789abcdef") is None
+
+
+@pytest.mark.asyncio
+async def test_build_runtime_wires_strict_gates_without_preparing_storage(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    import codex_bridge.workflows.manager as manager_module
+
+    state_root = tmp_path / "isolated-workflow-state"
+    monkeypatch.setattr(manager_module, "default_workflow_state_root", lambda: state_root)
+    settings = BridgeConfig.from_sources(
+        explicit_allowed_roots=(str(tmp_path),),
+        environ={"CODEX_BRIDGE_CONTROL_TOKEN": "A" * 32},
+        config_data={
+            "workflow": {
+                "strict_runtime_enabled": True,
+                "strict_codex_jobs_enabled": True,
+            }
+        },
+    )
+    settings = replace(
+        settings,
+        codex_executable=sys.executable,
+        codex_executable_source="explicit",
+    )
+
+    runtime = build_runtime(
+        settings,
+        final_answer_database_path=tmp_path / "runtime-final-answers.sqlite3",
+    )
+    try:
+        assert runtime.workflow_manager is not None
+        assert runtime.workflow_service is not None
+        assert runtime.workflow_manager.enable_isolated_strict_runtime is True
+        assert runtime.workflow_manager._enable_isolated_strict_codex_jobs is True
+        assert runtime.workflow_service._enable_isolated_strict_runtime is True
+        assert runtime.workflow_service._enable_isolated_strict_codex_jobs is True
+        assert not (state_root / "definitions.sqlite").exists()
+        assert not (state_root / "requests.sqlite").exists()
+        assert not state_root.exists()
+    finally:
+        await runtime.workflow_manager.shutdown()
 
 
 @pytest.mark.asyncio

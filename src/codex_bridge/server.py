@@ -203,9 +203,16 @@ def build_runtime(
     workflow_manager = WorkflowWorkerManager(
         allowed_roots=config.allowed_roots,
         control_token=config.control_token,
+        enable_isolated_strict_runtime=config.workflow_strict_runtime_enabled,
+        enable_isolated_strict_codex_jobs=config.workflow_strict_codex_jobs_enabled,
     )
     workflow_definitions = select_workflow_definition_repository(workflow_manager.state_root)
-    workflow_service = WorkflowService(workflow_manager, codex_bridge_port=config.ui_port)
+    workflow_service = WorkflowService(
+        workflow_manager,
+        codex_bridge_port=config.ui_port,
+        enable_isolated_strict_runtime=config.workflow_strict_runtime_enabled,
+        enable_isolated_strict_codex_jobs=config.workflow_strict_codex_jobs_enabled,
+    )
     ui_server = LocalUiServer(
         create_ui_app(
             bridge,

@@ -44,7 +44,11 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "toolsets": list,
         "max_tools": int,
     },
-    "workflow": {"mcp_permissions": list},
+    "workflow": {
+        "mcp_permissions": list,
+        "strict_runtime_enabled": bool,
+        "strict_codex_jobs_enabled": bool,
+    },
     "mcp_events": {
         "enabled": bool,
         "db_path": str,
