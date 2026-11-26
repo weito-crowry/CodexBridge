@@ -469,7 +469,7 @@ def codex_agent_capabilities(
             OptionConstraint("reasoning_effort", None, "model", None),
             OptionConstraint("sandbox_mode", '"danger-full-access"', "confirm_full_access", "true"),
         ),
-        usage_supported=True,
+        usage_supported=False,
         contract_version=context.contract_version,
         endpoint=context.endpoint,
         workspace=context.workspace,
