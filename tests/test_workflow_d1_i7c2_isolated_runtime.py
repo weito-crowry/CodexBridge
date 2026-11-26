@@ -88,6 +88,45 @@ async def test_default_strict_admission_stays_disabled_without_allocating_a_run(
 
 
 @pytest.mark.asyncio
+async def test_enabled_strict_admission_does_not_prepare_missing_request_storage(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    definitions = StrictWorkflowDefinitionStore(state_root)
+    definitions.initialize_new_database()
+    revision = definitions.create(
+        mutation_request_id="i7c2-unprepared-definition-001",
+        source_yaml=_source(),
+        max_live_codex_jobs=1,
+        contract=_contract(),
+    )
+    manager = _manager(state_root, workspace, enabled=True)
+    service = WorkflowService(
+        manager,
+        codex_bridge_port=18001,
+        enable_isolated_strict_runtime=True,
+    )
+
+    with pytest.raises(WorkflowServiceUnavailable):
+        await service.start_saved_workflow(
+            repository=StrictWorkflowDefinitionRepository(state_root),
+            definition_id=revision.definition_id,
+            revision=revision.revision,
+            client_request_id="i7c2-unprepared-request-001",
+            input_data={},
+            workspace_root=str(workspace.resolve()),
+        )
+
+    assert not (state_root / "requests.sqlite").exists()
+    assert not tuple(state_root.glob("run-*"))
+    assert manager.get_status("run-0123456789abcdef0123456789abcdef") is None
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_codex_job_admission_stays_disabled_without_internal_job_opt_in(
     tmp_path: Path,
 ) -> None:

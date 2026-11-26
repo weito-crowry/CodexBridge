@@ -824,6 +824,70 @@ def test_workflow_mcp_permissions_default_to_empty_and_parse_as_tuple() -> None:
     assert configured.workflow_mcp_permissions == ("read", "write", "execute")
 
 
+def test_strict_workflow_runtime_settings_default_off_and_parse_from_toml(tmp_path: Path) -> None:
+    default = BridgeConfig.from_sources(environ={}, config_data={})
+    assert default.workflow_strict_runtime_enabled is False
+    assert default.workflow_strict_codex_jobs_enabled is False
+
+    config_path = tmp_path / "strict-workflow.toml"
+    config_path.write_text(
+        "[workflow]\nstrict_runtime_enabled = true\nstrict_codex_jobs_enabled = false\n",
+        encoding="utf-8",
+    )
+    configured = BridgeConfig.from_sources(environ={"CODEX_BRIDGE_CONFIG": str(config_path)})
+
+    assert configured.workflow_strict_runtime_enabled is True
+    assert configured.workflow_strict_codex_jobs_enabled is False
+
+
+@pytest.mark.parametrize(
+    "workflow, message",
+    [
+        ({"strict_runtime_enabled": "true"}, "strict_runtime_enabled"),
+        ({"strict_codex_jobs_enabled": 1}, "strict_codex_jobs_enabled"),
+        (
+            {"strict_codex_jobs_enabled": True},
+            "requires workflow.strict_runtime_enabled",
+        ),
+    ],
+)
+def test_strict_workflow_settings_reject_bad_types_and_invalid_dependency(
+    workflow: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=message):
+        BridgeConfig.from_sources(environ={}, config_data={"workflow": workflow})
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        'strict_runtime_enabled = "true"',
+        "strict_runtime_enabled = 1",
+        'strict_codex_jobs_enabled = "false"',
+    ],
+)
+def test_strict_workflow_settings_require_toml_booleans(tmp_path: Path, setting: str) -> None:
+    from codex_bridge.config_file import ConfigFileError, load_user_config
+
+    config_path = tmp_path / "strict-workflow-invalid.toml"
+    config_path.write_text(f"[workflow]\n{setting}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigFileError, match="boolean"):
+        load_user_config(path=config_path)
+
+
+def test_strict_workflow_settings_validate_direct_bridge_config_construction() -> None:
+    from dataclasses import replace
+
+    base = BridgeConfig.from_sources(environ={}, config_data={})
+    with pytest.raises(ConfigurationError, match="workflow.strict_runtime_enabled"):
+        replace(base, workflow_strict_runtime_enabled=1)
+    with pytest.raises(ConfigurationError, match="workflow.strict_codex_jobs_enabled"):
+        replace(base, workflow_strict_codex_jobs_enabled=1)
+    with pytest.raises(ConfigurationError, match="requires workflow.strict_runtime_enabled"):
+        replace(base, workflow_strict_codex_jobs_enabled=True)
+
+
 @pytest.mark.parametrize(
     "permissions",
     [

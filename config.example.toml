@@ -69,6 +69,10 @@ max_tools = 0
 # Allowed values are "read", "write", and "execute"; only "read" enables B1 tools.
 [workflow]
 mcp_permissions = []
+# These separate D1 runtime gates stay off unless an operator enables them after preparation.
+strict_runtime_enabled = false
+# Codex job calls also require strict_runtime_enabled and the existing control token.
+strict_codex_jobs_enabled = false
 
 # An explicit target table must include exactly one local target.
 # [targets.local]
