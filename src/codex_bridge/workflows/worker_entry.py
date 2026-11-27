@@ -337,8 +337,7 @@ def _read_config(config_path: Path, run_dir: Path, mode: str) -> dict[str, objec
     if (value["version"] == 1 and set(value) != legacy_keys) or (
         value["version"] == 2
         and (
-            set(value) != strict_keys
-            or value.get("strict_runtime") is not True
+            value.get("strict_runtime") is not True
             or type(value.get("execution_mode")) is not str
             or value.get("execution_mode")
             not in {"isolated", "authorized_codex", "authorized_agent"}

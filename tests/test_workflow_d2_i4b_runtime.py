@@ -411,6 +411,7 @@ def test_strict_agent_flag_defaults_off_and_is_independent_of_codex_jobs() -> No
 def test_worker_entry_flag_off_refuses_agent_start_and_recovery(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
     mode: str,
 ) -> None:
     from codex_bridge.workflows import worker_entry
@@ -446,6 +447,87 @@ def test_worker_entry_flag_off_refuses_agent_start_and_recovery(
     assert (run_dir / "worker-entry-status.json").is_file()
     assert not (run_dir / "dbos.sqlite").exists()
     assert adapter.checkpoint_identity["workflow_id"]
+    assert "strict Agent runtime is not enabled" in capfd.readouterr().err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["start", "recover"])
+async def test_manager_agent_config_passes_worker_entry_and_reaches_worker_main(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    from pathlib import Path
+
+    from codex_bridge.workflows import manager as manager_module
+    from codex_bridge.workflows import worker, worker_entry
+    from codex_bridge.workflows.manager import WorkflowWorkerManager
+
+    _adapter, run_dir, allowed_roots, context = _reserved_agent_run(
+        tmp_path,
+        [_agent_task("invoke")],
+    )
+    manager = WorkflowWorkerManager(
+        state_root=run_dir.parent,
+        allowed_roots=allowed_roots,
+        control_token="test-control-token",
+        enable_isolated_strict_runtime=True,
+        enable_strict_agent=True,
+    )
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        pid = 43101
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeProcess:
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        manager_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    handle = await manager.start_worker(
+        run_dir,
+        mode=mode,
+        workspace_root=Path(context.workspace),
+        max_live_codex_jobs=1,
+        strict_runtime=True,
+        codex_bridge_port=int(context.endpoint.rsplit(":", 1)[1]),
+    )
+    config_path = run_dir / f"worker-config-{manager._records[run_dir.name].launch_id}.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["execution_mode"] == "authorized_agent"
+    assert config["strict_agent_enabled"] is True
+
+    worker_args: list[list[str]] = []
+    monkeypatch.setattr(worker_entry, "missing_workflow_dependencies", lambda: ())
+    monkeypatch.setattr(worker, "main", lambda args: worker_args.append(list(args)) or 0)
+    for key in (
+        worker.CONTROL_TOKEN_ENV,
+        "CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED",
+        "CODEXBRIDGE_WORKFLOW_BRIDGE_PORT",
+    ):
+        monkeypatch.setenv(key, captured["env"][key])
+
+    exit_code = worker_entry.main(
+        ["--mode", mode, "--run-dir", str(run_dir), "--config", str(config_path)]
+    )
+    await handle.wait(timeout_seconds=2)
+    await manager.shutdown()
+
+    assert exit_code == 0
+    assert len(worker_args) == 1
+    assert "--strict-runtime-mode" in worker_args[0]
+    assert worker_args[0][worker_args[0].index("--strict-runtime-mode") + 1] == "authorized_agent"
+    assert "--codex-bridge-port" in worker_args[0]
+    assert (
+        json.loads((run_dir / "worker-entry-status.json").read_text(encoding="utf-8"))["state"]
+        == "completed"
+    )
 
 
 def test_agent_worker_cli_cannot_relabel_the_pinned_task_tree(
@@ -1130,3 +1212,499 @@ def test_actual_dbos_strict_agent_runtime_handles_wait_observe_and_skipped_branc
     assert len(records) == 3
     assert all(record.result_json is not None for record in records)
     assert all("skipped_agent" not in record.node_pointer for record in records)
+
+
+@pytest.mark.asyncio
+async def test_uncertain_agent_dispatch_is_handled_succeeded_and_readable(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import sqlite3
+    import threading
+    from pathlib import Path
+
+    import httpx2 as httpx
+    from starlette.applications import Starlette
+
+    from codex_bridge.workflows import manager as manager_module
+    from codex_bridge.workflows import strict_executor, worker, worker_entry
+    from codex_bridge.workflows.agent_contracts import (
+        AgentResult,
+        DispatchReceipt,
+        PreparedProviderRequest,
+        ProviderCapabilities,
+        ProviderRegistry,
+    )
+    from codex_bridge.workflows.agent_ledger import AgentInvocationLedger
+    from codex_bridge.workflows.api import create_workflow_routes
+    from codex_bridge.workflows.manager import (
+        WorkflowWorkerManager,
+    )
+    from codex_bridge.workflows.service import WorkflowService
+
+    tasks = [
+        _agent_task(
+            "invoke",
+            _agent_wire(prompt="uncertain call", bindings={}, wait=True),
+        ),
+        {
+            "route": {
+                "switch": [
+                    {
+                        "handled_unknown": {
+                            "when": '${ .status == "UNKNOWN" }',
+                            "then": "handled_unknown",
+                        }
+                    },
+                    {"unexpected_status": {"then": "unexpected_status"}},
+                ]
+            }
+        },
+        {"handled_unknown": {"set": {"handled": True}, "then": "exit"}},
+        {"unexpected_status": {"set": {"handled": False}, "then": "exit"}},
+    ]
+    adapter, run_dir, allowed_roots, context = _reserved_agent_run(tmp_path, tasks)
+    workflow_id = str(adapter.checkpoint_identity["workflow_id"])
+    dispatch_entered = threading.Event()
+    release_dispatch = threading.Event()
+    branch_events: list[Any] = []
+
+    class FakeProvider:
+        dispatches = 0
+
+        def capabilities(self, target: str) -> ProviderCapabilities:
+            assert target == "default"
+            return ProviderCapabilities(
+                provider="codex",
+                target="default",
+                operations=("invoke", "observe", "wait"),
+                session_modes=("new",),
+                endpoint=context.endpoint,
+                workspace=context.workspace,
+            )
+
+        def prepare(self, request: Any, target_context: Any) -> PreparedProviderRequest:
+            assert target_context == context
+            return PreparedProviderRequest(request, target_context)
+
+        def preflight(self, prepared: Any) -> None:
+            assert prepared.operation == "invoke"
+
+        def dispatch(self, prepared: Any, client_request_id: str) -> DispatchReceipt:
+            assert prepared.operation == "invoke"
+            assert client_request_id.startswith("cba-")
+            self.dispatches += 1
+            dispatch_entered.set()
+            if not release_dispatch.wait(timeout=90):
+                raise TimeoutError("test dispatch gate expired")
+            return DispatchReceipt.uncertain()
+
+        def observe(self, *_args: Any) -> Any:
+            raise AssertionError("UNKNOWN invoke must not trigger observe")
+
+        def interrupt(self, *_args: Any) -> DispatchReceipt:
+            raise AssertionError("I4-B has no interrupt operation")
+
+    provider = FakeProvider()
+    registry = ProviderRegistry({"codex": provider}, {"codex": "default"})
+    monkeypatch.setattr(
+        strict_executor,
+        "build_codex_agent_runtime",
+        lambda **_kwargs: (provider, registry, context),
+    )
+    interpreter_type = strict_executor.Interpreter
+
+    def capture_interpreter(definition: Any, **kwargs: Any) -> Any:
+        observer = kwargs.pop("observer", None)
+
+        def capture(event: Any) -> None:
+            if event.event_type == "branch_selected":
+                branch_events.append(event)
+            if observer is not None:
+                observer(event)
+
+        return interpreter_type(definition, observer=capture, **kwargs)
+
+    monkeypatch.setattr(strict_executor, "Interpreter", capture_interpreter)
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED", "1")
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_BRIDGE_PORT", "18001")
+    manager = WorkflowWorkerManager(
+        state_root=run_dir.parent,
+        allowed_roots=tuple(allowed_roots),
+        control_token="test-control-token",
+        enable_isolated_strict_runtime=True,
+        enable_strict_agent=True,
+    )
+    spawned: dict[str, Any] = {}
+
+    class FakeWorkerProcess:
+        pid = 43103
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeWorkerProcess:
+        spawned["args"] = args
+        spawned["env"] = kwargs["env"]
+        return FakeWorkerProcess()
+
+    monkeypatch.setattr(
+        manager_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    worker_handle = await manager.start_worker(
+        run_dir,
+        mode="start",
+        workspace_root=Path(context.workspace),
+        max_live_codex_jobs=1,
+        strict_runtime=True,
+        codex_bridge_port=18001,
+    )
+    config_path = run_dir / f"worker-config-{manager._records[run_dir.name].launch_id}.json"
+    for key in (
+        worker.CONTROL_TOKEN_ENV,
+        "CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED",
+        "CODEXBRIDGE_WORKFLOW_BRIDGE_PORT",
+    ):
+        monkeypatch.setenv(key, spawned["env"][key])
+
+    service = WorkflowService(
+        manager,
+        codex_bridge_port=18001,
+        enable_isolated_strict_runtime=True,
+        enable_strict_agent=True,
+    )
+
+    worker_entry_task = asyncio.create_task(
+        asyncio.to_thread(
+            worker_entry.main,
+            [
+                "--mode",
+                "start",
+                "--run-dir",
+                str(run_dir),
+                "--config",
+                str(config_path),
+            ],
+        )
+    )
+    try:
+        assert await asyncio.to_thread(dispatch_entered.wait, 60)
+        in_flight = await service.get_workflow(workflow_id)
+        assert in_flight.status in {"starting", "running"}
+    finally:
+        release_dispatch.set()
+        entry_exit_code = await worker_entry_task
+        await worker_handle.wait(timeout_seconds=2)
+        shutdown_report = await manager.shutdown()
+
+    assert entry_exit_code == 0
+    terminal = json.loads((run_dir / "strict-terminal.json").read_text(encoding="utf-8"))
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"] == {}
+    assert provider.dispatches == 1
+    assert len(branch_events) == 1
+    assert branch_events[0].case_index == 0
+
+    ledger = AgentInvocationLedger.open_existing(
+        run_dir,
+        adapter.checkpoint_identity,
+        context,
+    )
+    records = ledger.list_invocations(limit=10)
+    assert len(records) == 1
+    record = records[0]
+    assert record.result_json is not None
+    logical_result = AgentResult.from_json(record.result_json)
+    assert record.dispatch_state == "MAYBE_SENT"
+    assert logical_result.status == "UNKNOWN"
+    assert logical_result.handle is None
+    assert logical_result.error is not None
+    assert logical_result.error["code"] == "dispatch_uncertain"
+    assert shutdown_report.owned_turns == frozenset()
+    assert shutdown_report.ownership_complete is False
+
+    snapshot = await service.get_workflow(workflow_id)
+    result_snapshot = await service.get_result(workflow_id)
+    assert snapshot.status == "succeeded"
+    assert result_snapshot.workflow.status == "succeeded"
+    assert result_snapshot.result is not None
+    assert result_snapshot.result["result"] == {}
+
+    routes = create_workflow_routes(
+        service,
+        token="i4b-uncertain-api-token",
+        ui_port=18001,
+        authorize=lambda request, token: request.headers.get("authorization") == f"Bearer {token}",
+        ready=lambda: True,
+    )
+    app = Starlette(routes=routes)
+    headers = {"authorization": "Bearer i4b-uncertain-api-token"}
+    prefix = f"/ui-api/control/workflows/{workflow_id}"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://127.0.0.1:18001",
+    ) as client:
+        status_response = await client.get(prefix, headers=headers)
+        result_response = await client.get(f"{prefix}/result", headers=headers)
+        list_response = await client.get(f"{prefix}/agent-invocations", headers=headers)
+        assert status_response.status_code == 200, status_response.text
+        assert result_response.status_code == 200, result_response.text
+        assert list_response.status_code == 200, list_response.text
+        assert status_response.json()["status"] == "succeeded"
+        assert result_response.json()["status"] == "succeeded"
+        listed = list_response.json()["invocations"]
+        assert len(listed) == 1
+        assert listed[0]["status"] == "UNKNOWN"
+        assert listed[0]["handle"] is None
+        assert listed[0]["error_code"] == "dispatch_uncertain"
+        invocation_id = listed[0]["invocation_id"]
+        detail_response = await client.get(
+            f"{prefix}/agent-invocations/{invocation_id}",
+            headers=headers,
+        )
+        assert detail_response.status_code == 200, detail_response.text
+        assert detail_response.json()["status"] == "UNKNOWN"
+        assert detail_response.json()["error_code"] == "dispatch_uncertain"
+        assert "result_digest" in detail_response.json()
+        assert "uncertain call" not in list_response.text
+        assert "uncertain call" not in detail_response.text
+
+    connection = sqlite3.connect(run_dir / "agent_invocations.sqlite")
+    try:
+        connection.execute(
+            "UPDATE invocations SET result_json=NULL,result_sha256=NULL WHERE invocation_id=?",
+            (record.invocation_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    incomplete_terminal = await service.get_workflow(workflow_id)
+    assert incomplete_terminal.status == "needs_reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_agent_run_with_legacy_codex_jobs_database_needs_reconciliation(
+    tmp_path: Any,
+) -> None:
+    import sqlite3
+
+    from codex_bridge.workflows.manager import WorkflowWorkerManager
+    from codex_bridge.workflows.service import WorkflowService
+
+    adapter, run_dir, allowed_roots, _context = _reserved_agent_run(
+        tmp_path,
+        [_agent_task("invoke")],
+    )
+    workflow_id = str(adapter.checkpoint_identity["workflow_id"])
+    codex_jobs_path = run_dir / "codex_jobs.sqlite"
+    connection = sqlite3.connect(codex_jobs_path)
+    try:
+        connection.execute(
+            "CREATE TABLE jobs (job_id TEXT, workflow_id TEXT, state TEXT, "
+            "thread_id TEXT, turn_id TEXT)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    dbos_connection = sqlite3.connect(run_dir / "dbos.sqlite")
+    try:
+        dbos_connection.execute("CREATE TABLE workflow_status (workflow_uuid TEXT, status TEXT)")
+        dbos_connection.execute(
+            "INSERT INTO workflow_status VALUES (?, ?)",
+            (workflow_id, "RUNNING"),
+        )
+        dbos_connection.commit()
+    finally:
+        dbos_connection.close()
+
+    manager = WorkflowWorkerManager(
+        state_root=run_dir.parent,
+        allowed_roots=tuple(allowed_roots),
+        enable_isolated_strict_runtime=True,
+        enable_strict_agent=True,
+    )
+    service = WorkflowService(
+        manager,
+        codex_bridge_port=18001,
+        enable_isolated_strict_runtime=True,
+        enable_strict_agent=True,
+    )
+    snapshot = await service.get_workflow(workflow_id)
+    assert snapshot.status == "needs_reconciliation"
+
+
+@pytest.mark.parametrize("checkpoint_conflict", ["error_checkpoint", "request_mismatch"])
+def test_agent_preparation_checkpoint_conflicts_with_existing_ledger_row(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_conflict: str,
+) -> None:
+    from dbos import DBOS, SetWorkflowID
+
+    from codex_bridge.workflows import strict_executor, worker
+    from codex_bridge.workflows.agent_contracts import (
+        AgentRequest,
+        DispatchReceipt,
+        PreparedProviderRequest,
+        ProviderCapabilities,
+        ProviderRegistry,
+    )
+    from codex_bridge.workflows.agent_ledger import AgentInvocationLedger
+    from codex_bridge.workflows.contracts import sha256_json
+
+    adapter, run_dir, allowed_roots, context = _reserved_agent_run(
+        tmp_path,
+        [_agent_task("invoke", _agent_wire(prompt="current request", bindings={}))],
+    )
+    ledger = AgentInvocationLedger.open_existing(
+        run_dir,
+        adapter.checkpoint_identity,
+        context,
+    )
+    stale_request = AgentRequest(
+        operation="invoke",
+        provider="codex",
+        target="default",
+        target_context=context,
+        session={"mode": "new"},
+        handle=None,
+        options={},
+        prompt="different request",
+        response={"format": "text"},
+        wait=False,
+        timeout_seconds=None,
+    )
+    stale_record = ledger.prepare_invoke(
+        "/do/0/invoke",
+        [],
+        PreparedProviderRequest(stale_request, context),
+        created_ms=1000,
+    )
+    checkpoint_request = AgentRequest(
+        operation="invoke",
+        provider="codex",
+        target="default",
+        target_context=context,
+        session={"mode": "new"},
+        handle=None,
+        options={},
+        prompt="checkpoint request",
+        response={"format": "text"},
+        wait=False,
+        timeout_seconds=None,
+    )
+    checkpoint_request_json = checkpoint_request.to_json()
+
+    class FakeProvider:
+        dispatches = 0
+
+        def capabilities(self, target: str) -> ProviderCapabilities:
+            return ProviderCapabilities(
+                provider="codex",
+                target=target,
+                operations=("invoke", "observe", "wait"),
+                session_modes=("new",),
+                endpoint=context.endpoint,
+                workspace=context.workspace,
+            )
+
+        def prepare(self, request: Any, target_context: Any) -> PreparedProviderRequest:
+            return PreparedProviderRequest(request, target_context)
+
+        def preflight(self, prepared: Any) -> None:
+            return None
+
+        def dispatch(self, prepared: Any, client_request_id: str) -> DispatchReceipt:
+            self.dispatches += 1
+            return DispatchReceipt.uncertain()
+
+        def observe(self, *_args: Any) -> Any:
+            raise AssertionError("error preparation checkpoint must not observe")
+
+        def interrupt(self, *_args: Any) -> DispatchReceipt:
+            raise AssertionError("I4-B has no interrupt operation")
+
+    provider = FakeProvider()
+    registry = ProviderRegistry({"codex": provider}, {"codex": "default"})
+    monkeypatch.setattr(
+        strict_executor,
+        "build_codex_agent_runtime",
+        lambda **_kwargs: (provider, registry, context),
+    )
+    checkpoint_seen = False
+
+    def error_prepare_step(_step_identity: str) -> Any:
+        def make_checkpoint(*args: Any) -> dict[str, Any]:
+            nonlocal checkpoint_seen
+            checkpoint_seen = True
+            (
+                _state_root,
+                run_id,
+                _roots,
+                identity,
+                _port,
+                node_id,
+                iteration_vector,
+                task_name,
+                _task_spec,
+                input_data,
+                variables,
+            ) = args
+            assert run_id == run_dir.name
+            return {
+                "checkpoint_version": 1,
+                "kind": "agent_request_preparation",
+                "binding_identity": identity,
+                "node_id": node_id,
+                "iteration_vector": iteration_vector,
+                "task_name": task_name,
+                "input_sha256": sha256_json(input_data),
+                "variables_sha256": sha256_json(variables),
+                "invocation_id": ledger.invocation_id_for(node_id, iteration_vector),
+                "request_json": (
+                    None if checkpoint_conflict == "error_checkpoint" else checkpoint_request_json
+                ),
+                "error_code": (
+                    "invalid_request" if checkpoint_conflict == "error_checkpoint" else None
+                ),
+            }
+
+        return make_checkpoint
+
+    monkeypatch.setattr(strict_executor, "_prepare_agent_request_step", error_prepare_step)
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED", "1")
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_BRIDGE_PORT", "18001")
+
+    DBOS(config=worker._dbos_config(run_dir / "dbos.sqlite"))
+    DBOS.launch()
+    result: Any = None
+    workflow_error: Exception | None = None
+    workflow_handle: Any = None
+    try:
+        with SetWorkflowID(str(adapter.checkpoint_identity["workflow_id"])):
+            workflow_handle = DBOS.start_workflow(
+                strict_executor.execute_strict_ows_workflow,
+                run_dir.name,
+                str(run_dir.parent),
+                list(allowed_roots),
+                "authorized_agent",
+            )
+        try:
+            result = workflow_handle.get_result()
+        except Exception as error:
+            workflow_error = error
+            result = None
+    finally:
+        DBOS.destroy()
+
+    assert checkpoint_seen
+    assert result is None or result.get("status") != "succeeded"
+    assert isinstance(workflow_error, strict_executor.StrictWorkflowExecutionError)
+    assert workflow_error.reason_code == "strict_execution_uncertain"
+    assert provider.dispatches == 0
+    preserved = ledger.get_invocation(stale_record.invocation_id)
+    assert preserved.result_json is None
+    assert preserved.dispatch_state == "PREPARED"

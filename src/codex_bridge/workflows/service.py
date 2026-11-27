@@ -2725,9 +2725,9 @@ def _inspect_strict_reserved_run(
             agent_records = _read_verified_agent_invocations(run_dir, manifest, definition)
         except Exception:
             return reconciliation(reason_code="strict_execution_uncertain")
-        if any(record.dispatch_state == "MAYBE_SENT" for record in agent_records):
-            return reconciliation(reason_code="strict_execution_uncertain")
     jobs_path = run_dir / "codex_jobs.sqlite"
+    if has_agents and (jobs_path.exists() or jobs_path.is_symlink()):
+        return reconciliation(worker_state, reason_code="run_integrity_invalid")
     if has_codex_jobs:
         if not (jobs_path.exists() or jobs_path.is_symlink()):
             if dbos_status in {"SUCCESS", "SUCCEEDED", "ERROR", "CANCELLED", "FAILED"}:

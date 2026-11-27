@@ -20,6 +20,7 @@ from .agent_contracts import (
     AgentError,
     AgentRequest,
     AgentResult,
+    PreparedProviderRequest,
     evaluate_agent_request,
     validate_agent_wire,
 )
@@ -744,7 +745,12 @@ def _execute_verified_run(
                     ):
                         raise StrictWorkflowExecutionError("strict_execution_uncertain")
                     if checkpoint["error_code"] is not None:
-                        if type(checkpoint["error_code"]) is not str:
+                        if (
+                            type(checkpoint["error_code"]) is not str
+                            or checkpoint["request_json"] is not None
+                            or ledger.get_invocation_for_node(node_id, list(iteration_vector))
+                            is not None
+                        ):
                             raise StrictWorkflowExecutionError("strict_execution_uncertain")
                         wire = _task_spec.get("with")
                         operation = (
@@ -764,6 +770,13 @@ def _execute_verified_run(
                         raise StrictWorkflowExecutionError("strict_execution_uncertain")
                     request = AgentRequest.from_json(checkpoint["request_json"])
                     if request.target_context != context:
+                        raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                    existing = ledger.get_invocation_for_node(node_id, list(iteration_vector))
+                    if (
+                        existing is not None
+                        and PreparedProviderRequest(request, context).to_json()
+                        != existing.request_json
+                    ):
                         raise StrictWorkflowExecutionError("strict_execution_uncertain")
                     result = AgentInvocationExecutor(ledger, provider).execute(
                         lambda: AgentRequest.from_json(checkpoint["request_json"]),
