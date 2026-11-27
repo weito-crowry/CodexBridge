@@ -66,6 +66,25 @@ class StrictVariableRuntimeError(RuntimeError):
         return f"{type(self).__name__}(<{self.reason_code}>)"
 
 
+def checkpoint_identity_from_manifest(
+    manifest: StrictWorkflowManifestV2,
+) -> dict[str, object]:
+    """Build the shared DBOS and Agent ledger binding from a verified manifest."""
+    if type(manifest) is not StrictWorkflowManifestV2:
+        raise StrictVariableRuntimeError("strict_variable_run_invalid")
+    return {
+        "run_id": manifest.run_id,
+        "workflow_id": manifest.workflow_id,
+        "definition_id": manifest.definition_id,
+        "definition_revision": manifest.definition_revision,
+        "request_digest": manifest.request_digest,
+        "source_sha256": manifest.source_sha256,
+        "contract_sha256": manifest.contract_sha256,
+        "binding_digest": manifest.binding_digest,
+        "normalized_input_sha256": manifest.normalized_input_sha256,
+    }
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class PreparedStrictVariableMutation:
     """Detached apply arguments captured before the I4 ledger transaction."""
@@ -223,17 +242,7 @@ class StrictWorkflowVariableRuntimeAdapter:
         manifest = self._verified_manifest
         if manifest is None:
             raise StrictVariableRuntimeError("strict_variable_run_invalid")
-        return {
-            "run_id": manifest.run_id,
-            "workflow_id": manifest.workflow_id,
-            "definition_id": manifest.definition_id,
-            "definition_revision": manifest.definition_revision,
-            "request_digest": manifest.request_digest,
-            "source_sha256": manifest.source_sha256,
-            "contract_sha256": manifest.contract_sha256,
-            "binding_digest": manifest.binding_digest,
-            "normalized_input_sha256": manifest.normalized_input_sha256,
-        }
+        return checkpoint_identity_from_manifest(manifest)
 
     @property
     def max_live_codex_jobs(self) -> int:
@@ -674,4 +683,5 @@ __all__ = [
     "PreparedStrictVariableMutation",
     "StrictVariableRuntimeError",
     "StrictWorkflowVariableRuntimeAdapter",
+    "checkpoint_identity_from_manifest",
 ]

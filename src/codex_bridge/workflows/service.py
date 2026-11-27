@@ -15,11 +15,19 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..paths import AllowedPathPolicy, PathPolicyError
+from .agent_contracts import AgentResult, DispatchReceipt
+from .agent_ledger import AgentInvocationLedger, AgentLedgerIntegrityError
+from .agent_runtime import (
+    build_codex_agent_runtime,
+    inspect_agent_ledger_binding,
+    validate_pinned_agent_definition,
+)
 from .contracts import (
     CompiledContract,
     ContractInputInvalid,
     ContractOutputInvalid,
     ContractResourceLimit,
+    canonical_json,
     compile_contract,
     normalize_input,
     sha256_json,
@@ -38,6 +46,7 @@ from .startup_diagnostics import (
 from .strict_binding import StrictWorkflowInputNormalization
 from .strict_manifest import (
     StrictWorkflowSnapshotError,
+    StrictWorkflowSnapshotVerifier,
     StrictWorkflowSnapshotWriter,
     strict_request_digest_v2,
 )
@@ -47,7 +56,14 @@ from .strict_reader_gate import (
     verify_strict_reserved_readonly,
 )
 from .strict_requests import StrictWorkflowRequestError, StrictWorkflowRequestStore
+from .strict_variable_runtime import checkpoint_identity_from_manifest
 from .strict_variables import StrictWorkflowRunBindingInput, StrictWorkflowVariableStore
+from .task_tree import (
+    StrictTaskTreeKind,
+    TaskTreeClassificationError,
+    classify_task_tree,
+    definition_has_call_target,
+)
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,99}\Z", re.ASCII)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -294,6 +310,7 @@ class WorkflowService:
         codex_bridge_port: int,
         enable_isolated_strict_runtime: bool = False,
         enable_isolated_strict_codex_jobs: bool = False,
+        enable_strict_agent: bool = False,
     ) -> None:
         if type(codex_bridge_port) is not int or not 1 <= codex_bridge_port <= 65535:
             raise ValueError("workflow CodexBridge port is invalid")
@@ -308,6 +325,9 @@ class WorkflowService:
         self._enable_isolated_strict_codex_jobs = bool(
             enable_isolated_strict_codex_jobs
             and getattr(worker_manager, "_enable_isolated_strict_codex_jobs", False)
+        )
+        self._enable_strict_agent = bool(
+            enable_strict_agent and getattr(worker_manager, "enable_strict_agent", False)
         )
         self._start_lock = asyncio.Lock()
 
@@ -530,7 +550,16 @@ class WorkflowService:
 
                 if not self._enable_isolated_strict_runtime:
                     raise WorkflowServiceUnavailable("strict workflow execution is not available")
-                if _definition_contains_codex_job(prepared.definition) and (
+                try:
+                    classification = classify_task_tree(prepared.definition, strict_contract=True)
+                except TaskTreeClassificationError:
+                    raise WorkflowContractUnavailable() from None
+                if classification.kind is StrictTaskTreeKind.STRICT_AGENT:
+                    if not self._enable_strict_agent:
+                        raise WorkflowServiceUnavailable("strict Agent execution is not available")
+                    if prepared.max_live_codex_jobs != 1:
+                        raise WorkflowContractUnavailable()
+                if classification.kind is StrictTaskTreeKind.STRICT_CODEX_JOB and (
                     not self._enable_isolated_strict_codex_jobs
                 ):
                     raise WorkflowServiceUnavailable("strict codex-job execution is not available")
@@ -734,6 +763,36 @@ class WorkflowService:
                 normalized_input=normalized,
                 created_at=created_at,
             )
+            is_agent = classify_task_tree(prepared.definition, strict_contract=True).kind is (
+                StrictTaskTreeKind.STRICT_AGENT
+            )
+            if is_agent:
+                if not self._enable_strict_agent or prepared.max_live_codex_jobs != 1:
+                    raise WorkflowServiceUnavailable("strict Agent execution is not available")
+                verified_pre = await asyncio.to_thread(
+                    StrictWorkflowSnapshotVerifier(
+                        self._state_root, self._allowed_roots
+                    ).verify_pre_reservation,
+                    run_id,
+                )
+                manifest = verified_pre.manifest
+                try:
+                    _provider, registry, target_context = build_codex_agent_runtime(
+                        port=self._codex_bridge_port,
+                        allowed_roots=self._allowed_roots,
+                        workspace_root=manifest.workspace_root,
+                    )
+                    validate_pinned_agent_definition(prepared.definition, registry)
+                    binding_identity = checkpoint_identity_from_manifest(manifest)
+                    AgentInvocationLedger.initialize_new_database(
+                        canonical_run_dir,
+                        binding_identity,
+                        target_context,
+                    )
+                except Exception:
+                    raise WorkflowServiceUnavailable(
+                        "strict Agent target or ledger could not be initialized"
+                    ) from None
             reserved = await asyncio.to_thread(
                 _reserve_prepared_strict_run,
                 self._state_root,
@@ -835,6 +894,7 @@ class WorkflowService:
                 codex_bridge_port=(
                     self._codex_bridge_port
                     if _definition_contains_codex_job(prepared.definition)
+                    or _definition_contains_agent(prepared.definition)
                     else None
                 ),
             )
@@ -1189,6 +1249,72 @@ class WorkflowService:
             raise
         except (OSError, sqlite3.Error, ValueError):
             raise WorkflowServiceUnavailable("workflow task events are unavailable") from None
+
+    async def list_agent_invocations(
+        self,
+        workflow_id: str,
+        *,
+        limit: int = 50,
+        after: tuple[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise WorkflowRequestError("Agent invocation limit is invalid")
+        normalized = _normalize_workflow_id(workflow_id)
+        try:
+            row, ledger = await asyncio.to_thread(
+                _open_readonly_agent_ledger_for_workflow,
+                self._state_root,
+                self._allowed_roots,
+                normalized,
+            )
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
+            snapshot = _snapshot_from_inspection(row, inspection)
+            if inspection.status == "needs_reconciliation":
+                raise WorkflowReconciliationRequired(snapshot)
+            records = await asyncio.to_thread(ledger.list_invocations, limit=limit, after=after)
+            return {
+                "invocations": [_agent_invocation_json(record) for record in records],
+                "limit": limit,
+                "next_after": (
+                    (records[-1].created_ms, records[-1].invocation_id)
+                    if len(records) == limit and records
+                    else None
+                ),
+            }
+        except (WorkflowNotFoundError, WorkflowReconciliationRequired, WorkflowRequestError):
+            raise
+        except (OSError, sqlite3.Error, ValueError, AgentLedgerIntegrityError):
+            raise WorkflowServiceUnavailable("Agent invocation ledger is unavailable") from None
+
+    async def get_agent_invocation(self, workflow_id: str, invocation_id: str) -> dict[str, Any]:
+        if type(invocation_id) is not str or re.fullmatch(r"[0-9a-f]{64}", invocation_id) is None:
+            raise WorkflowRequestError("Agent invocation ID is invalid")
+        normalized = _normalize_workflow_id(workflow_id)
+        try:
+            row, ledger = await asyncio.to_thread(
+                _open_readonly_agent_ledger_for_workflow,
+                self._state_root,
+                self._allowed_roots,
+                normalized,
+            )
+            inspection = await asyncio.to_thread(
+                _inspect_run, self._state_root, row, allowed_roots=self._allowed_roots
+            )
+            snapshot = _snapshot_from_inspection(row, inspection)
+            if inspection.status == "needs_reconciliation":
+                raise WorkflowReconciliationRequired(snapshot)
+            record = await asyncio.to_thread(ledger.get_invocation, invocation_id)
+            return _agent_invocation_json(record, include_digest=True)
+        except (WorkflowNotFoundError, WorkflowReconciliationRequired, WorkflowRequestError):
+            raise
+        except AgentLedgerIntegrityError as error:
+            if "missing" in str(error).casefold():
+                raise WorkflowNotFoundError("Agent invocation was not found") from None
+            raise WorkflowServiceUnavailable("Agent invocation ledger is unavailable") from None
+        except (OSError, sqlite3.Error, ValueError):
+            raise WorkflowServiceUnavailable("Agent invocation ledger is unavailable") from None
 
     async def _replay(self, row: _RequestRow, request_digest: str) -> WorkflowSnapshot:
         if row.request_digest != request_digest:
@@ -2587,7 +2713,20 @@ def _inspect_strict_reserved_run(
     job_id: str | None = None
     thread_id: str | None = None
     definition = definition_revision.definition
-    has_codex_jobs = _definition_contains_codex_job(definition)
+    try:
+        task_classification = classify_task_tree(definition, strict_contract=True)
+    except TaskTreeClassificationError:
+        return reconciliation(reason_code="run_integrity_invalid")
+    has_codex_jobs = task_classification.kind is StrictTaskTreeKind.STRICT_CODEX_JOB
+    has_agents = task_classification.kind is StrictTaskTreeKind.STRICT_AGENT
+    agent_records: tuple[Any, ...] = ()
+    if has_agents:
+        try:
+            agent_records = _read_verified_agent_invocations(run_dir, manifest, definition)
+        except Exception:
+            return reconciliation(reason_code="strict_execution_uncertain")
+        if any(record.dispatch_state == "MAYBE_SENT" for record in agent_records):
+            return reconciliation(reason_code="strict_execution_uncertain")
     jobs_path = run_dir / "codex_jobs.sqlite"
     if has_codex_jobs:
         if not (jobs_path.exists() or jobs_path.is_symlink()):
@@ -2630,7 +2769,7 @@ def _inspect_strict_reserved_run(
                     thread_id = jobs[-1].thread_id
             except (OSError, sqlite3.Error, ValueError, TypeError, WorkflowServiceUnavailable):
                 return reconciliation(worker_state)
-    elif jobs_path.exists() or jobs_path.is_symlink():
+    elif not has_agents and (jobs_path.exists() or jobs_path.is_symlink()):
         return reconciliation(worker_state, reason_code="run_integrity_invalid")
 
     if job_reconciliation or any(job["state"] == "MAYBE_SENT" for job in records):
@@ -2687,6 +2826,7 @@ def _inspect_strict_reserved_run(
                 or dbos_status not in {"SUCCESS", "SUCCEEDED"}
                 or (has_codex_jobs and len(records) != len(expected))
                 or any(job["state"] != "SUCCEEDED" for job in records)
+                or (has_agents and any(record.result_json is None for record in agent_records))
             ):
                 return reconciliation(worker_state, jobs=jobs, job_id=job_id, thread_id=thread_id)
             try:
@@ -2847,6 +2987,135 @@ def _inspect_strict_reserved_run(
         job_id=job_id,
         thread_id=thread_id,
     )
+
+
+def _read_verified_agent_invocations(
+    run_dir: Path,
+    manifest: Any,
+    definition: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Read every Agent row and validate it against the pinned task tree."""
+    inspection, target_context = inspect_agent_ledger_binding(run_dir, manifest)
+    ledger = AgentInvocationLedger(run_dir, inspection.binding_identity, target_context)
+    from .strict_executor import _strict_task_map
+
+    pinned = _strict_task_map(definition, execution_mode="authorized_agent")
+    collected: list[Any] = []
+    after: tuple[int, str] | None = None
+    while True:
+        page = ledger.list_invocations(limit=100, after=after)
+        for record in page:
+            task = pinned.get(record.node_pointer)
+            if task is None or task[1] != "call" or task[2].get("call") != "codexbridge-agent":
+                raise AgentLedgerIntegrityError("Agent invocation is not pinned to a task")
+            wire = task[2].get("with")
+            expected_operation = wire.get("operation", "invoke") if type(wire) is dict else None
+            request = record.request
+            if (
+                expected_operation != record.operation
+                or request.operation != record.operation
+                or request.provider != "codex"
+                or request.target != "default"
+                or canonical_json(request.target_identity)
+                != canonical_json(target_context.to_dict())
+                or record.invocation_id
+                != ledger.invocation_id_for(record.node_pointer, record.iteration_vector)
+            ):
+                raise AgentLedgerIntegrityError("Agent invocation does not match its pinned task")
+            if record.result_json is not None:
+                result = AgentResult.from_json(record.result_json)
+                if (
+                    result.invocation_id != record.invocation_id
+                    or result.operation != record.operation
+                    or result.provider != "codex"
+                    or result.target != "default"
+                ):
+                    raise AgentLedgerIntegrityError("Agent result identity is invalid")
+            collected.append(record)
+        if len(page) < 100:
+            break
+        last = page[-1]
+        after = (last.created_ms, last.invocation_id)
+    return tuple(collected)
+
+
+def _open_readonly_agent_ledger_for_workflow(
+    state_root: Path,
+    allowed_roots: tuple[str, ...],
+    workflow_id: str,
+) -> tuple[_RequestRow, AgentInvocationLedger]:
+    row = _find_workflow(state_root, workflow_id)
+    if row is None:
+        raise WorkflowNotFoundError("workflow was not found")
+    run_dir = _validated_run_directory(state_root, row.run_id)
+    inspection = _inspect_run(state_root, row, allowed_roots=allowed_roots)
+    if inspection.status == "needs_reconciliation":
+        raise WorkflowReconciliationRequired(_snapshot_from_inspection(row, inspection))
+    manifest_path = run_dir / "manifest.json"
+    manifest_bytes = _read_regular_file(manifest_path, limit=32 * 1024)
+    verification = verify_strict_reserved_readonly(
+        state_root,
+        row.run_id,
+        manifest_bytes,
+        expected_workflow_id=row.workflow_id,
+        expected_request_digest=row.request_digest,
+        allowed_roots=allowed_roots,
+    )
+    if verification is None or verification._definition is None:
+        raise WorkflowNotFoundError("Agent invocations are not available for this workflow")
+    classification = classify_task_tree(
+        verification._definition.definition,
+        strict_contract=True,
+    )
+    if classification.kind is not StrictTaskTreeKind.STRICT_AGENT:
+        raise WorkflowNotFoundError("Agent invocations are not available for this workflow")
+    ledger_binding, target_context = inspect_agent_ledger_binding(run_dir, verification.manifest)
+    return row, AgentInvocationLedger(run_dir, ledger_binding.binding_identity, target_context)
+
+
+def _agent_invocation_json(record: Any, *, include_digest: bool = False) -> dict[str, Any]:
+    request = record.request
+    result = AgentResult.from_json(record.result_json) if record.result_json is not None else None
+    receipt = (
+        DispatchReceipt.from_json(record.dispatch_receipt_json)
+        if record.dispatch_receipt_json is not None
+        else None
+    )
+    if result is not None:
+        value = result.to_dict()
+        status = result.status
+        handle = value["handle"]
+        remote_state = result.remote_state
+        usage = value["usage"]
+        error_code = None if value["error"] is None else value["error"]["code"]
+    else:
+        status = "PREPARED" if record.dispatch_state == "NONE" else record.dispatch_state
+        handle = None
+        remote_state = None
+        usage = None
+        error_code = None
+    if handle is None and receipt is not None:
+        handle = receipt.handle
+    if remote_state is None and receipt is not None:
+        remote_state = receipt.remote_state
+    if handle is None:
+        handle = request.handle
+    metadata: dict[str, Any] = {
+        "invocation_id": record.invocation_id,
+        "operation": record.operation,
+        "provider": request.provider,
+        "target": request.target,
+        "status": status,
+        "handle": handle,
+        "remote_state": remote_state,
+        "usage": usage,
+        "error_code": error_code,
+        "created_ms": record.created_ms,
+        "deadline_ms": record.deadline_ms,
+    }
+    if include_digest:
+        metadata["result_digest"] = record.result_sha256
+    return metadata
 
 
 def _three_job_task_identities(definition: Any, input_data: Any) -> tuple[str, ...]:
@@ -3627,10 +3896,8 @@ def _strict_request_candidate(state_root: Path, run_id: str) -> bool:
 
 
 def _definition_contains_codex_job(value: object) -> bool:
-    if isinstance(value, dict):
-        if value.get("call") == "codex-job":
-            return True
-        return any(_definition_contains_codex_job(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_definition_contains_codex_job(child) for child in value)
-    return False
+    return definition_has_call_target(value, "codex-job")
+
+
+def _definition_contains_agent(value: object) -> bool:
+    return definition_has_call_target(value, "codexbridge-agent")

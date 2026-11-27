@@ -476,6 +476,62 @@ def codex_agent_capabilities(
     )
 
 
+class _StaticCodexAgentProvider:
+    """Capability-only provider used for saved-definition validation."""
+
+    def capabilities(self, target: str) -> ProviderCapabilities:
+        if type(target) is not str or target != "default":
+            _fail("unsupported_target")
+        return ProviderCapabilities(
+            provider="codex",
+            target="default",
+            operations=("invoke", "observe", "wait"),
+            session_modes=("new",),
+            option_rules=(
+                OptionCapability("title", ("new",), ("string",)),
+                OptionCapability(
+                    "sandbox_mode",
+                    ("new",),
+                    ("string",),
+                    allowed_values=('"inherit"',),
+                ),
+                OptionCapability(
+                    "confirm_full_access",
+                    ("new",),
+                    ("boolean",),
+                    allowed_values=("false",),
+                ),
+            ),
+            usage_supported=False,
+        )
+
+    def prepare(
+        self, request: AgentRequest, target_context: TargetContext
+    ) -> PreparedProviderRequest:
+        _fail("unsupported_operation")
+
+    def dispatch(
+        self, prepared: PreparedProviderRequest, client_request_id: str
+    ) -> DispatchReceipt:
+        _fail("unsupported_operation")
+
+    def observe(self, handle: object, target_context: TargetContext) -> Observation:
+        _fail("unsupported_operation")
+
+    def interrupt(
+        self, handle: object, target_context: TargetContext, client_request_id: str
+    ) -> DispatchReceipt:
+        _fail("unsupported_operation")
+
+
+def codex_agent_i4b_registry() -> ProviderRegistry:
+    """Return the static I4-B operation and option surface for definitions."""
+    return ProviderRegistry(
+        {"codex": _StaticCodexAgentProvider()},
+        {"codex": "default"},
+    )
+
+
 def _option_value_matches(rule: OptionCapability, value: Any) -> bool:
     if not _matches_type(value, rule.value_types):
         return False
@@ -1908,6 +1964,7 @@ __all__ = [
     "ProviderRegistry",
     "TargetContext",
     "codex_agent_capabilities",
+    "codex_agent_i4b_registry",
     "evaluate_agent_request",
     "result_from_dispatch_receipt",
     "result_from_observation",

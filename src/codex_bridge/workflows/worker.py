@@ -21,6 +21,11 @@ from dbos import DBOS, DBOSConfig, SetWorkflowID
 from sqlalchemy.engine import URL
 
 from ..paths import AllowedPathPolicy, PathPolicyError
+from .agent_runtime import (
+    build_codex_agent_runtime,
+    open_agent_ledger_for_manifest,
+    validate_pinned_agent_definition,
+)
 from .codex_job_adapter import (
     CodexJobAdapter,
     CodexJobFailedError,
@@ -58,6 +63,12 @@ from .strict_reader_gate import (
     verify_strict_reserved_readonly,
 )
 from .strict_variable_runtime import StrictWorkflowVariableRuntimeAdapter
+from .task_tree import (
+    StrictTaskTreeKind,
+    TaskTreeClassificationError,
+    classify_task_tree,
+    definition_has_call_target,
+)
 
 APPLICATION_NAME = "codexbridge-ows-phase3-poc"
 APPLICATION_VERSION = "1.0.3-subset"
@@ -1127,7 +1138,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--shutdown-file", type=Path)
     parser.add_argument(
         "--strict-runtime-mode",
-        choices=("isolated", "authorized_codex"),
+        choices=("isolated", "authorized_codex", "authorized_agent"),
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--codex-bridge-port", type=int, help=argparse.SUPPRESS)
@@ -1151,7 +1162,7 @@ def _strict_worker_adapter(
     args: argparse.Namespace, run_dir: Path
 ) -> StrictWorkflowVariableRuntimeAdapter:
     mode = args.strict_runtime_mode
-    if mode not in {"isolated", "authorized_codex"}:
+    if mode not in {"isolated", "authorized_codex", "authorized_agent"}:
         raise OwsError("strict workflow runtime is not supported")
     try:
         adapter = StrictWorkflowVariableRuntimeAdapter.from_manifest_claim(
@@ -1163,8 +1174,15 @@ def _strict_worker_adapter(
         definition = adapter.pinned_definition
         if manifest is None or definition is None:
             raise ValueError
-        has_codex_jobs = _definition_contains_codex_job(definition)
-        expected_mode = "authorized_codex" if has_codex_jobs else "isolated"
+        try:
+            classification = classify_task_tree(definition, strict_contract=True)
+        except TaskTreeClassificationError:
+            raise ValueError from None
+        expected_mode = {
+            StrictTaskTreeKind.STRICT_AGENT: "authorized_agent",
+            StrictTaskTreeKind.STRICT_CODEX_JOB: "authorized_codex",
+            StrictTaskTreeKind.STRICT_PURE: "isolated",
+        }.get(classification.kind)
         if mode != expected_mode:
             raise ValueError
         if args.workspace_root is None:
@@ -1182,12 +1200,26 @@ def _strict_worker_adapter(
             or state_root.is_relative_to(workspace)
         ):
             raise ValueError
-        if mode == "authorized_codex" and (
+        if mode in {"authorized_codex", "authorized_agent"} and (
             type(args.codex_bridge_port) is not int
             or not 1 <= args.codex_bridge_port <= 65535
             or not os.environ.get(CONTROL_TOKEN_ENV, "").strip()
         ):
             raise ValueError
+        if mode == "authorized_agent":
+            if os.environ.get("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED") != "1":
+                raise ValueError
+            _provider, registry, _context = build_codex_agent_runtime(
+                port=args.codex_bridge_port,
+                allowed_roots=tuple(args.allowed_root),
+                workspace_root=manifest.workspace_root,
+            )
+            validate_pinned_agent_definition(definition, registry)
+            open_agent_ledger_for_manifest(
+                run_dir,
+                manifest,
+                expected_port=args.codex_bridge_port,
+            )
         if mode == "isolated" and args.codex_bridge_port is not None:
             raise ValueError
         return adapter
@@ -1198,13 +1230,7 @@ def _strict_worker_adapter(
 
 
 def _definition_contains_codex_job(value: object) -> bool:
-    if isinstance(value, dict):
-        if value.get("call") == "codex-job":
-            return True
-        return any(_definition_contains_codex_job(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_definition_contains_codex_job(child) for child in value)
-    return False
+    return definition_has_call_target(value, "codex-job")
 
 
 def _strict_failure_reason(error: BaseException) -> str:
@@ -1266,11 +1292,11 @@ def _write_strict_terminal(run_dir: Path, envelope: dict[str, Any]) -> None:
 def _wait_for_strict_result(
     database_path: Path,
     workflow_id: str,
-    timeout: float,
+    timeout: float | None,
     shutdown_file: Path | None,
 ) -> tuple[Any | None, str | None]:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while deadline is None or time.monotonic() < deadline:
         if shutdown_file is not None and shutdown_file.is_file():
             raise WorkerShutdownRequested("workflow worker shutdown was requested")
         status = _read_workflow_status(database_path, workflow_id)
@@ -1301,7 +1327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     input_data: Any
     if strict_execution_mode is not None:
         strict_adapter = _strict_worker_adapter(args, run_dir)
-        if strict_execution_mode == "authorized_codex":
+        if strict_execution_mode in {"authorized_codex", "authorized_agent"}:
             os.environ["CODEXBRIDGE_WORKFLOW_BRIDGE_PORT"] = str(args.codex_bridge_port)
         verified_manifest = strict_adapter._verified_manifest
         if verified_manifest is None:
@@ -1327,7 +1353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not isinstance(control, dict):
         raise OwsError("manifest control must be an object")
     if strict_adapter is not None:
-        codex_job_live = strict_execution_mode == "authorized_codex"
+        codex_job_live = strict_execution_mode in {"authorized_codex", "authorized_agent"}
         manifest_workflow_id = strict_adapter.checkpoint_identity.get("workflow_id")
         workflow_id: str | None = (
             manifest_workflow_id if isinstance(manifest_workflow_id, str) else None
@@ -1518,7 +1544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 strict_result, failure_reason = _wait_for_strict_result(
                     database_path,
                     workflow_id,
-                    args.timeout_seconds,
+                    None if strict_execution_mode == "authorized_agent" else args.timeout_seconds,
                     shutdown_file,
                 )
                 if failure_reason is None:

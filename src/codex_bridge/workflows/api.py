@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +36,12 @@ class WorkflowPayloadTooLarge(WorkflowRequestError):
 class WorkflowTaskQueryError(WorkflowRequestError):
     def __init__(self, error_code: str) -> None:
         super().__init__("workflow task query is invalid")
+        self.error_code = error_code
+
+
+class WorkflowAgentQueryError(WorkflowRequestError):
+    def __init__(self, error_code: str) -> None:
+        super().__init__("Agent invocation query is invalid")
         self.error_code = error_code
 
 
@@ -280,6 +288,72 @@ def create_workflow_routes(
         except Exception:
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
+    async def agent_invocations(request: Request) -> Response:
+        forbidden = _authorization_error(request, token, ui_port, authorize)
+        if forbidden is not None:
+            return forbidden
+        try:
+            limit, after = _parse_agent_invocation_query(request)
+            result = await service.list_agent_invocations(
+                request.path_params["workflow_id"],
+                limit=limit,
+                after=after,
+            )
+            after_value = result.pop("next_after")
+            result["next_cursor"] = (
+                None if after_value is None else _encode_agent_cursor(after_value)
+            )
+            return JSONResponse(result)
+        except WorkflowAgentQueryError as error:
+            return JSONResponse({"error": error.error_code}, status_code=400)
+        except WorkflowRequestError:
+            return JSONResponse({"error": "invalid_workflow_id"}, status_code=400)
+        except ValueError:
+            return JSONResponse({"error": "invalid_workflow_id"}, status_code=400)
+        except WorkflowNotFoundError:
+            return JSONResponse({"error": "workflow_not_found"}, status_code=404)
+        except WorkflowReconciliationRequired as error:
+            return JSONResponse(
+                {"error": "workflow_needs_reconciliation", **_snapshot_json(error.snapshot)},
+                status_code=409,
+            )
+        except WorkflowServiceUnavailable:
+            return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
+        except Exception:
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
+    async def agent_invocation_detail(request: Request) -> Response:
+        forbidden = _authorization_error(request, token, ui_port, authorize)
+        if forbidden is not None:
+            return forbidden
+        invocation_id = request.path_params["invocation_id"]
+        if (
+            type(invocation_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", invocation_id, re.ASCII) is None
+        ):
+            return JSONResponse({"error": "invalid_invocation_id"}, status_code=400)
+        try:
+            value = await service.get_agent_invocation(
+                request.path_params["workflow_id"],
+                invocation_id,
+            )
+            return JSONResponse(value)
+        except ValueError:
+            return JSONResponse({"error": "invalid_workflow_id"}, status_code=400)
+        except WorkflowRequestError:
+            return JSONResponse({"error": "invalid_workflow_id"}, status_code=400)
+        except WorkflowNotFoundError:
+            return JSONResponse({"error": "workflow_not_found"}, status_code=404)
+        except WorkflowReconciliationRequired as error:
+            return JSONResponse(
+                {"error": "workflow_needs_reconciliation", **_snapshot_json(error.snapshot)},
+                status_code=409,
+            )
+        except WorkflowServiceUnavailable:
+            return JSONResponse({"error": "workflow_service_unavailable"}, status_code=503)
+        except Exception:
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
     return [
         Route("/ui-api/control/workflows", start, methods=["POST"]),
         Route("/ui-api/control/workflows", list_workflows, methods=["GET"]),
@@ -291,6 +365,16 @@ def create_workflow_routes(
         Route(
             "/ui-api/control/workflows/{workflow_id}/task-events",
             workflow_task_events,
+            methods=["GET"],
+        ),
+        Route(
+            "/ui-api/control/workflows/{workflow_id}/agent-invocations",
+            agent_invocations,
+            methods=["GET"],
+        ),
+        Route(
+            "/ui-api/control/workflows/{workflow_id}/agent-invocations/{invocation_id}",
+            agent_invocation_detail,
             methods=["GET"],
         ),
         Route("/ui-api/control/workflows/{workflow_id}/result", workflow_result, methods=["GET"]),
@@ -364,6 +448,60 @@ def _parse_limit(request: Request) -> int:
     if not 1 <= limit <= 100:
         raise WorkflowRequestError("limit is invalid")
     return limit
+
+
+def _parse_agent_invocation_query(request: Request) -> tuple[int, tuple[int, str] | None]:
+    items = list(request.query_params.multi_items())
+    if any(key not in {"limit", "cursor"} for key, _value in items):
+        raise WorkflowAgentQueryError("invalid_query")
+    values: dict[str, list[str]] = {"limit": [], "cursor": []}
+    for key, value in items:
+        values[key].append(value)
+    if len(values["limit"]) > 1:
+        raise WorkflowAgentQueryError("invalid_limit")
+    if len(values["cursor"]) > 1:
+        raise WorkflowAgentQueryError("invalid_cursor")
+    limit = 50
+    if values["limit"]:
+        raw_limit = values["limit"][0]
+        if not raw_limit.isascii() or not raw_limit.isdigit():
+            raise WorkflowAgentQueryError("invalid_limit")
+        limit = int(raw_limit)
+        if not 1 <= limit <= 100:
+            raise WorkflowAgentQueryError("invalid_limit")
+    after = _decode_agent_cursor(values["cursor"][0]) if values["cursor"] else None
+    return limit, after
+
+
+def _encode_agent_cursor(value: tuple[int, str]) -> str:
+    payload = json.dumps([value[0], value[1]], separators=(",", ":")).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_agent_cursor(value: str) -> tuple[int, str]:
+    if (
+        type(value) is not str
+        or not value
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,512}", value, re.ASCII) is None
+    ):
+        raise WorkflowAgentQueryError("invalid_cursor")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+        item = json.loads(decoded)
+        if (
+            type(item) is not list
+            or len(item) != 2
+            or type(item[0]) is not int
+            or not 0 <= item[0] <= 2**63 - 1
+            or type(item[1]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", item[1], re.ASCII) is None
+            or _encode_agent_cursor((item[0], item[1])) != value
+        ):
+            raise ValueError
+        return item[0], item[1]
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise WorkflowAgentQueryError("invalid_cursor") from None
 
 
 def _parse_task_event_query(request: Request) -> tuple[int, int]:

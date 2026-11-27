@@ -15,6 +15,8 @@ import jq
 import yaml
 from jsonschema import Draft202012Validator
 
+from .agent_contracts import AgentContractError, codex_agent_i4b_registry, validate_agent_wire
+from .agent_prompt import collect_agent_operation_expressions
 from .contracts import CompiledContract, canonical_json
 from .job_adapter import JobRequestError, validate_mock_job_request
 from .strict_variable_logic import (
@@ -23,6 +25,7 @@ from .strict_variable_logic import (
     _pointer_segments,
     calculate_variable_candidate,
 )
+from .task_tree import TaskTreeClassificationError, classify_task_tree
 
 if TYPE_CHECKING:
     from .strict_variable_runtime import StrictWorkflowVariableRuntimeAdapter
@@ -512,7 +515,18 @@ def _validate_subset(
     tasks = definition.get("do")
     if not isinstance(tasks, list) or not tasks:
         raise OwsError("top-level do must be a non-empty task list")
+    try:
+        task_tree = classify_task_tree(definition, strict_contract=strict_contract is not None)
+    except TaskTreeClassificationError as error:
+        raise OwsError(str(error)) from None
     codex_calls, mock_calls, looped_codex_calls = _find_job_calls(tasks)
+    agent_calls = task_tree.agent_calls
+    if agent_calls and strict_contract is None:
+        raise OwsError("codexbridge-agent requires a strict workflow contract")
+    if agent_calls and max_live_codex_jobs != 1:
+        raise OwsError("codexbridge-agent requires max_live_codex_jobs=1 sentinel")
+    if task_tree.agent_calls_under_for:
+        raise OwsError("codexbridge-agent may not be nested under for")
     if codex_calls and not codex_job_live:
         raise OwsError("codex-job requires --codex-job-live")
     if codex_job_live:
@@ -547,28 +561,13 @@ def _validate_subset(
 
 
 def _find_job_calls(tasks: list[dict[str, Any]]) -> tuple[list[str], int, bool]:
-    codex_calls: list[str] = []
-    mock_calls = 0
-    looped_codex_calls = False
-
-    def visit(task_list: list[dict[str, Any]], *, inside_for: bool = False) -> None:
-        nonlocal mock_calls, looped_codex_calls
-        for task_item in task_list:
-            if not isinstance(task_item, dict) or len(task_item) != 1:
-                continue
-            task_name, task_spec = next(iter(task_item.items()))
-            if not isinstance(task_spec, dict):
-                continue
-            if task_spec.get("call") == "codex-job":
-                codex_calls.append(str(task_name))
-                looped_codex_calls = looped_codex_calls or inside_for
-            elif task_spec.get("call") == "mock-job":
-                mock_calls += 1
-            nested = task_spec.get("do")
-            if isinstance(nested, list):
-                visit(nested, inside_for=inside_for or "for" in task_spec)
-
-    visit(tasks)
+    try:
+        task_tree = classify_task_tree({"do": tasks}, strict_contract=False)
+    except TaskTreeClassificationError as error:
+        raise OwsError(str(error)) from None
+    codex_calls = [call.task_name for call in task_tree.codex_job_calls]
+    mock_calls = len(task_tree.mock_job_calls)
+    looped_codex_calls = any(call.under_for for call in task_tree.codex_job_calls)
     return codex_calls, mock_calls, looped_codex_calls
 
 
@@ -848,6 +847,24 @@ def _validate_action(
                     strict_contract=strict_contract,
                 )
             return
+        if target == "codexbridge-agent":
+            if strict_contract is None:
+                raise OwsError("codexbridge-agent requires a strict workflow contract")
+            wire = action.get("with")
+            try:
+                validate_agent_wire(wire, codex_agent_i4b_registry())
+            except AgentContractError as error:
+                raise OwsError(f"invalid codexbridge-agent definition ({error.code})") from None
+            for expression_index, expression in enumerate(
+                collect_agent_operation_expressions(wire)
+            ):
+                _compile_required_expression(
+                    expression,
+                    f"{task_path}.with.agent_expression[{expression_index}]",
+                    jq_variables.union({"context", "input"}),
+                    strict_contract=strict_contract,
+                )
+            return
         if target != "mock-job":
             raise OwsError(f"unsupported call target {target!r}; only 'mock-job' is allowed")
         arguments = action.get("with")
@@ -865,11 +882,11 @@ def _validate_action(
             raise OwsError("mock-job operation must be 'process'")
         duration = arguments["duration_ms"]
         if isinstance(duration, str):
-            expression = _optional_expression(duration, f"{task_path}.with.duration_ms")
-            if expression is None:
+            duration_expression = _optional_expression(duration, f"{task_path}.with.duration_ms")
+            if duration_expression is None:
                 raise OwsError("mock-job duration_ms must be an integer expression or literal")
             _compile_jq(
-                expression,
+                duration_expression,
                 f"{task_path}.with.duration_ms",
                 jq_variables.union({"context", "input"}),
             )
@@ -1335,7 +1352,7 @@ def _uses_strict_cbvars(value: Any, contract: CompiledContract) -> bool:
         return expression is not None and _rewrite_strict_cbvars(expression, contract) != expression
     if isinstance(value, dict):
         return any(_uses_strict_cbvars(child, contract) for child in value.values())
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return any(_uses_strict_cbvars(child, contract) for child in value)
     return False
 
@@ -2042,6 +2059,8 @@ class Interpreter:
     @staticmethod
     def _operation_jq_values(operation: str, task_spec: dict[str, Any]) -> Any:
         if operation == "call":
+            if task_spec.get("call") == "codexbridge-agent":
+                return collect_agent_operation_expressions(task_spec.get("with"))
             return task_spec.get("with")
         if operation == "set":
             return task_spec.get("set")

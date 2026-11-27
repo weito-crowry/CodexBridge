@@ -15,6 +15,21 @@ from typing import Any
 
 from dbos import DBOS
 
+from .agent_contracts import (
+    AgentContractError,
+    AgentError,
+    AgentRequest,
+    AgentResult,
+    evaluate_agent_request,
+    validate_agent_wire,
+)
+from .agent_executor import AgentInvocationExecutor
+from .agent_ledger import AgentLedgerConflictError, AgentLedgerIntegrityError
+from .agent_runtime import (
+    build_codex_agent_runtime,
+    open_agent_ledger_for_manifest,
+    validate_pinned_agent_definition,
+)
 from .contracts import (
     ContractOutputInvalid,
     ContractResourceLimit,
@@ -30,12 +45,18 @@ from .interpreter import (
     _task_action,
     compute_codex_job_request,
     compute_task_action,
+    evaluate_jq_single_result,
     validate_workflow,
 )
 from .strict_variable_runtime import (
     PreparedStrictVariableMutation,
     StrictVariableRuntimeError,
     StrictWorkflowVariableRuntimeAdapter,
+)
+from .task_tree import (
+    StrictTaskTreeKind,
+    TaskTreeClassificationError,
+    classify_task_tree,
 )
 
 _STEP_DOMAIN = "codexbridge.workflow.strict.dbos-checkpoint.v1"
@@ -337,21 +358,142 @@ def _task_action_step(step_identity: str) -> Any:
     return DBOS.step(name=_step_name("pure-task", step_identity))(_compute_task_checkpoint_body)
 
 
+def _prepare_agent_request_checkpoint_body(
+    state_root: str,
+    run_id: str,
+    allowed_roots: list[str],
+    expected_identity: dict[str, Any],
+    port: int,
+    node_id: str,
+    iteration_vector: list[int],
+    task_name: str,
+    task_spec: dict[str, Any],
+    input_data: Any,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        adapter = _verified_adapter(state_root, run_id, allowed_roots, expected_identity)
+        manifest = adapter._verified_manifest
+        definition = adapter.pinned_definition
+        if (
+            manifest is None
+            or definition is None
+            or type(node_id) is not str
+            or type(iteration_vector) is not list
+            or any(type(index) is not int or index < 0 for index in iteration_vector)
+            or type(task_name) is not str
+            or type(task_spec) is not dict
+            or type(variables) is not dict
+        ):
+            raise StrictWorkflowExecutionError("strict_execution_uncertain")
+        pinned = _strict_task_map(definition, execution_mode="authorized_agent").get(node_id)
+        if (
+            pinned is None
+            or pinned[0] != task_name
+            or pinned[1] != "call"
+            or canonical_json(pinned[2]) != canonical_json(task_spec)
+        ):
+            raise StrictWorkflowExecutionError("strict_execution_uncertain")
+        provider, registry, context = build_codex_agent_runtime(
+            port=port,
+            allowed_roots=tuple(allowed_roots),
+            workspace_root=manifest.workspace_root,
+        )
+        validate_pinned_agent_definition(definition, registry)
+        run_directory = Path(state_root) / run_id
+        ledger = open_agent_ledger_for_manifest(
+            run_directory,
+            manifest,
+            expected_port=port,
+        )
+        invocation_id = ledger.invocation_id_for(node_id, iteration_vector)
+        wire = task_spec.get("with")
+        try:
+            call_definition = validate_agent_wire(wire, registry)
+            request = evaluate_agent_request(
+                call_definition,
+                lambda expression: evaluate_jq_single_result(
+                    expression,
+                    input_data,
+                    variables,
+                    strict_contract=adapter.compiled_contract,
+                ),
+            )
+            provider.prepare(request, context)
+            return {
+                "checkpoint_version": 1,
+                "kind": "agent_request_preparation",
+                "binding_identity": expected_identity,
+                "node_id": node_id,
+                "iteration_vector": iteration_vector,
+                "task_name": task_name,
+                "input_sha256": sha256_json(input_data),
+                "variables_sha256": sha256_json(variables),
+                "invocation_id": invocation_id,
+                "request_json": request.to_json(),
+                "error_code": None,
+            }
+        except (AgentContractError, OwsError) as error:
+            code = getattr(error, "code", None)
+            if type(code) is not str:
+                code = "preflight_failed"
+            return {
+                "checkpoint_version": 1,
+                "kind": "agent_request_preparation",
+                "binding_identity": expected_identity,
+                "node_id": node_id,
+                "iteration_vector": iteration_vector,
+                "task_name": task_name,
+                "input_sha256": sha256_json(input_data),
+                "variables_sha256": sha256_json(variables),
+                "invocation_id": invocation_id,
+                "request_json": None,
+                "error_code": code,
+            }
+    except StrictWorkflowExecutionError:
+        raise
+    except (AgentLedgerConflictError, AgentLedgerIntegrityError):
+        raise StrictWorkflowExecutionError("strict_execution_uncertain") from None
+    except Exception as error:
+        raise _safe_execution_error(error) from None
+
+
+@cache
+def _prepare_agent_request_step(step_identity: str) -> Any:
+    return DBOS.step(name=_step_name("agent-request-prepare", step_identity))(
+        _prepare_agent_request_checkpoint_body
+    )
+
+
 def _strict_task_map(
     definition: dict[str, Any], *, execution_mode: str = "isolated"
 ) -> dict[str, tuple[str, str, dict[str, Any]]]:
     try:
+        if execution_mode not in {"isolated", "authorized_codex", "authorized_agent"}:
+            raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
+        classification = classify_task_tree(definition, strict_contract=True)
+        if execution_mode == "authorized_agent" and (
+            classification.kind is not StrictTaskTreeKind.STRICT_AGENT
+        ):
+            raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
+        if execution_mode == "isolated" and classification.kind is StrictTaskTreeKind.STRICT_AGENT:
+            raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
         task_map = _pinned_task_map(definition)
+        allowed_call_targets = {"codexbridge-variable"}
+        if execution_mode == "authorized_codex":
+            allowed_call_targets.add("codex-job")
+        elif execution_mode == "authorized_agent":
+            allowed_call_targets.add("codexbridge-agent")
         if any(
-            operation == "call"
-            and task_spec.get("call") != "codexbridge-variable"
-            and not (execution_mode == "authorized_codex" and task_spec.get("call") == "codex-job")
+            operation == "call" and task_spec.get("call") not in allowed_call_targets
             for _name, operation, task_spec in task_map.values()
         ):
             raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
         return task_map
     except StrictWorkflowExecutionError:
         raise
+    except TaskTreeClassificationError:
+        raise StrictWorkflowExecutionError("strict_execution_invalid") from None
     except Exception as error:
         raise _safe_execution_error(error) from None
 
@@ -375,7 +517,7 @@ def _execute_verified_run(
         definition = adapter.pinned_definition
         if definition is None:
             raise StrictWorkflowExecutionError("strict_execution_uncertain")
-        if execution_mode not in {"isolated", "authorized_codex"}:
+        if execution_mode not in {"isolated", "authorized_codex", "authorized_agent"}:
             raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
         _strict_task_map(definition, execution_mode=execution_mode)
         validate_workflow(
@@ -533,6 +675,105 @@ def _execute_verified_run(
             iteration_vector: tuple[int, ...],
         ) -> Any:
             try:
+                if _operation == "call" and _task_spec.get("call") == "codexbridge-agent":
+                    if execution_mode != "authorized_agent":
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    if os.environ.get("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED") != "1":
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    port_text = os.environ.get("CODEXBRIDGE_WORKFLOW_BRIDGE_PORT", "")
+                    if not port_text.isascii() or not port_text.isdigit():
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    port = int(port_text)
+                    if not 1 <= port <= 65535:
+                        raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
+                    manifest = adapter._verified_manifest
+                    pinned_definition = adapter.pinned_definition
+                    if manifest is None or pinned_definition is None:
+                        raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                    provider, registry, context = build_codex_agent_runtime(
+                        port=port,
+                        allowed_roots=tuple(roots),
+                        workspace_root=manifest.workspace_root,
+                    )
+                    validate_pinned_agent_definition(pinned_definition, registry)
+                    ledger = open_agent_ledger_for_manifest(
+                        Path(state_root) / run_id,
+                        manifest,
+                        expected_port=port,
+                    )
+                    step_identity = f"{node_id}:{canonical_json(list(iteration_vector))}"
+                    checkpoint = _prepare_agent_request_step(step_identity)(
+                        state_root,
+                        run_id,
+                        roots,
+                        identity,
+                        port,
+                        node_id,
+                        list(iteration_vector),
+                        _task_name,
+                        _task_spec,
+                        input_data,
+                        variables,
+                    )
+                    checkpoint = _validate_envelope(
+                        checkpoint,
+                        expected_fields={
+                            "checkpoint_version",
+                            "kind",
+                            "binding_identity",
+                            "node_id",
+                            "iteration_vector",
+                            "task_name",
+                            "input_sha256",
+                            "variables_sha256",
+                            "invocation_id",
+                            "request_json",
+                            "error_code",
+                        },
+                        expected_kind="agent_request_preparation",
+                        expected_identity=identity,
+                    )
+                    if (
+                        checkpoint["node_id"] != node_id
+                        or checkpoint["iteration_vector"] != list(iteration_vector)
+                        or checkpoint["task_name"] != _task_name
+                        or checkpoint["input_sha256"] != sha256_json(input_data)
+                        or checkpoint["variables_sha256"] != sha256_json(variables)
+                        or checkpoint["invocation_id"]
+                        != ledger.invocation_id_for(node_id, list(iteration_vector))
+                    ):
+                        raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                    if checkpoint["error_code"] is not None:
+                        if type(checkpoint["error_code"]) is not str:
+                            raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                        wire = _task_spec.get("with")
+                        operation = (
+                            wire.get("operation", "invoke") if type(wire) is dict else "invoke"
+                        )
+                        if operation not in {"invoke", "observe", "wait"}:
+                            raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                        return AgentResult(
+                            invocation_id=checkpoint["invocation_id"],
+                            operation=operation,
+                            provider="codex",
+                            target="default",
+                            status="FAILED",
+                            error=AgentError(checkpoint["error_code"]),
+                        ).to_dict()
+                    if type(checkpoint["request_json"]) is not str:
+                        raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                    request = AgentRequest.from_json(checkpoint["request_json"])
+                    if request.target_context != context:
+                        raise StrictWorkflowExecutionError("strict_execution_uncertain")
+                    result = AgentInvocationExecutor(ledger, provider).execute(
+                        lambda: AgentRequest.from_json(checkpoint["request_json"]),
+                        node_pointer=node_id,
+                        iteration_vector=list(iteration_vector),
+                        definition_sha256=manifest.source_sha256,
+                        task_input=input_data,
+                        variables=variables,
+                    )
+                    return result.to_dict()
                 if _operation == "call" and _task_spec.get("call") == "codex-job":
                     if execution_mode != "authorized_codex":
                         raise StrictWorkflowExecutionError("strict_execution_target_unavailable")
@@ -545,7 +786,7 @@ def _execute_verified_run(
                     manifest = adapter._verified_manifest
                     if manifest is None:
                         raise StrictWorkflowExecutionError("strict_execution_uncertain")
-                    request = compute_codex_job_request(
+                    codex_job_request = compute_codex_job_request(
                         _task_spec,
                         input_data,
                         variables,
@@ -560,7 +801,7 @@ def _execute_verified_run(
                         operation=_operation,
                         task_input=input_data,
                         variables=variables,
-                        request=request,
+                        request=codex_job_request,
                         definition_sha256=manifest.source_sha256,
                         trace_path=str(Path(state_root) / run_id / "task-events.jsonl"),
                         control={
@@ -657,18 +898,13 @@ def execute_strict_ows_workflow(
 ) -> dict[str, Any]:
     """Run only an existing reserved strict snapshot in the selected private mode."""
     try:
-        if execution_mode not in {"isolated", "authorized_codex"}:
+        if execution_mode not in {"isolated", "authorized_codex", "authorized_agent"}:
             raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
         adapter = _verified_adapter(state_root, run_id, allowed_roots)
         definition = adapter.pinned_definition
         if definition is None:
             raise StrictWorkflowExecutionError("strict_execution_uncertain")
-        has_codex_jobs = any(
-            operation == "call" and task.get("call") == "codex-job"
-            for _name, operation, task in _pinned_task_map(definition).values()
-        )
-        if has_codex_jobs != (execution_mode == "authorized_codex"):
-            raise StrictWorkflowExecutionError("strict_execution_mode_invalid")
+        _strict_task_map(definition, execution_mode=execution_mode)
         workflow_id = DBOS.workflow_id
         if (
             type(workflow_id) is not str

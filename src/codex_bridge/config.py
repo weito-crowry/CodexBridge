@@ -535,6 +535,7 @@ class BridgeConfig:
     mcp_events: McpEventsConfig = field(default_factory=McpEventsConfig)
     workflow_strict_runtime_enabled: bool = False
     workflow_strict_codex_jobs_enabled: bool = False
+    workflow_strict_agent_enabled: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "targets", _validate_execution_targets(self.targets))
@@ -547,9 +548,15 @@ class BridgeConfig:
             raise ConfigurationError("workflow.strict_runtime_enabled must be a boolean")
         if type(self.workflow_strict_codex_jobs_enabled) is not bool:
             raise ConfigurationError("workflow.strict_codex_jobs_enabled must be a boolean")
+        if type(self.workflow_strict_agent_enabled) is not bool:
+            raise ConfigurationError("workflow.strict_agent_enabled must be a boolean")
         if self.workflow_strict_codex_jobs_enabled and not self.workflow_strict_runtime_enabled:
             raise ConfigurationError(
                 "workflow.strict_codex_jobs_enabled requires workflow.strict_runtime_enabled"
+            )
+        if self.workflow_strict_agent_enabled and not self.workflow_strict_runtime_enabled:
+            raise ConfigurationError(
+                "workflow.strict_agent_enabled requires workflow.strict_runtime_enabled"
             )
         if self.mcp_token is not None and _CONTROL_TOKEN_PATTERN.fullmatch(self.mcp_token) is None:
             raise ConfigurationError(
@@ -636,9 +643,17 @@ class BridgeConfig:
             workflow_config.get("strict_codex_jobs_enabled", False),
             "workflow.strict_codex_jobs_enabled",
         )
+        strict_agent_enabled = _strict_config_boolean(
+            workflow_config.get("strict_agent_enabled", False),
+            "workflow.strict_agent_enabled",
+        )
         if strict_codex_jobs_enabled and not strict_runtime_enabled:
             raise ConfigurationError(
                 "workflow.strict_codex_jobs_enabled requires workflow.strict_runtime_enabled"
+            )
+        if strict_agent_enabled and not strict_runtime_enabled:
+            raise ConfigurationError(
+                "workflow.strict_agent_enabled requires workflow.strict_runtime_enabled"
             )
 
         wait_max = _positive_float(
@@ -792,6 +807,7 @@ class BridgeConfig:
             workflow_mcp_permissions=workflow_permissions,
             workflow_strict_runtime_enabled=strict_runtime_enabled,
             workflow_strict_codex_jobs_enabled=strict_codex_jobs_enabled,
+            workflow_strict_agent_enabled=strict_agent_enabled,
             targets=_execution_targets(target_config),
             mcp_events=McpEventsConfig(
                 enabled=enabled,

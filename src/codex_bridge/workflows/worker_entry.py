@@ -10,6 +10,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ..paths import AllowedPathPolicy, PathPolicyError
+from .agent_runtime import (
+    build_codex_agent_runtime,
+    open_agent_ledger_for_manifest,
+    validate_pinned_agent_definition,
+)
 from .http_client import CONTROL_TOKEN_ENV
 from .manager import missing_workflow_dependencies
 from .strict_manifest import StrictWorkflowSnapshotVerification, _is_symlink_or_junction
@@ -19,6 +24,12 @@ from .strict_reader_gate import (
     _decode_manifest,
     classify_readonly,
     verify_strict_reserved_readonly,
+)
+from .task_tree import (
+    StrictTaskTreeKind,
+    TaskTreeClassificationError,
+    classify_task_tree,
+    definition_has_call_target,
 )
 
 _RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
@@ -67,8 +78,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             definition_revision = verification._definition
             if definition_revision is None:
                 raise WorkflowWorkerEntryError("workflow request binding is invalid")
-            has_codex_jobs = _definition_contains_codex_job(definition_revision.definition)
-            strict_execution_mode = "authorized_codex" if has_codex_jobs else "isolated"
+            try:
+                classification = classify_task_tree(
+                    definition_revision.definition, strict_contract=True
+                )
+            except TaskTreeClassificationError:
+                raise WorkflowWorkerEntryError("strict workflow definition is invalid") from None
+            strict_execution_mode = {
+                StrictTaskTreeKind.STRICT_AGENT: "authorized_agent",
+                StrictTaskTreeKind.STRICT_CODEX_JOB: "authorized_codex",
+                StrictTaskTreeKind.STRICT_PURE: "isolated",
+            }.get(classification.kind)
+            if strict_execution_mode is None:
+                raise WorkflowWorkerEntryError("strict execution mode is invalid")
             if config.get("execution_mode") != strict_execution_mode:
                 raise WorkflowWorkerEntryError("strict execution mode is invalid")
             raw_workspace = config.get("workspace_root")
@@ -76,7 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 os.path.abspath(raw_workspace)
             ) != os.path.normcase(os.path.abspath(verification.manifest.workspace_root)):
                 raise WorkflowWorkerEntryError("workflow workspace does not match its manifest")
-            if has_codex_jobs:
+            if strict_execution_mode in {"authorized_codex", "authorized_agent"}:
                 raw_codex_bridge_port = config.get("codex_bridge_port")
                 if (
                     type(raw_codex_bridge_port) is not int
@@ -84,7 +106,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ):
                     raise WorkflowWorkerEntryError("strict codex-job configuration is invalid")
                 codex_bridge_port = raw_codex_bridge_port
-            elif config.get("codex_bridge_port") is not None:
+            if strict_execution_mode == "authorized_agent":
+                if (
+                    config.get("strict_agent_enabled") is not True
+                    or os.environ.get("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED") != "1"
+                ):
+                    raise WorkflowWorkerEntryError("strict Agent runtime is not enabled")
+                raw_workspace = config.get("workspace_root")
+                if type(raw_workspace) is not str or codex_bridge_port is None:
+                    raise WorkflowWorkerEntryError("strict Agent configuration is invalid")
+                try:
+                    _provider, registry, _context = build_codex_agent_runtime(
+                        port=codex_bridge_port,
+                        allowed_roots=allowed_roots,
+                        workspace_root=verification.manifest.workspace_root,
+                    )
+                    validate_pinned_agent_definition(definition_revision.definition, registry)
+                    open_agent_ledger_for_manifest(
+                        run_dir,
+                        verification.manifest,
+                        expected_port=codex_bridge_port,
+                    )
+                except Exception:
+                    raise WorkflowWorkerEntryError(
+                        "strict Agent ledger or target binding is invalid"
+                    ) from None
+            elif config.get("strict_agent_enabled") is not None:
+                raise WorkflowWorkerEntryError("strict worker config has unexpected Agent settings")
+            if strict_execution_mode == "isolated" and config.get("codex_bridge_port") is not None:
                 raise WorkflowWorkerEntryError("strict worker config has unexpected job settings")
         elif config.get("version") != 1:
             raise WorkflowWorkerEntryError("legacy workflow config version is unsupported")
@@ -102,7 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"manifest max_live_codex_jobs={max_live_codex_jobs} requires codex_job_live"
                 )
         else:
-            live = strict_execution_mode == "authorized_codex"
+            live = strict_execution_mode in {"authorized_codex", "authorized_agent"}
             raw_max_live_codex_jobs = manifest.get("max_live_codex_jobs")
             if type(raw_max_live_codex_jobs) is not int or raw_max_live_codex_jobs not in {
                 1,
@@ -276,9 +325,11 @@ def _read_config(config_path: Path, run_dir: Path, mode: str) -> dict[str, objec
         "execution_mode",
         "codex_bridge_port",
     }
+    agent_strict_keys = strict_keys | {"strict_agent_enabled"}
     if not isinstance(value, dict) or frozenset(value) not in {
         frozenset(legacy_keys),
         frozenset(strict_keys),
+        frozenset(agent_strict_keys),
     }:
         raise WorkflowWorkerEntryError("workflow worker config has an invalid shape")
     if type(value.get("version")) is not int or value["version"] not in {1, 2}:
@@ -289,7 +340,15 @@ def _read_config(config_path: Path, run_dir: Path, mode: str) -> dict[str, objec
             set(value) != strict_keys
             or value.get("strict_runtime") is not True
             or type(value.get("execution_mode")) is not str
-            or value.get("execution_mode") not in {"isolated", "authorized_codex"}
+            or value.get("execution_mode")
+            not in {"isolated", "authorized_codex", "authorized_agent"}
+            or (
+                value.get("execution_mode") == "authorized_agent"
+                and (
+                    set(value) != agent_strict_keys or value.get("strict_agent_enabled") is not True
+                )
+            )
+            or (value.get("execution_mode") != "authorized_agent" and set(value) != strict_keys)
             or (
                 value.get("codex_bridge_port") is not None
                 and (
@@ -376,13 +435,7 @@ def _verify_strict_reserved(
 
 
 def _definition_contains_codex_job(value: object) -> bool:
-    if isinstance(value, dict):
-        if value.get("call") == "codex-job":
-            return True
-        return any(_definition_contains_codex_job(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_definition_contains_codex_job(child) for child in value)
-    return False
+    return definition_has_call_target(value, "codex-job")
 
 
 def _control_token_configured() -> bool:
