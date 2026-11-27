@@ -293,6 +293,16 @@ class AgentInvocationLedger:
             cast(dict[str, Any], _load_canonical(ledger._target_context_json)),
         )
 
+    @classmethod
+    def inspect_stored_binding(cls, run_directory: Path) -> AgentLedgerInspection:
+        """Read and validate stored binding and target context without current config."""
+        ledger = object.__new__(cls)
+        ledger._run_directory = Path(run_directory)
+        with ledger._read_connection() as connection:
+            _check_schema(connection)
+            binding, target_context = _read_validated_run_binding(connection)
+        return AgentLedgerInspection(binding, target_context)
+
     def read_binding(self) -> dict[str, Any]:
         with self._read_connection() as connection:
             _check_schema(connection)
@@ -1479,6 +1489,20 @@ def _validate_run_binding(
     expected_binding_json: str,
     expected_target_context_json: str,
 ) -> None:
+    try:
+        binding, target_context = _read_validated_run_binding(connection)
+        if (
+            canonical_json(binding) != expected_binding_json
+            or canonical_json(target_context) != expected_target_context_json
+        ):
+            raise ValueError
+    except (TypeError, ValueError, KeyError, RecursionError):
+        raise AgentLedgerIntegrityError("Agent run binding is invalid or mismatched") from None
+
+
+def _read_validated_run_binding(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     rows = connection.execute("SELECT * FROM run_binding").fetchall()
     if len(rows) != 1:
         raise AgentLedgerIntegrityError("Agent run binding row count is invalid")
@@ -1493,15 +1517,22 @@ def _validate_run_binding(
             or type(row["target_context_sha256"]) is not str
             or _sha256(row["binding_json"]) != row["binding_sha256"]
             or _sha256(row["target_context_json"]) != row["target_context_sha256"]
-            or _canonical_binding(_load_canonical(row["binding_json"])) != row["binding_json"]
-            or TargetContext.from_dict(_load_canonical(row["target_context_json"])).to_dict()
-            != _load_canonical(row["target_context_json"])
-            or row["binding_json"] != expected_binding_json
-            or row["target_context_json"] != expected_target_context_json
         ):
             raise ValueError
+        binding = _load_canonical(row["binding_json"])
+        target_value = _load_canonical(row["target_context_json"])
+        if _canonical_binding(binding) != row["binding_json"]:
+            raise ValueError
+        target_context = TargetContext.from_dict(target_value).to_dict()
+        if canonical_json(target_context) != row["target_context_json"]:
+            raise ValueError
+        if type(binding) is not dict or type(target_context) is not dict:
+            raise ValueError
+        return binding, target_context
+    except AgentLedgerIntegrityError:
+        raise
     except (TypeError, ValueError, KeyError, RecursionError):
-        raise AgentLedgerIntegrityError("Agent run binding is invalid or mismatched") from None
+        raise AgentLedgerIntegrityError("Agent run binding is invalid") from None
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:

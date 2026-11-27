@@ -73,6 +73,8 @@ mcp_permissions = []
 strict_runtime_enabled = false
 # Codex job calls also require strict_runtime_enabled and the existing control token.
 strict_codex_jobs_enabled = false
+# Strict Agent calls have an independent opt-in and also require strict_runtime_enabled.
+strict_agent_enabled = false
 
 # An explicit target table must include exactly one local target.
 # [targets.local]

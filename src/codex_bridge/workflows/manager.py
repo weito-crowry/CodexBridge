@@ -14,6 +14,13 @@ from typing import Literal
 
 from ..paths import AllowedPathPolicy, PathPolicyError
 from ..runtime_mode import WORKFLOW_WORKER_FLAG
+from .agent_ledger import AgentInvocationLedger
+from .agent_runtime import (
+    build_codex_agent_runtime,
+    inspect_agent_ledger_binding,
+    open_agent_ledger_for_manifest,
+    validate_pinned_agent_definition,
+)
 from .diagnostic_log import append_lifecycle_event
 from .http_client import CONTROL_TOKEN_ENV
 from .startup_diagnostics import (
@@ -26,6 +33,12 @@ from .strict_reader_gate import (
     StrictReaderGateError,
     classify_readonly,
     verify_strict_reserved_readonly,
+)
+from .task_tree import (
+    StrictTaskTreeKind,
+    TaskTreeClassificationError,
+    classify_task_tree,
+    definition_has_call_target,
 )
 
 WorkerMode = Literal["start", "recover"]
@@ -122,6 +135,7 @@ class WorkflowWorkerManager:
         graceful_shutdown_seconds: float = 2.0,
         enable_isolated_strict_runtime: bool = False,
         enable_isolated_strict_codex_jobs: bool = False,
+        enable_strict_agent: bool = False,
     ) -> None:
         if not 0.05 <= graceful_shutdown_seconds <= 30:
             raise ValueError("workflow worker shutdown wait must be from 0.05 to 30 seconds")
@@ -135,6 +149,7 @@ class WorkflowWorkerManager:
         self._graceful_shutdown_seconds = graceful_shutdown_seconds
         self.enable_isolated_strict_runtime = bool(enable_isolated_strict_runtime)
         self._enable_isolated_strict_codex_jobs = bool(enable_isolated_strict_codex_jobs)
+        self.enable_strict_agent = bool(enable_strict_agent)
         self._accepting = True
         self._lifecycle_lock = asyncio.Lock()
         self._shutdown_report: WorkflowShutdownReport | None = None
@@ -193,6 +208,7 @@ class WorkflowWorkerManager:
                 manifest = self._read_manifest(canonical_run_dir)
                 strict_verification: StrictWorkflowSnapshotVerification | None = None
                 strict_execution_mode: str | None = None
+                strict_agent_enabled = False
                 if manifest.get("run_format_version") == 2:
                     if not strict_runtime or not self.enable_isolated_strict_runtime:
                         raise WorkflowManagerError("strict workflow runtime is not supported")
@@ -203,13 +219,55 @@ class WorkflowWorkerManager:
                         or type(definition_revision.definition) is not dict
                     ):
                         raise WorkflowManagerError("strict workflow definition is invalid")
-                    has_codex_jobs = _definition_contains_codex_job(definition_revision.definition)
+                    try:
+                        classification = classify_task_tree(
+                            definition_revision.definition, strict_contract=True
+                        )
+                    except TaskTreeClassificationError:
+                        raise WorkflowManagerError(
+                            "strict workflow definition is invalid"
+                        ) from None
+                    has_codex_jobs = classification.kind is StrictTaskTreeKind.STRICT_CODEX_JOB
+                    has_agents = classification.kind is StrictTaskTreeKind.STRICT_AGENT
                     declared_jobs = manifest.get("max_live_codex_jobs")
                     if type(declared_jobs) is not int or declared_jobs not in {1, 2, 3}:
                         raise WorkflowManagerError("strict workflow job limit is invalid")
                     if max_live_codex_jobs != declared_jobs:
                         raise WorkflowManagerError("worker job limit does not match the manifest")
-                    if has_codex_jobs:
+                    if has_agents:
+                        if declared_jobs != 1:
+                            raise WorkflowManagerError("strict Agent job limit is invalid")
+                        if (
+                            not self.enable_strict_agent
+                            or not self._control_token
+                            or type(codex_bridge_port) is not int
+                            or not 1 <= codex_bridge_port <= 65535
+                        ):
+                            raise WorkflowManagerError("strict Agent runtime is not available")
+                        manifest_workspace = strict_verification.manifest.workspace_root
+                        try:
+                            provider, registry, context = build_codex_agent_runtime(
+                                port=codex_bridge_port,
+                                allowed_roots=self.allowed_roots,
+                                workspace_root=manifest_workspace,
+                            )
+                            validate_pinned_agent_definition(
+                                definition_revision.definition, registry
+                            )
+                            ledger = open_agent_ledger_for_manifest(
+                                canonical_run_dir,
+                                strict_verification.manifest,
+                                expected_port=codex_bridge_port,
+                            )
+                            del provider, context, ledger
+                        except Exception:
+                            raise WorkflowManagerError(
+                                "strict Agent ledger or target binding is invalid"
+                            ) from None
+                        live = True
+                        strict_execution_mode = "authorized_agent"
+                        strict_agent_enabled = True
+                    elif has_codex_jobs:
                         if (
                             not self._enable_isolated_strict_codex_jobs
                             or not self._control_token
@@ -271,6 +329,8 @@ class WorkflowWorkerManager:
                         "execution_mode": strict_execution_mode,
                         "codex_bridge_port": codex_bridge_port if live else None,
                     }
+                    if strict_execution_mode == "authorized_agent":
+                        worker_config["strict_agent_enabled"] = strict_agent_enabled
                 _write_private_json(config_path, worker_config)
                 if diagnostic is not None:
                     diagnostic.complete_if_active(WorkflowStartupStage.WORKER_CONFIG_WRITE)
@@ -295,6 +355,9 @@ class WorkflowWorkerManager:
                 )
                 if strict_execution_mode == "authorized_codex":
                     environment["CODEXBRIDGE_WORKFLOW_BRIDGE_PORT"] = str(codex_bridge_port)
+                elif strict_execution_mode == "authorized_agent":
+                    environment["CODEXBRIDGE_WORKFLOW_BRIDGE_PORT"] = str(codex_bridge_port)
+                    environment["CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED"] = "1"
                 if diagnostic is not None:
                     diagnostic.mark_worker_spawned(None)
                 append_lifecycle_event(
@@ -565,6 +628,16 @@ class WorkflowWorkerManager:
             database_path = run_dir / "codex_jobs.sqlite"
             turns: set[tuple[str, str]]
             try:
+                persisted_manifest = self._read_manifest(run_dir)
+                if persisted_manifest.get("run_format_version") == 2:
+                    verification = self._verify_strict_run(run_dir)
+                    pinned = verification._definition
+                    if pinned is None or type(pinned.definition) is not dict:
+                        raise WorkflowManagerError("strict workflow definition is unavailable")
+                    classification = classify_task_tree(pinned.definition, strict_contract=True)
+                    if classification.kind is StrictTaskTreeKind.STRICT_AGENT:
+                        # Agent ownership is read from every reserved strict run below.
+                        continue
                 from .codex_job_adapter import CodexJobAdapter
 
                 if database_path.is_symlink() or not database_path.is_file():
@@ -602,6 +675,14 @@ class WorkflowWorkerManager:
             if not complete:
                 ownership_complete = False
                 errors.append("workflow turn ownership is incomplete")
+        agent_turns, agent_complete = _persisted_reserved_strict_agent_turns(
+            self.state_root,
+            allowed_roots=self.allowed_roots,
+        )
+        owned_turns.update(agent_turns)
+        if not agent_complete:
+            ownership_complete = False
+            errors.append("strict Agent turn ownership is incomplete")
         self._shutdown_report = WorkflowShutdownReport(
             frozenset(owned_turns), ownership_complete, tuple(dict.fromkeys(errors))
         )
@@ -798,6 +879,202 @@ def default_workflow_state_root() -> Path:
     if not local_app_data:
         raise WorkflowManagerError("LOCALAPPDATA is required for workflow state storage")
     return Path(local_app_data) / "CodexBridge" / "workflows"
+
+
+def _persisted_reserved_strict_agent_turns(
+    state_root: Path,
+    *,
+    allowed_roots: tuple[str, ...],
+) -> tuple[set[tuple[str, str]], bool]:
+    """Read Agent ownership from every reserved strict run using stable pages."""
+    root = Path(state_root)
+    if root.is_symlink():
+        return set(), False
+    if not root.exists():
+        return set(), True
+    try:
+        canonical_root = root.resolve(strict=True)
+    except OSError:
+        return set(), False
+    database = canonical_root / "requests.sqlite"
+    if database.is_symlink():
+        return set(), False
+    if not database.exists():
+        return set(), True
+    if not database.is_file():
+        return set(), False
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            database.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=2.0
+        )
+        connection.execute("PRAGMA query_only = ON")
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "workflow_requests" not in tables:
+            return set(), False
+        has_binding_table = "workflow_request_contract_bindings" in tables
+        turns: set[tuple[str, str]] = set()
+        complete = True
+        after_run_id = ""
+        while True:
+            if has_binding_table:
+                rows = connection.execute(
+                    "SELECT r.workflow_id,r.run_id,r.request_digest,b.workflow_id,b.request_digest "
+                    "FROM workflow_requests AS r LEFT JOIN workflow_request_contract_bindings AS b "
+                    "ON b.run_id=r.run_id WHERE r.run_id>? ORDER BY r.run_id LIMIT 100",
+                    (after_run_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT workflow_id,run_id,request_digest,NULL,NULL "
+                    "FROM workflow_requests WHERE run_id>? ORDER BY run_id LIMIT 100",
+                    (after_run_id,),
+                ).fetchall()
+            if not rows:
+                break
+            after_run_id = str(rows[-1][1])
+            for workflow_id, run_id, request_digest, binding_workflow_id, binding_digest in rows:
+                try:
+                    if (
+                        type(workflow_id) is not str
+                        or type(run_id) is not str
+                        or type(request_digest) is not str
+                        or _RUN_ID_RE.fullmatch(run_id) is None
+                        or re.fullmatch(r"[0-9a-f]{64}", request_digest, re.ASCII) is None
+                        or str(uuid.UUID(workflow_id)) != workflow_id
+                    ):
+                        raise ValueError
+                    run_dir = canonical_root / run_id
+                    manifest_path = run_dir / "manifest.json"
+                    if binding_workflow_id is None and binding_digest is None:
+                        if not run_dir.exists() and not run_dir.is_symlink():
+                            continue
+                        if run_dir.is_symlink() or not run_dir.is_dir():
+                            raise ValueError
+                        if not manifest_path.exists() and not manifest_path.is_symlink():
+                            # Pre-v2 runs have no manifest or v2 reservation binding.
+                            continue
+                        if manifest_path.is_symlink() or not manifest_path.is_file():
+                            raise ValueError
+                        try:
+                            manifest_bytes = manifest_path.read_bytes()
+                            if len(manifest_bytes) > 32 * 1024:
+                                raise ValueError
+                            legacy_manifest = json.loads(
+                                manifest_bytes,
+                                object_pairs_hook=_unique_json_object,
+                            )
+                        except Exception:
+                            complete = False
+                            continue
+                        if (
+                            type(legacy_manifest) is dict
+                            and legacy_manifest.get("run_format_version") == 2
+                        ):
+                            complete = False
+                        continue
+                    if (
+                        type(binding_workflow_id) is not str
+                        or type(binding_digest) is not str
+                        or workflow_id != binding_workflow_id
+                        or request_digest != binding_digest
+                        or run_dir.is_symlink()
+                        or not run_dir.is_dir()
+                        or manifest_path.is_symlink()
+                        or not manifest_path.is_file()
+                    ):
+                        raise ValueError
+                    manifest_bytes = manifest_path.read_bytes()
+                    verification = verify_strict_reserved_readonly(
+                        canonical_root,
+                        run_id,
+                        manifest_bytes,
+                        expected_workflow_id=workflow_id,
+                        expected_request_digest=request_digest,
+                        allowed_roots=allowed_roots,
+                    )
+                    if verification is None or verification._definition is None:
+                        raise ValueError
+                    definition_revision = verification._definition
+                    definition = definition_revision.definition
+                    classification = classify_task_tree(definition, strict_contract=True)
+                    if classification.kind is not StrictTaskTreeKind.STRICT_AGENT:
+                        continue
+                    validate_pinned_agent_definition(definition)
+                    inspection, target_context = inspect_agent_ledger_binding(
+                        run_dir, verification.manifest
+                    )
+                    ledger = AgentInvocationLedger(
+                        run_dir,
+                        inspection.binding_identity,
+                        target_context,
+                    )
+                    pinned = {
+                        call.node_pointer: call.task_spec for call in classification.agent_calls
+                    }
+                    after: tuple[int, str] | None = None
+                    while True:
+                        invocations = ledger.list_invocations(limit=100, after=after)
+                        for record in invocations:
+                            task = pinned.get(record.node_pointer)
+                            wire = task.get("with") if type(task) is dict else None
+                            operation = (
+                                wire.get("operation", "invoke") if type(wire) is dict else None
+                            )
+                            if (
+                                operation != record.operation
+                                or record.invocation_id
+                                != ledger.invocation_id_for(
+                                    record.node_pointer, record.iteration_vector
+                                )
+                            ):
+                                raise ValueError
+                            if record.dispatch_state == "MAYBE_SENT":
+                                complete = False
+                            if record.result_json is not None:
+                                from .agent_contracts import AgentResult
+
+                                result = AgentResult.from_json(record.result_json)
+                                if result.invocation_id != record.invocation_id:
+                                    raise ValueError
+                        if len(invocations) < 100:
+                            break
+                        last = invocations[-1]
+                        after = (last.created_ms, last.invocation_id)
+                    after_invocation_id: str | None = None
+                    while True:
+                        handles = ledger.list_owned_handles(
+                            limit=100,
+                            after_invocation_id=after_invocation_id,
+                        )
+                        for owned in handles:
+                            handle = owned.handle
+                            if (
+                                owned.provider != "codex"
+                                or set(handle) != {"thread_id", "turn_id"}
+                                or type(handle.get("thread_id")) is not str
+                                or type(handle.get("turn_id")) is not str
+                            ):
+                                raise ValueError
+                            if not owned.remote_terminal:
+                                turns.add((handle["thread_id"], handle["turn_id"]))
+                        if len(handles) < 100:
+                            break
+                        after_invocation_id = handles[-1].invocation_id
+                except Exception:
+                    complete = False
+            if len(rows) < 100:
+                break
+        return turns, complete
+    except (OSError, sqlite3.Error, ValueError):
+        return set(), False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _persisted_live_run_directories(
@@ -1029,13 +1306,7 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _definition_contains_codex_job(value: object) -> bool:
-    if isinstance(value, dict):
-        if value.get("call") == "codex-job":
-            return True
-        return any(_definition_contains_codex_job(child) for child in value.values())
-    if isinstance(value, list):
-        return any(_definition_contains_codex_job(child) for child in value)
-    return False
+    return definition_has_call_target(value, "codex-job")
 
 
 def _write_private_json(path: Path, value: Mapping[str, object]) -> None:

@@ -48,6 +48,7 @@ _SCHEMA: dict[str, dict[str, type[object]]] = {
         "mcp_permissions": list,
         "strict_runtime_enabled": bool,
         "strict_codex_jobs_enabled": bool,
+        "strict_agent_enabled": bool,
     },
     "mcp_events": {
         "enabled": bool,

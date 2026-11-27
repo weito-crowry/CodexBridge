@@ -28,6 +28,7 @@ from .strict_requests import (
     StrictWorkflowRequestStore,
     _same_request,
 )
+from .task_tree import StrictTaskTreeKind, classify_task_tree
 
 _REASON_CODE = "NEEDS_RECONCILIATION"
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z", re.ASCII)
@@ -208,6 +209,16 @@ def verify_strict_reserved_readonly(
             or verification.manifest.request_digest != expected_request_digest
         ):
             _fail()
+        pinned = verification._definition
+        if pinned is not None and type(pinned.definition) is dict:
+            classification = classify_task_tree(pinned.definition, strict_contract=True)
+            if classification.kind is StrictTaskTreeKind.STRICT_AGENT:
+                from .agent_runtime import inspect_agent_ledger_binding
+
+                inspect_agent_ledger_binding(
+                    Path(state_root) / run_id,
+                    verification.manifest,
+                )
         return verification
     except Exception:
         raise StrictReaderGateError() from None
@@ -242,6 +253,16 @@ def _reserve_prepared_strict_run(
         existing = store.read_binding(run_id)
         if existing is None:
             prepared = verifier.verify_pre_reservation(run_id)
+            pinned = prepared._definition
+            if pinned is not None and type(pinned.definition) is dict:
+                classification = classify_task_tree(pinned.definition, strict_contract=True)
+                if classification.kind is StrictTaskTreeKind.STRICT_AGENT:
+                    from .agent_runtime import inspect_agent_ledger_binding
+
+                    inspect_agent_ledger_binding(
+                        Path(state_root) / run_id,
+                        prepared.manifest,
+                    )
             request = _request_input_from_manifest(prepared.manifest, client_request_id)
             reservation = store.reserve_strict(request)
         else:
