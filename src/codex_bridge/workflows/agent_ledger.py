@@ -1084,6 +1084,18 @@ def _validate_receipt_for_request(
                 receipt.remote_state,
                 receipt.remote_state in _CODEX_TERMINAL_REMOTE_STATES,
             )
+            session = request.session
+            if (
+                session is not None
+                and session.get("mode") == "continue"
+                and (
+                    receipt.handle is None
+                    or receipt.handle.get("thread_id") != session["thread_id"]
+                )
+            ):
+                raise AgentLedgerIntegrityError(
+                    "accepted Codex continue receipt changed the requested thread"
+                )
     elif receipt.disposition == "REJECTED":
         if receipt.handle is not None or receipt.remote_state is not None:
             raise AgentLedgerIntegrityError("rejected dispatch receipt claims remote execution")

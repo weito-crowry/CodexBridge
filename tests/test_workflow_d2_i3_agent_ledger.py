@@ -67,6 +67,22 @@ def _request(
     )
 
 
+def _continue_request(thread_id: str = "thread_123456") -> AgentRequest:
+    return AgentRequest(
+        operation="invoke",
+        provider="codex",
+        target="default",
+        target_context=_target_context(),
+        session={"mode": "continue", "thread_id": thread_id},
+        handle=None,
+        options={},
+        prompt="Continue the exact existing thread.",
+        response={"format": "text"},
+        wait=False,
+        timeout_seconds=None,
+    )
+
+
 def _read_only_request(
     operation: str,
     handle: dict[str, str],
@@ -361,6 +377,34 @@ def test_accepted_receipt_and_exact_owned_handle_are_atomic_and_immutable(tmp_pa
                 remote_state="in_progress",
             ),
         )
+
+
+def test_continue_receipt_must_match_requested_thread_before_ownership(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    record = ledger.prepare_invoke(
+        "/do/continue",
+        [],
+        PreparedProviderRequest(_continue_request(), _target_context()),
+        created_ms=1,
+    )
+    assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is True
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(
+            record.invocation_id,
+            DispatchReceipt.accepted(
+                handle={"thread_id": "thread_87654321", "turn_id": "turn_123456"},
+                remote_state="in_progress",
+            ),
+        )
+
+    assert ledger.get_invocation(record.invocation_id).dispatch_state == "MAYBE_SENT"
+    assert ledger.list_owned_handles() == ()
 
 
 def test_receipt_and_result_semantics_are_checked_before_persistence(tmp_path: Path) -> None:

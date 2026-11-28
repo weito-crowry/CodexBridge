@@ -17,11 +17,13 @@ from codex_bridge.workflows.agent_contracts import (
     PreparedProviderRequest,
     ProviderCapabilities,
     TargetContext,
+    codex_agent_capabilities,
 )
 from codex_bridge.workflows.agent_ledger import (
     AgentInvocationLedger,
     AgentLedgerIntegrityError,
 )
+from codex_bridge.workflows.agent_provider import FakeAgentProvider
 from codex_bridge.workflows.contracts import canonical_json, sha256_json
 
 _HANDLE = {"thread_id": "thread_12345678", "turn_id": "turn_12345678"}
@@ -104,11 +106,6 @@ class _Provider:
         self, prepared: PreparedProviderRequest, client_request_id: str
     ) -> DispatchReceipt:
         assert client_request_id.startswith("cba-")
-        if prepared.operation == "interrupt":
-            self.interrupt_count += 1
-            assert prepared.handle is not None
-            self.interrupted_handles.append(dict(prepared.handle))
-            return self._interrupt_receipt
         assert prepared.operation == "invoke"
         self.dispatch_count += 1
         if self.dispatch_count <= len(self._receipt_sequence):
@@ -168,7 +165,7 @@ def _run_actual_agent_executor(execution_key: str) -> str:
 
 def _executor(
     tmp_path: Path,
-    provider: _Provider,
+    provider: Any,
     *,
     clock: Callable[[], int] | None = None,
     sleeper: Callable[[float], None] | None = None,
@@ -434,6 +431,83 @@ def test_interrupt_ack_is_dispatch_only_and_later_observe_confirms_terminal_stat
     assert ledger.get_owned_handle(invoke_result.invocation_id).remote_state == "interrupted"
     assert ledger.get_owned_handle(invoke_result.invocation_id).remote_terminal is True
     assert len(ledger.list_owned_handles()) == 1
+
+
+def test_executor_uses_provider_interrupt_contract_without_dispatch(tmp_path: Path) -> None:
+    provider = FakeAgentProvider(
+        codex_agent_capabilities(_CONTEXT),
+        interrupt_receipts=(DispatchReceipt.accepted(handle=_HANDLE, remote_state="in_progress"),),
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    result = _execute(executor, _interrupt_request())
+
+    assert result.status == "ACCEPTED"
+    assert result.handle == _HANDLE
+    assert [call.operation for call in provider.calls] == ["prepare", "interrupt"]
+    assert provider.calls[1].client_request_id == f"cba-{result.invocation_id}"
+    assert provider.calls[1].handle_json == canonical_json(_HANDLE)
+    assert ledger.list_owned_handles() == ()
+
+
+def test_executor_maps_mismatched_fake_interrupt_receipt_to_unknown_without_repost(
+    tmp_path: Path,
+) -> None:
+    provider = FakeAgentProvider(
+        codex_agent_capabilities(_CONTEXT),
+        interrupt_receipts=(
+            DispatchReceipt.accepted(
+                handle={"thread_id": "thread_87654321", "turn_id": _HANDLE["turn_id"]},
+                remote_state="in_progress",
+            ),
+        ),
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    first = _execute(executor, _interrupt_request(), node_pointer="/do/0/interrupt")
+    replay = _execute(executor, _interrupt_request(), node_pointer="/do/0/interrupt")
+
+    assert first.status == "UNKNOWN"
+    assert first.handle == _HANDLE
+    assert replay.to_json() == first.to_json()
+    external_calls = [call for call in provider.calls if call.operation != "prepare"]
+    assert [call.operation for call in external_calls] == ["interrupt"]
+    assert ledger.get_invocation(first.invocation_id).dispatch_state == "MAYBE_SENT"
+    assert ledger.list_owned_handles() == ()
+
+
+def test_executor_maps_mismatched_continue_thread_to_unknown_without_repost(
+    tmp_path: Path,
+) -> None:
+    provider = FakeAgentProvider(
+        codex_agent_capabilities(_CONTEXT),
+        dispatch_receipts=(
+            DispatchReceipt.accepted(
+                handle={"thread_id": "thread_87654321", "turn_id": "turn_12345678"},
+                remote_state="in_progress",
+            ),
+        ),
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    first = _execute(
+        executor,
+        _continue_request(wait=False),
+        node_pointer="/do/0/continue",
+    )
+    replay = _execute(
+        executor,
+        _continue_request(wait=False),
+        node_pointer="/do/0/continue",
+    )
+
+    assert first.status == "UNKNOWN"
+    assert first.handle is None
+    assert replay.to_json() == first.to_json()
+    external_calls = [call for call in provider.calls if call.operation != "prepare"]
+    assert [call.operation for call in external_calls] == ["dispatch"]
+    assert ledger.get_invocation(first.invocation_id).dispatch_state == "MAYBE_SENT"
+    assert ledger.list_owned_handles() == ()
 
 
 def test_uncertain_interrupt_keeps_target_unknown_and_never_reposts(
@@ -1395,8 +1469,9 @@ def test_actual_dbos_rewind_recovers_interrupt_receipt_without_reposting_or_obse
 
     from codex_bridge.workflows.worker import _dbos_config
 
-    provider = _Provider(
-        interrupt_receipt=DispatchReceipt.accepted(handle=_HANDLE, remote_state="in_progress")
+    provider = FakeAgentProvider(
+        codex_agent_capabilities(_CONTEXT),
+        interrupt_receipts=(DispatchReceipt.accepted(handle=_HANDLE, remote_state="in_progress"),),
     )
     run_directory = tmp_path / "isolated-run"
     run_directory.mkdir()
@@ -1435,9 +1510,9 @@ def test_actual_dbos_rewind_recovers_interrupt_receipt_without_reposting_or_obse
     assert result.handle == _HANDLE
     assert record.dispatch_state == "ACCEPTED"
     assert record.result_json == result.to_json()
-    assert provider.interrupt_count == 1
-    assert provider.interrupted_handles == [_HANDLE]
-    assert provider.observe_count == 0
+    external_calls = [call for call in provider.calls if call.operation != "prepare"]
+    assert [call.operation for call in external_calls] == ["interrupt"]
+    assert external_calls[0].handle_json == canonical_json(_HANDLE)
     assert ledger.list_owned_handles() == ()
 
 

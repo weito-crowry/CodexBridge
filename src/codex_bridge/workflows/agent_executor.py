@@ -286,9 +286,16 @@ class AgentInvocationExecutor:
 
             self._inject_fault("after_claim_before_post")
             try:
-                receipt = self._provider.dispatch(
-                    current.request, cast(str, current.client_request_id)
-                )
+                if current.operation == "interrupt":
+                    receipt = self._provider.interrupt(
+                        current.request.handle,
+                        TargetContext.from_dict(current.request.target_identity),
+                        cast(str, current.client_request_id),
+                    )
+                else:
+                    receipt = self._provider.dispatch(
+                        current.request, cast(str, current.client_request_id)
+                    )
             except Exception:
                 self._save_dispatch_uncertain(self._ledger.get_invocation(invocation_id))
                 return self._dispatch_metadata(self._ledger.get_invocation(invocation_id))

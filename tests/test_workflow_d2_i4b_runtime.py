@@ -1311,14 +1311,8 @@ def test_actual_dbos_strict_agent_new_continue_interrupt_then_observe_and_wait(
 
         def dispatch(self, prepared: Any, client_request_id: str) -> DispatchReceipt:
             assert client_request_id.startswith("cba-")
-            self.dispatched_operations.append(prepared.operation)
-            if prepared.operation == "interrupt":
-                assert prepared.handle == continued_handle
-                return DispatchReceipt.accepted(
-                    handle=continued_handle,
-                    remote_state="in_progress",
-                )
             assert prepared.operation == "invoke"
+            self.dispatched_operations.append("invoke")
             if prepared.session["mode"] == "new":
                 return DispatchReceipt.accepted(
                     handle=new_handle,
@@ -1328,6 +1322,18 @@ def test_actual_dbos_strict_agent_new_continue_interrupt_then_observe_and_wait(
                 "mode": "continue",
                 "thread_id": new_handle["thread_id"],
             }
+            return DispatchReceipt.accepted(
+                handle=continued_handle,
+                remote_state="in_progress",
+            )
+
+        def interrupt(
+            self, handle: object, target_context: Any, client_request_id: str
+        ) -> DispatchReceipt:
+            assert client_request_id.startswith("cba-")
+            assert target_context == context
+            assert handle == continued_handle
+            self.dispatched_operations.append("interrupt")
             return DispatchReceipt.accepted(
                 handle=continued_handle,
                 remote_state="in_progress",
@@ -1343,9 +1349,6 @@ def test_actual_dbos_strict_agent_new_continue_interrupt_then_observe_and_wait(
                 remote_state="interrupted",
                 error=AgentError("remote_interrupted"),
             )
-
-        def interrupt(self, *_args: Any) -> DispatchReceipt:
-            raise AssertionError("executor must use its claimed dispatch path")
 
     provider = FakeProvider()
     registry = ProviderRegistry({"codex": provider}, {"codex": "default"})
