@@ -756,7 +756,7 @@ def _execute_verified_run(
                         operation = (
                             wire.get("operation", "invoke") if type(wire) is dict else "invoke"
                         )
-                        if operation not in {"invoke", "observe", "wait"}:
+                        if operation not in {"invoke", "observe", "wait", "interrupt"}:
                             raise StrictWorkflowExecutionError("strict_execution_uncertain")
                         return AgentResult(
                             invocation_id=checkpoint["invocation_id"],

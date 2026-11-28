@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from codex_bridge.workflows.agent_contracts import (
+    AgentError,
     AgentRequest,
     AgentResult,
     DispatchReceipt,
@@ -86,6 +87,25 @@ def _read_only_request(
         response={"format": "text"},
         wait=None,
         timeout_seconds=timeout,
+    )
+
+
+def _interrupt_request(
+    handle: dict[str, str], context: TargetContext | None = None
+) -> AgentRequest:
+    target = context or _target_context()
+    return AgentRequest(
+        operation="interrupt",
+        provider="codex",
+        target="default",
+        target_context=target,
+        session=None,
+        handle=handle,
+        options=None,
+        prompt=None,
+        response=None,
+        wait=None,
+        timeout_seconds=None,
     )
 
 
@@ -574,6 +594,149 @@ def test_read_only_owned_handle_lookup_updates_only_exact_prior_owner(tmp_path: 
     assert ledger.get_invocation(invoke.invocation_id).result_json is None
     assert ledger.get_invocation(observe.invocation_id).dispatch_state == "NONE"
     assert len(ledger.list_owned_handles()) == 1
+
+
+def test_interrupt_receipt_and_result_preserve_explicit_handle_without_ownership(
+    tmp_path: Path,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    handle = {"thread_id": "thread:external", "turn_id": "turn:active"}
+    request = _interrupt_request(handle)
+    record = ledger.prepare_invoke(
+        "/do/interrupt",
+        [1],
+        PreparedProviderRequest(request, _target_context()),
+        created_ms=1_800_000_000_000,
+    )
+
+    assert record.dispatch_state == "PREPARED"
+    assert record.client_request_id == f"cba-{record.invocation_id}"
+    assert record.deadline_ms is None
+    assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is True
+    receipt = DispatchReceipt.accepted(handle=handle, remote_state="in_progress")
+    accepted = ledger.save_dispatch_receipt(record.invocation_id, receipt)
+    result = ledger.save_result(
+        record.invocation_id,
+        AgentResult(
+            invocation_id=record.invocation_id,
+            operation="interrupt",
+            provider="codex",
+            target="default",
+            status="ACCEPTED",
+            handle=handle,
+            remote_state="in_progress",
+        ),
+    )
+
+    assert accepted.dispatch_state == "ACCEPTED"
+    assert accepted.dispatch_receipt_json == receipt.to_json()
+    assert result.dispatch_state == "ACCEPTED"
+    assert AgentResult.from_json(result.result_json).handle == handle
+    assert ledger.list_owned_handles() == ()
+
+    reopened = module.AgentInvocationLedger.open_existing(
+        run_directory,
+        _binding(),
+        _target_context(),
+    )
+    persisted = reopened.get_invocation(record.invocation_id)
+    assert persisted.result_json == result.result_json
+    assert persisted.dispatch_state == "ACCEPTED"
+    assert reopened.list_owned_handles() == ()
+
+
+def test_interrupt_receipt_mismatch_stays_maybe_sent_without_ownership(tmp_path: Path) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    requested = {"thread_id": "thread:external", "turn_id": "turn:active"}
+    record = ledger.prepare_invoke(
+        "/do/interrupt/mismatch",
+        [],
+        PreparedProviderRequest(_interrupt_request(requested), _target_context()),
+        created_ms=1_800_000_000_000,
+    )
+    assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is True
+
+    with pytest.raises(module.AgentLedgerIntegrityError):
+        ledger.save_dispatch_receipt(
+            record.invocation_id,
+            DispatchReceipt.accepted(
+                handle={"thread_id": "thread:other", "turn_id": "turn:active"},
+                remote_state="interrupted",
+            ),
+        )
+
+    assert ledger.get_invocation(record.invocation_id).dispatch_state == "MAYBE_SENT"
+    assert ledger.list_owned_handles() == ()
+
+
+@pytest.mark.parametrize(
+    ("dispatch_state", "status", "error_code", "receipt"),
+    [
+        ("PREPARED", "FAILED", "preflight_failed", None),
+        ("MAYBE_SENT", "UNKNOWN", "dispatch_uncertain", None),
+        (
+            "REJECTED",
+            "FAILED",
+            "unauthorized",
+            DispatchReceipt.rejected(
+                "unauthorized",
+                handle={
+                    "thread_id": "thread:external",
+                    "turn_id": "turn:active",
+                },
+            ),
+        ),
+    ],
+)
+def test_interrupt_nonaccepted_results_keep_known_target_without_ownership(
+    tmp_path: Path,
+    dispatch_state: str,
+    status: str,
+    error_code: str,
+    receipt: DispatchReceipt | None,
+) -> None:
+    module = _ledger_module()
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = module.AgentInvocationLedger.initialize_new_database(
+        run_directory, _binding(), _target_context()
+    )
+    handle = {"thread_id": "thread:external", "turn_id": "turn:active"}
+    record = ledger.prepare_invoke(
+        f"/do/interrupt/{dispatch_state.lower()}",
+        [],
+        PreparedProviderRequest(_interrupt_request(handle), _target_context()),
+        created_ms=1_800_000_000_000,
+    )
+    if dispatch_state in {"MAYBE_SENT", "REJECTED"}:
+        assert ledger.claim_dispatch(record.invocation_id, record.request_sha256) is True
+    if receipt is not None:
+        ledger.save_dispatch_receipt(record.invocation_id, receipt)
+    result = AgentResult(
+        invocation_id=record.invocation_id,
+        operation="interrupt",
+        provider="codex",
+        target="default",
+        status=status,
+        handle=handle,
+        error=AgentError(error_code),
+    )
+
+    stored = ledger.save_result(record.invocation_id, result)
+
+    assert stored.dispatch_state == dispatch_state
+    assert AgentResult.from_json(stored.result_json).handle == handle
+    assert ledger.list_owned_handles() == ()
 
 
 def test_none_rows_detect_dispatch_receipt_owner_result_and_digest_corruption(

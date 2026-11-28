@@ -228,7 +228,9 @@ class AgentInvocationExecutor:
             if current.result_json is not None:
                 return self._dispatch_metadata(current)
             if current.dispatch_state in {"ACCEPTED", "REJECTED"}:
-                if current.dispatch_state == "ACCEPTED" and current.request.wait is False:
+                if current.dispatch_state == "ACCEPTED" and (
+                    current.operation == "interrupt" or current.request.wait is False
+                ):
                     self._save_dispatch_only_result(current)
                     current = self._ledger.get_invocation(invocation_id)
                 elif current.dispatch_state == "REJECTED":
@@ -309,7 +311,9 @@ class AgentInvocationExecutor:
             if receipt.disposition == "REJECTED":
                 self._save_rejected_result(current)
                 current = self._ledger.get_invocation(invocation_id)
-            elif receipt.disposition == "ACCEPTED" and current.request.wait is False:
+            elif receipt.disposition == "ACCEPTED" and (
+                current.operation == "interrupt" or current.request.wait is False
+            ):
                 self._inject_fault("after_receipt_before_dispatch_checkpoint")
                 self._save_dispatch_only_result(current)
                 current = self._ledger.get_invocation(invocation_id)
@@ -324,6 +328,11 @@ class AgentInvocationExecutor:
             return self._result_from_record(current)
         if current.dispatch_state != "ACCEPTED":
             raise AgentLedgerIntegrityError("Agent dispatch checkpoint has no confirmed receipt")
+        if current.operation == "interrupt":
+            if current.result_json is None:
+                self._save_dispatch_only_result(current)
+                current = self._ledger.get_invocation(invocation_id)
+            return self._result_from_record(current)
         if current.request.wait is False:
             if current.result_json is None:
                 self._save_dispatch_only_result(current)
@@ -643,7 +652,7 @@ class AgentInvocationExecutor:
     ) -> PreparedProviderRequest:
         if type(request) is not AgentRequest:
             raise AgentContractError("invalid_request")
-        if request.operation not in {"invoke", "observe", "wait"}:
+        if request.operation not in {"invoke", "observe", "wait", "interrupt"}:
             raise AgentContractError("unsupported_operation")
         try:
             prepared = self._provider.prepare(request, target_context)
@@ -663,6 +672,16 @@ class AgentInvocationExecutor:
             raise AgentContractError("unsupported_operation")
         if prepared.operation in {"observe", "wait"} and (
             prepared.wait is not None or prepared.handle != request.handle
+        ):
+            raise AgentContractError("unsupported_operation")
+        if prepared.operation == "interrupt" and (
+            prepared.wait is not None
+            or prepared.timeout_seconds is not None
+            or prepared.handle != request.handle
+            or prepared.session is not None
+            or prepared.options is not None
+            or prepared.prompt is not None
+            or prepared.response is not None
         ):
             raise AgentContractError("unsupported_operation")
         return PreparedProviderRequest.from_json(prepared.to_json())
@@ -702,8 +721,10 @@ class AgentInvocationExecutor:
 
     def _save_dispatch_only_result(self, record: AgentInvocationRecord) -> None:
         if (
-            record.operation != "invoke"
-            or record.request.wait is not False
+            not (
+                record.operation == "interrupt"
+                or (record.operation == "invoke" and record.request.wait is False)
+            )
             or record.dispatch_state != "ACCEPTED"
             or record.dispatch_receipt_json is None
         ):
@@ -748,6 +769,8 @@ class AgentInvocationExecutor:
             provider=record.request.provider,
             target=record.request.target,
             status="FAILED",
+            handle=receipt.handle if record.operation == "interrupt" else None,
+            remote_state=receipt.remote_state if record.operation == "interrupt" else None,
             error=receipt.error,
         )
         self._ledger.save_result(record.invocation_id, result)
@@ -761,6 +784,7 @@ class AgentInvocationExecutor:
             provider=record.request.provider,
             target=record.request.target,
             status="UNKNOWN",
+            handle=record.request.handle if record.operation == "interrupt" else None,
             error=AgentError("dispatch_uncertain"),
         )
         self._ledger.save_result(record.invocation_id, result)
@@ -774,6 +798,7 @@ class AgentInvocationExecutor:
             provider=record.request.provider,
             target=record.request.target,
             status="FAILED",
+            handle=record.request.handle if record.operation == "interrupt" else None,
             error=AgentError(code),
         )
         self._ledger.save_result(record.invocation_id, result)

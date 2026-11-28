@@ -55,6 +55,7 @@ class _Provider:
         observations: list[Observation] | None = None,
         dispatch_receipt: DispatchReceipt | None = None,
         dispatch_receipts: list[DispatchReceipt] | None = None,
+        interrupt_receipt: DispatchReceipt | None = None,
         preflight_error: str | None = None,
     ) -> None:
         self._observations = list(observations or [])
@@ -62,10 +63,15 @@ class _Provider:
             handle=_HANDLE, remote_state="in_progress"
         )
         self._receipt_sequence = list(dispatch_receipts or [])
+        self._interrupt_receipt = interrupt_receipt or DispatchReceipt.accepted(
+            handle=_HANDLE, remote_state="in_progress"
+        )
         self.preflight_error = preflight_error
         self.dispatch_count = 0
+        self.interrupt_count = 0
         self.observe_count = 0
         self.observed_handles: list[dict[str, Any]] = []
+        self.interrupted_handles: list[dict[str, Any]] = []
         self.prepare_count = 0
         self.preflight_count = 0
 
@@ -74,8 +80,8 @@ class _Provider:
         return ProviderCapabilities(
             provider="codex",
             target="default",
-            operations=("invoke", "observe", "wait"),
-            session_modes=("new",),
+            operations=("invoke", "observe", "wait", "interrupt"),
+            session_modes=("new", "continue"),
             usage_supported=False,
             endpoint=_CONTEXT.endpoint,
             workspace=_CONTEXT.workspace,
@@ -97,8 +103,13 @@ class _Provider:
     def dispatch(
         self, prepared: PreparedProviderRequest, client_request_id: str
     ) -> DispatchReceipt:
-        assert prepared.operation == "invoke"
         assert client_request_id.startswith("cba-")
+        if prepared.operation == "interrupt":
+            self.interrupt_count += 1
+            assert prepared.handle is not None
+            self.interrupted_handles.append(dict(prepared.handle))
+            return self._interrupt_receipt
+        assert prepared.operation == "invoke"
         self.dispatch_count += 1
         if self.dispatch_count <= len(self._receipt_sequence):
             return self._receipt_sequence[self.dispatch_count - 1]
@@ -120,7 +131,12 @@ class _Provider:
     def interrupt(
         self, handle: object, target_context: TargetContext, client_request_id: str
     ) -> DispatchReceipt:
-        raise AssertionError("I3 executor must not send external interrupt")
+        assert target_context == _CONTEXT
+        assert type(handle) is dict
+        assert client_request_id.startswith("cba-")
+        self.interrupt_count += 1
+        self.interrupted_handles.append(dict(handle))
+        return self._interrupt_receipt
 
 
 class _StepHarness:
@@ -204,6 +220,22 @@ def _request(
     )
 
 
+def _continue_request(*, wait: bool = True) -> AgentRequest:
+    return AgentRequest(
+        operation="invoke",
+        provider="codex",
+        target="default",
+        target_context=_CONTEXT,
+        session={"mode": "continue", "thread_id": _HANDLE["thread_id"]},
+        handle=None,
+        options={},
+        prompt="Continue the existing conversation.",
+        response={"format": "text"},
+        wait=wait,
+        timeout_seconds=None,
+    )
+
+
 def _read_only_request(
     operation: str,
     *,
@@ -223,6 +255,22 @@ def _read_only_request(
         response=response or {"format": "text"},
         wait=None,
         timeout_seconds=timeout,
+    )
+
+
+def _interrupt_request(handle: dict[str, str] | None = None) -> AgentRequest:
+    return AgentRequest(
+        operation="interrupt",
+        provider="codex",
+        target="default",
+        target_context=_CONTEXT,
+        session=None,
+        handle=dict(_HANDLE) if handle is None else handle,
+        options=None,
+        prompt=None,
+        response=None,
+        wait=None,
+        timeout_seconds=None,
     )
 
 
@@ -296,6 +344,118 @@ def test_wait_false_returns_accepted_receipt_without_remote_observation(tmp_path
     assert provider.observe_count == 0
     assert ledger.get_invocation(result.invocation_id).dispatch_state == "ACCEPTED"
     assert ledger.get_owned_handle(result.invocation_id).remote_terminal is True
+
+
+def test_continue_wait_true_owns_only_the_new_turn_and_observes_it(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        observations=[
+            Observation(
+                "COMPLETED",
+                handle=_HANDLE,
+                remote_state="completed",
+                final_text="continued result",
+            )
+        ]
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    result = _execute(
+        executor,
+        _continue_request(wait=True),
+        node_pointer="/do/0/continue",
+    )
+
+    assert result.status == "SUCCEEDED"
+    assert result.handle == _HANDLE
+    assert result.final_text == "continued result"
+    assert provider.dispatch_count == 1
+    assert provider.observe_count == 1
+    assert provider.observed_handles == [_HANDLE]
+    assert ledger.get_owned_handle(result.invocation_id).handle == _HANDLE
+    assert ledger.get_owned_handle(result.invocation_id).remote_terminal is True
+
+
+def test_interrupt_ack_is_dispatch_only_and_later_observe_confirms_terminal_state(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        interrupt_receipt=DispatchReceipt.accepted(handle=_HANDLE, remote_state="in_progress"),
+        observations=[
+            Observation(
+                "INTERRUPTED",
+                handle=_HANDLE,
+                remote_state="interrupted",
+                error=AgentError("remote_interrupted"),
+            )
+        ],
+    )
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    invoke_result = _execute(executor, _request(wait=False), node_pointer="/do/0/invoke")
+    invoke_record = ledger.get_invocation(invoke_result.invocation_id)
+    invoke_result_json = invoke_record.result_json
+    assert invoke_result.status == "ACCEPTED"
+    assert invoke_result_json is not None
+    assert ledger.get_owned_handle(invoke_result.invocation_id).remote_state == "in_progress"
+
+    acknowledged = _execute(
+        executor,
+        _interrupt_request(),
+        node_pointer="/do/1/interrupt",
+    )
+
+    assert acknowledged.status == "ACCEPTED"
+    assert acknowledged.handle == _HANDLE
+    assert acknowledged.remote_state == "in_progress"
+    assert provider.interrupt_count == 1
+    assert provider.interrupted_handles == [_HANDLE]
+    assert provider.dispatch_count == 1
+    assert provider.observe_count == 0
+    owned_rows = ledger.list_owned_handles()
+    assert len(owned_rows) == 1
+    assert {item.invocation_id for item in owned_rows} == {invoke_result.invocation_id}
+    assert ledger.get_invocation(invoke_result.invocation_id).result_json == invoke_result_json
+    assert ledger.get_owned_handle(invoke_result.invocation_id).remote_state == "in_progress"
+    assert ledger.get_owned_handle(invoke_result.invocation_id).remote_terminal is False
+
+    observed = _execute(
+        executor,
+        _read_only_request("observe"),
+        node_pointer="/do/2/observe",
+    )
+
+    assert observed.status == "INTERRUPTED"
+    assert observed.handle == _HANDLE
+    assert observed.remote_state == "interrupted"
+    assert provider.observe_count == 1
+    assert ledger.get_invocation(invoke_result.invocation_id).result_json == invoke_result_json
+    assert ledger.get_owned_handle(invoke_result.invocation_id).remote_state == "interrupted"
+    assert ledger.get_owned_handle(invoke_result.invocation_id).remote_terminal is True
+    assert len(ledger.list_owned_handles()) == 1
+
+
+def test_uncertain_interrupt_keeps_target_unknown_and_never_reposts(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(interrupt_receipt=DispatchReceipt.uncertain(handle=_HANDLE))
+    executor, ledger, _harness = _executor(tmp_path, provider)
+
+    first = _execute(executor, _interrupt_request(), node_pointer="/do/0/interrupt")
+    replay = _execute(executor, _interrupt_request(), node_pointer="/do/0/interrupt")
+
+    assert first.status == "UNKNOWN"
+    assert first.handle == _HANDLE
+    assert first.error == {
+        "code": "dispatch_uncertain",
+        "message": "Agent request acceptance could not be confirmed.",
+    }
+    assert replay.to_json() == first.to_json()
+    assert provider.interrupt_count == 1
+    assert provider.observe_count == 0
+    assert ledger.get_invocation(first.invocation_id).dispatch_state == "MAYBE_SENT"
+    assert ledger.list_owned_handles() == ()
 
 
 def test_wait_false_replays_saved_receipt_after_checkpoint_fault_without_posting_again(
@@ -438,6 +598,7 @@ def test_wait_returns_nonrunning_observation_states_to_workflow(
     assert result.status == expected_status
     assert provider.observe_count == 1
     assert provider.dispatch_count == 0
+    assert provider.interrupt_count == 0
 
 
 def test_observe_json_result_validation_preserves_invalid_raw_text(tmp_path: Path) -> None:
@@ -527,6 +688,7 @@ def test_wait_timeout_keeps_handle_remote_state_and_never_interrupts(tmp_path: P
     assert result.remote_state == "in_progress"
     assert provider.observe_count == 1
     assert provider.dispatch_count == 0
+    assert provider.interrupt_count == 0
     assert ledger.get_invocation(result.invocation_id).deadline_ms == 2_000
     assert ledger.list_owned_handles() == ()
 
@@ -1224,6 +1386,59 @@ def test_actual_dbos_rewind_recovers_wait_false_receipt_without_observing(tmp_pa
     assert result.remote_state == "completed"
     assert provider.dispatch_count == 1
     assert provider.observe_count == 0
+
+
+def test_actual_dbos_rewind_recovers_interrupt_receipt_without_reposting_or_observing(
+    tmp_path: Path,
+) -> None:
+    from dbos import SetWorkflowID
+
+    from codex_bridge.workflows.worker import _dbos_config
+
+    provider = _Provider(
+        interrupt_receipt=DispatchReceipt.accepted(handle=_HANDLE, remote_state="in_progress")
+    )
+    run_directory = tmp_path / "isolated-run"
+    run_directory.mkdir()
+    ledger = AgentInvocationLedger.initialize_new_database(run_directory, _binding(), _CONTEXT)
+    from codex_bridge.workflows.agent_executor import AgentInvocationExecutor
+
+    executor = AgentInvocationExecutor(
+        ledger,
+        provider,
+        clock_ms=lambda: 1_800_000_000_000,
+        fault_injector=_crash_once("after_receipt_before_dispatch_checkpoint"),
+    )
+    execution_key = f"i5-{uuid4()}"
+    workflow_id = f"workflow-{uuid4()}"
+    request = _interrupt_request()
+    _DBOS_EXECUTION_REGISTRY[execution_key] = (executor, request)
+    DBOS(config=_dbos_config(run_directory / "dbos.sqlite"))
+    DBOS.launch()
+    try:
+        with SetWorkflowID(workflow_id):
+            handle = DBOS.start_workflow(_run_actual_agent_executor, execution_key)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            handle.get_result()
+
+        resumed = DBOS.rewind_workflow(workflow_id)
+        result_json = resumed.get_result()
+    finally:
+        DBOS.destroy()
+        _DBOS_EXECUTION_REGISTRY.pop(execution_key, None)
+
+    from codex_bridge.workflows.agent_contracts import AgentResult
+
+    result = AgentResult.from_json(result_json)
+    record = ledger.get_invocation(result.invocation_id)
+    assert result.status == "ACCEPTED"
+    assert result.handle == _HANDLE
+    assert record.dispatch_state == "ACCEPTED"
+    assert record.result_json == result.to_json()
+    assert provider.interrupt_count == 1
+    assert provider.interrupted_handles == [_HANDLE]
+    assert provider.observe_count == 0
+    assert ledger.list_owned_handles() == ()
 
 
 def test_actual_dbos_rewind_does_not_repeat_saved_read_only_result(tmp_path: Path) -> None:

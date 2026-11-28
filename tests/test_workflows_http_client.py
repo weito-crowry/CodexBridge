@@ -5,6 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -61,6 +62,32 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(self.state.capabilities_status, b'{"models":[]}')
         elif self.path == "/ui-api/control/threads":
             self._reply(201, json.dumps(EXPECTED_THREAD).encode("utf-8"))
+        elif self.command == "POST" and self.path.endswith("/interrupt"):
+            parsed = urlsplit(self.path)
+            parts = parsed.path.split("/")
+            self._reply(
+                200,
+                json.dumps(
+                    {
+                        "thread_id": unquote(parts[4]),
+                        "turn_id": unquote(parts[6]),
+                        "state": "in_progress",
+                    }
+                ).encode("utf-8"),
+            )
+        elif self.command == "POST" and self.path.endswith("/turns"):
+            parsed = urlsplit(self.path)
+            parts = parsed.path.split("/")
+            self._reply(
+                200,
+                json.dumps(
+                    {
+                        "thread_id": unquote(parts[4]),
+                        "turn_id": "turn_123456",
+                        "state": "in_progress",
+                    }
+                ).encode("utf-8"),
+            )
         elif self.path == "/http-error":
             self._reply(403, b'{"detail":"forbidden"}')
         elif self.path == "/invalid-json":
@@ -115,6 +142,11 @@ def _http_client_module():
 def _client(server: _FakeHTTPServer, **options: Any):
     module = _http_client_module()
     return module.CodexHTTPClient(port=server.server_address[1], **options)
+
+
+def _agent_client(server: _FakeHTTPServer, **options: Any):
+    module = _http_client_module()
+    return module.CodexAgentHTTPClient(port=server.server_address[1], **options)
 
 
 def _payload(cwd: Path) -> dict[str, Any]:
@@ -276,6 +308,121 @@ def test_create_thread_rejects_request_over_size_limit(
 
     with pytest.raises(module.CodexProtocolError, match="size limit"):
         _client(fake_api, max_response_bytes=128).create_thread(payload)
+
+    assert fake_api.state.requests == []
+
+
+def test_agent_client_reads_authenticated_control_capabilities(fake_api: _FakeHTTPServer) -> None:
+    client = _agent_client(fake_api)
+
+    capabilities = client.get_control_capabilities()
+
+    assert capabilities == {"models": []}
+    assert len(fake_api.state.requests) == 1
+    request = fake_api.state.requests[0]
+    assert request["method"] == "GET"
+    assert request["path"] == "/ui-api/control/capabilities"
+    assert request["headers"]["Authorization"] == f"Bearer {CONTROL_TOKEN}"
+
+
+def test_agent_client_continues_thread_with_only_request_id_and_prompt(
+    fake_api: _FakeHTTPServer,
+) -> None:
+    client = _agent_client(fake_api)
+    thread_id = "thread:123456"
+    body = {"client_request_id": "cba-" + "a" * 64, "prompt": "Continue this thread."}
+
+    result = client.continue_agent_thread(thread_id, body)
+
+    assert result == {
+        "thread_id": thread_id,
+        "turn_id": "turn_123456",
+        "state": "in_progress",
+    }
+    assert len(fake_api.state.requests) == 1
+    request = fake_api.state.requests[0]
+    assert request["method"] == "POST"
+    assert request["path"] == "/ui-api/control/threads/thread%3A123456/turns"
+    assert request["headers"]["Authorization"] == f"Bearer {CONTROL_TOKEN}"
+    assert json.loads(request["body"]) == body
+
+
+def test_agent_client_interrupts_exact_turn_with_only_request_id(
+    fake_api: _FakeHTTPServer,
+) -> None:
+    client = _agent_client(fake_api)
+    thread_id = "thread:123456"
+    turn_id = "turn:123456"
+    body = {"client_request_id": "cba-" + "b" * 64}
+
+    result = client.interrupt_agent_turn(thread_id, turn_id, body)
+
+    assert result == {"thread_id": thread_id, "turn_id": turn_id, "state": "in_progress"}
+    assert len(fake_api.state.requests) == 1
+    request = fake_api.state.requests[0]
+    assert request["method"] == "POST"
+    assert request["path"] == (
+        "/ui-api/control/threads/thread%3A123456/turns/turn%3A123456/interrupt"
+    )
+    assert request["headers"]["Authorization"] == f"Bearer {CONTROL_TOKEN}"
+    assert json.loads(request["body"]) == body
+
+
+def test_agent_client_new_thread_options_and_continue_payload_shape_are_checked(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    module = _http_client_module()
+    client = _agent_client(fake_api)
+    payload = {
+        "client_request_id": "cba-" + "c" * 64,
+        "cwd": str(tmp_path.resolve()),
+        "prompt": "Start with explicit options.",
+        "model": "model-a",
+        "reasoning_effort": "high",
+        "sandbox_mode": "danger-full-access",
+        "confirm_full_access": True,
+    }
+
+    client.create_agent_thread(payload)
+
+    assert json.loads(fake_api.state.requests[0]["body"]) == payload
+    assert len(fake_api.state.requests) == 1
+    with pytest.raises(module.CodexProtocolError):
+        client.continue_agent_thread(
+            "thread_123456",
+            {
+                "client_request_id": "cba-" + "d" * 64,
+                "prompt": "Continue.",
+                "cwd": str(tmp_path.resolve()),
+            },
+        )
+    malformed = dict(payload)
+    malformed["sandbox_mode"] = []
+    with pytest.raises(module.CodexProtocolError):
+        client.create_agent_thread(malformed)
+    assert len(fake_api.state.requests) == 1
+
+
+def test_agent_client_new_and_continue_bodies_enforce_the_byte_cap(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    module = _http_client_module()
+    client = _agent_client(fake_api)
+    oversized_prompt = "漢" * 22_000
+    new_payload = {
+        "client_request_id": "cba-" + "e" * 64,
+        "cwd": str(tmp_path.resolve()),
+        "prompt": oversized_prompt,
+    }
+    continue_payload = {
+        "client_request_id": "cba-" + "f" * 64,
+        "prompt": oversized_prompt,
+    }
+
+    with pytest.raises(module.CodexProtocolError):
+        client.create_agent_thread(new_payload)
+    with pytest.raises(module.CodexProtocolError):
+        client.continue_agent_thread("thread_123456", continue_payload)
 
     assert fake_api.state.requests == []
 

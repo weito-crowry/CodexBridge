@@ -12,10 +12,10 @@ from .agent_contracts import (
     AgentRequest,
     DispatchReceipt,
     Observation,
-    OptionCapability,
     PreparedProviderRequest,
     ProviderCapabilities,
     TargetContext,
+    codex_agent_capabilities,
 )
 from .codex_job_adapter import CodexJobAdapter
 from .http_client import (
@@ -24,6 +24,8 @@ from .http_client import (
     CodexHTTPStatusError,
     CodexPreflightError,
     CodexProtocolError,
+    validate_agent_continue_payload,
+    validate_agent_interrupt_payload,
     validate_agent_thread_payload,
 )
 
@@ -86,33 +88,21 @@ class CodexAgentProvider:
     def capabilities(self, target: str) -> ProviderCapabilities:
         if type(target) is not str or target != _TARGET:
             raise AgentContractError("unsupported_target")
+        capabilities = codex_agent_capabilities(self._context)
         return ProviderCapabilities(
-            provider="codex",
-            target=_TARGET,
-            operations=("invoke", "observe", "wait"),
-            session_modes=("new",),
-            option_rules=(
-                OptionCapability("title", ("new",), ("string",)),
-                OptionCapability(
-                    "sandbox_mode",
-                    ("new",),
-                    ("string",),
-                    allowed_values=('"inherit"',),
-                ),
-                OptionCapability(
-                    "confirm_full_access",
-                    ("new",),
-                    ("boolean",),
-                    allowed_values=("false",),
-                ),
-            ),
-            usage_supported=False,
+            provider=capabilities.provider,
+            target=capabilities.target,
+            operations=capabilities.operations,
+            session_modes=capabilities.session_modes,
+            option_rules=capabilities.option_rules,
+            option_constraints=capabilities.option_constraints,
+            usage_supported=capabilities.usage_supported,
             transport_constraints={
                 "max_request_bytes": _MAX_REQUEST_BYTES,
                 "max_prompt_characters": _MAX_PROMPT_CHARS,
                 "max_response_bytes": _MAX_RESPONSE_BYTES,
             },
-            contract_version=self._context.contract_version,
+            contract_version=capabilities.contract_version,
             endpoint=self._context.endpoint,
             workspace=self._context.workspace,
         )
@@ -127,7 +117,7 @@ class CodexAgentProvider:
         if type(request) is not AgentRequest or request.target_context != self._context:
             raise AgentContractError("unsupported_target")
         if request.operation == "invoke":
-            if request.session is None or request.session.get("mode") != "new":
+            if request.session is None or request.session.get("mode") not in {"new", "continue"}:
                 raise AgentContractError("unsupported_operation")
             if type(request.wait) is not bool:
                 raise AgentContractError("invalid_request")
@@ -139,16 +129,16 @@ class CodexAgentProvider:
             except UnicodeEncodeError:
                 raise AgentContractError("invalid_request") from None
             options = request.options or {}
-            if set(options) - {"title", "sandbox_mode", "confirm_full_access"}:
-                raise AgentContractError("unsupported_option")
-            if "title" in options and (
-                type(options["title"]) is not str or not options["title"].strip()
-            ):
+            if request.session["mode"] == "new":
+                _validate_new_options(options)
+            else:
+                if _validate_codex_id(request.session.get("thread_id")) is None:
+                    raise AgentContractError("invalid_request")
+                if options:
+                    raise AgentContractError("unsupported_option")
+        elif request.operation == "interrupt":
+            if _validate_handle(request.handle) is None:
                 raise AgentContractError("invalid_request")
-            if options.get("sandbox_mode", "inherit") != "inherit":
-                raise AgentContractError("unsupported_option")
-            if options.get("confirm_full_access", False) is not False:
-                raise AgentContractError("unsupported_option")
         elif request.operation in {"observe", "wait"}:
             if _validate_handle(request.handle) is None:
                 raise AgentContractError("invalid_request")
@@ -159,11 +149,26 @@ class CodexAgentProvider:
         return prepared
 
     def preflight(self, prepared: PreparedProviderRequest) -> None:
-        if type(prepared) is not PreparedProviderRequest or prepared.operation != "invoke":
+        if type(prepared) is not PreparedProviderRequest or prepared.operation not in {
+            "invoke",
+            "interrupt",
+        }:
             raise AgentContractError("unsupported_operation")
         self._validate_prepared(prepared)
         try:
             self._client.preflight()
+            if (
+                prepared.operation == "invoke"
+                and prepared.session is not None
+                and prepared.session.get("mode") == "new"
+                and prepared.options is not None
+                and "model" in prepared.options
+            ):
+                capabilities = self._client.get_control_capabilities()
+                _validate_current_model_catalog(prepared.options, capabilities)
+        except CodexHTTPStatusError as error:
+            code = "unauthorized" if error.status_code == 403 else "preflight_failed"
+            raise AgentContractError(code) from None
         except CodexPreflightError as error:
             message = str(error).casefold()
             code = "unauthorized" if "token" in message else "preflight_failed"
@@ -176,32 +181,59 @@ class CodexAgentProvider:
         prepared: PreparedProviderRequest,
         client_request_id: str,
     ) -> DispatchReceipt:
-        if type(prepared) is not PreparedProviderRequest or prepared.operation != "invoke":
+        if type(prepared) is not PreparedProviderRequest or prepared.operation not in {
+            "invoke",
+            "interrupt",
+        }:
             raise AgentContractError("unsupported_operation")
+        request = _request_from_prepared(prepared)
+        known_handle = request.handle if request.operation == "interrupt" else None
         try:
             self._validate_prepared(prepared)
             if (
                 type(client_request_id) is not str
                 or re.fullmatch(r"cba-[0-9a-f]{64}", client_request_id, re.ASCII) is None
             ):
-                return DispatchReceipt.rejected("invalid_request")
-            body = self._request_body(prepared, client_request_id)
-            validate_agent_thread_payload(body)
-            response = self._client.create_agent_thread(body)
+                return DispatchReceipt.rejected("invalid_request", handle=known_handle)
+            if request.operation == "invoke" and request.session is not None:
+                if request.session.get("mode") == "new":
+                    body = self._request_body(prepared, client_request_id)
+                    validate_agent_thread_payload(body)
+                    response = self._client.create_agent_thread(body)
+                else:
+                    body = self._continue_body(prepared, client_request_id)
+                    validate_agent_continue_payload(body)
+                    response = self._client.continue_agent_thread(
+                        request.session["thread_id"], body
+                    )
+            else:
+                body = self._interrupt_body(prepared, client_request_id)
+                validate_agent_interrupt_payload(body)
+                handle = _validate_handle(request.handle)
+                if handle is None:
+                    return DispatchReceipt.rejected("invalid_request")
+                response = self._client.interrupt_agent_turn(
+                    handle["thread_id"], handle["turn_id"], body
+                )
         except CodexHTTPStatusError as error:
             if error.status_code == 403:
-                return DispatchReceipt.rejected("unauthorized")
+                return DispatchReceipt.rejected("unauthorized", handle=known_handle)
             if error.status_code == 413:
-                return DispatchReceipt.rejected("request_too_large")
-            if error.status_code == 404:
+                return DispatchReceipt.rejected("request_too_large", handle=known_handle)
+            if (
+                error.status_code == 404
+                and request.operation == "invoke"
+                and request.session is not None
+                and request.session.get("mode") == "new"
+            ):
                 return DispatchReceipt.rejected("dispatch_rejected")
-            return DispatchReceipt.uncertain()
+            return DispatchReceipt.uncertain(handle=known_handle)
         except (CodexHTTPError, OSError, TimeoutError):
-            return DispatchReceipt.uncertain()
+            return DispatchReceipt.uncertain(handle=known_handle)
         except AgentContractError:
-            return DispatchReceipt.uncertain()
+            return DispatchReceipt.uncertain(handle=known_handle)
         except Exception:
-            return DispatchReceipt.uncertain()
+            return DispatchReceipt.uncertain(handle=known_handle)
         if (
             type(response) is not dict
             or not {"thread_id", "turn_id", "state"}.issubset(response)
@@ -212,9 +244,17 @@ class CodexAgentProvider:
             or type(response.get("state")) is not str
             or response["state"] not in _ACTIVE_STATES | _TERMINAL_STATES
         ):
-            return DispatchReceipt.uncertain()
+            return DispatchReceipt.uncertain(handle=known_handle)
+        response_handle = {"thread_id": response["thread_id"], "turn_id": response["turn_id"]}
+        if request.operation == "invoke" and request.session is not None:
+            if request.session.get("mode") == "continue" and response_handle[
+                "thread_id"
+            ] != request.session.get("thread_id"):
+                return DispatchReceipt.uncertain()
+        elif response_handle != known_handle:
+            return DispatchReceipt.uncertain(handle=known_handle)
         return DispatchReceipt.accepted(
-            handle={"thread_id": response["thread_id"], "turn_id": response["turn_id"]},
+            handle=response_handle,
             remote_state=response["state"],
         )
 
@@ -323,8 +363,26 @@ class CodexAgentProvider:
         target_context: TargetContext,
         client_request_id: str,
     ) -> DispatchReceipt:
-        del handle, target_context, client_request_id
-        raise AgentContractError("unsupported_operation")
+        if type(target_context) is not TargetContext or target_context != self._context:
+            raise AgentContractError("unsupported_target")
+        parsed_handle = _validate_handle(handle)
+        if parsed_handle is None:
+            raise AgentContractError("invalid_request")
+        request = AgentRequest(
+            operation="interrupt",
+            provider="codex",
+            target=_TARGET,
+            target_context=self._context,
+            session=None,
+            handle=parsed_handle,
+            options=None,
+            prompt=None,
+            response=None,
+            wait=None,
+            timeout_seconds=None,
+        )
+        prepared = PreparedProviderRequest(request, self._context)
+        return self.dispatch(prepared, client_request_id)
 
     def _validate_prepared(self, prepared: PreparedProviderRequest) -> None:
         if type(prepared) is not PreparedProviderRequest:
@@ -351,31 +409,42 @@ class CodexAgentProvider:
             ):
                 raise AgentContractError("invalid_request")
             return
+        if normalized.operation == "interrupt":
+            if (
+                _validate_handle(request.handle) is None
+                or request.session is not None
+                or request.options is not None
+                or request.prompt is not None
+                or request.response is not None
+                or request.wait is not None
+                or request.timeout_seconds is not None
+            ):
+                raise AgentContractError("invalid_request")
+            return
+        if normalized.operation != "invoke" or request.session is None:
+            raise AgentContractError("unsupported_operation")
         if (
-            normalized.operation != "invoke"
-            or request.session is None
-            or request.session.get("mode") != "new"
+            request.session.get("mode") not in {"new", "continue"}
             or type(normalized.wait) is not bool
         ):
             raise AgentContractError("unsupported_operation")
         prompt = request.prompt
         options = request.options or {}
-        if (
-            type(prompt) is not str
-            or not prompt.strip()
-            or len(prompt) > _MAX_PROMPT_CHARS
-            or set(options) - {"title", "sandbox_mode", "confirm_full_access"}
-            or (
-                "title" in options
-                and (type(options["title"]) is not str or not options["title"].strip())
-            )
-            or options.get("sandbox_mode", "inherit") != "inherit"
-            or options.get("confirm_full_access", False) is not False
-        ):
-            raise AgentContractError("unsupported_option")
-        body = self._request_body_unchecked(normalized, "cba-" + "0" * 64)
+        if type(prompt) is not str or not prompt.strip() or len(prompt) > _MAX_PROMPT_CHARS:
+            raise AgentContractError("invalid_request")
+        if request.session["mode"] == "new":
+            _validate_new_options(options)
+            body = self._request_body_unchecked(normalized, "cba-" + "0" * 64)
+            validator = validate_agent_thread_payload
+        else:
+            if _validate_codex_id(request.session.get("thread_id")) is None:
+                raise AgentContractError("invalid_request")
+            if options:
+                raise AgentContractError("unsupported_option")
+            body = self._continue_body_unchecked(normalized, "cba-" + "0" * 64)
+            validator = validate_agent_continue_payload
         try:
-            validate_agent_thread_payload(body)
+            validator(body)
         except CodexProtocolError:
             raise AgentContractError("request_too_large") from None
 
@@ -401,9 +470,37 @@ class CodexAgentProvider:
             "sandbox_mode": options.get("sandbox_mode", "inherit"),
             "confirm_full_access": options.get("confirm_full_access", False),
         }
-        if "title" in options:
-            body["title"] = options["title"]
+        for option in ("model", "reasoning_effort", "title"):
+            if option in options:
+                body[option] = options[option]
         return body
+
+    def _continue_body(
+        self,
+        prepared: PreparedProviderRequest,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        self._validate_prepared(prepared)
+        return self._continue_body_unchecked(prepared, client_request_id)
+
+    def _continue_body_unchecked(
+        self,
+        prepared: PreparedProviderRequest,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        request = _request_from_prepared(prepared)
+        return {
+            "client_request_id": client_request_id,
+            "prompt": request.prompt,
+        }
+
+    def _interrupt_body(
+        self,
+        prepared: PreparedProviderRequest,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        self._validate_prepared(prepared)
+        return {"client_request_id": client_request_id}
 
     def _find_exact_turn_state(self, thread_id: str, turn_id: str) -> str | None:
         cursor: str | None = None
@@ -497,6 +594,71 @@ def _validate_handle(value: object) -> dict[str, str] | None:
     ):
         return None
     return {"thread_id": value["thread_id"], "turn_id": value["turn_id"]}
+
+
+def _validate_codex_id(value: object) -> str | None:
+    if type(value) is not str or _CODEX_ID.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _validate_new_options(options: Mapping[str, Any]) -> None:
+    if set(options) - {
+        "model",
+        "reasoning_effort",
+        "title",
+        "sandbox_mode",
+        "confirm_full_access",
+    }:
+        raise AgentContractError("unsupported_option")
+    for name in ("model", "reasoning_effort", "title"):
+        if name in options and (type(options[name]) is not str or not options[name].strip()):
+            raise AgentContractError("invalid_request")
+    if "reasoning_effort" in options and "model" not in options:
+        raise AgentContractError("invalid_request")
+    sandbox_mode = options.get("sandbox_mode", "inherit")
+    if type(sandbox_mode) is not str or sandbox_mode not in {"inherit", "danger-full-access"}:
+        raise AgentContractError("invalid_request")
+    confirm = options.get("confirm_full_access", False)
+    if type(confirm) is not bool:
+        raise AgentContractError("invalid_request")
+    if sandbox_mode == "danger-full-access" and confirm is not True:
+        raise AgentContractError("invalid_request")
+
+
+def _validate_current_model_catalog(options: Mapping[str, Any], catalog: object) -> None:
+    if type(catalog) is not dict or type(catalog.get("models")) is not list:
+        raise AgentContractError("preflight_failed")
+    models: dict[str, set[str]] = {}
+    for item in catalog["models"]:
+        if (
+            not isinstance(item, Mapping)
+            or type(item.get("model")) is not str
+            or not item["model"].strip()
+            or item["model"] in models
+        ):
+            raise AgentContractError("preflight_failed")
+        raw_efforts = item.get("reasoning_efforts")
+        if type(raw_efforts) is not list or not raw_efforts:
+            raise AgentContractError("preflight_failed")
+        efforts: set[str] = set()
+        for effort in raw_efforts:
+            if (
+                not isinstance(effort, Mapping)
+                or type(effort.get("id")) is not str
+                or not effort["id"].strip()
+                or effort["id"] in efforts
+            ):
+                raise AgentContractError("preflight_failed")
+            efforts.add(effort["id"])
+        models[item["model"]] = efforts
+    model_name = options.get("model")
+    if type(model_name) is not str or model_name not in models:
+        raise AgentContractError("unsupported_option")
+    if "reasoning_effort" not in options:
+        return
+    if options["reasoning_effort"] not in models[model_name]:
+        raise AgentContractError("unsupported_option")
 
 
 def _request_from_prepared(prepared: PreparedProviderRequest) -> AgentRequest:

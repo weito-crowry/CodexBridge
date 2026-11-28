@@ -355,20 +355,24 @@ def test_dynamic_agent_preparation_failure_returns_safe_result_without_ledger_ro
 @pytest.mark.parametrize(
     "wire",
     [
-        _agent_wire(
-            operation="interrupt",
-            handle={"thread_id": "thread_12345678", "turn_id": "turn_12345678"},
-        ),
-        _agent_wire(session={"mode": "continue", "thread_id": "thread_12345678"}),
+        {
+            "operation": "interrupt",
+            "provider": "codex",
+            "handle": {"thread_id": "thread_12345678", "turn_id": "turn_12345678"},
+        },
+        {
+            "provider": "codex",
+            "session": {"mode": "continue", "thread_id": "thread_12345678"},
+            "prompt": "Continue the thread.",
+        },
         _agent_wire(options={"model": "example-model"}),
     ],
 )
-def test_static_agent_validation_rejects_i5_operations_and_options(wire: dict[str, Any]) -> None:
-    with pytest.raises(OwsError):
-        validate_workflow(
-            _definition([_agent_task("invoke", wire)]),
-            strict_contract=compile_contract(_contract()),
-        )
+def test_static_agent_validation_accepts_i5_operations_and_options(wire: dict[str, Any]) -> None:
+    validate_workflow(
+        _definition([_agent_task("invoke", wire)]),
+        strict_contract=compile_contract(_contract()),
+    )
 
 
 def test_strict_agent_flag_defaults_off_and_is_independent_of_codex_jobs() -> None:
@@ -1212,6 +1216,346 @@ def test_actual_dbos_strict_agent_runtime_handles_wait_observe_and_skipped_branc
     assert len(records) == 3
     assert all(record.result_json is not None for record in records)
     assert all("skipped_agent" not in record.node_pointer for record in records)
+
+
+def test_actual_dbos_strict_agent_new_continue_interrupt_then_observe_and_wait(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dbos import DBOS, SetWorkflowID
+
+    from codex_bridge.workflows import strict_executor, worker
+    from codex_bridge.workflows.agent_contracts import (
+        AgentError,
+        DispatchReceipt,
+        Observation,
+        PreparedProviderRequest,
+        ProviderCapabilities,
+        ProviderRegistry,
+    )
+    from codex_bridge.workflows.agent_ledger import AgentInvocationLedger
+
+    new_handle = {"thread_id": "thread_12345678", "turn_id": "turn_12345678"}
+    continued_handle = {"thread_id": "thread_12345678", "turn_id": "turn_87654321"}
+
+    def invoke_wire(session: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "operation": "invoke",
+            "provider": "codex",
+            "target": "default",
+            "session": session,
+            "prompt": "Continue the conversation.",
+            "bindings": {},
+            "options": {},
+            "response": {"format": "text"},
+            "wait": False,
+        }
+
+    tasks = [
+        _agent_task("new", invoke_wire({"mode": "new"})),
+        _agent_task(
+            "continue",
+            invoke_wire({"mode": "continue", "thread_id": "${ .handle.thread_id }"}),
+        ),
+        _agent_task(
+            "interrupt",
+            {
+                "operation": "interrupt",
+                "provider": "codex",
+                "target": "default",
+                "handle": "${ .handle }",
+            },
+        ),
+        _agent_task(
+            "observe",
+            {
+                "operation": "observe",
+                "provider": "codex",
+                "target": "default",
+                "handle": "${ .handle }",
+            },
+        ),
+        _agent_task(
+            "wait",
+            {
+                "operation": "wait",
+                "provider": "codex",
+                "target": "default",
+                "handle": "${ .handle }",
+                "timeout_seconds": 30,
+            },
+        ),
+    ]
+    adapter, run_dir, allowed_roots, context = _reserved_agent_run(tmp_path, tasks)
+
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.dispatched_operations: list[str] = []
+            self.observed_handles: list[dict[str, str]] = []
+
+        def capabilities(self, target: str) -> ProviderCapabilities:
+            return ProviderCapabilities(
+                provider="codex",
+                target=target,
+                operations=("invoke", "observe", "wait", "interrupt"),
+                session_modes=("new", "continue"),
+                endpoint=context.endpoint,
+                workspace=context.workspace,
+            )
+
+        def prepare(self, request: Any, target_context: Any) -> PreparedProviderRequest:
+            return PreparedProviderRequest(request, target_context)
+
+        def preflight(self, prepared: Any) -> None:
+            assert prepared.operation in {"invoke", "interrupt"}
+
+        def dispatch(self, prepared: Any, client_request_id: str) -> DispatchReceipt:
+            assert client_request_id.startswith("cba-")
+            self.dispatched_operations.append(prepared.operation)
+            if prepared.operation == "interrupt":
+                assert prepared.handle == continued_handle
+                return DispatchReceipt.accepted(
+                    handle=continued_handle,
+                    remote_state="in_progress",
+                )
+            assert prepared.operation == "invoke"
+            if prepared.session["mode"] == "new":
+                return DispatchReceipt.accepted(
+                    handle=new_handle,
+                    remote_state="in_progress",
+                )
+            assert prepared.session == {
+                "mode": "continue",
+                "thread_id": new_handle["thread_id"],
+            }
+            return DispatchReceipt.accepted(
+                handle=continued_handle,
+                remote_state="in_progress",
+            )
+
+        def observe(self, observed_handle: object, target_context: Any) -> Observation:
+            assert target_context == context
+            assert observed_handle == continued_handle
+            self.observed_handles.append(dict(observed_handle))
+            return Observation(
+                "INTERRUPTED",
+                handle=continued_handle,
+                remote_state="interrupted",
+                error=AgentError("remote_interrupted"),
+            )
+
+        def interrupt(self, *_args: Any) -> DispatchReceipt:
+            raise AssertionError("executor must use its claimed dispatch path")
+
+    provider = FakeProvider()
+    registry = ProviderRegistry({"codex": provider}, {"codex": "default"})
+    monkeypatch.setattr(
+        strict_executor,
+        "build_codex_agent_runtime",
+        lambda **_kwargs: (provider, registry, context),
+    )
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED", "1")
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_BRIDGE_PORT", context.endpoint.rsplit(":", 1)[1])
+    DBOS(config=worker._dbos_config(run_dir / "dbos.sqlite"))
+    DBOS.launch()
+    try:
+        with SetWorkflowID(str(adapter.checkpoint_identity["workflow_id"])):
+            workflow_handle = DBOS.start_workflow(
+                strict_executor.execute_strict_ows_workflow,
+                run_dir.name,
+                str(run_dir.parent),
+                list(allowed_roots),
+                "authorized_agent",
+            )
+        result = workflow_handle.get_result()
+    finally:
+        DBOS.destroy()
+
+    ledger = AgentInvocationLedger.open_existing(
+        run_dir,
+        adapter.checkpoint_identity,
+        context,
+    )
+    records = ledger.list_invocations(limit=100)
+    assert result["status"] == "succeeded"
+    assert provider.dispatched_operations == ["invoke", "invoke", "interrupt"]
+    assert provider.observed_handles == [continued_handle, continued_handle]
+    assert [record.operation for record in records] == [
+        "invoke",
+        "invoke",
+        "interrupt",
+        "observe",
+        "wait",
+    ]
+    assert all(record.result_json is not None for record in records)
+    owned_rows = ledger.list_owned_handles()
+    owned = {item.handle["turn_id"] for item in owned_rows}
+    assert owned == {new_handle["turn_id"], continued_handle["turn_id"]}
+    interrupt_record = next(record for record in records if record.operation == "interrupt")
+    assert interrupt_record.invocation_id not in {item.invocation_id for item in owned_rows}
+    assert interrupt_record.result_json is not None
+
+
+@pytest.mark.parametrize("failure_kind", ["dynamic_interrupt", "unsupported_model"])
+def test_actual_dbos_strict_agent_failure_result_can_select_workflow_branch(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    from dbos import DBOS, SetWorkflowID
+
+    from codex_bridge.workflows import strict_executor, worker
+    from codex_bridge.workflows.agent_contracts import (
+        AgentContractError,
+        DispatchReceipt,
+        PreparedProviderRequest,
+        ProviderCapabilities,
+        ProviderRegistry,
+        codex_agent_capabilities,
+    )
+    from codex_bridge.workflows.agent_ledger import AgentInvocationLedger
+
+    if failure_kind == "dynamic_interrupt":
+        failure_task = _agent_task(
+            "interrupt",
+            {
+                "operation": "interrupt",
+                "provider": "codex",
+                "target": "default",
+                "handle": "${ .missing_handle }",
+            },
+        )
+    else:
+        failure_task = _agent_task(
+            "invoke",
+            _agent_wire(
+                prompt="Try the selected model.",
+                bindings={},
+                options={"model": "model-not-in-catalog"},
+                wait=False,
+            ),
+        )
+    tasks = [
+        failure_task,
+        {
+            "route": {
+                "switch": [
+                    {
+                        "handled_failure": {
+                            "when": '${ .status == "FAILED" }',
+                            "then": "handled_failure",
+                        }
+                    },
+                    {"unexpected_result": {"then": "unexpected_result"}},
+                ]
+            }
+        },
+        {"handled_failure": {"set": {"handled": True}, "then": "exit"}},
+        {"unexpected_result": {"set": {"handled": False}, "then": "exit"}},
+    ]
+    adapter, run_dir, allowed_roots, context = _reserved_agent_run(tmp_path, tasks)
+
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.prepare_count = 0
+            self.preflight_count = 0
+            self.dispatch_count = 0
+
+        def capabilities(self, target: str) -> ProviderCapabilities:
+            assert target == "default"
+            return codex_agent_capabilities(context)
+
+        def prepare(self, request: Any, target_context: Any) -> PreparedProviderRequest:
+            self.prepare_count += 1
+            return PreparedProviderRequest(request, target_context)
+
+        def preflight(self, prepared: Any) -> None:
+            self.preflight_count += 1
+            if failure_kind == "unsupported_model":
+                raise AgentContractError("unsupported_option")
+            raise AssertionError("dynamic interrupt preparation must fail before preflight")
+
+        def dispatch(self, prepared: Any, client_request_id: str) -> DispatchReceipt:
+            self.dispatch_count += 1
+            raise AssertionError("failed Agent preparation must not dispatch")
+
+        def observe(self, *_args: Any) -> Any:
+            raise AssertionError("failure branch must not observe")
+
+        def interrupt(self, *_args: Any) -> DispatchReceipt:
+            raise AssertionError("failure branch must not interrupt")
+
+    provider = FakeProvider()
+    registry = ProviderRegistry({"codex": provider}, {"codex": "default"})
+    monkeypatch.setattr(
+        strict_executor,
+        "build_codex_agent_runtime",
+        lambda **_kwargs: (provider, registry, context),
+    )
+    interpreter_type = strict_executor.Interpreter
+    events: list[tuple[str, str, str | None, int | None]] = []
+
+    def instrumented_interpreter(definition: Any, **kwargs: Any) -> Any:
+        observer = kwargs.pop("observer", None)
+
+        def capture_event(event: Any) -> None:
+            events.append(
+                (
+                    event.event_type,
+                    event.task_identity or "",
+                    event.branch_class,
+                    event.case_index,
+                )
+            )
+            if observer is not None:
+                observer(event)
+
+        return interpreter_type(definition, observer=capture_event, **kwargs)
+
+    monkeypatch.setattr(strict_executor, "Interpreter", instrumented_interpreter)
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_STRICT_AGENT_ENABLED", "1")
+    monkeypatch.setenv("CODEXBRIDGE_WORKFLOW_BRIDGE_PORT", context.endpoint.rsplit(":", 1)[1])
+    DBOS(config=worker._dbos_config(run_dir / "dbos.sqlite"))
+    DBOS.launch()
+    try:
+        with SetWorkflowID(str(adapter.checkpoint_identity["workflow_id"])):
+            workflow_handle = DBOS.start_workflow(
+                strict_executor.execute_strict_ows_workflow,
+                run_dir.name,
+                str(run_dir.parent),
+                list(allowed_roots),
+                "authorized_agent",
+            )
+        result = workflow_handle.get_result()
+    finally:
+        DBOS.destroy()
+
+    ledger = AgentInvocationLedger.open_existing(
+        run_dir,
+        adapter.checkpoint_identity,
+        context,
+    )
+    assert result["status"] == "succeeded"
+    assert any(
+        event_type == "branch_selected" and case_index == 0
+        for event_type, _task_identity, _branch_class, case_index in events
+    )
+    assert not any(
+        event_type == "branch_selected" and case_index == 1
+        for event_type, _task_identity, _branch_class, case_index in events
+    )
+    assert provider.dispatch_count == 0
+    if failure_kind == "dynamic_interrupt":
+        assert provider.prepare_count == 0
+        assert provider.preflight_count == 0
+        assert ledger.list_invocations(limit=10) == ()
+    else:
+        records = ledger.list_invocations(limit=10)
+        assert provider.prepare_count >= 1
+        assert provider.preflight_count == 1
+        assert len(records) == 1
+        assert records[0].dispatch_state == "PREPARED"
+        assert records[0].result_json is not None
 
 
 @pytest.mark.asyncio

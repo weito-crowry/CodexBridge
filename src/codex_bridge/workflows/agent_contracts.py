@@ -482,28 +482,7 @@ class _StaticCodexAgentProvider:
     def capabilities(self, target: str) -> ProviderCapabilities:
         if type(target) is not str or target != "default":
             _fail("unsupported_target")
-        return ProviderCapabilities(
-            provider="codex",
-            target="default",
-            operations=("invoke", "observe", "wait"),
-            session_modes=("new",),
-            option_rules=(
-                OptionCapability("title", ("new",), ("string",)),
-                OptionCapability(
-                    "sandbox_mode",
-                    ("new",),
-                    ("string",),
-                    allowed_values=('"inherit"',),
-                ),
-                OptionCapability(
-                    "confirm_full_access",
-                    ("new",),
-                    ("boolean",),
-                    allowed_values=("false",),
-                ),
-            ),
-            usage_supported=False,
-        )
+        return codex_agent_capabilities(TargetContext("codex", "default", 1))
 
     def prepare(
         self, request: AgentRequest, target_context: TargetContext
@@ -525,7 +504,7 @@ class _StaticCodexAgentProvider:
 
 
 def codex_agent_i4b_registry() -> ProviderRegistry:
-    """Return the static I4-B operation and option surface for definitions."""
+    """Return the static Codex Agent operation and option surface for definitions."""
     return ProviderRegistry(
         {"codex": _StaticCodexAgentProvider()},
         {"codex": "default"},
