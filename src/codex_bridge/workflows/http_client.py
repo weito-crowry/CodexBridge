@@ -241,6 +241,55 @@ class CodexAgentHTTPClient(CodexHTTPClient):
             preserve_http_status=True,
         )
 
+    def get_control_capabilities(self) -> dict[str, Any]:
+        token = self._control_token()
+        return self._request_json(
+            "GET",
+            "/ui-api/control/capabilities",
+            token=token,
+            preserve_http_status=True,
+        )
+
+    def continue_agent_thread(self, thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        validate_agent_continue_payload(payload)
+        _validate_agent_thread_id(thread_id)
+        result = self._request_json(
+            "POST",
+            f"/ui-api/control/threads/{quote(thread_id, safe='')}/turns",
+            payload,
+            authenticated=True,
+            preserve_http_status=True,
+        )
+        if (
+            result.get("thread_id") != thread_id
+            or type(result.get("turn_id")) is not str
+            or _ID_RE.fullmatch(result["turn_id"]) is None
+            or type(result.get("state")) is not str
+        ):
+            raise CodexProtocolError("CodexBridge returned a mismatched continued Agent turn")
+        return result
+
+    def interrupt_agent_turn(
+        self, thread_id: str, turn_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        _validate_agent_handle_ids(thread_id, turn_id)
+        validate_agent_interrupt_payload(payload)
+        result = self._request_json(
+            "POST",
+            f"/ui-api/control/threads/{quote(thread_id, safe='')}/turns/"
+            f"{quote(turn_id, safe='')}/interrupt",
+            payload,
+            authenticated=True,
+            preserve_http_status=True,
+        )
+        if (
+            result.get("thread_id") != thread_id
+            or result.get("turn_id") != turn_id
+            or type(result.get("state")) is not str
+        ):
+            raise CodexProtocolError("CodexBridge returned a mismatched interrupted Agent turn")
+        return result
+
     def get_agent_thread_status(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         _validate_agent_handle_ids(thread_id, turn_id)
         query = urlencode({"turn_id": turn_id, "activity_limit": 1})
@@ -310,12 +359,20 @@ def _validate_agent_thread_payload(payload: object) -> None:
     if type(payload) is not dict:
         raise CodexProtocolError("Agent request body has an invalid shape")
     required = {"client_request_id", "cwd", "prompt"}
-    allowed = required | {"title", "sandbox_mode", "confirm_full_access"}
+    allowed = required | {
+        "model",
+        "reasoning_effort",
+        "title",
+        "sandbox_mode",
+        "confirm_full_access",
+    }
     if not required.issubset(payload) or set(payload) - allowed:
         raise CodexProtocolError("Agent request body has an invalid shape")
     request_id = payload.get("client_request_id")
     cwd = payload.get("cwd")
     prompt = payload.get("prompt")
+    sandbox_mode = payload.get("sandbox_mode", "inherit")
+    confirm_full_access = payload.get("confirm_full_access", False)
     if (
         type(request_id) is not str
         or _AGENT_REQUEST_ID_RE.fullmatch(request_id) is None
@@ -324,13 +381,30 @@ def _validate_agent_thread_payload(payload: object) -> None:
         or type(prompt) is not str
         or not prompt.strip()
         or len(prompt) > _AGENT_PROMPT_LIMIT
-        or payload.get("sandbox_mode", "inherit") != "inherit"
-        or payload.get("confirm_full_access", False) is not False
+        or (
+            "model" in payload
+            and (type(payload["model"]) is not str or not payload["model"].strip())
+        )
+        or (
+            "reasoning_effort" in payload
+            and (
+                type(payload["reasoning_effort"]) is not str
+                or not payload["reasoning_effort"].strip()
+            )
+        )
+        or ("reasoning_effort" in payload and "model" not in payload)
+        or type(sandbox_mode) is not str
+        or sandbox_mode not in {"inherit", "danger-full-access"}
+        or type(confirm_full_access) is not bool
+        or (sandbox_mode == "danger-full-access" and confirm_full_access is not True)
     ):
         raise CodexProtocolError("Agent request body violates the supported API contract")
     try:
         prompt.encode("utf-8", errors="strict")
         cwd.encode("utf-8", errors="strict")
+        for name in ("model", "reasoning_effort"):
+            if name in payload:
+                payload[name].encode("utf-8", errors="strict")
         if "title" in payload:
             title = payload["title"]
             if type(title) is not str or not title.strip():
@@ -355,6 +429,55 @@ def validate_agent_thread_payload(payload: object) -> int:
         raise CodexProtocolError("Agent request body is invalid") from None
     if len(encoded) > _AGENT_REQUEST_LIMIT:
         raise CodexProtocolError("Agent request exceeds the UI API size limit")
+    return len(encoded)
+
+
+def validate_agent_continue_payload(payload: object) -> int:
+    """Validate the exact continue body and its UI API request-size limit."""
+    if type(payload) is not dict or set(payload) != {"client_request_id", "prompt"}:
+        raise CodexProtocolError("Agent continue body has an invalid shape")
+    request_id = payload.get("client_request_id")
+    prompt = payload.get("prompt")
+    if (
+        type(request_id) is not str
+        or _AGENT_REQUEST_ID_RE.fullmatch(request_id) is None
+        or type(prompt) is not str
+        or not prompt.strip()
+        or len(prompt) > _AGENT_PROMPT_LIMIT
+    ):
+        raise CodexProtocolError("Agent continue body violates the supported API contract")
+    try:
+        prompt.encode("utf-8", errors="strict")
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8", errors="strict")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise CodexProtocolError("Agent continue body is invalid") from None
+    if len(encoded) > _AGENT_REQUEST_LIMIT:
+        raise CodexProtocolError("Agent continue body exceeds the UI API size limit")
+    return len(encoded)
+
+
+def validate_agent_interrupt_payload(payload: object) -> int:
+    """Validate the exact interrupt body before a dispatch claim is consumed."""
+    if type(payload) is not dict or set(payload) != {"client_request_id"}:
+        raise CodexProtocolError("Agent interrupt body has an invalid shape")
+    request_id = payload.get("client_request_id")
+    if type(request_id) is not str or _AGENT_REQUEST_ID_RE.fullmatch(request_id) is None:
+        raise CodexProtocolError("Agent interrupt body violates the supported API contract")
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > _AGENT_REQUEST_LIMIT:
+        raise CodexProtocolError("Agent interrupt body exceeds the UI API size limit")
     return len(encoded)
 
 

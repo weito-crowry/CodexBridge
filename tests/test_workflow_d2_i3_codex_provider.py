@@ -5,7 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -26,11 +26,17 @@ class _APIState:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.create_status = 201
+        self.continue_status = 201
+        self.interrupt_status = 200
+        self.capabilities_status = 200
+        self.capabilities_body: Any = {"models": []}
         self.create_body: Any = {
             "thread_id": THREAD_ID,
             "turn_id": TURN_ID,
             "state": "in_progress",
         }
+        self.continue_body: Any | None = None
+        self.interrupt_body: Any | None = None
         self.status_body: Any = {
             "thread_id": THREAD_ID,
             "turn_id": TURN_ID,
@@ -91,7 +97,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/ui-api/status":
             self._json(200, {"app_server": "ready"})
         elif self.path == "/ui-api/control/capabilities":
-            self._json(200, {"models": []})
+            self._json(self.state.capabilities_status, self.state.capabilities_body)
         elif self.path == "/ui-api/control/threads":
             self._json(self.state.create_status, self.state.create_body)
         else:
@@ -100,7 +106,23 @@ class _Handler(BaseHTTPRequestHandler):
             if override is not None:
                 self._reply(*override)
                 return
-            if parsed.path.endswith("/status"):
+            if self.command == "POST" and parsed.path.endswith("/interrupt"):
+                parts = parsed.path.split("/")
+                body = self.state.interrupt_body or {
+                    "thread_id": unquote(parts[4]),
+                    "turn_id": unquote(parts[6]),
+                    "state": "in_progress",
+                }
+                self._json(self.state.interrupt_status, body)
+            elif self.command == "POST" and parsed.path.endswith("/turns"):
+                parts = parsed.path.split("/")
+                body = self.state.continue_body or {
+                    "thread_id": unquote(parts[4]),
+                    "turn_id": "turn_123456",
+                    "state": "in_progress",
+                }
+                self._json(self.state.continue_status, body)
+            elif parsed.path.endswith("/status"):
                 self._json(200, self.state.status_body)
             elif parsed.path.endswith("/turns"):
                 cursor = parse_qs(parsed.query).get("cursor", [""])[0]
@@ -198,7 +220,23 @@ def _read_only(
     )
 
 
-def test_codex_provider_advertises_only_implemented_operations_and_usage_is_unknown(
+def _interrupt(context: TargetContext, handle: dict[str, str]) -> AgentRequest:
+    return AgentRequest(
+        operation="interrupt",
+        provider="codex",
+        target="default",
+        target_context=context,
+        session=None,
+        handle=handle,
+        options=None,
+        prompt=None,
+        response=None,
+        wait=None,
+        timeout_seconds=None,
+    )
+
+
+def test_codex_provider_advertises_i5_operations_and_usage_is_unknown(
     fake_api: _FakeHTTPServer,
     tmp_path: Path,
 ) -> None:
@@ -206,13 +244,13 @@ def test_codex_provider_advertises_only_implemented_operations_and_usage_is_unkn
 
     capabilities = provider.capabilities("default")
 
-    assert capabilities.operations == ("invoke", "observe", "wait")
-    assert capabilities.session_modes == ("new",)
+    assert capabilities.operations == ("invoke", "observe", "wait", "interrupt")
+    assert capabilities.session_modes == ("new", "continue")
     assert capabilities.usage_supported is False
     registry = ProviderRegistry({"codex": provider})
     assert registry.resolve("codex", "default") == capabilities
     context = capabilities.target_context
-    request = _invoke(context, options={"model": "unsupported-in-i3"})
+    request = _invoke(context, options={"unknown-option": "value"})
     with pytest.raises(AgentContractError) as error:
         provider.prepare(request, context)
     assert error.value.code == "unsupported_option"
@@ -250,6 +288,28 @@ def test_prepare_supports_dispatch_only_and_explicit_read_only_operations(
         "turn_id": TURN_ID,
     }
     assert wait.operation == "wait" and wait.timeout_seconds == 3
+    assert fake_api.state.requests == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"sandbox_mode": "danger-full-access"},
+        {"sandbox_mode": "danger-full-access", "confirm_full_access": False},
+    ],
+)
+def test_danger_full_access_requires_explicit_confirmation_before_any_request(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+    options: dict[str, Any],
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+
+    with pytest.raises(AgentContractError) as error:
+        provider.prepare(_invoke(context, options=options), context)
+
+    assert error.value.code == "invalid_request"
     assert fake_api.state.requests == []
 
 
@@ -295,6 +355,295 @@ def test_provider_preflight_and_dispatch_use_only_fake_local_bridge(
         "confirm_full_access": False,
     }
     assert CONTROL_TOKEN.encode() not in post["body"]
+
+
+def test_new_session_model_effort_and_explicit_full_access_are_forwarded(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    fake_api.state.capabilities_body = {
+        "models": [{"model": "model-a", "reasoning_efforts": [{"id": "high"}]}]
+    }
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    request = _invoke(
+        context,
+        options={
+            "model": "model-a",
+            "reasoning_effort": "high",
+            "title": "Workflow request",
+            "sandbox_mode": "danger-full-access",
+            "confirm_full_access": True,
+        },
+    )
+    prepared = provider.prepare(request, context)
+
+    provider.preflight(prepared)
+    receipt = provider.dispatch(prepared, "cba-" + "6" * 64)
+
+    assert receipt.disposition == "ACCEPTED"
+    post = [item for item in fake_api.state.requests if item["method"] == "POST"]
+    assert len(post) == 1
+    assert json.loads(post[0]["body"]) == {
+        "client_request_id": "cba-" + "6" * 64,
+        "cwd": str(tmp_path.resolve()),
+        "prompt": "Say hello.",
+        "model": "model-a",
+        "reasoning_effort": "high",
+        "title": "Workflow request",
+        "sandbox_mode": "danger-full-access",
+        "confirm_full_access": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("catalog", "options", "expected_code"),
+    [
+        ({"models": []}, {"model": "missing-model"}, "unsupported_option"),
+        (
+            {"models": [{"model": "model-a", "reasoning_efforts": [{"id": "low"}]}]},
+            {"model": "model-a", "reasoning_effort": "high"},
+            "unsupported_option",
+        ),
+        ({"models": "malformed"}, {"model": "model-a"}, "preflight_failed"),
+        (
+            {"models": [{"model": "model-a"}, {"model": "model-a"}]},
+            {"model": "model-a"},
+            "preflight_failed",
+        ),
+        (
+            {"models": [{"model": "model-a", "reasoning_efforts": "malformed"}]},
+            {"model": "model-a", "reasoning_effort": "high"},
+            "preflight_failed",
+        ),
+        ({"models": [{"model": "model-a"}]}, {"model": "model-a"}, "preflight_failed"),
+        (
+            {
+                "models": [
+                    {
+                        "model": "model-a",
+                        "reasoning_efforts": [{"id": "low"}, {"id": "low"}],
+                    }
+                ]
+            },
+            {"model": "model-a"},
+            "preflight_failed",
+        ),
+    ],
+)
+def test_model_catalog_is_validated_before_dispatch_claim_or_post(
+    fake_api: _FakeHTTPServer,
+    tmp_path: Path,
+    catalog: Any,
+    options: dict[str, str],
+    expected_code: str,
+) -> None:
+    fake_api.state.capabilities_body = catalog
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = provider.prepare(_invoke(context, options=options), context)
+
+    with pytest.raises(AgentContractError) as error:
+        provider.preflight(prepared)
+
+    assert error.value.code == expected_code
+    assert not any(item["method"] == "POST" for item in fake_api.state.requests)
+
+
+def test_unavailable_model_catalog_fails_preflight_without_post(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    fake_api.state.capabilities_status = 503
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = provider.prepare(_invoke(context, options={"model": "model-a"}), context)
+
+    with pytest.raises(AgentContractError) as error:
+        provider.preflight(prepared)
+
+    assert error.value.code == "preflight_failed"
+    assert not any(item["method"] == "POST" for item in fake_api.state.requests)
+
+
+def test_effort_without_model_is_rejected_before_control_request(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+
+    with pytest.raises(AgentContractError) as error:
+        provider.prepare(_invoke(context, options={"reasoning_effort": "high"}), context)
+
+    assert error.value.code == "invalid_request"
+    assert fake_api.state.requests == []
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_continue_dispatches_exact_thread_without_workspace_or_options(
+    fake_api: _FakeHTTPServer, tmp_path: Path, wait: bool
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    thread_id = "thread:external"
+    prepared = provider.prepare(
+        _invoke(
+            context,
+            session={"mode": "continue", "thread_id": thread_id},
+            prompt="Continue the external thread.",
+            options={},
+            wait=wait,
+        ),
+        context,
+    )
+    provider.preflight(prepared)
+
+    receipt = provider.dispatch(prepared, "cba-" + "9" * 64)
+
+    assert receipt.disposition == "ACCEPTED"
+    assert receipt.handle == {"thread_id": thread_id, "turn_id": "turn_123456"}
+    posts = [item for item in fake_api.state.requests if item["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["path"] == "/ui-api/control/threads/thread%3Aexternal/turns"
+    assert json.loads(posts[0]["body"]) == {
+        "client_request_id": "cba-" + "9" * 64,
+        "prompt": "Continue the external thread.",
+    }
+
+
+def test_continue_options_are_rejected_before_post(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+
+    with pytest.raises(AgentContractError) as error:
+        provider.prepare(
+            _invoke(
+                context,
+                session={"mode": "continue", "thread_id": "thread_123456"},
+                options={"title": "unsupported"},
+            ),
+            context,
+        )
+
+    assert error.value.code == "unsupported_option"
+    assert fake_api.state.requests == []
+
+
+def test_continue_mismatch_and_409_are_uncertain_without_retry(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    prepared = provider.prepare(
+        _invoke(
+            context,
+            session={"mode": "continue", "thread_id": "thread_123456"},
+            options={},
+        ),
+        context,
+    )
+    fake_api.state.continue_body = {
+        "thread_id": "thread_654321",
+        "turn_id": "turn_123456",
+        "state": "in_progress",
+    }
+    mismatch = provider.dispatch(prepared, "cba-" + "a" * 64)
+    assert mismatch.disposition == "UNCERTAIN"
+    assert sum(item["method"] == "POST" for item in fake_api.state.requests) == 1
+
+    fake_api.state.requests.clear()
+    fake_api.state.continue_body = None
+    fake_api.state.continue_status = 409
+    conflict = provider.dispatch(prepared, "cba-" + "b" * 64)
+    assert conflict.disposition == "UNCERTAIN"
+    assert sum(item["method"] == "POST" for item in fake_api.state.requests) == 1
+
+    fake_api.state.requests.clear()
+    fake_api.state.continue_status = 200
+    fake_api.state.continue_body = {
+        "thread_id": "thread_123456",
+        "turn_id": "turn_123456",
+    }
+    malformed = provider.dispatch(prepared, "cba-" + "e" * 64)
+    assert malformed.disposition == "UNCERTAIN"
+    assert sum(item["method"] == "POST" for item in fake_api.state.requests) == 1
+
+
+def test_interrupt_ack_is_accepted_for_exact_handle_without_observation(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    handle = {"thread_id": "thread:external", "turn_id": "turn:active"}
+    prepared = provider.prepare(_interrupt(context, handle), context)
+    provider.preflight(prepared)
+    preflight_request_count = len(fake_api.state.requests)
+
+    receipt = provider.dispatch(prepared, "cba-" + "c" * 64)
+
+    assert receipt.disposition == "ACCEPTED"
+    assert receipt.handle == handle
+    assert receipt.remote_state == "in_progress"
+    posts = [item for item in fake_api.state.requests if item["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["path"] == (
+        "/ui-api/control/threads/thread%3Aexternal/turns/turn%3Aactive/interrupt"
+    )
+    assert json.loads(posts[0]["body"]) == {"client_request_id": "cba-" + "c" * 64}
+    dispatch_requests = fake_api.state.requests[preflight_request_count:]
+    assert not any(
+        item["path"].split("?")[0].endswith(("/status", "/turns", "/items"))
+        for item in dispatch_requests
+    )
+
+
+def test_provider_protocol_interrupt_dispatches_one_explicit_handle(
+    fake_api: _FakeHTTPServer, tmp_path: Path
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    handle = {"thread_id": "thread:external", "turn_id": "turn:active"}
+
+    receipt = provider.interrupt(handle, context, "cba-" + "7" * 64)
+
+    assert receipt.disposition == "ACCEPTED"
+    assert receipt.handle == handle
+    assert receipt.remote_state == "in_progress"
+    assert len(fake_api.state.requests) == 1
+    request = fake_api.state.requests[0]
+    assert request["method"] == "POST"
+    assert request["path"] == (
+        "/ui-api/control/threads/thread%3Aexternal/turns/turn%3Aactive/interrupt"
+    )
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "conflict", "malformed"])
+def test_interrupt_mismatch_or_409_is_uncertain_without_retry(
+    fake_api: _FakeHTTPServer, tmp_path: Path, failure: str
+) -> None:
+    provider = _provider(fake_api, tmp_path)
+    context = provider.capabilities("default").target_context
+    handle = {"thread_id": THREAD_ID, "turn_id": TURN_ID}
+    prepared = provider.prepare(_interrupt(context, handle), context)
+    if failure == "mismatch":
+        fake_api.state.interrupt_body = {
+            "thread_id": THREAD_ID,
+            "turn_id": "turn_654321",
+            "state": "interrupted",
+        }
+    elif failure == "conflict":
+        fake_api.state.interrupt_status = 409
+    else:
+        fake_api.state.interrupt_body = {
+            "thread_id": THREAD_ID,
+            "turn_id": TURN_ID,
+        }
+
+    receipt = provider.dispatch(prepared, "cba-" + "d" * 64)
+
+    assert receipt.disposition == "UNCERTAIN"
+    assert receipt.handle == handle
+    assert sum(item["method"] == "POST" for item in fake_api.state.requests) == 1
 
 
 @pytest.mark.parametrize(

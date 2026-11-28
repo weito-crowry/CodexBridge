@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from .agent_contracts import (
+    AgentError,
     AgentRequest,
     AgentResult,
     DispatchReceipt,
@@ -328,13 +329,13 @@ class AgentInvocationLedger:
             raise AgentLedgerIntegrityError("prepared Agent request is invalid") from None
         target_context = TargetContext.from_dict(normalized.target_identity)
         if (
-            normalized.operation not in {"invoke", "observe", "wait"}
+            normalized.operation not in {"invoke", "observe", "wait", "interrupt"}
             or normalized.provider != target_context.provider
             or normalized.target != target_context.target
             or canonical_json(target_context.to_dict()) != self._target_context_json
         ):
             raise AgentLedgerIntegrityError("prepared Agent request does not match the run")
-        if normalized.operation in {"observe", "wait"}:
+        if normalized.operation in {"observe", "wait", "interrupt"}:
             _canonical_handle(normalized.handle, self._target_context_json)
         pointer = _validate_node_pointer(node_pointer)
         iteration_json = _canonical_iteration(iteration_vector)
@@ -354,7 +355,9 @@ class AgentInvocationLedger:
             "iteration_vector": cast(list[int], _load_canonical(iteration_json)),
         }
         invocation_id = _sha256(canonical_json(identity))
-        client_request_id = f"cba-{invocation_id}" if normalized.operation == "invoke" else None
+        client_request_id = (
+            f"cba-{invocation_id}" if normalized.operation in {"invoke", "interrupt"} else None
+        )
         dispatch_state = "NONE" if normalized.operation in {"observe", "wait"} else "PREPARED"
         request_json = normalized.to_json()
         request_sha256 = _sha256(request_json)
@@ -519,25 +522,26 @@ class AgentInvocationLedger:
                         AND dispatch_receipt_json IS NULL""",
                     (raw_json, receipt_sha256, invocation_id),
                 )
-                connection.execute(
-                    """INSERT INTO owned_handles (
-                        invocation_id,provider,target_identity_sha256,handle_json,
-                        handle_sha256,remote_state,observed_ms,remote_terminal
-                    ) VALUES (?,?,?,?,?,?,?,?)""",
-                    (
-                        invocation_id,
-                        record.request.provider,
-                        target_identity_sha256,
-                        handle_json,
-                        handle_sha256,
-                        receipt.remote_state,
-                        None,
-                        int(
-                            record.request.provider == "codex"
-                            and receipt.remote_state in _CODEX_TERMINAL_REMOTE_STATES
+                if record.operation == "invoke":
+                    connection.execute(
+                        """INSERT INTO owned_handles (
+                            invocation_id,provider,target_identity_sha256,handle_json,
+                            handle_sha256,remote_state,observed_ms,remote_terminal
+                        ) VALUES (?,?,?,?,?,?,?,?)""",
+                        (
+                            invocation_id,
+                            record.request.provider,
+                            target_identity_sha256,
+                            handle_json,
+                            handle_sha256,
+                            receipt.remote_state,
+                            None,
+                            int(
+                                record.request.provider == "codex"
+                                and receipt.remote_state in _CODEX_TERMINAL_REMOTE_STATES
+                            ),
                         ),
-                    ),
-                )
+                    )
             else:
                 connection.execute(
                     """UPDATE invocations SET dispatch_state='REJECTED',
@@ -1025,8 +1029,49 @@ def _canonical_handle(value: object, target_context_json: str) -> str:
 def _validate_receipt_for_request(
     request: PreparedProviderRequest, receipt: DispatchReceipt
 ) -> None:
+    if request.operation == "interrupt":
+        target_handle = _validate_codex_handle(
+            request.handle, canonical_json(request.target_identity)
+        )
+        if receipt.disposition == "ACCEPTED":
+            if receipt.handle != request.handle:
+                raise AgentLedgerIntegrityError("accepted interrupt receipt changed its target")
+            if receipt.error is not None or receipt.remote_state is None:
+                raise AgentLedgerIntegrityError("accepted interrupt receipt is incomplete")
+            context = TargetContext.from_dict(request.target_identity)
+            if context.provider == "codex":
+                _validate_codex_remote_state(
+                    receipt.remote_state,
+                    receipt.remote_state in _CODEX_TERMINAL_REMOTE_STATES,
+                )
+        elif receipt.disposition == "REJECTED":
+            if (
+                receipt.handle != request.handle
+                or receipt.remote_state is not None
+                or receipt.error is None
+                or receipt.error.get("code")
+                not in {
+                    "dispatch_rejected",
+                    "unauthorized",
+                    "request_too_large",
+                    "unsupported_option",
+                    "unsupported_operation",
+                    "unsupported_target",
+                    "preflight_failed",
+                    "invalid_request",
+                }
+            ):
+                raise AgentLedgerIntegrityError("rejected interrupt receipt is invalid")
+        elif receipt.disposition == "UNCERTAIN":
+            if receipt.handle != request.handle or receipt.remote_state is not None:
+                raise AgentLedgerIntegrityError("uncertain interrupt receipt changed its target")
+        else:
+            raise AgentLedgerIntegrityError("interrupt receipt disposition is invalid")
+        if target_handle != canonical_json(request.handle):
+            raise AgentLedgerIntegrityError("interrupt request handle is invalid")
+        return
     if request.operation != "invoke":
-        raise AgentLedgerIntegrityError("dispatch receipt does not match an I3 invoke")
+        raise AgentLedgerIntegrityError("dispatch receipt does not match a dispatch operation")
     if receipt.disposition == "ACCEPTED":
         _validate_codex_handle(receipt.handle, canonical_json(request.target_identity))
         if receipt.error is not None:
@@ -1039,6 +1084,18 @@ def _validate_receipt_for_request(
                 receipt.remote_state,
                 receipt.remote_state in _CODEX_TERMINAL_REMOTE_STATES,
             )
+            session = request.session
+            if (
+                session is not None
+                and session.get("mode") == "continue"
+                and (
+                    receipt.handle is None
+                    or receipt.handle.get("thread_id") != session["thread_id"]
+                )
+            ):
+                raise AgentLedgerIntegrityError(
+                    "accepted Codex continue receipt changed the requested thread"
+                )
     elif receipt.disposition == "REJECTED":
         if receipt.handle is not None or receipt.remote_state is not None:
             raise AgentLedgerIntegrityError("rejected dispatch receipt claims remote execution")
@@ -1137,6 +1194,79 @@ def _validate_result_for_record(
             ) from None
         if expected.to_json() != result.to_json():
             raise AgentLedgerIntegrityError("read-only Agent result semantics are invalid")
+        return
+    if record.operation == "interrupt":
+        if owned is not None:
+            raise AgentLedgerIntegrityError("interrupt operation cannot own a remote handle")
+        expected_handle = request.handle
+        if (
+            result.handle != expected_handle
+            or result.remote_state is None
+            and (record.dispatch_state == "ACCEPTED")
+        ):
+            raise AgentLedgerIntegrityError("interrupt result changed its exact target handle")
+        if record.dispatch_state == "PREPARED":
+            if (
+                result.status != "FAILED"
+                or result.remote_state is not None
+                or result.error is None
+                or result.error.get("code")
+                not in {
+                    "unauthorized",
+                    "preflight_failed",
+                    "invalid_request",
+                    "unsupported_operation",
+                    "unsupported_option",
+                    "unsupported_target",
+                    "request_too_large",
+                }
+            ):
+                raise AgentLedgerIntegrityError("unclaimed interrupt has an invalid result")
+            expected = AgentResult(
+                invocation_id=record.invocation_id,
+                operation="interrupt",
+                provider=request.provider,
+                target=request.target,
+                status="FAILED",
+                handle=expected_handle,
+                error=result.error,
+            )
+        elif record.dispatch_state == "MAYBE_SENT":
+            expected = AgentResult(
+                invocation_id=record.invocation_id,
+                operation="interrupt",
+                provider=request.provider,
+                target=request.target,
+                status="UNKNOWN",
+                handle=expected_handle,
+                error=AgentError("dispatch_uncertain"),
+            )
+        elif record.dispatch_state == "REJECTED":
+            receipt = DispatchReceipt.from_json(cast(str, record.dispatch_receipt_json))
+            expected = AgentResult(
+                invocation_id=record.invocation_id,
+                operation="interrupt",
+                provider=request.provider,
+                target=request.target,
+                status="FAILED",
+                handle=expected_handle,
+                error=receipt.error,
+            )
+        elif record.dispatch_state == "ACCEPTED":
+            receipt = DispatchReceipt.from_json(cast(str, record.dispatch_receipt_json))
+            expected = AgentResult(
+                invocation_id=record.invocation_id,
+                operation="interrupt",
+                provider=request.provider,
+                target=request.target,
+                status="ACCEPTED",
+                handle=receipt.handle,
+                remote_state=receipt.remote_state,
+            )
+        else:
+            raise AgentLedgerIntegrityError("interrupt dispatch state is invalid")
+        if result.to_json() != expected.to_json():
+            raise AgentLedgerIntegrityError("interrupt result disagrees with its receipt")
         return
     if record.dispatch_state == "PREPARED":
         timed_out_before_claim = (
@@ -1396,6 +1526,13 @@ def _validate_row_relationships(
     owned_row = connection.execute(
         "SELECT * FROM owned_handles WHERE invocation_id=?", (record.invocation_id,)
     ).fetchone()
+    if record.dispatch_state == "ACCEPTED" and record.operation == "interrupt":
+        if owned_row is not None:
+            raise AgentLedgerIntegrityError("accepted interrupt unexpectedly owns its target")
+        if record.result_json is not None:
+            result = AgentResult.from_json(record.result_json)
+            _validate_result_for_record(record, result, None)
+        return None
     if record.dispatch_state == "ACCEPTED":
         if owned_row is None:
             raise AgentLedgerIntegrityError("accepted invoke has no owned handle")
